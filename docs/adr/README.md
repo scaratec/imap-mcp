@@ -61,3 +61,25 @@ edit its Status line and link the replacement. Do not delete the file.
 | #    | Title                                   | Status   |
 |------|-----------------------------------------|----------|
 | 0000 | [Record Architecture Decisions](0000-record-architecture-decisions.md) | Accepted |
+| 0001 | [Default-Deny Hierarchical Policy Model](0001-default-deny-hierarchical-policy.md) | Accepted |
+| 0002 | [Linear Visibility Levels](0002-linear-visibility-levels.md) | Accepted |
+| 0003 | [Explicit Whitelist and Blacklist Folder Modes](0003-whitelist-blacklist-folder-modes.md) | Accepted |
+| 0004 | [Sender Rule Matcher Grammar](0004-sender-rule-matcher-grammar.md) | Accepted |
+| 0005 | [Per-Folder Write Capabilities](0005-per-folder-write-capabilities.md) | Accepted |
+| 0006 | [Cross-Account Move via Saga, Native MOVE Within Account](0006-cross-account-move-via-saga.md) | Accepted |
+| 0007 | [SQLite as Write-Ahead Log Store](0007-sqlite-as-wal-store.md) | Accepted |
+| 0008 | [Idempotency via Message-ID with Content-Hash Witness](0008-idempotency-via-message-id-and-hash.md) | Accepted |
+| 0009 | [OAuth2 Authorization-Code Flow with Per-Account Scope Minimization](0009-oauth2-authorization-code-with-scope-minimization.md) | Accepted |
+| 0010 | [Configurable Token Cache Strategy](0010-configurable-token-cache-strategy.md) | Accepted |
+| 0011 | [Pluggable Secret Store Backend](0011-pluggable-secret-store-backend.md) | Accepted |
+| 0012 | [Python 3.11+ Runtime and Library Stack](0012-python-runtime-and-library-stack.md) | Accepted |
+| 0013 | [Hybrid IMAP Connection Pool](0013-hybrid-connection-pool.md) | Accepted |
+| 0014 | [Policy as Git-Versioned YAML with SIGHUP Reload](0014-policy-as-git-versioned-yaml.md) | Accepted |
+| 0015 | [Caller Identity and Authentication](0015-caller-identity-and-authentication.md) | Accepted |
+| 0016 | [MCP Tool Set](0016-mcp-tool-set.md) | Accepted |
+| 0017 | [Response Transparency for Policy-Filtered Data](0017-response-transparency-for-filtered-data.md) | Accepted |
+| 0018 | [Non-Goal Tool Surface](0018-non-goal-tool-surface.md) | Accepted |
+| 0019 | [Gmail Label Semantics](0019-gmail-label-semantics.md) | Accepted |
+| 0020 | [imap-agent as a Future Client, not a Component](0020-imap-agent-as-future-client.md) | Accepted |
+| 0021 | [Audit Log Format](0021-audit-log-format.md) | Accepted |
+| 0022 | [Audit Retention and Access Model](0022-audit-retention-and-access-model.md) | Accepted |
