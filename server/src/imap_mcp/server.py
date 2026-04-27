@@ -12,8 +12,7 @@ server module stays a thin dispatcher.
 
 from __future__ import annotations
 
-from __future__ import annotations
-
+import contextvars
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,14 +62,35 @@ from .policy import (
 from .secrets import build_secret_store
 
 
+# Per-request override for the caller identity. The HTTP transport
+# (ADR 0015 + LIM-0007 paydown) sets this in the bearer-auth middleware
+# so that each request runs against the caller derived from its
+# Authorization header. The stdio transport leaves it unset and falls
+# back to the static `default_caller_id` resolved at startup.
+_CURRENT_CALLER_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "imap_mcp_current_caller_id", default=None
+)
+
+
 @dataclass(frozen=True)
 class ServerContext:
-    caller_id: str
+    default_caller_id: str
     pdp: PolicyDecisionPoint
     configuration: "object"  # loaded Configuration; typed below via TYPE_CHECKING
     secret_store: "object"  # SecretStore protocol
     audit: "AuditWriter | None" = None
     saga: "SagaManager | None" = None
+
+    @property
+    def caller_id(self) -> str:
+        """Caller identity for the in-flight request.
+
+        On HTTP transport the bearer-auth middleware sets a per-request
+        ContextVar; on stdio it remains unset and the constructor-time
+        default applies.
+        """
+        override = _CURRENT_CALLER_ID.get()
+        return override if override is not None else self.default_caller_id
 
     def account_by_id(self, account_id: str) -> "object | None":
         from .config import Configuration
@@ -1604,8 +1624,15 @@ async def _handle_search(
     }
 
 
-async def run_stdio(config_dir: Path, caller_id: str) -> None:
-    configuration = load_configuration(config_dir)
+def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerContext, "Configuration"]:
+    """Load configuration and assemble a ServerContext.
+
+    Shared by `run_stdio` and `run_http`. The transport-specific code
+    around it is the only thing that differs.
+    """
+    from .config import Configuration
+
+    configuration: Configuration = load_configuration(config_dir)
     pdp = PolicyDecisionPoint(configuration)
     store_cfg = configuration.accounts_file.secret_store
     if store_cfg is None:
@@ -1631,7 +1658,7 @@ async def run_stdio(config_dir: Path, caller_id: str) -> None:
             wal=wal, audit_emitter=audit_writer, retry_limit=retry_limit
         )
     context = ServerContext(
-        caller_id=caller_id,
+        default_caller_id=default_caller_id,
         pdp=pdp,
         configuration=configuration,
         secret_store=secret_store,
@@ -1642,6 +1669,11 @@ async def run_stdio(config_dir: Path, caller_id: str) -> None:
         async def _resolver(account_id: str) -> tuple[Any, str]:
             return await _password_for(context, account_id)
         saga_mgr.account_resolver = _resolver
+    return context, configuration
+
+
+async def run_stdio(config_dir: Path, caller_id: str) -> None:
+    context, _configuration = _build_context(config_dir, default_caller_id=caller_id)
     app = build_server(context)
 
     async with stdio_server() as (read_stream, write_stream):
@@ -1650,6 +1682,157 @@ async def run_stdio(config_dir: Path, caller_id: str) -> None:
             write_stream,
             app.create_initialization_options(),
         )
+
+
+async def run_http(config_dir: Path, host: str, port: int) -> None:
+    """Serve MCP over Streamable HTTP with bearer-token caller auth.
+
+    Bearer token + caller_id arrive as HTTP headers
+    (`Authorization: Bearer <token>` and `X-MCP-Caller-Id: <id>`). The
+    bearer-auth middleware resolves the caller against `callers.yaml`,
+    validates the token via the configured `secret_store`, and either
+    sets the per-request caller in `_CURRENT_CALLER_ID` or rejects the
+    request with HTTP 401 + an `auth_failed` audit record. Non-MCP
+    routes return HTTP 404 (ADR 0018, non_goal_rejection.feature).
+    """
+    import hmac
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse, Response
+    from starlette.routing import Mount
+
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    # `default_caller_id` is unused on HTTP — every request supplies its
+    # own. We still need a non-empty placeholder because the dataclass
+    # frozen-default guard expects a string.
+    context, configuration = _build_context(
+        config_dir, default_caller_id="<http-no-default>"
+    )
+
+    # ADR 0015 invariant: stdio_trusted callers cannot authenticate
+    # over HTTP. The orchestrator-trust assumption that justifies
+    # stdio_trusted does not survive a network boundary — there is no
+    # orchestrator on the other end of an HTTP socket. Any
+    # stdio_trusted caller in the configured set therefore makes the
+    # config invalid for HTTP, fatal at startup.
+    stdio_trusted = [
+        c.id for c in configuration.callers_file.callers
+        if c.auth.type == "stdio_trusted"
+    ]
+    if stdio_trusted:
+        names = ", ".join(f'"{c}"' for c in stdio_trusted)
+        raise SystemExit(
+            f"caller {names} as \"stdio_trusted not permitted on "
+            "non-stdio transport\""
+        )
+
+    app_mcp = build_server(context)
+    session_manager = StreamableHTTPSessionManager(
+        app=app_mcp, json_response=True, stateless=True
+    )
+
+    def _audit_auth_failed(
+        caller_id_claim: str | None, reason: str, addr: str
+    ) -> None:
+        if context.audit is None:
+            return
+        record: dict[str, Any] = {
+            "caller_id": caller_id_claim,
+            "caller_addr": addr,
+            "tool": "auth_failed",
+            "decision": "DENY",
+            "reason": "auth_failed",
+            "auth_failure_reason": reason,
+        }
+        context.audit.write(record)
+
+    def _resolve_token(secret_ref: str | None) -> str | None:
+        if secret_ref is None:
+            return None
+        try:
+            return context.secret_store.get(secret_ref)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+
+    class BearerAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
+            # Only the MCP route requires authentication. Anything else
+            # is a non-route and returns 404 unconditionally below.
+            if not request.url.path.rstrip("/").endswith("/mcp"):
+                return await call_next(request)
+            addr = request.client.host if request.client else "http:?"
+            caller_id_claim = request.headers.get("x-mcp-caller-id")
+            authz = request.headers.get("authorization", "")
+            scheme, _, token = authz.partition(" ")
+            if scheme.lower() != "bearer" or not token:
+                _audit_auth_failed(
+                    caller_id_claim, "no_bearer_token", f"http:{addr}"
+                )
+                return JSONResponse(
+                    {"error": "auth_failed"}, status_code=401
+                )
+            if not caller_id_claim:
+                _audit_auth_failed(None, "no_caller_id", f"http:{addr}")
+                return JSONResponse(
+                    {"error": "no_caller_identity"}, status_code=401
+                )
+            caller = configuration.caller_by_id(caller_id_claim)
+            if caller is None:
+                _audit_auth_failed(
+                    caller_id_claim, "unknown_caller_id", f"http:{addr}"
+                )
+                return JSONResponse(
+                    {"error": "unknown_caller_id"}, status_code=401
+                )
+            if caller.auth.type != "shared_token":
+                _audit_auth_failed(
+                    caller_id_claim, "wrong_auth_type", f"http:{addr}"
+                )
+                return JSONResponse(
+                    {"error": "auth_failed"}, status_code=401
+                )
+            expected = _resolve_token(caller.auth.token_secret_ref)
+            if expected is None or not hmac.compare_digest(token, expected):
+                _audit_auth_failed(
+                    caller_id_claim, "wrong_token", f"http:{addr}"
+                )
+                return JSONResponse(
+                    {"error": "auth_failed"}, status_code=401
+                )
+            token_var = _CURRENT_CALLER_ID.set(caller_id_claim)
+            try:
+                return await call_next(request)
+            finally:
+                _CURRENT_CALLER_ID.reset(token_var)
+
+    async def _handle_mcp(scope, receive, send):  # type: ignore[no-untyped-def]
+        await session_manager.handle_request(scope, receive, send)
+
+    async def _not_found(request):  # type: ignore[no-untyped-def]
+        return Response(status_code=404)
+
+    from starlette.routing import Route
+
+    starlette_app = Starlette(
+        routes=[
+            Mount("/mcp", app=_handle_mcp),
+            Route(
+                "/{path:path}",
+                endpoint=_not_found,
+                methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+            ),
+        ],
+        middleware=[],
+    )
+    starlette_app.add_middleware(BearerAuthMiddleware)
+
+    async with session_manager.run():
+        config = uvicorn.Config(
+            starlette_app, host=host, port=port, log_level="warning"
+        )
+        await uvicorn.Server(config).serve()
 
 
 def _caller_id_from_env_or_exit() -> str:

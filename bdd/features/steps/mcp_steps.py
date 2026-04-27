@@ -16,12 +16,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from behave import when
+from behave import given, when
 from behave.runner import Context
 
-from support.mcp_client import MCPClient
+from support.mcp_client import MCPClient, MCPClientError, MCPHttpClient, MCPRPCError
 
 SERVER_BINARY_ENV = "IMAP_MCP_SERVER_BINARY"
+
+
+def _server_binary(context: Context) -> Path:
+    import os
+
+    return Path(
+        os.environ.get(
+            SERVER_BINARY_ENV,
+            context.bdd_root.parent / "server" / ".venv" / "bin" / "imap-mcp",
+        )
+    )
 
 
 def _ensure_mcp_client(context: Context, caller_id: str) -> MCPClient:
@@ -340,6 +351,123 @@ def step_caller_triggers_sender_blacklist(
         {"account": account_id, "folder": folder.path, "uid": actual_uid},
     )
     _store_result(context, payload)
+
+
+@given('the server process is started with transport "http" on a random port')
+@given('the server is started with transport "http" on a random port')
+@given('the server process is started with transport "http"')
+@given('the server is started with transport "http"')
+def step_server_started_http(context: Context) -> None:
+    _start_http_server_for_test(context)
+
+
+def _start_http_server_for_test(context: Context) -> None:
+    """Launch the server subprocess in HTTP mode.
+
+    On success, the running client is parked in `context.mcp_http`.
+    On startup failure (e.g. an ADR-0015-violating config that refuses
+    to bind), the captured exit code + stderr are placed in
+    `context.startup_proc` so that subsequent Then-steps can assert on
+    the failure mode without distinguishing the two transport
+    variants.
+
+    A stdio MCPClient that an earlier Background step started (via
+    `… completes an Initialize handshake successfully`) is closed
+    first — the scenario is switching transports."""
+    stdio_client = getattr(context, "mcp", None)
+    if stdio_client is not None:
+        stdio_client.close()
+        context.mcp = None
+
+    from features.steps.policy_steps import flush_staged_messages
+
+    flush_staged_messages(context)
+    builder = getattr(context, "policy_builder", None)
+    if builder is not None:
+        builder.write()
+    extra_env = getattr(context, "mcp_extra_env", None) or {}
+    extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
+    context.mcp_extra_env = extra_env
+    client = MCPHttpClient(
+        server_binary=_server_binary(context),
+        config_dir=context.config_dir,
+        extra_env=extra_env,
+    )
+    try:
+        client.start_server()
+    except MCPClientError as exc:
+        # Synthesize a `startup_proc`-shape result so the existing
+        # `the server refuses to start` Then-step can read it.
+        from types import SimpleNamespace
+
+        proc = client._proc
+        rc = proc.returncode if proc is not None else 1
+        context.startup_proc = SimpleNamespace(
+            returncode=rc,
+            stderr=client.stderr_text,
+            stdout="",
+        )
+        context.http_startup_error = str(exc)
+        return
+    context.mcp_http = client
+
+
+from behave import use_step_matcher as _use_step_matcher
+
+
+_use_step_matcher("re")
+
+
+@when(
+    r'the MCP client performs an Initialize handshake with caller_id '
+    r'"(?P<caller_id>[^"]+)" and bearer token "(?P<token>[^"]*)"'
+)
+def step_mcp_client_init_with_token(
+    context: Context, caller_id: str, token: str
+) -> None:
+    client = context.mcp_http
+    context.last_handshake_error = None
+    try:
+        client.initialize(caller_id, token)
+        context.last_handshake_succeeded = True
+    except MCPRPCError as exc:
+        context.last_handshake_succeeded = False
+        context.last_handshake_error = exc.message
+
+
+@when(
+    r'a client sends an Initialize with caller_id "(?P<caller_id>[^"]+)" '
+    r'and bearer token "(?P<token>[^"]*)"'
+)
+def step_client_send_initialize(
+    context: Context, caller_id: str, token: str
+) -> None:
+    step_mcp_client_init_with_token(context, caller_id, token)
+
+
+_use_step_matcher("parse")
+
+
+@when("an HTTP client makes GET /admin against the server")
+def step_http_client_get_admin(context: Context) -> None:
+    import httpx
+
+    client = context.mcp_http
+    response = httpx.get(
+        f"http://{client.host}:{client.port}/admin", timeout=2.0
+    )
+    context.last_http_response = response
+
+
+@when("an HTTP client makes POST /admin/reload-policy against the server")
+def step_http_client_post_admin_reload(context: Context) -> None:
+    import httpx
+
+    client = context.mcp_http
+    response = httpx.post(
+        f"http://{client.host}:{client.port}/admin/reload-policy", timeout=2.0
+    )
+    context.last_http_response = response
 
 
 @when("the server's background recovery loop runs {passes:d} times")

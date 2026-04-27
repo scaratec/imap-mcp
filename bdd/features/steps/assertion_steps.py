@@ -1542,6 +1542,72 @@ def step_audit_share_same_tx_id(context: Context) -> None:
         )
 
 
+@then("the handshake succeeds")
+def step_handshake_succeeds(context: Context) -> None:
+    if not getattr(context, "last_handshake_succeeded", False):
+        err = getattr(context, "last_handshake_error", None)
+        raise AssertionError(
+            f"Handshake unexpectedly failed: {err!r}"
+        )
+
+
+@then('the handshake fails with error "{expected}"')
+def step_handshake_fails(context: Context, expected: str) -> None:
+    if getattr(context, "last_handshake_succeeded", True):
+        raise AssertionError("Handshake unexpectedly succeeded")
+    err = getattr(context, "last_handshake_error", None)
+    if err != expected:
+        raise AssertionError(
+            f"Handshake error message: expected {expected!r}, got {err!r}"
+        )
+
+
+@then('a subsequent get_caller_identity returns caller_id "{caller_id}"')
+def step_subsequent_caller_identity(context: Context, caller_id: str) -> None:
+    import json as _json
+
+    client = context.mcp_http
+    payload = client.call_tool("get_caller_identity", {})
+    content = payload.get("content") or []
+    text = content[0]["text"] if content else "{}"
+    data = _json.loads(text)
+    actual = data.get("caller_id")
+    if actual != caller_id:
+        raise AssertionError(
+            f"caller_id: expected {caller_id!r}, got {actual!r}"
+        )
+
+
+@then("the HTTP response status code is {status:d}")
+def step_http_response_status_code(context: Context, status: int) -> None:
+    response = context.last_http_response
+    if response.status_code != status:
+        raise AssertionError(
+            f"HTTP status: expected {status}, got {response.status_code}; "
+            f"body: {response.text!r}"
+        )
+
+
+@then('the startup error indicates caller "{caller_id}" as "{message}"')
+def step_startup_error_indicates_caller(
+    context: Context, caller_id: str, message: str
+) -> None:
+    text = ""
+    proc = getattr(context, "startup_proc", None)
+    if proc is not None:
+        text = (proc.stderr or "") + (proc.stdout or "")
+    else:
+        text = getattr(context, "startup_error", "") or ""
+    if caller_id not in text:
+        raise AssertionError(
+            f"Startup error did not mention caller {caller_id!r}; got: {text!r}"
+        )
+    if message not in text:
+        raise AssertionError(
+            f"Startup error did not mention message {message!r}; got: {text!r}"
+        )
+
+
 @then('the IMAP server has no folder named "{folder_path}" that now holds uid {uid:d}')
 def step_imap_server_no_folder_holding_uid(
     context: Context, folder_path: str, uid: int

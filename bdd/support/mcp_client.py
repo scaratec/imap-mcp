@@ -1,14 +1,22 @@
-"""Stdio-subprocess wrapper around the imap-mcp server.
+"""Subprocess wrappers around the imap-mcp server.
 
-The BDD harness talks to the server exclusively through this client.
-It speaks the MCP Initialize / list_tools / tools/call handshakes as
-JSON-RPC 2.0 framed over line-delimited stdio, the way the MCP stdio
-transport expects.
+The BDD harness talks to the server exclusively through these clients.
+They speak the MCP Initialize / list_tools / tools/call handshakes as
+JSON-RPC 2.0 framed over the chosen transport.
 
-No Python-level import of the server package occurs. The server is
-started as `SERVER_BINARY` (path configurable via IMAP_MCP_SERVER_BINARY
-env var), and communication is byte-level. This is deliberate: the BDD
-suite must exercise the same surface any other MCP client would.
+Two transports are supported:
+
+- `MCPClient` — stdio. Caller identity is the `IMAP_MCP_CALLER_ID` env
+  var (stdio_trusted, ADR 0015).
+- `MCPHttpClient` — Streamable HTTP. Caller identity comes from the
+  `X-MCP-Caller-Id` header; the bearer token from
+  `Authorization: Bearer <token>` (LIM-0007 paydown, ADR 0023).
+
+No Python-level import of the server package occurs in either client.
+The server is started as `SERVER_BINARY` (path configurable via
+IMAP_MCP_SERVER_BINARY env var), and communication is byte-level. This
+is deliberate: the BDD suite must exercise the same surface any other
+MCP client would.
 """
 
 from __future__ import annotations
@@ -16,11 +24,12 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -189,6 +198,255 @@ class MCPClient:
             if message.get("id") == request_id:
                 return message
         raise MCPClientError(f"Timed out waiting for response to {request_id}")
+
+    def _drain_stderr(self, stream: io.BufferedReader) -> None:
+        for chunk in iter(lambda: stream.read(4096), b""):
+            if not chunk:
+                break
+            self._stderr_log.append(chunk)
+
+    @property
+    def stderr_text(self) -> str:
+        return b"".join(self._stderr_log).decode("utf-8", "replace")
+
+
+def _pick_free_port() -> int:
+    """Reserve and release an ephemeral TCP port. Standard test pattern;
+    a transient race can occur if a concurrent process grabs the port
+    in the half-second before the server binds, but in CI it's fine."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+@dataclass
+class MCPHttpClient:
+    """Streamable HTTP variant of `MCPClient`.
+
+    The server is launched as a subprocess with `--transport http`
+    on a randomly chosen free port, then driven via JSON-RPC POST
+    to `/mcp/`. The bearer token + caller_id are sent on every
+    request as HTTP headers.
+
+    Initialize is a normal JSON-RPC method; failures surface as
+    HTTP 401 (auth path) or as a JSON-RPC error (protocol path).
+    """
+
+    server_binary: Path
+    config_dir: Path
+    extra_env: dict[str, str] | None = None
+    host: str = "127.0.0.1"
+    port: int = 0
+    bearer_token: str | None = None
+    caller_id: str | None = None
+    _proc: subprocess.Popen[bytes] | None = field(default=None, init=False)
+    _stderr_log: list[bytes] = field(default_factory=list, init=False)
+    _stderr_thread: threading.Thread | None = field(default=None, init=False)
+    _initialized: bool = field(default=False, init=False)
+    _session_id: str | None = field(default=None, init=False)
+
+    # ---------------------------------------------------------- lifecycle
+
+    def start_server(self, port: int | None = None) -> None:
+        if self._proc is not None:
+            raise MCPClientError("server already started")
+        self.port = port or _pick_free_port()
+        env = dict(os.environ)
+        env["IMAP_MCP_CONFIG_DIR"] = str(self.config_dir)
+        if self.extra_env:
+            env.update(self.extra_env)
+        self._proc = subprocess.Popen(
+            [
+                str(self.server_binary),
+                "--transport", "http",
+                "--host", self.host,
+                "--port", str(self.port),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            bufsize=0,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            args=(self._proc.stderr,),
+            daemon=True,
+        )
+        self._stderr_thread.start()
+        # Drain stdout in the background too so a noisy server doesn't
+        # deadlock on a full pipe.
+        threading.Thread(
+            target=self._drain_stderr,
+            args=(self._proc.stdout,),
+            daemon=True,
+        ).start()
+        self._wait_for_listening(timeout=5.0)
+
+    def _wait_for_listening(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._proc and self._proc.poll() is not None:
+                stderr = b"".join(self._stderr_log).decode("utf-8", "replace")
+                raise MCPClientError(
+                    f"Server exited before listening (rc="
+                    f"{self._proc.returncode}). Stderr:\n{stderr}"
+                )
+            try:
+                with socket.create_connection((self.host, self.port), timeout=0.5):
+                    return
+            except OSError:
+                time.sleep(0.1)
+        raise MCPClientError(
+            f"Server did not start listening on {self.host}:{self.port} "
+            f"within {timeout}s"
+        )
+
+    def close(self, timeout: float = 3.0) -> None:
+        if self._proc is None:
+            return
+        try:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=timeout)
+        finally:
+            self._proc = None
+
+    # ------------------------------------------------------------- MCP API
+
+    def initialize(
+        self, caller_id: str, bearer_token: str
+    ) -> dict[str, Any]:
+        """Perform the MCP Initialize handshake. Returns the result on
+        success; raises MCPClientError on transport-level failure or
+        MCPRPCError on JSON-RPC error."""
+        self.caller_id = caller_id
+        self.bearer_token = bearer_token
+        result = self._rpc(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "imap-mcp-bdd-http", "version": "0.1.0"},
+            },
+        )
+        # The SDK returns the session id in a header; with stateless=True
+        # there is none, but we record it for completeness.
+        self._initialized = True
+        return result
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        result = self._rpc("tools/list", {})
+        return list(result.get("tools", []))
+
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        return self._rpc("tools/call", {"name": name, "arguments": arguments})
+
+    def raw_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        return self._rpc(method, params)
+
+    # -------------------------------------------------------- internals
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}/mcp/"
+
+    def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        import httpx
+
+        request_id = str(uuid.uuid4())
+        body = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        if self.caller_id is not None:
+            headers["X-MCP-Caller-Id"] = self.caller_id
+        if self._session_id is not None:
+            headers["Mcp-Session-Id"] = self._session_id
+
+        try:
+            response = httpx.post(self.url, json=body, headers=headers, timeout=10.0)
+        except httpx.HTTPError as exc:
+            raise MCPClientError(f"HTTP transport error: {exc}") from exc
+
+        if response.status_code == 401:
+            try:
+                err = response.json()
+            except json.JSONDecodeError:
+                err = {"error": "auth_failed"}
+            raise MCPRPCError(
+                code=-32001,
+                message=str(err.get("error") or "auth_failed"),
+                data=err,
+            )
+        if response.status_code == 404:
+            raise MCPRPCError(
+                code=-32601,
+                message=f"HTTP 404 for {self.url}",
+            )
+        if response.status_code >= 400:
+            raise MCPClientError(
+                f"HTTP {response.status_code} from server: {response.text!r}"
+            )
+
+        # Capture session id on first stateful response (no-op when
+        # the server runs stateless=True).
+        if "mcp-session-id" in response.headers and self._session_id is None:
+            self._session_id = response.headers["mcp-session-id"]
+
+        # Streamable HTTP returns either application/json or
+        # text/event-stream; with json_response=True on the server it
+        # is the former, but be lenient.
+        ctype = response.headers.get("content-type", "")
+        if "text/event-stream" in ctype:
+            payload = self._parse_sse(response.text, request_id)
+        else:
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as exc:
+                raise MCPClientError(
+                    f"Non-JSON response: {response.text!r} ({exc})"
+                )
+
+        if isinstance(payload, list):
+            payload = next(
+                (m for m in payload if m.get("id") == request_id), payload[0]
+            )
+        if "error" in payload:
+            err = payload["error"]
+            raise MCPRPCError(err["code"], err.get("message", ""), err.get("data"))
+        return payload.get("result", {})
+
+    def _parse_sse(self, text: str, request_id: str) -> dict[str, Any]:
+        """Pick the JSON-RPC message matching `request_id` out of an
+        SSE-framed response."""
+        for block in text.split("\n\n"):
+            for line in block.splitlines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if not data:
+                    continue
+                try:
+                    msg = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("id") == request_id:
+                    return msg
+        raise MCPClientError(
+            f"No SSE message matched request_id={request_id!r}: {text!r}"
+        )
 
     def _drain_stderr(self, stream: io.BufferedReader) -> None:
         for chunk in iter(lambda: stream.read(4096), b""):

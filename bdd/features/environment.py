@@ -98,6 +98,10 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
     if mcp is not None:
         mcp.close()
         context.mcp = None
+    mcp_http = getattr(context, "mcp_http", None)
+    if mcp_http is not None:
+        mcp_http.close()
+        context.mcp_http = None
     scratch = getattr(context, "scratch_dir", None)
     if scratch is not None and scratch.exists():
         shutil.rmtree(scratch, ignore_errors=True)

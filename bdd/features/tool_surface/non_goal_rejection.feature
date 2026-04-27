@@ -58,9 +58,12 @@ Feature: Non-goal tool surface is genuinely absent
     When invoice-agent calls describe_policy
     Then the JSON response does NOT contain the literal string "Banking"
 
-  @pending @pending_LIM_0007
   Scenario: An attempt to reach `/admin` over HTTP transport is 404, not a routed endpoint
-    Given the server is started with transport "http" on a random port
+    Given the server is configured with callers:
+      | caller_id     | auth_type    | token_secret_ref                     |
+      | invoice-agent | shared_token | secret://callers/invoice-agent/token |
+    And the secret store contains value "tok" under "callers/invoice-agent/token"
+    And the server is started with transport "http" on a random port
     When an HTTP client makes GET /admin against the server
     Then the HTTP response status code is 404
     When an HTTP client makes POST /admin/reload-policy against the server

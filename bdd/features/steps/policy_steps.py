@@ -86,14 +86,33 @@ def step_imap_account_exists_with_single_folder(
 
 @given("the server is configured with caller:")
 def step_server_configured_with_caller(context: Context) -> None:
+    """Single-row caller setup. Tolerates table schemas with or
+    without `policy` and `auth_type` columns.
+
+    A missing `policy` column derives `<caller_id>-policy` so the
+    loader's "policy must exist" invariant is satisfied without the
+    feature having to spell it out for auth-only scenarios.
+    """
     builder = _ensure_builder(context)
     for row in context.table:
-        builder.add_caller(
-            id=row["caller_id"],
-            policy=row["policy"],
-            auth_type="stdio_trusted",
+        caller_id = row["caller_id"]
+        policy = row["policy"] if "policy" in row.headings else f"{caller_id}-policy"
+        auth_type = row["auth_type"] if "auth_type" in row.headings else "stdio_trusted"
+        token_secret_ref = (
+            row["token_secret_ref"] if "token_secret_ref" in row.headings else None
         )
-        builder.add_policy(row["policy"])
+        if token_secret_ref == "(n/a)":
+            token_secret_ref = None
+        builder.add_caller(
+            id=caller_id,
+            policy=policy,
+            auth_type=auth_type,
+            token_secret_ref=token_secret_ref,
+        )
+        builder.add_policy(policy)
+    # Boot-time invariant: at least one account must exist for the
+    # accounts.yaml schema to validate.
+    _ensure_account_registered(context, builder, "gupta-scaratec")
     builder.write()
 
 
@@ -1013,7 +1032,58 @@ def step_cross_account_move_begins(context: Context) -> None:
         context.last_tx_id = data.get("tx_id")
 
 
-@given("the server is configured to crash after WAL BEGIN persistence")
+@given("the server is configured with callers:")
+def step_server_with_callers_table(context: Context) -> None:
+    """Multi-caller setup. Each row drops one caller into the policy
+    builder; the secret store is populated by the dedicated step
+    `the secret store contains value "..." under "..."` (which is
+    distinct so each token can be addressed by name).
+
+    Existing callers with the same id are replaced. This is the
+    natural behaviour for a feature that, in its Background, set up a
+    default-stdio caller and now wants to override the auth_type to
+    shared_token for an HTTP-specific scenario.
+    """
+    builder = _ensure_builder(context)
+    for row in context.table:
+        caller_id = row["caller_id"]
+        auth_type = row["auth_type"]
+        token_secret_ref = row.get("token_secret_ref") if "token_secret_ref" in row.headings else None
+        if token_secret_ref == "(n/a)":
+            token_secret_ref = None
+        # Drop any prior caller with this id (e.g. seeded as stdio
+        # by an earlier Background step). The policy attached to the
+        # caller is preserved if present, otherwise a default one is
+        # created so the loader's invariant holds.
+        existing = next(
+            (c for c in builder.callers if c.id == caller_id), None
+        )
+        if existing is not None:
+            policy_name = existing.policy
+            builder.callers = [c for c in builder.callers if c.id != caller_id]
+        else:
+            policy_name = f"{caller_id}-policy"
+        builder.add_caller(
+            id=caller_id,
+            policy=policy_name,
+            auth_type=auth_type,
+            token_secret_ref=token_secret_ref,
+        )
+        if not any(p.name == policy_name for p in builder.policies):
+            builder.add_policy(policy_name)
+    # Ensure at least one account exists so the loader can boot.
+    _ensure_account_registered(context, builder, "gupta-scaratec")
+    builder.write()
+
+
+@given('the secret store contains value "{value}" under "{path}"')
+def step_secret_store_value(context: Context, value: str, path: str) -> None:
+    target = context.secrets_dir / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(value, encoding="utf-8")
+
+
+@given('the server is configured to crash after WAL BEGIN persistence')
 def step_crash_at_post_begin(context: Context) -> None:
     context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
     context.mcp_extra_env["IMAP_MCP_CRASH_AT"] = "post_begin"
@@ -1488,6 +1558,24 @@ def step_server_loads_policy_file_containing(context: Context) -> None:
 
 @then("the server refuses to start")
 def step_server_refuses_to_start(context: Context) -> None:
+    """Two paths reach this assertion:
+
+    1. A prior `Given the server process is started with transport
+       "http"` step has already launched the binary and captured the
+       result in `context.startup_proc` — we just inspect its exit
+       code (used by caller_authentication scenarios).
+    2. No prior step did so — we run a bootstrap probe inline
+       (used by config-validation scenarios).
+    """
+    proc = getattr(context, "startup_proc", None)
+    if proc is not None:
+        if proc.returncode == 0:
+            raise AssertionError(
+                "Expected the server to refuse to start, but it exited 0. "
+                f"Stdout: {proc.stdout!r}, stderr: {proc.stderr!r}"
+            )
+        context.startup_error = (proc.stderr or "") + (proc.stdout or "")
+        return
     result = _run_bootstrap_probe(context)
     context.startup_error = result.stderr
     if result.exit_code == 0:

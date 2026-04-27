@@ -101,9 +101,12 @@ Feature: Audit log format
     Then the audit record does NOT contain the literal string "vertrauensvoll"
     And the audit record contains a field "search_query_digest" equal to the SHA-256 hex digest of the canonicalized JSON criteria
 
-  @pending @pending_LIM_0007
   Scenario: auth_failed events are recorded with caller_addr and no token material
-    Given the server is started with transport "http"
+    Given the server is configured with callers:
+      | caller_id     | auth_type    | token_secret_ref                     |
+      | invoice-agent | shared_token | secret://callers/invoice-agent/token |
+    And the secret store contains value "correct-horse-battery" under "callers/invoice-agent/token"
+    And the server is started with transport "http" on a random port
     When a client sends an Initialize with caller_id "invoice-agent" and bearer token "wrong-token"
     Then the audit file contains a JSONL record with:
       | field       | value          |
