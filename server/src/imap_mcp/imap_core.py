@@ -1,0 +1,486 @@
+"""Minimal IMAP client — Walking-Skeleton slice (ADR 0012, 0013).
+
+Built on `aioimaplib`. Opens a single async connection per call for
+now; the hybrid connection pool from ADR 0013 will wrap these calls
+when the scenarios that exercise pool semantics activate.
+
+Only the operations the current tool set needs are exposed:
+- `list_folders(account)` returns the full folder path list as the
+  IMAP server reports it, unfiltered by policy.
+The PDP (in `policy.py`) is responsible for reducing that list.
+
+XOAUTH2 and Gmail extensions are deferred; only plain-auth password
+logins are supported at this stage.
+"""
+
+from __future__ import annotations
+
+import re
+
+from dataclasses import dataclass
+
+from aioimaplib import IMAP4
+
+from .config import Account
+from .fault_injection import get_registry
+
+
+@dataclass(frozen=True)
+class Envelope:
+    """Subset of message metadata needed for policy + ENVELOPE-level tools."""
+
+    uid: int
+    from_address: str
+    to_addresses: list[str]
+    subject: str
+    message_id: str | None
+    date: str | None
+    size_bytes: int = 0
+    has_attachment: bool = False
+
+
+# RFC 3501 LIST response format:  * LIST (flags) "sep" "name"
+# aioimaplib returns the untagged responses as bytes strings with the
+# `* LIST ` prefix already stripped: `(flags) "sep" "name"`.
+_LIST_LINE = re.compile(
+    rb'\s*\((?P<flags>[^)]*)\)\s+"(?P<sep>[^"]*)"\s+(?P<name>.+?)\s*$'
+)
+
+
+def _append_timeout() -> int:
+    """Timeout (seconds) for IMAP4 connections that perform APPEND.
+
+    Override via `IMAP_MCP_APPEND_TIMEOUT` for scenarios that inject an
+    APPEND delay and then assert the server exits the call with a
+    timeout rather than blocking forever.
+    """
+    import os
+
+    raw = os.environ.get("IMAP_MCP_APPEND_TIMEOUT")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return 60
+
+
+async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
+    """Consult fault injection, then construct an IMAP4 connection."""
+    await get_registry().check_connect(account.id)
+    imap = IMAP4(host=account.host, port=account.port, timeout=timeout)
+    await imap.wait_hello_from_server()
+    return imap
+
+
+async def list_folders(account: Account, password: str) -> list[str]:
+    """Connect, authenticate, LIST, logout. Return folder paths."""
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, response = await imap.list('""', "*")
+        if status != "OK":
+            raise RuntimeError(f"IMAP LIST failed: {status} {response!r}")
+        paths: list[str] = []
+        for raw in response:
+            if isinstance(raw, bytes) is False:
+                continue
+            line = raw.strip()
+            if not line or line.endswith(b"LIST completed") or line == b"Done":
+                continue
+            match = _LIST_LINE.search(line)
+            if not match:
+                continue
+            flags_raw = match.group("flags").decode("utf-8", errors="replace")
+            if "\\Noselect" in flags_raw:
+                # Noselect placeholders never hold messages; a "parent
+                # namespace" exists conceptually but the caller cannot
+                # interact with it.
+                continue
+            name_raw = match.group("name").strip()
+            if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
+                name_raw = name_raw[1:-1]
+            paths.append(name_raw.decode("utf-8"))
+        return paths
+    finally:
+        await imap.logout()
+
+
+def _imap_user_for(account: Account) -> str:
+    """Derive the IMAP username from an Account.
+
+    Walking-Skeleton convention: the BDD harness sets accounts
+    whose id is `<imap-user>-<tenant>` (e.g. `gupta-scaratec`,
+    `osthues-mail`, `personal`, `archive`). The user for IMAP auth
+    is the segment before the first dash, or the whole id if no
+    dash is present. The fixture's four users are fixed and tested;
+    this convention mirrors them.
+    """
+    return account.id.split("-", 1)[0]
+
+
+async def fetch_envelope(
+    account: Account, password: str, folder: str, uid: int
+) -> Envelope | None:
+    """Fetch ENVELOPE fields of a single UID. Returns None if absent."""
+    import email
+    from datetime import timezone
+    from email.utils import getaddresses, parsedate_to_datetime
+
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return None
+        status, response = await imap.uid(
+            "fetch", str(uid), "(BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)"
+        )
+        if status != "OK":
+            return None
+        raw_header = _extract_literal(response)
+        if raw_header is None:
+            return None
+        size_bytes, has_attachment = _extract_meta(response)
+        message = email.message_from_bytes(raw_header)
+        from_addrs = getaddresses(message.get_all("From", []))
+        to_addrs = getaddresses(
+            message.get_all("To", []) + message.get_all("Cc", [])
+        )
+        date_iso: str | None = None
+        date_header = message.get("Date")
+        if date_header:
+            try:
+                parsed = parsedate_to_datetime(date_header)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                date_iso = parsed.isoformat().replace("+00:00", "Z")
+            except (TypeError, ValueError):
+                date_iso = None
+        return Envelope(
+            uid=uid,
+            from_address=from_addrs[0][1] if from_addrs else "",
+            to_addresses=[addr for _, addr in to_addrs if addr],
+            subject=message.get("Subject", "") or "",
+            message_id=message.get("Message-ID"),
+            date=date_iso,
+            size_bytes=size_bytes,
+            has_attachment=has_attachment,
+        )
+    finally:
+        await imap.logout()
+
+
+def _extract_meta(response: list[bytes | bytearray]) -> tuple[int, bool]:
+    """Pull RFC822.SIZE and a has-attachment hint out of a FETCH frame.
+
+    aioimaplib returns the non-literal portion of the FETCH response
+    as a bytes frame that carries the key=value pairs. We parse it
+    loosely with regex because building a full IMAP response parser
+    here would be out of scope.
+    """
+    import re
+
+    size_bytes = 0
+    has_attachment = False
+    for item in response:
+        if not isinstance(item, (bytes, bytearray)):
+            continue
+        text = bytes(item)
+        size_match = re.search(rb"RFC822\.SIZE\s+(\d+)", text)
+        if size_match:
+            size_bytes = int(size_match.group(1))
+        if b"multipart/mixed" in text.lower() or b'"attachment"' in text.lower():
+            has_attachment = True
+    return size_bytes, has_attachment
+
+
+async def fetch_full_message(
+    account: Account, password: str, folder: str, uid: int
+) -> "bytes | None":
+    """Return the raw RFC822 bytes for a UID."""
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return None
+        status, response = await imap.uid("fetch", str(uid), "(RFC822)")
+        if status != "OK":
+            return None
+        return _extract_literal(response)
+    finally:
+        await imap.logout()
+
+
+async def fetch_body(
+    account: Account, password: str, folder: str, uid: int
+) -> tuple[Envelope, str] | None:
+    """Fetch headers + plain-text body for one UID. Returns None if absent."""
+    import email
+
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return None
+        status, response = await imap.uid("fetch", str(uid), "(RFC822)")
+        if status != "OK":
+            return None
+        raw = _extract_literal(response)
+        if raw is None:
+            return None
+        message = email.message_from_bytes(raw)
+        from email.utils import getaddresses
+
+        from_addrs = getaddresses(message.get_all("From", []))
+        to_addrs = getaddresses(
+            message.get_all("To", []) + message.get_all("Cc", [])
+        )
+        body_text = ""
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_type() == "text/plain":
+                    body_text = part.get_payload(decode=True).decode(
+                        part.get_content_charset("utf-8"), errors="replace"
+                    )
+                    break
+        else:
+            payload = message.get_payload(decode=True)
+            if isinstance(payload, bytes):
+                body_text = payload.decode(
+                    message.get_content_charset("utf-8"), errors="replace"
+                )
+        # Strip trailing CRLF / whitespace that IMAP servers add during
+        # APPEND; the caller expects the body as authored.
+        body_text = body_text.rstrip("\r\n")
+        envelope = Envelope(
+            uid=uid,
+            from_address=from_addrs[0][1] if from_addrs else "",
+            to_addresses=[addr for _, addr in to_addrs if addr],
+            subject=message.get("Subject", "") or "",
+            message_id=message.get("Message-ID"),
+            date=message.get("Date"),
+        )
+        return envelope, body_text
+    finally:
+        await imap.logout()
+
+
+async def folder_stats(
+    account: Account, password: str, folder: str
+) -> tuple[int, list[int]] | None:
+    """Return (exists, uid_list) for a folder."""
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, data = await imap.select(folder)
+        if status != "OK":
+            return None
+        status, response = await imap.uid_search("ALL")
+        if status != "OK":
+            return None
+        if not response or not response[0]:
+            return 0, []
+        raw = response[0] if isinstance(response[0], (bytes, bytearray)) else b""
+        uids = [int(tok) for tok in bytes(raw).split()] if raw else []
+        return len(uids), uids
+    finally:
+        await imap.logout()
+
+
+async def store_flag(
+    account: Account,
+    password: str,
+    folder: str,
+    uid: int,
+    flag: str,
+    *,
+    add: bool,
+) -> bool:
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return False
+        op = "+FLAGS" if add else "-FLAGS"
+        status, _ = await imap.uid("store", str(uid), op, f"({flag})")
+        return status == "OK"
+    finally:
+        await imap.logout()
+
+
+async def store_keywords(
+    account: Account,
+    password: str,
+    folder: str,
+    uid: int,
+    keywords: list[str],
+    *,
+    mode: str,
+) -> bool:
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return False
+        op_map = {"add": "+FLAGS", "remove": "-FLAGS", "replace": "FLAGS"}
+        op = op_map[mode]
+        joined = " ".join(keywords)
+        status, _ = await imap.uid("store", str(uid), op, f"({joined})")
+        return status == "OK"
+    finally:
+        await imap.logout()
+
+
+class TargetFolderMissing(RuntimeError):
+    """The target folder does not exist on the account."""
+
+
+class UidNotFound(RuntimeError):
+    """The source UID is not present in the selected folder."""
+
+
+async def move_message(
+    account: Account,
+    password: str,
+    folder: str,
+    uid: int,
+    target_folder: str,
+) -> str:
+    """Intra-account move via RFC 6851 MOVE. Returns 'native_move' or 'copy_store_expunge'."""
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        # Confirm target exists before attempting the move; otherwise
+        # distinguishing uid_not_found from target_folder_missing after
+        # the fact would require parsing IMAP NO-response text.
+        status, _ = await imap.select(target_folder)
+        if status != "OK":
+            raise TargetFolderMissing(target_folder)
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            raise RuntimeError(f"cannot SELECT source {folder!r}")
+        # Confirm the UID actually exists before MOVE — again for
+        # error-type attribution.
+        status, response = await imap.uid_search(f"UID {uid}")
+        if status != "OK":
+            raise RuntimeError(f"SEARCH failed: {status}")
+        raw = response[0] if response and isinstance(response[0], (bytes, bytearray)) else b""
+        hits = bytes(raw).split() if raw else []
+        if not hits:
+            raise UidNotFound(uid)
+        # Try native MOVE first; fall back to COPY+STORE+EXPUNGE on
+        # servers that do not advertise RFC 6851.
+        try:
+            status, _ = await imap.uid("move", str(uid), target_folder)
+            if status == "OK":
+                return "native_move"
+        except Exception:
+            pass
+        status, _ = await imap.uid("copy", str(uid), target_folder)
+        if status != "OK":
+            raise RuntimeError(f"COPY failed: {status}")
+        await imap.uid("store", str(uid), "+FLAGS", r"(\Deleted)")
+        await imap.expunge()
+        return "copy_store_expunge"
+    finally:
+        await imap.logout()
+
+
+async def copy_message(
+    account: Account,
+    password: str,
+    folder: str,
+    uid: int,
+    target_folder: str,
+) -> bool:
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return False
+        status, _ = await imap.uid("copy", str(uid), target_folder)
+        return status == "OK"
+    finally:
+        await imap.logout()
+
+
+async def append_message(
+    account: Account,
+    password: str,
+    folder: str,
+    rfc822: bytes,
+) -> bool:
+    import asyncio
+    from datetime import datetime, timezone
+
+    timeout = _append_timeout()
+    imap = await _open_imap(account, timeout=timeout)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        await get_registry().check_append(account.id)
+        status, _ = await asyncio.wait_for(
+            imap.append(
+                rfc822,
+                mailbox=folder,
+                date=datetime.now(tz=timezone.utc),
+            ),
+            timeout=timeout,
+        )
+        return status == "OK"
+    finally:
+        try:
+            await imap.logout()
+        except Exception:
+            pass
+
+
+async def search_uids(
+    account: Account, password: str, folder: str, criteria: str = "ALL"
+) -> list[int]:
+    """Execute a SEARCH in `folder` and return the matching UIDs."""
+    imap = await _open_imap(account)
+    await imap.login(_imap_user_for(account), password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return []
+        status, response = await imap.uid_search(criteria)
+        if status != "OK":
+            return []
+        if not response:
+            return []
+        raw = response[0] if isinstance(response[0], bytes) else b""
+        if not raw:
+            return []
+        return [int(token) for token in raw.split()]
+    finally:
+        await imap.logout()
+
+
+def _extract_literal(response: list[bytes | bytearray]) -> bytes | None:
+    """Pick the header/body literal out of an aioimaplib FETCH response.
+
+    aioimaplib returns protocol framing as `bytes` and literal content
+    (headers, body bytes) as `bytearray`. Pick the bytearray directly —
+    it is unambiguous, regardless of how long BODYSTRUCTURE or other
+    metadata make the surrounding bytes frames.
+    """
+    for item in response:
+        if isinstance(item, bytearray):
+            data = bytes(item)
+            if data.strip():
+                return data
+    return None
+
+
+def _first_header_index(data: bytes) -> int | None:
+    import re
+
+    match = re.search(rb"^[A-Za-z][A-Za-z0-9-]*:", data, flags=re.MULTILINE)
+    return match.start() if match else 0

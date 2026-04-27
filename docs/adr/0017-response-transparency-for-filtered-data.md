@@ -55,21 +55,53 @@ Every PDP decision carries a reason code drawn from a closed
 vocabulary. DENY responses expose the code; redacted ALLOW responses
 expose it alongside the partial data.
 
-| Code | Trigger |
-|------|---------|
-| `rule_matched`            | ALLOW: a sender rule matched and granted the required level |
-| `folder_default_applied`  | ALLOW: no sender rule matched but folder default sufficed |
-| `folder_hidden`           | DENY: no FolderPolicy for this folder (default NONE) |
-| `account_hidden`          | DENY: no AccountPolicy for this account |
-| `sender_not_whitelisted`  | DENY in whitelist mode, no rule matched |
-| `sender_blacklisted`      | DENY in blacklist mode, rule capped to NONE |
-| `visibility_below_<level>`| DENY: matched but granted level is below the tool's minimum |
-| `capability_missing`      | DENY: write tool required a capability not granted on the folder |
-| `auth_failed`             | DENY: caller authentication could not be resolved |
+#### 2.1 Canonical table
+
+The table is the contract surface. Each row binds a code to its
+exact emission condition and to the caller-side reaction it is
+meant to enable. A scenario asserting on a code references this
+row by name; a server emission must match the row exactly. New
+codes require an ADR amendment that extends this table.
+
+The "Decision" column distinguishes ALLOW (call succeeds, possibly
+partial) from DENY (call refused, no business payload), and
+`audit-only` for codes that appear in audit records but never in
+caller-visible responses.
+
+| Code                         | Decision | Trigger (server-side condition)                                              | Intended caller-side reaction                                                                       |
+|------------------------------|----------|------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
+| `rule_matched`               | ALLOW    | A sender rule matched and granted ≥ the tool's minimum visibility            | Treat the response as authoritative for the matched scope; no caveat needed.                         |
+| `folder_default_applied`     | ALLOW    | No sender rule matched, folder `default` sufficed                            | Same as `rule_matched`; the caller does not distinguish in normal flow.                              |
+| `account_hidden`             | DENY     | No AccountPolicy entry for this account in the caller's policy               | Stop probing this account; the caller has no grant on it. Surface to operator if business expects access. |
+| `folder_hidden`              | DENY     | Account is granted but no FolderPolicy for this folder                       | Stop probing this folder. Do not assume "empty"; the folder is invisible by design.                  |
+| `sender_not_whitelisted`     | DENY     | Whitelist-mode folder, no rule matched the message's sender                  | The message exists but is out of scope. Do not retry; do not enumerate alternatives.                 |
+| `sender_blacklisted`         | DENY     | Blacklist-mode folder, a rule capped visibility to NONE for this sender      | Same as `sender_not_whitelisted`; the caller treats the message as filtered out.                     |
+| `visibility_below_COUNT`     | DENY     | Tool minimum is COUNT; granted level is below                                | Caller cannot count messages here; offer to narrow scope or escalate.                                |
+| `visibility_below_METADATA`  | DENY     | Tool minimum is METADATA; granted level is below                             | Caller cannot read metadata; do not infer existence from absence.                                    |
+| `visibility_below_ENVELOPE`  | DENY     | Tool minimum is ENVELOPE; granted level is below                             | Caller cannot read addresses/subjects; same handling as the above.                                   |
+| `visibility_below_HEADERS`   | DENY     | Tool minimum is HEADERS; granted level is below                              | Caller cannot read full headers; respect the redacted-fields hint on partial calls.                  |
+| `visibility_below_BODY`      | DENY     | Tool minimum is BODY; granted level is below                                 | Caller may have envelope but not body; do not summarize body content.                                |
+| `visibility_below_FULL`      | DENY     | Tool minimum is FULL; granted level is below                                 | Caller may have body but not attachments; do not assume attachments are absent.                     |
+| `capability_missing`         | DENY     | Write tool required a capability not granted on the folder                   | Caller may not perform the write; explain to the human user that the policy lacks the capability.   |
+| `forbidden_system_flag`      | DENY     | A reserved IMAP system flag (`\Deleted`, `\Recent`) was passed to a write tool | Caller used a reserved flag; never auto-retry without the flag. Surface to the operator.             |
+| `auth_failed`                | DENY     | Caller authentication could not be resolved (unknown id / wrong token / absent identity) | Caller is not authenticated; halt. Do not retry with synthesized credentials.                       |
+| `unknown_tool`               | DENY     | A `tools/call` arrived for a name not on the tool surface                    | Caller invoked an unknown tool; treat as protocol violation, do not retry.                           |
+| `saga_not_configured`        | INFO     | `move`/`copy` for cross-account paths called while no WAL is configured      | Server is not provisioned for cross-account writes; escalate to the operator.                        |
+| `saga_step`                  | audit-only | Saga writes one record per WAL transition (`begin`, `fetched`, `staged`, `deleted`, `commit`, `escalated`, `aborted`) | Never reaches the caller — informational for operator forensics only.                                 |
+
+#### 2.2 Variance discipline
+
+Every code that the server may emit is exercised by **at least two**
+non-pending Feature-File scenarios with materially different
+inputs (different sender, folder, account, or tool). The
+`reason_code_contract.feature` file enforces this by enumerating
+every code and pointing at the scenarios that cover it.
+
+#### 2.3 Closure rule
 
 The vocabulary is closed: new reasons require a new ADR or an
-amendment. Policy rule identifiers, match patterns, and folder names
-of hidden targets are never included.
+amendment. Policy rule identifiers, match patterns, and folder
+names of hidden targets are never included.
 
 ### 3. Response field flags on partial content
 

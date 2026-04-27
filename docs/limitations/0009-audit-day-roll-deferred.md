@@ -1,0 +1,85 @@
+# LIM 0009: Audit day-roll and retention deferred
+
+- **Status:** Accepted
+- **Resolution intent:** must-resolve (technical debt)
+- **Date proposed:** 2026-04-21
+- **Date approved:** 2026-04-21
+- **Proposed by:** claude (imap-mcp BDD phase F)
+- **Approved by:** Randy N. Gupta
+- **Related ADRs:** [ADR-0021](../adr/0021-audit-format.md),
+  [ADR-0022](../adr/0022-audit-retention.md)
+- **Related Guidelines:** BDD Guidelines §4.5
+
+## Resolution intent
+
+`must-resolve`. The audit writer persists every record with a SHA-256
+hash chain (ADR 0021) and the retention policy (ADR 0022) requires
+day-rotation with gzip, warm/cold boundaries, and optional external
+root-hash notification. The hash-chain and no-content-leak invariants
+are covered end-to-end; everything that depends on UTC-day
+boundaries needs time mocking that is not yet wired in the BDD
+harness.
+
+## Context
+
+Thirteen scenarios require the server to cross a UTC day boundary
+deterministically:
+
+- `audit_log_format.feature:78` — hash chain spans day rotation.
+- `audit_log_format.feature:113` — audit file permissions include a
+  transition from 0600 to 0400 at day roll.
+- `audit_retention.feature` (all 12 scenarios: gzip, deletion,
+  parameter overrides, root-hash hook, manual-removal detection,
+  warm-file permissions).
+
+Time mocking via `freezegun` — or a server-side
+`IMAP_MCP_FAKE_NOW_UTC` env var — plus a test-only
+`_test_trigger_rotation` tool would unblock all of these. Neither is
+yet implemented.
+
+## Nature of the weakness
+
+The thirteen scenarios are skipped and uncovered. A bug in the
+day-roll path (e.g. forgetting to fsync the final_hash record, or
+losing the prev_hash chain across the boundary) would pass the
+current suite.
+
+## Why the clean solution is not chosen
+
+Scope-bounded. The retention subsystem is a small module on its own
+with clear invariants (gzip at day+hot_days, delete at day+hot+warm,
+permission transitions). Its BDD coverage is a single focused pass;
+it is deferred only because the Phase F work sequencing put crash
+recovery and HTTP transport ahead of it.
+
+## Mitigations in place
+
+- Hash chain within a single day is fully covered
+  (`audit_log_format.feature:71` tamper scenario).
+- Directory permissions 0700 and current-day file permissions 0600
+  are enforced at creation (unit-tested in the audit writer).
+- A manual inspection of the retention code path has confirmed no
+  obvious logic error; the deferral is about having BDD-grade
+  coverage, not about correctness belief.
+
+## Residual risk
+
+A silent regression in the day-roll path goes undetected until the
+first production operator observes an inconsistent chain. In
+practice the first real-world day roll happens within 24 h of
+deployment; the blast radius is limited to the prior-day file and
+can be manually verified.
+
+## Triggers for revisit
+
+- First production deployment reaches its first day roll.
+- An operator reports a gap in the hash chain.
+- The retention parameters are exposed in a configuration surface
+  that admins edit (higher likelihood of regression).
+- Phase F of the BDD plan is re-opened.
+
+## References
+
+- Scenarios listed above.
+- ADR 0021, ADR 0022.
+- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase F)

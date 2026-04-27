@@ -1,0 +1,52 @@
+# Test IMAP fixtures for the imap-mcp BDD suite.
+#
+# Two independent Dovecot instances are started so that cross-account
+# scenarios actually exercise two distinct IMAP servers (mirroring
+# the real case of, e.g., gmail + a self-hosted dovecot).
+#
+# The dovecot config and test users are baked into the image at
+# build time via ./dovecot/Dockerfile. Mail storage is an ephemeral
+# named volume that `docker compose down -v` wipes.
+#
+# Lifecycle is managed by bdd/environment.py via `docker compose`.
+# Ports are bound to 127.0.0.1 only.
+
+name: imap-mcp-bdd
+
+services:
+
+  imap-a:
+    build:
+      context: ./dovecot
+      args:
+        USER_FILE: a.passwd
+    image: imap-mcp-bdd/dovecot-a:latest
+    container_name: imap-mcp-bdd-imap-a
+    hostname: imap-a
+    ports:
+      - "127.0.0.1:11143:143"
+    volumes:
+      - imap-a-maildir:/srv/mail
+    # Healthcheck is performed by bdd/environment.py via IMAP LOGIN
+    # rather than a container-side probe. The upstream dovecot image
+    # does not include netcat or a dovecot-side probe binary.
+
+  imap-b:
+    build:
+      context: ./dovecot
+      args:
+        USER_FILE: b.passwd
+    image: imap-mcp-bdd/dovecot-b:latest
+    container_name: imap-mcp-bdd-imap-b
+    hostname: imap-b
+    ports:
+      - "127.0.0.1:12143:143"
+    volumes:
+      - imap-b-maildir:/srv/mail
+    # Healthcheck is performed by bdd/environment.py via IMAP LOGIN
+    # rather than a container-side probe. The upstream dovecot image
+    # does not include netcat or a dovecot-side probe binary.
+
+volumes:
+  imap-a-maildir:
+  imap-b-maildir:

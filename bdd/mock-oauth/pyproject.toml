@@ -1,0 +1,43 @@
+[project]
+name = "imap-mcp-mock-oauth"
+version = "0.1.0"
+description = "OAuth2 mock provider fixture for imap-mcp BDD tests. Wraps navikt/mock-oauth2-server with a thin Python helper API."
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+
+# The OAuth mock itself is the navikt/mock-oauth2-server Docker
+# image, configured as a docker-compose service next to imap-a and
+# imap-b. This Python subproject is a *helper* — a small wrapper
+# around the mock's HTTP control API so BDD step files can prime
+# next-responses, read exchange counters, and rotate signing keys
+# without duplicating the wire format in every step.
+#
+# Isolation rules mirror the other BDD subprojects:
+# no imports from ../../server/ and no imports from ../support/
+# or ../mock-gmail/.
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

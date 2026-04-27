@@ -1,0 +1,42 @@
+[project]
+name = "imap-mcp-mock-gmail"
+version = "0.1.0"
+description = "Gmail IMAP protocol mock used as a BDD test fixture for imap-mcp. Validated against two independent Gmail-aware clients (mbsync, imapsync)."
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+
+# This subproject is isolated from both ../../server/ and .. (the BDD
+# harness). It contains no Python imports from either. It is started
+# as a separate process (eventually wrapped in a docker-compose
+# service next to imap-a and imap-b) and speaks only the IMAP
+# protocol on the wire.
+dependencies = [
+    "anyio>=4.0",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+mock-gmail-server = "mock_gmail.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
