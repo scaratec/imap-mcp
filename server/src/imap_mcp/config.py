@@ -60,6 +60,10 @@ class AuditConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     directory: str | None = None
+    hot_days: int = 90
+    warm_days: int = 275
+    delete_after_days: int = 365
+    external_root_hook: str | None = None
 
 
 class WALConfig(BaseModel):

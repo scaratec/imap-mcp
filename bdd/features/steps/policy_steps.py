@@ -1032,6 +1032,209 @@ def step_cross_account_move_begins(context: Context) -> None:
         context.last_tx_id = data.get("tx_id")
 
 
+@given("the server is configured with audit:")
+def step_server_with_audit_table(context: Context) -> None:
+    builder = _ensure_builder(context)
+    row = context.table[0]
+    if "directory" in row.headings and row["directory"] != "$TMPDIR/audit":
+        builder.audit_directory = Path(row["directory"])
+    # else: keep the per-scenario scratch dir from before_scenario.
+    if "hot_days" in row.headings:
+        builder.audit_hot_days = int(row["hot_days"])
+    if "warm_days" in row.headings:
+        builder.audit_warm_days = int(row["warm_days"])
+    if "delete_after_days" in row.headings:
+        builder.audit_delete_after_days = int(row["delete_after_days"])
+    builder.write()
+    # Make sure at least one caller + account + policy exist so the
+    # loader can boot when the rotation tool is invoked later.
+    if not builder.callers:
+        _ensure_account_registered(context, builder, "gupta-scaratec")
+        builder.add_caller(
+            id="invoice-agent", policy="invoice-policy", auth_type="stdio_trusted"
+        )
+        builder.add_policy("invoice-policy")
+        builder.write()
+
+
+@given(
+    "the server is configured with audit hot_days={hot:d}, "
+    "warm_days={warm:d}, delete_after_days={delete:d}"
+)
+def step_server_audit_inline_retention(
+    context: Context, hot: int, warm: int, delete: int
+) -> None:
+    builder = _ensure_builder(context)
+    builder.audit_hot_days = hot
+    builder.audit_warm_days = warm
+    builder.audit_delete_after_days = delete
+    if not builder.callers:
+        _ensure_account_registered(context, builder, "gupta-scaratec")
+        builder.add_caller(
+            id="invoice-agent", policy="invoice-policy", auth_type="stdio_trusted"
+        )
+        builder.add_policy("invoice-policy")
+    builder.write()
+
+
+@given(
+    'the server is configured with audit external_root_hook command "{cmd}"'
+)
+def step_server_audit_hook(context: Context, cmd: str) -> None:
+    builder = _ensure_builder(context)
+    builder.audit_external_root_hook = cmd
+    builder.write()
+
+
+@given("the audit directory contains:")
+def step_audit_directory_contains_table(context: Context) -> None:
+    """Stage backdated audit files using `os.utime` to set their
+    mtime relative to `IMAP_MCP_FAKE_NOW_UTC` (or wall time)."""
+    import os as _os
+    from datetime import timedelta as _td, timezone as _tz
+
+    now = _now_utc_for_test(context)
+    for row in context.table:
+        filename = row["filename"]
+        age_days = int(row["age_days"])
+        path = context.audit_dir / filename
+        # Plain payload — the actual content is irrelevant for
+        # rotation tests; the rotator inspects mtime, not content.
+        path.write_text(
+            f'{{"placeholder": true, "filename": "{filename}"}}\n',
+            encoding="utf-8",
+        )
+        target_mtime = (now - _td(days=age_days)).timestamp()
+        _os.utime(path, (target_mtime, target_mtime))
+
+
+@given('the audit directory contains a file "{filename}" with age {age:d} days')
+def step_audit_directory_single_file(
+    context: Context, filename: str, age: int
+) -> None:
+    import os as _os
+    from datetime import timedelta as _td
+
+    now = _now_utc_for_test(context)
+    path = context.audit_dir / filename
+    if filename.endswith(".gz"):
+        # Plain bytes are fine for retention age checks; the rotator
+        # only consults mtime + filename for delete decisions.
+        path.write_bytes(b"\x1f\x8b\x08\x00placeholder")
+    else:
+        path.write_text(
+            f'{{"placeholder": true, "filename": "{filename}"}}\n',
+            encoding="utf-8",
+        )
+    target_mtime = (now - _td(days=age)).timestamp()
+    _os.utime(path, (target_mtime, target_mtime))
+
+
+@given('a file "{filename}" with age {age:d} exists in the audit directory')
+def step_audit_directory_with_age(
+    context: Context, filename: str, age: int
+) -> None:
+    step_audit_directory_single_file(context, filename, age)
+
+
+@given('a file "{filename}" with mode {mode} exists')
+def step_audit_file_with_mode(
+    context: Context, filename: str, mode: str
+) -> None:
+    """Create the file with an mtime well past the default hot_days
+    boundary so the next rotation pass actually gzips it. Matches the
+    intent of the warm-file-permissions scenario: the test cares about
+    the gzip code path, not about the age boundary."""
+    import os as _os
+    from datetime import timedelta as _td
+
+    path = context.audit_dir / filename
+    path.write_text(
+        f'{{"placeholder": true, "filename": "{filename}"}}\n',
+        encoding="utf-8",
+    )
+    _os.chmod(path, int(mode, 8))
+    now = _now_utc_for_test(context)
+    target = (now - _td(days=100)).timestamp()
+    _os.utime(path, (target, target))
+
+
+@given("the audit file contains {n:d} records")
+def step_audit_file_contains_n_records(context: Context, n: int) -> None:
+    """Drive `n` ALLOW fetch_envelope-equivalent calls (via list_accounts
+    which is always allowed) so the audit file ends up with `n` records."""
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    client = _ensure_mcp_client(context, "invoice-agent")
+    for _ in range(n):
+        client.call_tool("list_accounts", {})
+
+
+@given(
+    'the audit writer is at {time:S} UTC with seq {seq:d} in file "{filename}"'
+)
+def step_audit_writer_at_time(
+    context: Context, time: str, seq: int, filename: str
+) -> None:
+    """Pin the fake clock to a specific UTC time within the named day,
+    pre-populate the file with `seq` records so the next write hits
+    seq+1, and start the server so subsequent SIGHUP/rotation steps
+    have a recipient.
+
+    The file content uses synthetic chain placeholders; the
+    `audit_log_format.feature:78` scenario checks that the *next*
+    file's first record references the eof_day's hash, not that the
+    pre-seeded records form a valid chain.
+    """
+    import os as _os
+    from datetime import datetime as _dt
+
+    # Parse the day from the filename (`YYYY-MM-DD.jsonl`) and combine
+    # with the `time` portion to produce the exact fake-now value.
+    day = filename.replace(".jsonl", "")
+    fake_now = f"{day}T{time}+00:00"
+    context.mcp_extra_env = getattr(context, "mcp_extra_env", {}) or {}
+    context.mcp_extra_env["IMAP_MCP_FAKE_NOW_UTC"] = fake_now
+    context.audit_pinned_day = day
+
+    # Prime the active file by driving `seq` MCP calls (each emits an
+    # audit record). list_accounts is allowed by the minimal-config
+    # caller and is the simplest record-emitter.
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    _ = _dt.fromisoformat(fake_now)  # validation
+    # Ensure a minimal caller config if none is staged yet.
+    builder = _ensure_builder(context)
+    if not builder.callers:
+        step_server_minimal_configuration(context)
+    client = _ensure_mcp_client(context, "invoice-agent")
+    for _ in range(seq):
+        client.call_tool("list_accounts", {})
+
+
+def _now_utc_for_test(context: Context):
+    """Mirror of audit._now_utc but reading the BDD-side env var.
+
+    The harness shares `IMAP_MCP_FAKE_NOW_UTC` with the server via
+    `mcp_extra_env`; for staging files we honour it locally too so
+    file mtimes line up with what the server will see.
+    """
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz
+
+    raw = (getattr(context, "mcp_extra_env", None) or {}).get(
+        "IMAP_MCP_FAKE_NOW_UTC"
+    ) or _os.environ.get("IMAP_MCP_FAKE_NOW_UTC")
+    if raw:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            return _dt.fromisoformat(raw).astimezone(_tz.utc)
+        except ValueError:
+            pass
+    return _dt.now(tz=_tz.utc)
+
+
 @given('policy "{policy_name}" folder "{folder_path}" has:')
 def step_policy_folder_has(
     context: Context, policy_name: str, folder_path: str

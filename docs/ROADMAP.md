@@ -37,7 +37,7 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 |---|---|---|---|
 | 13 | Phase D — HTTP transport + shared_token | Plan `noble-prancing-glacier.md` Phase D | [LIM-0007](limitations/0007-http-transport-deferred.md) |
 | ~~14~~ | ~~Phase E — SIGHUP policy reload~~ | Plan Phase E | **Mitigiert 2026-04-28** — 5/7 Szenarien grün; OAuth-Scope-Szenario unter LIM-0003, in-flight-Saga unter LIM-0008 (Saga-Pause-Mechanismus fehlt). |
-| 15 | Phase F-Rest — Audit day-roll & retention | Plan Phase F | [LIM-0009](limitations/0009-audit-day-roll-deferred.md) |
+| ~~15~~ | ~~Phase F-Rest — Audit day-roll & retention~~ | Plan Phase F | **Mitigiert 2026-04-28** — Rotation/gzip/Retention/eof_day grün; external-hook + manual-deletion-detection bleiben unter LIM-0009. |
 | 16 | Phase B-Rest — 5-Tupel-Fallback identity | Plan Phase B | [LIM-0006](limitations/0006-5-tuple-fallback-deferred.md) |
 | 17 | Phase C-Rest — UIDVALIDITY + CAPABILITY-Strip via MITM | Plan Phase C | [LIM-0005](limitations/0005-imap-mitm-scenarios-deferred.md) |
 

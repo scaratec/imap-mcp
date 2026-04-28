@@ -83,6 +83,10 @@ class PolicyBuilder:
     secret_store_backend: str = "file_dir"
     secret_store_path: Path | None = None
     audit_directory: Path | None = None
+    audit_hot_days: int | None = None
+    audit_warm_days: int | None = None
+    audit_delete_after_days: int | None = None
+    audit_external_root_hook: str | None = None
     wal_path: Path | None = None
 
     # ---------------------------------------------------------- collectors
@@ -176,6 +180,10 @@ class PolicyBuilder:
                             "directory": str(self.audit_directory)
                             if self.audit_directory
                             else None,
+                            "hot_days": self.audit_hot_days,
+                            "warm_days": self.audit_warm_days,
+                            "delete_after_days": self.audit_delete_after_days,
+                            "external_root_hook": self.audit_external_root_hook,
                         }
                     ),
                     "wal": {"path": str(self.wal_path) if self.wal_path else None},

@@ -476,6 +476,134 @@ def step_http_client_post_admin_reload(context: Context) -> None:
     context.last_http_response = response
 
 
+@when("the audit rotation task runs")
+def step_audit_rotation_runs(context: Context) -> None:
+    """Trigger AuditWriter.rotate() via the test-only MCP tool.
+
+    Lazy-starts the stdio MCPClient if no server is running."""
+    if (
+        getattr(context, "mcp", None) is None
+        and getattr(context, "mcp_http", None) is None
+    ):
+        _ensure_mcp_client(context, "invoice-agent")
+    client = getattr(context, "mcp", None) or getattr(context, "mcp_http")
+    payload = client.raw_call(
+        "tools/call",
+        {"name": "_test_run_audit_rotation", "arguments": {}},
+    )
+    context.last_rotation_result = payload
+
+
+@when('the audit rotation task compresses it to "{gz_filename}"')
+def step_audit_rotation_compresses_to(
+    context: Context, gz_filename: str
+) -> None:
+    """Bridge alias of the rotation step — the gz target name is
+    derived from the source name so this is a no-op convenience."""
+    _ = gz_filename
+    step_audit_rotation_runs(context)
+
+
+@when("the UTC day rolls")
+def step_utc_day_rolls(context: Context) -> None:
+    """Advance the server's fake clock by one day and trigger a
+    rotation pass. Combined effect: the prior day's file gets an
+    eof_day record + 0400 mode, today's file becomes the active one.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    extra_env = getattr(context, "mcp_extra_env", None) or {}
+    raw = extra_env.get("IMAP_MCP_FAKE_NOW_UTC")
+    if raw:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        base = _dt.fromisoformat(raw).astimezone(_tz.utc)
+    else:
+        base = _dt.now(tz=_tz.utc)
+    next_day = (base + _td(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    new_fake_now = next_day.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    extra_env["IMAP_MCP_FAKE_NOW_UTC"] = new_fake_now
+    context.mcp_extra_env = extra_env
+    # The server reads env on demand via audit._now_utc(), so we need
+    # the server's environ to reflect the change. Restart so the new
+    # value is picked up. Keep WAL/audit dirs intact.
+    if getattr(context, "mcp", None) is not None:
+        context.mcp.close()
+        context.mcp = None
+    if getattr(context, "mcp_http", None) is not None:
+        context.mcp_http.close()
+        context.mcp_http = None
+    client = _ensure_mcp_client(context, "invoice-agent")
+    # Force a rotation pass on the new fake-now so the prior day's
+    # file is closed with its eof_day record.
+    client.raw_call(
+        "tools/call",
+        {"name": "_test_run_audit_rotation", "arguments": {}},
+    )
+
+
+@when("the clock crosses midnight UTC")
+def step_clock_crosses_midnight(context: Context) -> None:
+    step_utc_day_rolls(context)
+
+
+@when(
+    "invoice-agent calls any of the tools list_accounts, "
+    "describe_policy, get_transaction_status"
+)
+def step_caller_calls_any_of_three(context: Context) -> None:
+    client = _ensure_mcp_client(context, "invoice-agent")
+    context.no_audit_leak_responses = []
+    for name, args in (
+        ("list_accounts", {}),
+        ("describe_policy", {}),
+        ("get_transaction_status", {"tx_id": "tx-fake"}),
+    ):
+        try:
+            payload = client.call_tool(name, args)
+            context.no_audit_leak_responses.append(payload)
+        except Exception:
+            pass
+
+
+@when('the file "{filename}" is deleted out-of-band')
+def step_file_deleted_out_of_band(context: Context, filename: str) -> None:
+    path = context.audit_dir / filename
+    if path.exists():
+        path.unlink()
+
+
+@given('the server is actively writing to "{filename}"')
+def step_server_actively_writing_to(context: Context, filename: str) -> None:
+    """Pin fake-now to the date encoded in `filename` and prime the
+    file by driving one tool call so the writer has the file open."""
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    day = filename.replace(".jsonl", "")
+    extra = getattr(context, "mcp_extra_env", None) or {}
+    extra["IMAP_MCP_FAKE_NOW_UTC"] = f"{day}T12:00:00+00:00"
+    context.mcp_extra_env = extra
+    builder = getattr(context, "policy_builder", None)
+    if builder is None or not builder.callers:
+        step_server_minimal_configuration(context)
+    client = _ensure_mcp_client(context, "invoice-agent")
+    client.call_tool("list_accounts", {})
+
+
+@given("the audit writer creates the file for today")
+def step_audit_writer_creates_file_for_today(context: Context) -> None:
+    """Drive one ALLOW call so the audit writer creates today's file."""
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    builder = getattr(context, "policy_builder", None)
+    if builder is None or not builder.callers:
+        step_server_minimal_configuration(context)
+    client = _ensure_mcp_client(context, "invoice-agent")
+    client.call_tool("list_accounts", {})
+
+
 @when("the server receives SIGHUP")
 def step_server_receives_sighup(context: Context) -> None:
     """Send SIGHUP to the running server process and give the loop a

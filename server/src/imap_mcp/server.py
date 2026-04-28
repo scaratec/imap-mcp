@@ -384,7 +384,10 @@ def build_server(context: ServerContext) -> Server:
         }
     )
     if os.environ.get("IMAP_MCP_TEST_MODE") == "1":
-        known_tools = known_tools | {"_test_run_recovery"}
+        known_tools = known_tools | {
+            "_test_run_recovery",
+            "_test_run_audit_rotation",
+        }
 
     async def _raw_call_tool_handler(req: CallToolRequest) -> ServerResult:
         """Intercept tools/call at the request-handler level.
@@ -462,6 +465,8 @@ def build_server(context: ServerContext) -> Server:
             return await _handle_get_transaction_status(context, arguments)
         if name == "_test_run_recovery":
             return await _handle_test_run_recovery(context, arguments)
+        if name == "_test_run_audit_rotation":
+            return await _handle_test_run_audit_rotation(context, arguments)
         # Unknown tool names must surface as a JSON-RPC method-not-found
         # so callers can distinguish "tool absent" from "tool denied".
         # ADR 0018 makes the non-goal list explicit; any probe of those
@@ -1131,6 +1136,26 @@ async def _handle_test_run_recovery(
     return {"processed": total, "passes": passes}
 
 
+async def _handle_test_run_audit_rotation(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Test-only: trigger AuditWriter.rotate() once. Reads
+    `IMAP_MCP_FAKE_NOW_UTC` from the env to advance the clock.
+
+    Guarded by `IMAP_MCP_TEST_MODE`. ADR 0023 documents the
+    test-only control surface.
+    """
+    if os.environ.get("IMAP_MCP_TEST_MODE") != "1":
+        raise McpError(
+            ErrorData(code=-32601, message="Unknown tool: '_test_run_audit_rotation'")
+        )
+    _ = arguments
+    if context.audit is None:
+        return {"reason": "audit_not_configured"}
+    summary = context.audit.rotate()
+    return summary
+
+
 async def _handle_describe_policy(
     context: ServerContext, arguments: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1678,7 +1703,13 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
     audit_cfg = configuration.accounts_file.audit
     audit_writer: AuditWriter | None = None
     if audit_cfg is not None and audit_cfg.directory:
-        audit_writer = AuditWriter(directory=Path(audit_cfg.directory))
+        audit_writer = AuditWriter(
+            directory=Path(audit_cfg.directory),
+            hot_days=audit_cfg.hot_days,
+            warm_days=audit_cfg.warm_days,
+            delete_after_days=audit_cfg.delete_after_days,
+            external_root_hook=audit_cfg.external_root_hook,
+        )
     wal_cfg = configuration.accounts_file.wal
     saga_mgr: SagaManager | None = None
     if wal_cfg is not None and wal_cfg.path:

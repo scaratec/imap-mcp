@@ -75,7 +75,6 @@ Feature: Audit log format
     And the offline verifier reports R4 (and later) as tampered
     And the offline verifier reports R1, R2 as unaffected
 
-  @pending @pending_LIM_0009
   Scenario: Hash chain spans day rotation
     Given the audit writer is at 23:59:59 UTC with seq 250 in file "2026-04-21.jsonl"
     When the clock crosses midnight UTC
@@ -115,7 +114,6 @@ Feature: Audit log format
       | reason      | auth_failed    |
     And the record does NOT contain the literal string "wrong-token"
 
-  @pending @pending_LIM_0009
   Scenario: Audit files have restrictive filesystem permissions
     Given the audit writer creates the file for today
     Then the current day's audit file has mode 0600

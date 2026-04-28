@@ -1611,6 +1611,326 @@ def step_startup_error_indicates_caller(
 from behave import use_step_matcher as _use_step_matcher_assert
 
 
+@then("the audit directory contains:")
+def step_audit_directory_contains_assert(context: Context) -> None:
+    """Compare the actual file-state of the audit dir to the table.
+
+    Each row carries `filename` plus `state` ∈ {plain, hot, warm,
+    deleted}. The mapping is: `*.jsonl` files are `plain` or `hot`
+    (synonym), `*.jsonl.gz` is `warm`, absent file is `deleted`.
+    """
+    actual = {p.name for p in context.audit_dir.iterdir() if p.is_file()}
+    issues: list[str] = []
+    for row in context.table:
+        filename = row["filename"]
+        state = row["state"]
+        present = filename in actual
+        if state in ("plain", "hot"):
+            if not present:
+                issues.append(f"expected {filename!r} present (state={state})")
+        elif state == "warm":
+            if not present:
+                issues.append(f"expected {filename!r} present (warm)")
+        elif state == "deleted":
+            if present:
+                issues.append(f"expected {filename!r} absent (deleted)")
+        else:
+            issues.append(f"unknown state {state!r} for {filename!r}")
+    if issues:
+        raise AssertionError(
+            "Audit directory mismatch:\n  " + "\n  ".join(issues)
+            + f"\nActual files: {sorted(actual)!r}"
+        )
+
+
+@then(
+    "the gzipped file, when decompressed, has SHA-256 equal to the "
+    "original plain file's SHA-256"
+)
+def step_gzip_sha256_matches_plain(context: Context) -> None:
+    """Round-trip the just-rotated `.jsonl.gz` and compare its
+    decompressed SHA-256 to the SHA-256 the staging step recorded."""
+    import gzip as _gzip
+    import hashlib as _hashlib
+
+    for path in sorted(context.audit_dir.glob("*.jsonl.gz")):
+        plain_name = path.name[:-3]
+        expected_plain = (
+            f'{{"placeholder": true, "filename": "{plain_name}"}}\n'
+        ).encode("utf-8")
+        with _gzip.open(path, "rb") as fh:
+            decompressed = fh.read()
+        if (
+            _hashlib.sha256(decompressed).hexdigest()
+            != _hashlib.sha256(expected_plain).hexdigest()
+        ):
+            raise AssertionError(
+                f"GZip round-trip SHA-256 mismatch for {path.name}: "
+                f"decompressed={decompressed!r} expected={expected_plain!r}"
+            )
+
+
+@then('the file "{filename}" no longer exists')
+def step_file_no_longer_exists(context: Context, filename: str) -> None:
+    path = context.audit_dir / filename
+    if path.exists():
+        raise AssertionError(
+            f"File {filename!r} unexpectedly still exists in {context.audit_dir}"
+        )
+
+
+@then("the original plain file no longer exists on disk")
+def step_original_plain_no_longer_exists(context: Context) -> None:
+    """For every `.jsonl.gz` in the audit dir, the same-day `.jsonl`
+    must be gone. Today's active file is not "an original" by this
+    scenario's intent; it is excluded.
+    """
+    leftovers: list[str] = []
+    for gz in context.audit_dir.glob("*.jsonl.gz"):
+        plain = context.audit_dir / gz.name[:-3]
+        if plain.exists():
+            leftovers.append(plain.name)
+    if leftovers:
+        raise AssertionError(
+            f"Plain originals remain after their .gz exists: {leftovers!r}"
+        )
+
+
+@then(
+    'an audit record with tool "{tool}" records the filename and age'
+)
+def step_audit_record_records_filename_and_age(
+    context: Context, tool: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    for rec in reader.records_today():
+        r = rec.record
+        if r.get("tool") == tool and "filename" in r and "age_days" in r:
+            context.last_matching_audit_record = r
+            return
+    raise AssertionError(
+        f"No audit record with tool={tool!r} carrying filename + age_days"
+    )
+
+
+@then('the file final state is "{state}"')
+def step_file_final_state_is(context: Context, state: str) -> None:
+    plain = list(context.audit_dir.glob("old.jsonl"))
+    gz = list(context.audit_dir.glob("old.jsonl.gz"))
+    if state == "hot":
+        if not plain:
+            raise AssertionError(
+                f"Expected hot (plain) old.jsonl; dir: "
+                f"{[p.name for p in context.audit_dir.iterdir()]!r}"
+            )
+    elif state == "warm":
+        if plain or not gz:
+            raise AssertionError(
+                f"Expected warm (gzipped) old.jsonl.gz only; dir: "
+                f"{[p.name for p in context.audit_dir.iterdir()]!r}"
+            )
+    elif state == "deleted":
+        if plain or gz:
+            raise AssertionError(
+                f"Expected deleted; dir: "
+                f"{[p.name for p in context.audit_dir.iterdir()]!r}"
+            )
+    else:
+        raise AssertionError(f"Unknown state {state!r}")
+
+
+@then(
+    "none of the responses contains any field whose value matches a record from the audit file"
+)
+def step_no_audit_leak_in_responses(context: Context) -> None:
+    import json as _json
+
+    for resp in getattr(context, "no_audit_leak_responses", []):
+        text = _json.dumps(resp)
+        for needle in ("seq", "prev_hash"):
+            if f'"{needle}":' in text:
+                raise AssertionError(
+                    f"Tool response contains audit-only field {needle!r}: {text!r}"
+                )
+
+
+@then('no MCP tool exists with name "{tool}"')
+def step_no_mcp_tool_exists(context: Context, tool: str) -> None:
+    from support.mcp_client import MCPRPCError
+
+    client = (
+        getattr(context, "mcp", None) or getattr(context, "mcp_http", None)
+    )
+    if client is None:
+        from features.steps.mcp_steps import _ensure_mcp_client
+
+        client = _ensure_mcp_client(context, "invoice-agent")
+    try:
+        client.raw_call("tools/call", {"name": tool, "arguments": {}})
+    except MCPRPCError as exc:
+        if exc.code == -32601:
+            return
+        raise AssertionError(
+            f"Tool {tool!r} responded with unexpected RPC error {exc.code}"
+        )
+    raise AssertionError(f"Tool {tool!r} unexpectedly exists")
+
+
+@then("the gzipped file has mode {mode}")
+def step_gzipped_file_has_mode(context: Context, mode: str) -> None:
+    import os as _os
+    import stat as _stat
+
+    expected = int(mode, 8)
+    for path in context.audit_dir.glob("*.jsonl.gz"):
+        actual = _stat.S_IMODE(_os.stat(path).st_mode)
+        if actual != expected:
+            raise AssertionError(
+                f"{path.name} mode is {oct(actual)}, expected {oct(expected)}"
+            )
+
+
+@then("the current day's audit file has mode {mode}")
+def step_current_day_audit_mode(context: Context, mode: str) -> None:
+    import os as _os
+    import stat as _stat
+    from datetime import datetime as _dt, timezone as _tz
+
+    now = _dt.now(tz=_tz.utc)
+    extra = getattr(context, "mcp_extra_env", None) or {}
+    raw = extra.get("IMAP_MCP_FAKE_NOW_UTC")
+    if raw:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            now = _dt.fromisoformat(raw).astimezone(_tz.utc)
+        except ValueError:
+            pass
+    today = now.strftime("%Y-%m-%d")
+    path = context.audit_dir / f"{today}.jsonl"
+    if not path.exists():
+        raise AssertionError(
+            f"Current-day audit file {path.name} does not exist"
+        )
+    expected = int(mode, 8)
+    actual = _stat.S_IMODE(_os.stat(path).st_mode)
+    if actual != expected:
+        raise AssertionError(
+            f"{path.name} mode is {oct(actual)}, expected {oct(expected)}"
+        )
+
+
+@then("the just-closed file has mode {mode}")
+def step_just_closed_file_has_mode(context: Context, mode: str) -> None:
+    import os as _os
+    import stat as _stat
+    from datetime import datetime as _dt, timezone as _tz
+
+    extra = getattr(context, "mcp_extra_env", None) or {}
+    raw = extra.get("IMAP_MCP_FAKE_NOW_UTC", "")
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    if raw:
+        try:
+            today = _dt.fromisoformat(raw).strftime("%Y-%m-%d")
+        except ValueError:
+            today = _dt.now(tz=_tz.utc).strftime("%Y-%m-%d")
+    else:
+        today = _dt.now(tz=_tz.utc).strftime("%Y-%m-%d")
+    expected = int(mode, 8)
+    candidates = [
+        p for p in context.audit_dir.glob("*.jsonl")
+        if not p.name.startswith(today)
+    ]
+    if not candidates:
+        raise AssertionError(
+            f"No just-closed audit file found in {context.audit_dir}; "
+            f"today={today!r}, dir={list(context.audit_dir.iterdir())!r}"
+        )
+    for path in candidates:
+        actual = _stat.S_IMODE(_os.stat(path).st_mode)
+        if actual != expected:
+            raise AssertionError(
+                f"{path.name} mode is {oct(actual)}, expected {oct(expected)}"
+            )
+
+
+@then("the audit directory has mode {mode}")
+def step_audit_directory_has_mode(context: Context, mode: str) -> None:
+    import os as _os
+    import stat as _stat
+
+    expected = int(mode, 8)
+    actual = _stat.S_IMODE(_os.stat(context.audit_dir).st_mode)
+    if actual != expected:
+        raise AssertionError(
+            f"audit dir mode is {oct(actual)}, expected {oct(expected)}"
+        )
+
+
+@then('file "{filename}" ends with a record of tool "{tool}" carrying field {field}')
+def step_file_ends_with_record(
+    context: Context, filename: str, tool: str, field: str
+) -> None:
+    import json as _json
+
+    path = context.audit_dir / filename
+    if not path.exists():
+        raise AssertionError(f"File {filename!r} does not exist")
+    lines = path.read_bytes().splitlines()
+    if not lines:
+        raise AssertionError(f"File {filename!r} is empty")
+    last = _json.loads(lines[-1])
+    if last.get("tool") != tool:
+        raise AssertionError(
+            f"Last record tool={last.get('tool')!r}, expected {tool!r}"
+        )
+    if field not in last:
+        raise AssertionError(
+            f"Last record missing field {field!r}: {last!r}"
+        )
+    context.last_eof_day_final_hash = last.get(field)
+
+
+@then('file "{filename}" begins with a record whose prev_hash equals that final_hash')
+def step_file_begins_with_prev_hash(
+    context: Context, filename: str
+) -> None:
+    import json as _json
+
+    path = context.audit_dir / filename
+    if not path.exists():
+        raise AssertionError(f"File {filename!r} does not exist")
+    lines = path.read_bytes().splitlines()
+    if not lines:
+        raise AssertionError(f"File {filename!r} is empty")
+    first = _json.loads(lines[0])
+    expected = context.last_eof_day_final_hash
+    if first.get("prev_hash") != expected:
+        raise AssertionError(
+            f"First record prev_hash={first.get('prev_hash')!r}, "
+            f"expected {expected!r}"
+        )
+
+
+@then('file "{filename}" first record has seq {seq:d}')
+def step_file_first_record_seq(
+    context: Context, filename: str, seq: int
+) -> None:
+    import json as _json
+
+    path = context.audit_dir / filename
+    lines = path.read_bytes().splitlines()
+    first = _json.loads(lines[0])
+    actual = first.get("seq")
+    if actual != seq:
+        raise AssertionError(
+            f"First record seq={actual!r}, expected {seq!r}"
+        )
+
+
 _use_step_matcher_assert("re")
 
 

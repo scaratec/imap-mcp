@@ -1,9 +1,17 @@
 # LIM 0009: Audit day-roll and retention deferred
 
-- **Status:** Accepted
+- **Status:** Mitigated
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
+- **Date mitigated:** 2026-04-28 — `AuditWriter.rotate()` mit
+  hot/warm/delete-Boundaries, Day-Roll-Detection on startup, eof_day-
+  Trailer mit `final_hash`, gzip preserving file mode, Test-Tool
+  `_test_run_audit_rotation` exposed via `IMAP_MCP_TEST_MODE`. Day-
+  rotation, file-mode-transitions, retention-deletion, gzip-integrity,
+  retention-parameter-overrides und no-MCP-tool-reads-audit Szenarien
+  laufen grün. Verbleibend: external-root-hash-hook (subprocess-Test
+  fragil) und manual-deletion-detection (braucht structured logger).
 - **Proposed by:** claude (imap-mcp BDD phase F)
 - **Approved by:** Randy N. Gupta
 - **Related ADRs:** [ADR-0021](../adr/0021-audit-format.md),
