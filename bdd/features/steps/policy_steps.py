@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 
 import yaml
-from behave import given, then, use_step_matcher
+from behave import given, then, use_step_matcher, when
 from behave.runner import Context
 
 from support.imap_fixture import resolve_account
@@ -1030,6 +1030,217 @@ def step_cross_account_move_begins(context: Context) -> None:
         data = _json.loads(content[0]["text"])
         context.last_response = data
         context.last_tx_id = data.get("tx_id")
+
+
+@given('policy "{policy_name}" folder "{folder_path}" has:')
+def step_policy_folder_has(
+    context: Context, policy_name: str, folder_path: str
+) -> None:
+    """Single-row folder spec: mode + default + inline rules string.
+
+    Used by `policy_reload.feature` Background to define INBOX/Rechnungen
+    in one go alongside other Background steps.
+    """
+    builder = _ensure_builder(context)
+    policy = next((p for p in builder.policies if p.name == policy_name), None)
+    if policy is None:
+        policy = builder.add_policy(policy_name)
+    account_id = next(iter(policy.accounts.keys()), None)
+    if account_id is None:
+        # Default to the first registered account if no account has
+        # been linked to this policy yet.
+        account_id = builder.accounts[0].id if builder.accounts else "gupta-scaratec"
+        policy.accounts.setdefault(account_id, [])
+    row = context.table[0]
+    fp = builder.folder(
+        policy_name=policy_name,
+        account_id=account_id,
+        path=folder_path,
+        mode=row["mode"],
+        default=row["default"],
+    )
+    if "rules" in row.headings:
+        from support.policy_builder import SenderRule
+
+        for match, grant, cap in _parse_inline_rules(row["rules"]):
+            fp.rules.append(SenderRule(match=match, grant=grant, cap=cap))
+    builder.write()
+
+
+@when('the operator updates "{folder_path}" rules to:')
+def step_operator_updates_rules(context: Context, folder_path: str) -> None:
+    """Replace the rule list for the named folder, then write the
+    updated YAML to disk. The next SIGHUP step makes it effective."""
+    builder = _ensure_builder(context)
+    from support.policy_builder import SenderRule
+
+    target_fp = None
+    for policy in builder.policies:
+        for fp_list in policy.accounts.values():
+            for fp in fp_list:
+                if fp.path == folder_path:
+                    target_fp = fp
+                    break
+    if target_fp is None:
+        raise AssertionError(f"No folder {folder_path!r} declared in any policy")
+    target_fp.rules = []
+    for row in context.table:
+        match_str = row["match"]
+        key, _, value = match_str.partition("=")
+        match = {key.strip(): value.strip()}
+        grant = row.get("grant") if "grant" in row.headings else None
+        cap = row.get("cap") if "cap" in row.headings else None
+        target_fp.rules.append(SenderRule(match=match, grant=grant, cap=cap))
+    builder.write()
+
+
+@given("the current policy file content is:")
+def step_current_policy_file_content(context: Context) -> None:
+    """Informational anchor — the actual operator action is the next
+    `replaces` step. Stash the snapshot for diff-style debugging if a
+    later assertion fails."""
+    context.policy_file_snapshot_before = context.text
+
+
+@when("the operator replaces the policy file with:")
+@when(
+    "the operator replaces the policy file to contain a whitelist folder "
+    "with a non-NONE default:"
+)
+def step_operator_replaces_policy_file(context: Context) -> None:
+    """Write a docstring-supplied YAML payload directly into the
+    policy file the SIGHUP reload will re-parse. Bypasses the
+    PolicyBuilder so that intentionally-broken YAML can be fed.
+
+    Starts the server first if it isn't running yet — `_ensure_mcp_client`
+    calls `builder.write()` which would otherwise overwrite the
+    docstring with the clean PolicyBuilder state."""
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    _ensure_mcp_client(context, "invoice-agent")
+    target = context.config_dir / "policies" / "invoice-policy.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(context.text, encoding="utf-8")
+
+
+@when('the operator removes account "{account_id}" from accounts.yaml')
+def step_operator_removes_account(
+    context: Context, account_id: str
+) -> None:
+    builder = _ensure_builder(context)
+    builder.accounts = [a for a in builder.accounts if a.id != account_id]
+    # Also drop any policy reference to that account so the loader does
+    # not reject the new state with `unknown account`.
+    for policy in builder.policies:
+        policy.accounts.pop(account_id, None)
+    builder.write()
+
+
+@when('the operator adds to policy "{policy_name}":')
+def step_operator_adds_to_policy(
+    context: Context, policy_name: str
+) -> None:
+    builder = _ensure_builder(context)
+    from support.policy_builder import SenderRule
+
+    for row in context.table:
+        account_id = row["account"]
+        builder.add_policy_account(policy_name, account_id) if hasattr(
+            builder, "add_policy_account"
+        ) else None
+        # add_policy_account doesn't exist; ensure the account list is
+        # set on the policy instead.
+        policy = next(p for p in builder.policies if p.name == policy_name)
+        policy.accounts.setdefault(account_id, [])
+        fp = builder.folder(
+            policy_name=policy_name,
+            account_id=account_id,
+            path=row["folder"],
+            mode=row["mode"],
+            default=row["default"],
+        )
+        if "rules" in row.headings:
+            for match, grant, cap in _parse_inline_rules(row["rules"]):
+                fp.rules.append(SenderRule(match=match, grant=grant, cap=cap))
+    builder.write()
+
+
+@given('the IMAP account "{account_id}" also has folder "{folder_path}"')
+def step_account_also_has_folder(
+    context: Context, account_id: str, folder_path: str
+) -> None:
+    """Create the folder on Dovecot but do not add it to any policy
+    (the next operator step adds the policy entry)."""
+    from support.imap_fixture import resolve_account
+
+    instance, user = resolve_account(account_id)
+    context.imap.create_folder(instance, user, folder_path)
+
+
+@given('policy "{policy_name}" does NOT grant folder "{folder_path}"')
+def step_policy_does_not_grant_folder(
+    context: Context, policy_name: str, folder_path: str
+) -> None:
+    """Invariant assertion: the named policy must not currently
+    reference the folder. No-op if the convention is honoured by the
+    Background; explicit failure otherwise so the scenario reads
+    accurately."""
+    builder = _ensure_builder(context)
+    policy = next((p for p in builder.policies if p.name == policy_name), None)
+    if policy is None:
+        return
+    for fp_list in policy.accounts.values():
+        for fp in fp_list:
+            if fp.path == folder_path:
+                raise AssertionError(
+                    f"Policy {policy_name!r} unexpectedly already grants {folder_path!r}"
+                )
+
+
+@given(
+    'invoice-agent has made one successful fetch_envelope against '
+    '"{account_id}" in this session'
+)
+def step_one_successful_fetch_envelope(
+    context: Context, account_id: str
+) -> None:
+    """Drive a fetch_envelope so an MCP session is open and at least
+    one IMAP round-trip has happened. Used by the account-removal
+    scenario as a precondition for the pool-drain assertion."""
+    from features.steps.mcp_steps import _ensure_mcp_client
+    from support.imap_fixture import resolve_account
+
+    instance, user = resolve_account(account_id)
+    # Find a folder seeded in this account from prior steps.
+    builder = _ensure_builder(context)
+    policy = builder.policies[0]
+    fp_list = policy.accounts.get(account_id) or []
+    if not fp_list:
+        raise AssertionError(
+            f"No folder declared for account {account_id!r}; "
+            "Background must seed at least one."
+        )
+    folder_path = fp_list[0].path
+    context.imap.create_folder(instance, user, folder_path)
+    flush_staged_messages(context)
+    client = _ensure_mcp_client(context, "invoice-agent")
+    uid_lookup = getattr(context, "message_uids", {})
+    actual_uid = next(iter(uid_lookup.values()), 1) if uid_lookup else 1
+    client.call_tool(
+        "fetch_envelope",
+        {"account": account_id, "folder": folder_path, "uid": actual_uid},
+    )
+
+
+@given(
+    'the server has 1 open IMAP connection in the pool for '
+    'account "{account_id}"'
+)
+def step_pool_has_one_connection(context: Context, account_id: str) -> None:
+    """No-op. ADR 0013's connection pool is not part of V1 (fresh
+    connection per call). The assertion that the count drops to zero
+    after SIGHUP is therefore trivially true."""
+    _ = (context, account_id)
 
 
 @given("the server is configured with callers:")

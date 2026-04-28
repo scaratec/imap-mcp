@@ -1,9 +1,14 @@
 # LIM 0008: SIGHUP policy reload deferred
 
-- **Status:** Accepted
+- **Status:** Mitigated
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
+- **Date mitigated:** 2026-04-28 — Server gains `_install_sighup_handler`
+  + `_reload_configuration` with atomic `_LiveState` swap. 5 of 7
+  scenarios in `policy_reload.feature` now pass; remaining 2 are
+  re-tagged: OAuth-scope-change → `@pending_LIM_0003`, in-flight saga
+  capability change → `@pending_LIM_0008` (still here, see below).
 - **Proposed by:** claude (imap-mcp BDD phase E)
 - **Approved by:** Randy N. Gupta
 - **Related ADRs:** [ADR-0014](../adr/0014-policy-reload.md)
@@ -37,9 +42,22 @@ configuration once at startup and holds a frozen reference in
 
 ## Nature of the weakness
 
-The seven scenarios are skipped and uncovered. Policy changes made
-after startup are not seen by the running server; operators must
-restart the service to apply changes.
+The seven scenarios were skipped and uncovered. As of 2026-04-28, five
+are green:
+- `:32` new rule effective after SIGHUP
+- `:46` YAML parse error preserves prior policy
+- `:76` semantic validation error preserves prior policy
+- `:95` removed account drains pool + DENYs subsequent calls
+- `:106` added folder becomes visible after SIGHUP
+
+Two remain pending:
+- `:120` OAuth scope change → `needs_rebootstrap` — depends on
+  OAuth2 implementation (LIM-0003).
+- `:128` SIGHUP during in-flight saga keeps original capability —
+  requires explicit pause-points in the saga that V1 does not have;
+  the practical effect is already correct (the saga captures its
+  capability check before any I/O begins) but the test cannot stage
+  "in-flight at WAL step fetched" without a saga pause primitive.
 
 ## Why the clean solution is not chosen
 

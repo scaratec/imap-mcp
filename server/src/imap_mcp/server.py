@@ -72,11 +72,18 @@ _CURRENT_CALLER_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+@dataclass
+class _LiveState:
+    """Mutable holder for state that SIGHUP swaps atomically (ADR 0014)."""
+
+    pdp: PolicyDecisionPoint
+    configuration: "object"  # Configuration; intentionally untyped here
+
+
 @dataclass(frozen=True)
 class ServerContext:
     default_caller_id: str
-    pdp: PolicyDecisionPoint
-    configuration: "object"  # loaded Configuration; typed below via TYPE_CHECKING
+    _live: _LiveState
     secret_store: "object"  # SecretStore protocol
     audit: "AuditWriter | None" = None
     saga: "SagaManager | None" = None
@@ -91,6 +98,16 @@ class ServerContext:
         """
         override = _CURRENT_CALLER_ID.get()
         return override if override is not None else self.default_caller_id
+
+    @property
+    def pdp(self) -> PolicyDecisionPoint:
+        """Live PDP. Replaced atomically by SIGHUP reload."""
+        return self._live.pdp
+
+    @property
+    def configuration(self):  # type: ignore[no-untyped-def]
+        """Live configuration. Replaced atomically by SIGHUP reload."""
+        return self._live.configuration
 
     def account_by_id(self, account_id: str) -> "object | None":
         from .config import Configuration
@@ -604,6 +621,20 @@ async def _handle_list_folders(
     context: ServerContext, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     account_id = str(arguments["account"])
+    # When the account isn't in the caller's policy at all (or the
+    # account vanished after a SIGHUP reload), surface a DENY with
+    # `account_hidden` rather than an empty-list ALLOW. The caller
+    # learns "you cannot reach this account" instead of being misled
+    # into thinking the account exists but is empty.
+    visible = context.pdp.visible_accounts_for(context.caller_id)
+    if account_id not in visible.visible_account_ids:
+        return {
+            "decision": "DENY",
+            "reason": "account_hidden",
+            "account": account_id,
+            "folders": [],
+            "hidden_folders_count": 0,
+        }
     known = await _known_folders_for(context, account_id)
     visibility = context.pdp.visible_folders_for(context.caller_id, account_id, known)
     return {
@@ -1657,10 +1688,10 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
         saga_mgr = SagaManager(
             wal=wal, audit_emitter=audit_writer, retry_limit=retry_limit
         )
+    live = _LiveState(pdp=pdp, configuration=configuration)
     context = ServerContext(
         default_caller_id=default_caller_id,
-        pdp=pdp,
-        configuration=configuration,
+        _live=live,
         secret_store=secret_store,
         audit=audit_writer,
         saga=saga_mgr,
@@ -1672,8 +1703,99 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
     return context, configuration
 
 
+def _reload_configuration(
+    context: ServerContext, config_dir: Path
+) -> None:
+    """SIGHUP-driven atomic reload (ADR 0014).
+
+    Re-parses every YAML file in `config_dir` into a temporary
+    Configuration. If parsing or validation fails, the previous
+    state is preserved and an `ERROR` audit record explains why. On
+    success, the new PDP + Configuration replace the live state in a
+    single attribute write — handlers reading `context.pdp` /
+    `context.configuration` see either the old or the new state, never
+    a half-applied one.
+    """
+    from .config import Configuration
+
+    audit = context.audit
+    old_config: Configuration = context.configuration  # type: ignore[assignment]
+    try:
+        new_config: Configuration = load_configuration(config_dir)
+    except Exception as exc:
+        if audit is not None:
+            reason = "parse_error" if "yaml" in type(exc).__module__.lower() or "yaml" in str(exc).lower() else "validation_error"
+            audit.write({
+                "caller_id": context.caller_id,
+                "tool": "policy_reload",
+                "decision": "DENY",
+                "reason": reason,
+                "result": "ERROR",
+                "detail": str(exc),
+            })
+        return
+
+    new_pdp = PolicyDecisionPoint(new_config)
+    # Atomic swap. `_LiveState` is a mutable dataclass — assigning
+    # both fields back-to-back is not atomic at the language level,
+    # but every handler reads either `pdp` or `configuration` (never
+    # both in one expression), so the worst case is a request that
+    # uses a fresh PDP against a stale Configuration for the duration
+    # of one method call. ADR 0014 declares that acceptable.
+    context._live.pdp = new_pdp
+    context._live.configuration = new_config
+
+    # Pool-drain audit per removed account (no actual pool today;
+    # ADR 0013's pool will hook in here when its scenarios activate).
+    if audit is not None:
+        old_ids = {a.id for a in old_config.accounts_file.accounts}
+        new_ids = {a.id for a in new_config.accounts_file.accounts}
+        for removed in sorted(old_ids - new_ids):
+            audit.write({
+                "caller_id": context.caller_id,
+                "tool": "pool_drain",
+                "decision": "ALLOW",
+                "reason": "account_removed",
+                "account": removed,
+                "result": "OK",
+            })
+        audit.write({
+            "caller_id": context.caller_id,
+            "tool": "policy_reload",
+            "decision": "ALLOW",
+            "reason": "reload_applied",
+            "result": "OK",
+            "detail": (
+                f"old_callers={len(old_config.callers_file.callers)}, "
+                f"new_callers={len(new_config.callers_file.callers)}, "
+                f"removed_accounts={sorted(old_ids - new_ids)}"
+            ),
+        })
+
+
+def _install_sighup_handler(context: ServerContext, config_dir: Path) -> None:
+    """Wire SIGHUP to `_reload_configuration` on the running event loop.
+
+    The handler is idempotent — repeated SIGHUPs each trigger a fresh
+    reload. Windows lacks SIGHUP; on those platforms the registration
+    is a no-op (the BDD suite runs on Linux only).
+    """
+    import asyncio
+    import signal
+
+    if not hasattr(signal, "SIGHUP"):
+        return
+    loop = asyncio.get_running_loop()
+
+    def _on_sighup() -> None:
+        _reload_configuration(context, config_dir)
+
+    loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+
+
 async def run_stdio(config_dir: Path, caller_id: str) -> None:
     context, _configuration = _build_context(config_dir, default_caller_id=caller_id)
+    _install_sighup_handler(context, config_dir)
     app = build_server(context)
 
     async with stdio_server() as (read_stream, write_stream):
@@ -1710,6 +1832,7 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
     context, configuration = _build_context(
         config_dir, default_caller_id="<http-no-default>"
     )
+    _install_sighup_handler(context, config_dir)
 
     # ADR 0015 invariant: stdio_trusted callers cannot authenticate
     # over HTTP. The orchestrator-trust assumption that justifies

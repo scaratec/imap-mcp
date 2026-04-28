@@ -175,6 +175,12 @@ def step_caller_calls_get_caller_identity(context: Context, caller_id: str) -> N
 def step_caller_calls_list_folders(
     context: Context, caller_id: str, account: str
 ) -> None:
+    # Stash the current hidden_folders_count (if any) as the
+    # "previous" anchor for `decreases by 1 compared to the previous
+    # call`-style assertions in policy_reload.feature.
+    prior = getattr(context, "last_response", None) or {}
+    if "hidden_folders_count" in prior:
+        context.previous_hidden_folders_count = prior["hidden_folders_count"]
     client = _ensure_mcp_client(context, caller_id)
     payload = client.call_tool("list_folders", {"account": account})
     _store_result(context, payload)
@@ -468,6 +474,36 @@ def step_http_client_post_admin_reload(context: Context) -> None:
         f"http://{client.host}:{client.port}/admin/reload-policy", timeout=2.0
     )
     context.last_http_response = response
+
+
+@when("the server receives SIGHUP")
+def step_server_receives_sighup(context: Context) -> None:
+    """Send SIGHUP to the running server process and give the loop a
+    moment to apply the reload before the next step's tool call.
+
+    A scenario can reach this step before performing any MCP call
+    (e.g. policy_reload's parse-error case sends SIGHUP first). In
+    that case the harness needs a running server to deliver the
+    signal to — start the stdio MCPClient implicitly."""
+    import signal as _signal
+    import time as _time
+
+    if (
+        getattr(context, "mcp", None) is None
+        and getattr(context, "mcp_http", None) is None
+    ):
+        # Lazy-start an stdio client so SIGHUP has a recipient.
+        _ensure_mcp_client(context, "invoice-agent")
+
+    proc = None
+    if getattr(context, "mcp", None) is not None:
+        proc = context.mcp._proc  # stdio MCPClient
+    elif getattr(context, "mcp_http", None) is not None:
+        proc = context.mcp_http._proc
+    if proc is None or proc.poll() is not None:
+        raise AssertionError("No running server to signal")
+    proc.send_signal(_signal.SIGHUP)
+    _time.sleep(0.4)
 
 
 @when("the server's background recovery loop runs {passes:d} times")

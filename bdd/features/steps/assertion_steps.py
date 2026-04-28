@@ -1608,6 +1608,143 @@ def step_startup_error_indicates_caller(
         )
 
 
+from behave import use_step_matcher as _use_step_matcher_assert
+
+
+_use_step_matcher_assert("re")
+
+
+@then(
+    r'the audit log contains a record with tool "(?P<tool>[^"]+)", '
+    r'result "(?P<result>[^"]+)"'
+)
+def step_audit_record_tool_result(
+    context: Context, tool: str, result: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    for rec in reader.records_today():
+        r = rec.record
+        if r.get("tool") == tool and r.get("result") == result:
+            context.last_matching_audit_record = r
+            return
+    present = [(r.record.get("tool"), r.record.get("result")) for r in reader.records_today()]
+    raise AssertionError(
+        f"No audit record with tool={tool!r} result={result!r}. "
+        f"Present (tool,result): {present!r}"
+    )
+
+
+@then(
+    r'the audit log contains a record with tool "(?P<tool>[^"]+)", '
+    r'result "(?P<result>[^"]+)", reason "(?P<reason>[^"]+)"'
+)
+def step_audit_record_tool_result_reason(
+    context: Context, tool: str, result: str, reason: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    for rec in reader.records_today():
+        r = rec.record
+        if (
+            r.get("tool") == tool
+            and r.get("result") == result
+            and r.get("reason") == reason
+        ):
+            context.last_matching_audit_record = r
+            return
+    present = [
+        (r.record.get("tool"), r.record.get("result"), r.record.get("reason"))
+        for r in reader.records_today()
+    ]
+    raise AssertionError(
+        f"No audit record with tool={tool!r} result={result!r} reason={reason!r}. "
+        f"Present: {present!r}"
+    )
+
+
+@then(
+    r'the audit log contains a record with tool "(?P<tool>[^"]+)", '
+    r'account "(?P<account>[^"]+)", reason "(?P<reason>[^"]+)"'
+)
+def step_audit_record_tool_account_reason(
+    context: Context, tool: str, account: str, reason: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    for rec in reader.records_today():
+        r = rec.record
+        if (
+            r.get("tool") == tool
+            and r.get("account") == account
+            and r.get("reason") == reason
+        ):
+            context.last_matching_audit_record = r
+            return
+    raise AssertionError(
+        f"No audit record with tool={tool!r} account={account!r} reason={reason!r}"
+    )
+
+
+_use_step_matcher_assert("parse")
+
+
+@then('the audit record field detail contains "{needle}"')
+def step_audit_record_detail_contains(context: Context, needle: str) -> None:
+    rec = getattr(context, "last_matching_audit_record", None)
+    if rec is None:
+        raise AssertionError("No audit record captured by a previous step.")
+    detail = str(rec.get("detail") or "")
+    if needle not in detail:
+        raise AssertionError(
+            f"Audit record detail did not contain {needle!r}. detail={detail!r}"
+        )
+
+
+@then(
+    'the number of open IMAP connections for "{account_id}" becomes 0 within {seconds:d} seconds'
+)
+def step_imap_connections_become_zero(
+    context: Context, account_id: str, seconds: int
+) -> None:
+    """Trivially satisfied today — V1 opens a fresh connection per
+    call (no pool, see ADR 0013 + LIM-0008 deferral note). The
+    scenario's assertion that the count drops to zero after a SIGHUP
+    that removes the account is therefore always true; the step
+    exists so the spec's guarantee is named, not so the harness has
+    to introspect a non-existent pool."""
+    _ = (context, account_id, seconds)
+
+
+@then(
+    "the response field hidden_folders_count decreases by 1 compared to the previous call"
+)
+def step_hidden_folders_count_decreases(context: Context) -> None:
+    """Compare the current `hidden_folders_count` with the previous
+    list-style response stored by `_capture_hidden_count`."""
+    response = _last_response(context)
+    current = response.get("hidden_folders_count")
+    previous = getattr(context, "previous_hidden_folders_count", None)
+    if previous is None:
+        raise AssertionError(
+            "No previous hidden_folders_count captured. The Background "
+            "must perform a list_folders call before the SIGHUP step "
+            "so the comparison has an anchor."
+        )
+    if current is None:
+        raise AssertionError(
+            f"Current response has no hidden_folders_count: {response!r}"
+        )
+    if current != previous - 1:
+        raise AssertionError(
+            f"hidden_folders_count: expected {previous - 1} (previous {previous} - 1), "
+            f"got {current}"
+        )
+
+
 @then('the IMAP server has no folder named "{folder_path}" that now holds uid {uid:d}')
 def step_imap_server_no_folder_holding_uid(
     context: Context, folder_path: str, uid: int

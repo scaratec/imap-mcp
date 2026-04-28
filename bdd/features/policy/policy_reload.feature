@@ -1,4 +1,3 @@
-@pending @pending_LIM_0008
 Feature: Policy reload via SIGHUP
 
   Policy and account configuration live as YAML files in a Git
@@ -117,6 +116,7 @@ Feature: Policy reload via SIGHUP
     Then the response field folders contains "Banking"
     And the response field hidden_folders_count decreases by 1 compared to the previous call
 
+  @pending @pending_LIM_0003
   Scenario: Changing an account's OAuth scope moves it to needs_rebootstrap
     Given account "gmail-archive" is configured with oauth_scope "https://www.googleapis.com/auth/gmail.readonly"
     And the account's state is "healthy"
@@ -126,6 +126,7 @@ Feature: Policy reload via SIGHUP
     And the audit log contains a record with tool "policy_reload", detail containing "oauth_scope changed; rebootstrap required"
     And new IMAP connection attempts to "gmail-archive" are refused with reason "needs_rebootstrap"
 
+  @pending @pending_LIM_0008
   Scenario: A SIGHUP during an in-flight saga applies only from the next transaction
     Given a cross-account move for uid 301 is in progress, currently at WAL step "fetched"
     When the operator changes policy "invoice-policy" to remove the move_out capability from "INBOX/Rechnungen"
