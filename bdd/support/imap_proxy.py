@@ -2,8 +2,8 @@
 injection (LIM-0005 paydown).
 
 The proxy listens on a free local port and forwards every byte to a
-real Dovecot instance. Two rewriting hooks let scenarios induce
-behaviour the live Dovecot cannot produce on its own:
+real Dovecot instance. Several hooks let scenarios induce behaviour
+the live Dovecot cannot produce on its own:
 
 - **`strip_capabilities`** — token-list to remove from any
   `* CAPABILITY` line and from `* OK [CAPABILITY …]` status responses.
@@ -15,6 +15,20 @@ behaviour the live Dovecot cannot produce on its own:
   response immediately before the *next* upstream→client frame after
   the matching client→upstream command. Used by the UIDVALIDITY-
   staleness scenario.
+
+- **`inject_failure_on`** — list of `{command, remaining}` specs.
+  When the next client→upstream command's verb matches `command`
+  (case-insensitive), the proxy synthesises a tagged `<tag> NO
+  simulated error 500\r\n` reply to the client and does NOT forward
+  the command to upstream. Used by the saga's APPEND-5xx and
+  EXPUNGE-5xx scenarios. `remaining` decrements per match; `null`
+  means unlimited.
+
+- **`delay_command_seconds`** — single `{command, seconds, remaining}`
+  spec. When the next client→upstream command's verb matches, the
+  proxy `await asyncio.sleep(seconds)` BEFORE forwarding it upstream.
+  Used by the APPEND-timeout scenario in conjunction with the server's
+  `IMAP_MCP_APPEND_TIMEOUT` to make the server-side `wait_for` fire.
 
 Every client→upstream command line is also written, with a UTC
 timestamp, into a per-account command log file. The harness reads
@@ -34,11 +48,16 @@ Configuration is loaded from the JSON file pointed at by
       "command_log_path": "/tmp/.../proxy.log",
       "strip_capabilities": ["MOVE"],
       "uidvalidity_change_after": "UID SEARCH",
-      "uidvalidity_new_value": "99999"
+      "uidvalidity_new_value": "99999",
+      "inject_failure_on": [{"command": "APPEND", "remaining": 1}],
+      "delay_command_seconds": {"command": "APPEND", "seconds": 45, "remaining": 1}
     }
 
-The file is reloaded on every new client connection so the harness
-can flip rules between scenarios without restarting the proxy.
+The file is read ONCE at proxy startup and shared across all
+sessions. Fault counters live inside the shared dict and mutate in
+place so they persist across the per-retry IMAP reconnects the
+saga's recovery loop performs. To flip rules, the harness writes a
+new config and restarts the proxy.
 """
 
 from __future__ import annotations
@@ -59,6 +78,61 @@ CAPABILITY_BRACKET_RE = re.compile(
     rb"\[CAPABILITY\s+([^\]]+)\]", re.IGNORECASE
 )
 LITERAL_TRAILER_RE = re.compile(rb"\{(\d+)\}\s*$")
+
+
+def _parse_tag_and_verb(command_line: bytes) -> tuple[bytes, str]:
+    """Split an IMAP command line into `(tag, verb_upper)`. Returns
+    `(b'', '')` if the line is malformed (not enough tokens)."""
+    parts = command_line.split(maxsplit=2)
+    if len(parts) < 2:
+        return b"", ""
+    return parts[0], parts[1].decode("ascii", errors="replace").upper()
+
+
+def _consume_command_match(specs: list, verb_upper: str) -> bool:
+    """If any spec in `specs` matches `verb_upper` and has a non-zero
+    `remaining` slot (or `null` = unlimited), decrement and return True.
+    Specs are mutated in place — list contents are shared with the
+    `ProxySession.config` dict, which is how the count survives
+    across sequential commands within a single connection."""
+    for spec in specs:
+        cmd = (spec.get("command") or "").upper()
+        if cmd != verb_upper:
+            continue
+        remaining = spec.get("remaining")
+        if remaining is None:
+            return True
+        if remaining <= 0:
+            continue
+        spec["remaining"] = remaining - 1
+        return True
+    return False
+
+
+def _consume_delay_match(spec: dict, verb_upper: str) -> bool:
+    """Same idea as `_consume_command_match` but for the singular
+    `delay_command_seconds` spec."""
+    cmd = (spec.get("command") or "").upper()
+    if cmd != verb_upper:
+        return False
+    remaining = spec.get("remaining")
+    if remaining is None:
+        return True
+    if remaining <= 0:
+        return False
+    spec["remaining"] = remaining - 1
+    return True
+
+
+def _build_no_response(tag: bytes, verb_upper: str) -> bytes:
+    """Tagged NO line synthesised in lieu of forwarding `tag verb` to
+    upstream. The text intentionally mentions `simulated error 500` so
+    grepping the IMAP client's exception text from logs is unambiguous."""
+    if not tag:
+        tag = b"*"
+    return tag + b" NO [SERVERBUG] simulated error 500 (" + verb_upper.encode(
+        "ascii", "replace"
+    ) + b")\r\n"
 
 
 def _strip_tokens(payload: bytes, tokens: list[str]) -> bytes:
@@ -95,18 +169,24 @@ def _now_iso() -> str:
 
 
 class ProxySession:
-    """One client↔upstream session. Owns its own pair of relays."""
+    """One client↔upstream session. Owns its own pair of relays.
+
+    The `config` dict is SHARED across all sessions (passed in by
+    `_main`). Per-session UIDVALIDITY state lives on the instance so
+    each connection re-arms the trigger; fault-counter state lives on
+    the shared dict so `inject_failure_on[*].remaining` and
+    `delay_command_seconds.remaining` decrement across reconnects (the
+    server's recovery loop opens fresh IMAP connections per retry)."""
 
     def __init__(
         self,
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
-        config_path: Path,
+        config: dict[str, Any],
     ) -> None:
         self.client_reader = client_reader
         self.client_writer = client_writer
-        self.config_path = config_path
-        self.config: dict[str, Any] = self._load_config()
+        self.config = config
         # Three states on the UIDVALIDITY-injection state machine:
         #   "idle"      — trigger not yet seen
         #   "saw_cmd"   — client sent the trigger command; awaiting
@@ -117,9 +197,10 @@ class ProxySession:
         self._uidv_state = "idle"
         self._cmd_log_lock = asyncio.Lock()
 
-    def _load_config(self) -> dict[str, Any]:
+    @staticmethod
+    def _load_config(config_path: Path) -> dict[str, Any]:
         try:
-            return json.loads(self.config_path.read_text(encoding="utf-8"))
+            return json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
 
@@ -192,26 +273,88 @@ class ProxySession:
 
     async def _pump_c2s(self, upstream: asyncio.StreamWriter) -> None:
         """Client → Upstream. Logs commands; arms UIDVALIDITY-inject
-        if the configured trigger matches."""
+        if the configured trigger matches; honours fault-injection
+        hooks (`inject_failure_on`, `delay_command_seconds`)."""
         trigger = (self.config.get("uidvalidity_change_after") or "").upper()
+        inject_specs = list(self.config.get("inject_failure_on", []) or [])
+        delay_spec = self.config.get("delay_command_seconds") or None
         while True:
-            frame = await self._read_imap_frame(self.client_reader)
-            if not frame:
+            line = await self.client_reader.readline()
+            if not line:
                 upstream.close()
                 return
-            command_line = frame.split(b"\r\n", 1)[0]
+            command_line = line.rstrip(b"\r\n")
             await self._log_command(command_line)
+            tag, verb = _parse_tag_and_verb(command_line)
+
+            if verb and _consume_command_match(inject_specs, verb):
+                # Synthesise a tagged NO; do NOT forward upstream. The
+                # client's APPEND-literal body never gets a `+ continue`
+                # so it stays unsent — upstream sees nothing.
+                resp = _build_no_response(tag, verb)
+                self.client_writer.write(resp)
+                try:
+                    await self.client_writer.drain()
+                except Exception:
+                    return
+                continue
+
+            if (
+                delay_spec is not None
+                and verb
+                and _consume_delay_match(delay_spec, verb)
+            ):
+                # Sleep, then DO NOT forward. The server's
+                # `wait_for(timeout=N)` will have fired by the time we
+                # wake, and forwarding stale literal-body bytes after
+                # the client's APPEND was cancelled leads to upstream
+                # confusion. Subsequent commands (LOGOUT, retry on a
+                # fresh connection) are handled normally.
+                await asyncio.sleep(float(delay_spec.get("seconds", 0) or 0))
+                continue
+
             if (
                 trigger
                 and self._uidv_state == "idle"
                 and trigger.encode("ascii", "replace") in command_line.upper()
             ):
                 self._uidv_state = "saw_cmd"
-            upstream.write(frame)
+
+            # Forward the command line FIRST. Synchronous IMAP literals
+            # require the upstream to send `+ continue` (handled by
+            # `_pump_s2c` in parallel) before the client sends the body
+            # bytes — so reading the body before forwarding the command
+            # would deadlock.
+            upstream.write(line)
             try:
                 await upstream.drain()
             except Exception:
                 return
+
+            # Then iteratively forward any literal-body bytes the
+            # client sends after seeing `+`, plus the trailing CRLF
+            # line (which itself may carry another `{N}` trailer).
+            tail = command_line
+            while True:
+                m = LITERAL_TRAILER_RE.search(tail)
+                if not m:
+                    break
+                n = int(m.group(1))
+                payload = await self.client_reader.readexactly(n)
+                upstream.write(payload)
+                cont = await self.client_reader.readline()
+                if not cont:
+                    try:
+                        await upstream.drain()
+                    except Exception:
+                        pass
+                    return
+                upstream.write(cont)
+                try:
+                    await upstream.drain()
+                except Exception:
+                    return
+                tail = cont.rstrip(b"\r\n")
 
     async def _pump_s2c(self, upstream: asyncio.StreamReader) -> None:
         """Upstream → Client. Rewrites CAPABILITY lines and (when
@@ -260,10 +403,17 @@ class ProxySession:
 
 
 async def _main(host: str, port: int, config_path: Path) -> None:
+    # Load the config dict ONCE per proxy process and share it across
+    # every session. Fault counters (`inject_failure_on[*].remaining`,
+    # `delay_command_seconds.remaining`) live inside this dict and
+    # mutate in place — they must persist across the per-retry IMAP
+    # reconnects the saga's recovery loop performs.
+    shared_config = ProxySession._load_config(config_path)
+
     async def _on_client(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        session = ProxySession(reader, writer, config_path)
+        session = ProxySession(reader, writer, shared_config)
         try:
             await session.run()
         except Exception:

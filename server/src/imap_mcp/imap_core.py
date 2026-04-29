@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from aioimaplib import IMAP4
 
 from .config import Account
-from .fault_injection import get_registry
 
 
 @dataclass(frozen=True)
@@ -66,8 +65,26 @@ def _append_timeout() -> int:
 
 
 async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
-    """Consult fault injection, then construct an IMAP4 connection."""
-    await get_registry().check_connect(account.id)
+    # Pre-flight TCP probe: aioimaplib swallows ConnectionRefusedError
+    # from its internal create_connection task and surfaces a generic
+    # TimeoutError after the wait_hello deadline. Probing the port
+    # directly first lets the saga's `except ConnectionRefusedError`
+    # branch distinguish "target_unreachable" from "target_append_timeout".
+    import asyncio as _asyncio
+    try:
+        _r, _w = await _asyncio.wait_for(
+            _asyncio.open_connection(account.host, account.port),
+            timeout=timeout,
+        )
+        _w.close()
+        try:
+            await _w.wait_closed()
+        except Exception:
+            pass
+    except ConnectionRefusedError:
+        raise
+    except OSError as exc:
+        raise ConnectionRefusedError(*exc.args) from exc
     imap = IMAP4(host=account.host, port=account.port, timeout=timeout)
     await imap.wait_hello_from_server()
     return imap
@@ -466,7 +483,6 @@ async def append_message(
     imap = await _open_imap(account, timeout=timeout)
     await imap.login(_imap_user_for(account), password)
     try:
-        await get_registry().check_append(account.id)
         status, _ = await asyncio.wait_for(
             imap.append(
                 rfc822,

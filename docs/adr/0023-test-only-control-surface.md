@@ -214,8 +214,10 @@ must extend the list below.
 ## References
 
 - [LIM-0004](../limitations/0004-imap-fault-injection-via-env-var.md)
-  — env-based fault injection for IMAP I/O. Distinct mechanism;
-  this ADR documents the saga-state-level injection.
+  — env-based fault injection for IMAP I/O. Resolved 2026-04-29:
+  superseded by wire-level proxy hooks in `bdd/support/imap_proxy.py`.
+  This ADR continues to document the saga-state-level crash injection
+  (`IMAP_MCP_CRASH_AT`), which remains an in-process mechanism.
 - [ADR-0006](0006-cross-account-move-saga.md) — the saga whose state
   transitions `IMAP_MCP_CRASH_AT` partitions.
 - [ADR-0007](0007-wal-schema.md) — the WAL inspected by recovery.

@@ -716,58 +716,38 @@ def step_wal_retry_limit(context: Context, limit: int) -> None:
     context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
 
 
-def _ensure_fault_registry(context: Context) -> dict[str, dict]:
-    """Build (and stash on context) the dict that serialises into
-    IMAP_MCP_FAULT_INJECTION when the server starts."""
-    extra_env = getattr(context, "mcp_extra_env", None)
-    if extra_env is None:
-        extra_env = {}
-        context.mcp_extra_env = extra_env
-    registry: dict[str, dict] = getattr(context, "fault_registry", None) or {}
-    context.fault_registry = registry
-    # Recovery scenarios need the test-only tool surfaced.
-    extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
-    return registry
-
-
-def _flush_fault_registry(context: Context) -> None:
-    """Serialise the fault registry back into mcp_extra_env."""
-    import json as _json
-
-    registry = getattr(context, "fault_registry", None)
-    if registry is None:
-        return
-    context.mcp_extra_env["IMAP_MCP_FAULT_INJECTION"] = _json.dumps(registry)
-
-
 @given('the IMAP server for "{account_id}" responds to the next APPEND with error {code:d}')
 def step_fault_next_append_error(context: Context, account_id: str, code: int) -> None:
-    registry = _ensure_fault_registry(context)
-    registry.setdefault(account_id, {})["append"] = {
-        "error": code,
-        "remaining": 1,
-    }
-    _flush_fault_registry(context)
+    _ = code  # the synthesised NO is fixed; real-world IMAP NO has no numeric code
+    _start_imap_proxy(
+        context, account_id,
+        inject_failure_on=[{"command": "APPEND", "remaining": 1}],
+    )
 
 
 @given('the IMAP server for "{account_id}" responds to every APPEND with error {code:d}')
 def step_fault_every_append_error(context: Context, account_id: str, code: int) -> None:
-    registry = _ensure_fault_registry(context)
-    registry.setdefault(account_id, {})["append"] = {
-        "error": code,
-        "remaining": None,
-    }
-    _flush_fault_registry(context)
+    _ = code
+    # The retry-exhaustion scenario also drives the recovery loop via
+    # _test_run_recovery; surface the test-only tool.
+    context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
+    context.mcp_extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
+    _start_imap_proxy(
+        context, account_id,
+        inject_failure_on=[{"command": "APPEND", "remaining": None}],
+    )
 
 
 @given('the IMAP server for "{account_id}" delays the next APPEND response by {seconds:d} seconds')
 def step_fault_append_delay(context: Context, account_id: str, seconds: int) -> None:
-    registry = _ensure_fault_registry(context)
-    registry.setdefault(account_id, {})["append"] = {
-        "delay_seconds": seconds,
-        "remaining": 1,
-    }
-    _flush_fault_registry(context)
+    _start_imap_proxy(
+        context, account_id,
+        delay_command_seconds={
+            "command": "APPEND",
+            "seconds": seconds,
+            "remaining": 1,
+        },
+    )
 
 
 @given('the server append_timeout is configured to {seconds:d} seconds')
@@ -778,19 +758,20 @@ def step_server_append_timeout(context: Context, seconds: int) -> None:
 
 @given('the IMAP server for "{account_id}" responds to the next EXPUNGE with error {code:d} exactly once')
 def step_fault_next_expunge_once(context: Context, account_id: str, code: int) -> None:
-    registry = _ensure_fault_registry(context)
-    registry.setdefault(account_id, {})["expunge"] = {
-        "error": code,
-        "remaining": 1,
-    }
-    _flush_fault_registry(context)
+    _ = code
+    _start_imap_proxy(
+        context, account_id,
+        inject_failure_on=[{"command": "EXPUNGE", "remaining": 1}],
+    )
 
 
 @given('the IMAP server for "{account_id}" refuses all connections')
 def step_fault_refuse_connections(context: Context, account_id: str) -> None:
-    registry = _ensure_fault_registry(context)
-    registry.setdefault(account_id, {})["connect"] = {"refuse": True}
-    _flush_fault_registry(context)
+    """Refuse-all = no proxy listens. We pick a free port, immediately
+    release it, and rewire the account so the server's TCP connect
+    fails with ECONNREFUSED — exactly what `target_unreachable`
+    needs."""
+    _start_imap_proxy(context, account_id, refuse_connections=True)
 
 
 @given('the folder "{folder}" contains no message with uid {uid:d}')
@@ -1509,12 +1490,22 @@ def _start_imap_proxy(
     strip_capabilities: list[str] | None = None,
     uidvalidity_change_after: str | None = None,
     uidvalidity_new_value: str | None = None,
+    inject_failure_on: list[dict] | None = None,
+    delay_command_seconds: dict | None = None,
+    refuse_connections: bool = False,
 ) -> int:
     """Spawn the BDD MITM proxy in front of the Dovecot instance for
     `account_id` and rewire the registered Account to point at it.
 
     Returns the proxy's listening port. Idempotent within a scenario:
-    a second call replaces the config without restarting the proxy."""
+    repeated calls for the SAME account_id merge new config keys into
+    the existing config file and reuse the running proxy. Calls for
+    DIFFERENT account_ids start additional proxy subprocesses (one per
+    account) so multi-account fault scenarios work.
+
+    `refuse_connections=True` is the special case: no proxy is started.
+    A free port is picked and released, and the account is rewired to
+    that port so the server's TCP connect fails with ECONNREFUSED."""
     import json as _json
     import os
     import socket
@@ -1531,18 +1522,65 @@ def _start_imap_proxy(
 
     log_path = context.scratch_dir / f"imap-proxy-{account_id}.log"
     config_path = context.scratch_dir / f"imap-proxy-{account_id}.json"
-    config = {
-        "upstream_host": upstream_host,
-        "upstream_port": upstream_port,
-        "command_log_path": str(log_path),
-        "strip_capabilities": list(strip_capabilities or []),
-        "uidvalidity_change_after": uidvalidity_change_after or "",
-        "uidvalidity_new_value": uidvalidity_new_value or "",
-    }
+
+    # Merge new keys into any existing config file for this account.
+    if config_path.exists():
+        try:
+            config = _json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            config = {}
+    else:
+        config = {}
+    config.setdefault("upstream_host", upstream_host)
+    config.setdefault("upstream_port", upstream_port)
+    config.setdefault("command_log_path", str(log_path))
+    if strip_capabilities is not None:
+        config["strip_capabilities"] = list(strip_capabilities)
+    config.setdefault("strip_capabilities", [])
+    if uidvalidity_change_after is not None:
+        config["uidvalidity_change_after"] = uidvalidity_change_after
+    config.setdefault("uidvalidity_change_after", "")
+    if uidvalidity_new_value is not None:
+        config["uidvalidity_new_value"] = uidvalidity_new_value
+    config.setdefault("uidvalidity_new_value", "")
+    if inject_failure_on is not None:
+        existing = list(config.get("inject_failure_on", []) or [])
+        existing.extend(inject_failure_on)
+        config["inject_failure_on"] = existing
+    config.setdefault("inject_failure_on", [])
+    if delay_command_seconds is not None:
+        config["delay_command_seconds"] = delay_command_seconds
     config_path.write_text(_json.dumps(config), encoding="utf-8")
 
-    proxy_proc = getattr(context, "imap_proxy_proc", None)
-    proxy_port = getattr(context, "imap_proxy_port", None)
+    procs = getattr(context, "imap_proxy_procs", None)
+    if procs is None:
+        procs = {}
+        context.imap_proxy_procs = procs
+    ports = getattr(context, "imap_proxy_ports", None)
+    if ports is None:
+        ports = {}
+        context.imap_proxy_ports = ports
+    if not hasattr(context, "imap_proxy_log_paths"):
+        context.imap_proxy_log_paths = {}
+    context.imap_proxy_log_paths[account_id] = log_path
+
+    # Refuse-mode: pick a port, don't bind anything to it, rewire the
+    # account. `connect()` to a port nothing listens on returns
+    # ECONNREFUSED on Linux — exactly the wire-level signal the saga
+    # maps to `target_unreachable`.
+    if refuse_connections:
+        if account_id not in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                ports[account_id] = int(probe.getsockname()[1])
+        for account in builder.accounts:
+            if account.id == account_id:
+                account.port = ports[account_id]
+                break
+        builder.write()
+        return ports[account_id]
+
+    proxy_proc = procs.get(account_id)
     if proxy_proc is None or proxy_proc.poll() is not None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
@@ -1580,11 +1618,10 @@ def _start_imap_proxy(
         else:
             proc.terminate()
             raise AssertionError("imap_proxy did not announce LISTEN within 5s")
-        context.imap_proxy_proc = proc
-        context.imap_proxy_port = proxy_port
-        context.imap_proxy_log_paths = {}
-    context.imap_proxy_log_paths[account_id] = log_path
-    context.imap_proxy_config_path = config_path
+        procs[account_id] = proc
+        ports[account_id] = proxy_port
+
+    proxy_port = ports[account_id]
     for account in builder.accounts:
         if account.id == account_id:
             account.port = proxy_port

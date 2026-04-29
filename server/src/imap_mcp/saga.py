@@ -539,7 +539,6 @@ async def _delete_source(
     Uses MOVE-to-trash-folder-emulation via STORE \\Deleted + EXPUNGE,
     which is the DELETE component of the saga.
     """
-    from .fault_injection import get_registry
     from .imap_core import _imap_user_for, _open_imap
 
     imap = await _open_imap(account)
@@ -551,7 +550,6 @@ async def _delete_source(
         status, _ = await imap.uid("store", str(uid), "+FLAGS", r"(\Deleted)")
         if status != "OK":
             raise RuntimeError(f"STORE \\Deleted failed: {status}")
-        await get_registry().check_expunge(account.id)
         status, _ = await imap.expunge()
         if status != "OK":
             raise RuntimeError(f"EXPUNGE failed: {status}")
