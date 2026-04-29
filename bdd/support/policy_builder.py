@@ -82,6 +82,8 @@ class PolicyBuilder:
 
     secret_store_backend: str = "file_dir"
     secret_store_path: Path | None = None
+    secret_store_recipient: str | None = None
+    secret_store_gnupghome: Path | None = None
     audit_directory: Path | None = None
     audit_hot_days: int | None = None
     audit_warm_days: int | None = None
@@ -169,12 +171,18 @@ class PolicyBuilder:
                         )
                         for a in self.accounts
                     ],
-                    "secret_store": {
-                        "backend": self.secret_store_backend,
-                        "path": str(self.secret_store_path)
-                        if self.secret_store_path
-                        else None,
-                    },
+                    "secret_store": _clean(
+                        {
+                            "backend": self.secret_store_backend,
+                            "path": str(self.secret_store_path)
+                            if self.secret_store_path
+                            else None,
+                            "recipient": self.secret_store_recipient,
+                            "gnupghome": str(self.secret_store_gnupghome)
+                            if self.secret_store_gnupghome
+                            else None,
+                        }
+                    ),
                     "audit": _clean(
                         {
                             "directory": str(self.audit_directory)

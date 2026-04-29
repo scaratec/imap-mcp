@@ -390,6 +390,28 @@ def _start_http_server_for_test(context: Context) -> None:
     flush_staged_messages(context)
     builder = getattr(context, "policy_builder", None)
     if builder is not None:
+        # ADR-0015 forbids stdio_trusted callers on non-stdio transport.
+        # If the caller-set was set up purely via the inline
+        # `using policy` step (which defaults to stdio_trusted) and
+        # the scenario then starts HTTP, auto-promote those callers
+        # to shared_token with a placeholder token_secret_ref so the
+        # ADR-0015 startup guard does not trip. Scenarios that
+        # explicitly exercise the ADR-0015 fatal path use an explicit
+        # `the server is configured with caller:` table that includes
+        # at least one shared_token entry alongside the stdio_trusted —
+        # in that case we leave the stdio_trusted caller alone.
+        has_shared_token = any(
+            getattr(c, "auth_type", None) == "shared_token"
+            for c in builder.callers
+        )
+        if not has_shared_token:
+            for caller in builder.callers:
+                if getattr(caller, "auth_type", None) == "stdio_trusted":
+                    caller.auth_type = "shared_token"
+                    if not getattr(caller, "token_secret_ref", None):
+                        caller.token_secret_ref = (
+                            f"secret://callers/{caller.id}/token"
+                        )
         builder.write()
     extra_env = getattr(context, "mcp_extra_env", None) or {}
     extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
@@ -700,6 +722,176 @@ def step_caller_calls_get_transaction_status(
 # behave treats "Then ... calls ..." as a Then-step; register the same
 # handler under @then so Then-line invocations of status polling work.
 from behave import then as _behave_then  # noqa: E402
+
+
+@given('the server process is started with transport "stdio" and environment IMAP_MCP_CALLER_ID="{caller_id}"')
+def step_server_started_stdio_with_caller(context: Context, caller_id: str) -> None:
+    """Spawn the stdio server with `IMAP_MCP_CALLER_ID=caller_id` set,
+    but do NOT yet send the Initialize handshake. The MCP-client step
+    that follows performs the handshake and captures success/error."""
+    _spawn_stdio_unhandshaked(context, caller_id=caller_id)
+
+
+@given('the server process is started with transport "stdio" and no IMAP_MCP_CALLER_ID set')
+def step_server_started_stdio_no_caller(context: Context) -> None:
+    _spawn_stdio_unhandshaked(context, caller_id=None)
+
+
+def _spawn_stdio_unhandshaked(context: Context, *, caller_id: str | None) -> None:
+    builder = getattr(context, "policy_builder", None)
+    if builder is not None:
+        builder.write()
+    extra_env = getattr(context, "mcp_extra_env", None) or {}
+    context.mcp_extra_env = extra_env
+    client = MCPClient(
+        server_binary=_server_binary(context),
+        config_dir=context.config_dir,
+        caller_id=caller_id or "",
+        extra_env=extra_env,
+    )
+    # Bypass the auto-Initialize that the regular `start()` performs.
+    # The Initialize is performed explicitly in the next When-step.
+    import io as _io
+    import os as _os
+    import subprocess as _subprocess
+    import threading as _threading
+
+    env = dict(_os.environ)
+    env["IMAP_MCP_CONFIG_DIR"] = str(client.config_dir)
+    if caller_id:
+        env["IMAP_MCP_CALLER_ID"] = caller_id
+    else:
+        env.pop("IMAP_MCP_CALLER_ID", None)
+    if extra_env:
+        env.update(extra_env)
+    proc = _subprocess.Popen(
+        [str(client.server_binary), "--transport", "stdio"],
+        stdin=_subprocess.PIPE,
+        stdout=_subprocess.PIPE,
+        stderr=_subprocess.PIPE,
+        env=env,
+        bufsize=0,
+    )
+    client._proc = proc
+    client._stdin = proc.stdin
+    client._stdout = proc.stdout
+    client._stderr_thread = _threading.Thread(
+        target=client._drain_stderr, args=(proc.stderr,), daemon=True
+    )
+    client._stderr_thread.start()
+    context.mcp = client
+
+
+@given('the MCP client completes an Initialize handshake as "{caller_id}" with the correct token')
+def step_mcp_initial_handshake(context: Context, caller_id: str) -> None:
+    """Establish a successful HTTP Initialize handshake. Uses the
+    bearer token from the secret store (set up via the file_dir
+    backend in the Background's `the secret store contains value`
+    step)."""
+    secrets_dir = getattr(context, "secrets_dir", None)
+    token = ""
+    if secrets_dir is not None:
+        f = secrets_dir / "callers" / caller_id / "token"
+        if f.is_file():
+            token = f.read_text(encoding="utf-8").rstrip("\n")
+    client = context.mcp_http
+    client.initialize(caller_id, token)
+    context.last_handshake_succeeded = True
+    context._initial_caller_id = caller_id
+    context._initial_bearer = token
+
+
+@when('the MCP client sends an Initialize-like message claiming caller_id "{claim}"')
+def step_mcp_initialize_like(context: Context, claim: str) -> None:
+    """Send a SECOND Initialize JSON-RPC against the same HTTP server
+    with the same bearer but a different `caller_id_claim` header.
+    Captures the response error string in `context.last_handshake_error`."""
+    import httpx
+    import json as _json
+    import uuid as _uuid
+
+    client = context.mcp_http
+    bearer = getattr(context, "_initial_bearer", "")
+    body = {
+        "jsonrpc": "2.0",
+        "id": str(_uuid.uuid4()),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "imap-mcp-bdd", "version": "0.1.0"},
+        },
+    }
+    response = httpx.post(
+        f"http://{client.host}:{client.port}/mcp",
+        json=body,
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "X-MCP-Caller-Id": claim,
+            "Accept": "application/json, text/event-stream",
+        },
+        timeout=5.0,
+    )
+    context._last_initlike_response = response
+    if response.status_code in (200, 202):
+        context.last_handshake_succeeded = True
+        context.last_handshake_error = None
+    else:
+        context.last_handshake_succeeded = False
+        try:
+            payload = response.json()
+            context.last_handshake_error = payload.get("error") or payload.get(
+                "message", ""
+            )
+        except Exception:
+            context.last_handshake_error = response.text
+
+
+@_behave_then('the server responds with error "{expected}"')
+def step_server_responds_with_error(context: Context, expected: str) -> None:
+    err = getattr(context, "last_handshake_error", None)
+    if err != expected:
+        raise AssertionError(
+            f"Server response error: expected {expected!r}, got {err!r}"
+        )
+
+
+@_behave_then('a subsequent get_caller_identity still returns caller_id "{caller_id}"')
+def step_subsequent_caller_identity_still(context: Context, caller_id: str) -> None:
+    """After an identity-immutability rejection, the original session
+    must still be usable. We re-initialize with the original
+    credentials and verify the caller stays as it was before."""
+    client = context.mcp_http
+    bearer = getattr(context, "_initial_bearer", "")
+    initial_caller = getattr(context, "_initial_caller_id", caller_id)
+    # Stateless HTTP — re-handshake to re-establish per-request caller.
+    client.initialize(initial_caller, bearer)
+    payload = client.call_tool("get_caller_identity", {})
+    import json as _json
+    content = payload.get("content") or []
+    text = content[0]["text"] if content else "{}"
+    data = _json.loads(text)
+    actual = data.get("caller_id")
+    if actual != caller_id:
+        raise AssertionError(
+            f"caller_id (post-immutable-rejection): expected {caller_id!r}, got {actual!r}"
+        )
+
+
+@when("the MCP client performs an Initialize handshake")
+def step_mcp_client_init_stdio(context: Context) -> None:
+    """Stdio variant: send the Initialize JSON-RPC and capture either
+    success or an MCPRPCError. The server may legitimately respond
+    with `error: {message: "unknown_caller_id" | "no_caller_identity"}`
+    when the caller cannot be authenticated (ADR-0015 stdio_trusted)."""
+    client = context.mcp
+    context.last_handshake_error = None
+    try:
+        client._initialize()
+        context.last_handshake_succeeded = True
+    except MCPRPCError as exc:
+        context.last_handshake_succeeded = False
+        context.last_handshake_error = exc.message
 
 
 @_behave_then(

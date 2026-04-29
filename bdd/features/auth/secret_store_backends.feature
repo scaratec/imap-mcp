@@ -1,4 +1,3 @@
-@pending @pending_LIM_0007
 Feature: Pluggable secret-store backends
 
   Secrets flow through a narrow SecretStore interface with three V1

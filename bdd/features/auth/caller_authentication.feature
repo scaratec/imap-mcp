@@ -30,7 +30,6 @@ Feature: Caller identity and authentication
   # scenarios run against a strictly-shared_token configuration
   # (ADR-0015 forbids stdio_trusted on non-stdio transport).
 
-  @pending @pending_LIM_0007
   Scenario: stdio_trusted — a known caller id in IMAP_MCP_CALLER_ID is accepted
     Given the server is configured with caller:
       | caller_id      | auth_type     |
@@ -40,7 +39,6 @@ Feature: Caller identity and authentication
     Then the handshake succeeds
     And a subsequent get_caller_identity returns caller_id "overview-agent"
 
-  @pending @pending_LIM_0007
   Scenario: stdio_trusted — an unknown caller id is rejected at Initialize time
     Given the server process is started with transport "stdio" and environment IMAP_MCP_CALLER_ID="ghost-agent"
     When the MCP client performs an Initialize handshake
@@ -52,7 +50,6 @@ Feature: Caller identity and authentication
       | reason      | auth_failed      |
       | caller_addr | stdio:pid=*      |
 
-  @pending @pending_LIM_0007
   Scenario: stdio_trusted — no caller id at all is rejected
     Given the server process is started with transport "stdio" and no IMAP_MCP_CALLER_ID set
     When the MCP client performs an Initialize handshake
@@ -76,7 +73,6 @@ Feature: Caller identity and authentication
       | correct-horse-batte |
       |                     |
 
-  @pending @pending_LIM_0007
   Scenario: Identity is immutable for the duration of a session
     Given the server process is started with transport "http" on a random port
     And the MCP client completes an Initialize handshake as "invoice-agent" with the correct token

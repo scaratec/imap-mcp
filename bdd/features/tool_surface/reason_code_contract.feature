@@ -128,7 +128,6 @@ Feature: Reason code vocabulary contract
       | saga_transition   | deleted |
       | saga_transition   | commit  |
 
-  @pending @pending_LIM_0007
   Scenario: auth_failed is reachable on HTTP transport with a wrong bearer token
     Given the server is started with transport "http"
     When a client sends an Initialize with caller_id "invoice-agent" and bearer token "wrong-token"

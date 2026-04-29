@@ -948,15 +948,30 @@ def step_audit_record_criteria_digest(context: Context, field: str) -> None:
 
 @then("the audit log contains an entry with:")
 def step_audit_log_contains_entry(context: Context) -> None:
-    """Verify the audit JSONL file has a record matching every cell in the table."""
+    """Verify the audit JSONL file has a record matching every cell in the table.
+
+    Cell values ending in `*` are treated as glob prefixes — used by
+    `caller_addr` like `stdio:pid=*` where the actual pid is opaque
+    to the test."""
+    import fnmatch as _fnmatch
+
     from support.audit_reader import AuditReader
 
     expected = {row["field"]: row["value"] for row in context.table}
+
+    def _matches(rec: dict, expected: dict) -> bool:
+        for k, v in expected.items():
+            actual = rec.get(k)
+            if isinstance(v, str) and ("*" in v or "?" in v):
+                if not isinstance(actual, str) or not _fnmatch.fnmatchcase(actual, v):
+                    return False
+            elif actual != v:
+                return False
+        return True
+
     reader = AuditReader(context.audit_dir)
     matches = [
-        rec
-        for rec in reader.records_today()
-        if all(rec.record.get(k) == v for k, v in expected.items())
+        rec for rec in reader.records_today() if _matches(rec.record, expected)
     ]
     if not matches:
         present = [rec.record for rec in reader.records_today()]
@@ -1566,7 +1581,8 @@ def step_handshake_fails(context: Context, expected: str) -> None:
 def step_subsequent_caller_identity(context: Context, caller_id: str) -> None:
     import json as _json
 
-    client = context.mcp_http
+    # Pick whichever transport this scenario is using.
+    client = getattr(context, "mcp_http", None) or context.mcp
     payload = client.call_tool("get_caller_identity", {})
     content = payload.get("content") or []
     text = content[0]["text"] if content else "{}"

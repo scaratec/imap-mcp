@@ -1483,6 +1483,258 @@ def step_secret_store_value(context: Context, value: str, path: str) -> None:
     target.write_text(value, encoding="utf-8")
 
 
+def _scratch_substitute(context: Context, raw: str) -> str:
+    """Replace `$SCRATCH` in feature-string arguments with the per-
+    scenario scratch dir. Also replaces a fake GPG fingerprint with
+    the real one if the GPG-keypair step has run (the feature uses a
+    hardcoded all-A's fingerprint for readability; the actual keypair
+    is generated at runtime)."""
+    scratch = getattr(context, "scratch_dir", None)
+    out = raw
+    if scratch is not None:
+        out = out.replace("$SCRATCH", str(scratch))
+    fake_fp = getattr(context, "_gpg_fake_fp", None)
+    real_fp = getattr(context, "_gpg_real_fp", None)
+    if fake_fp and real_fp:
+        out = out.replace(fake_fp, real_fp)
+    return out
+
+
+@given("secret_store configuration is")
+@given("secret_store configuration is:")
+def step_secret_store_config(context: Context) -> None:
+    """Override the PolicyBuilder's secret_store-section from a YAML
+    block in the feature file. Used by `secret_store_backends.feature`
+    to switch backends per-scenario."""
+    import yaml
+
+    builder = _ensure_builder(context)
+    raw = _scratch_substitute(context, context.text or "")
+    parsed = yaml.safe_load(raw) or {}
+    backend = parsed.get("backend") or "file_dir"
+    builder.secret_store_backend = backend
+    path = parsed.get("path")
+    builder.secret_store_path = Path(path) if path else None
+    recipient = parsed.get("recipient")
+    builder.secret_store_recipient = (
+        _scratch_substitute(context, recipient) if recipient else None
+    )
+    gh = parsed.get("gnupghome")
+    if gh:
+        builder.secret_store_gnupghome = Path(_scratch_substitute(context, gh))
+    elif backend == "gpg_file":
+        # Default to whichever gnupghome the prior gpg-keypair step
+        # set up. Lets feature files keep gpg_file YAML minimal.
+        prior = getattr(context, "_gpg_gnupghome", None)
+        if prior is not None:
+            builder.secret_store_gnupghome = prior
+
+
+@given('the file "{path}" contains the exact bytes "{value}"')
+def step_file_contains_bytes(context: Context, path: str, value: str) -> None:
+    target = Path(_scratch_substitute(context, path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(value.encode("utf-8"))
+
+
+@given('no file exists at "{path}"')
+def step_no_file_exists(context: Context, path: str) -> None:
+    target = Path(_scratch_substitute(context, path))
+    if target.exists():
+        target.unlink()
+
+
+@given("the server process environment includes")
+@given("the server process environment includes:")
+def step_server_process_env_includes(context: Context) -> None:
+    extra = getattr(context, "mcp_extra_env", None) or {}
+    context.mcp_extra_env = extra
+    for row in context.table:
+        extra[row["name"]] = row["value"]
+
+
+@given('the server process environment does NOT include any variable starting with "{prefix}"')
+def step_server_process_env_excludes_prefix(context: Context, prefix: str) -> None:
+    extra = getattr(context, "mcp_extra_env", None) or {}
+    context.mcp_extra_env = extra
+    for key in [k for k in list(extra) if k.startswith(prefix)]:
+        extra.pop(key, None)
+
+
+@given('a GPG keypair exists with fingerprint "{fake_fp}" and a pinentry that returns passphrase "{passphrase}"')
+def step_gpg_keypair_exists(
+    context: Context, fake_fp: str, passphrase: str
+) -> None:
+    """Generate a real test GPG keypair in `$SCRATCH/gnupg`. Stores
+    the actual fingerprint on the context; subsequent feature
+    references to `fake_fp` are substituted via `_scratch_substitute`.
+
+    Pinentry is bypassed: every later `gpg --decrypt` call will pipe
+    the passphrase via `--passphrase-fd`, so no interactive agent
+    machinery is needed. The `passphrase` argument is captured here
+    and consumed by the file-encryption step."""
+    import subprocess
+
+    gnupghome = context.scratch_dir / "gnupg"
+    gnupghome.mkdir(parents=True, exist_ok=True)
+    gnupghome.chmod(0o700)
+    batch = (
+        "%no-protection\n"
+        "Key-Type: RSA\n"
+        "Key-Length: 2048\n"
+        "Subkey-Type: RSA\n"
+        "Subkey-Length: 2048\n"
+        "Name-Real: imap-mcp BDD test\n"
+        "Name-Email: bdd@imap-mcp.invalid\n"
+        "Expire-Date: 0\n"
+        "%commit\n"
+    )
+    env = dict(os.environ)
+    env["GNUPGHOME"] = str(gnupghome)
+    subprocess.run(
+        ["gpg", "--batch", "--quiet", "--gen-key"],
+        input=batch.encode("utf-8"),
+        check=True,
+        env=env,
+        capture_output=True,
+        timeout=30,
+    )
+    list_keys = subprocess.run(
+        ["gpg", "--list-keys", "--with-colons", "bdd@imap-mcp.invalid"],
+        check=True,
+        env=env,
+        capture_output=True,
+        timeout=10,
+    )
+    real_fp = ""
+    for line in list_keys.stdout.decode("ascii", errors="replace").splitlines():
+        parts = line.split(":")
+        if parts[0] == "fpr" and len(parts) > 9:
+            real_fp = parts[9]
+            break
+    if not real_fp:
+        raise AssertionError(
+            f"Could not extract fingerprint from gpg --list-keys: "
+            f"{list_keys.stdout!r}"
+        )
+    context._gpg_fake_fp = fake_fp
+    context._gpg_real_fp = real_fp
+    context._gpg_passphrase = passphrase
+    context._gpg_gnupghome = gnupghome
+
+
+@given('the file "{path}" was produced by `gpg --encrypt --recipient {fp}` over the exact bytes "{value}"')
+def step_gpg_encrypt_exact(
+    context: Context, path: str, fp: str, value: str
+) -> None:
+    """Write the GPG-encrypted file at `path`. Uses the keypair the
+    prior step generated."""
+    import subprocess
+
+    target = Path(_scratch_substitute(context, path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    real_fp = getattr(context, "_gpg_real_fp", None)
+    gnupghome = getattr(context, "_gpg_gnupghome", None)
+    if real_fp is None or gnupghome is None:
+        raise AssertionError(
+            "GPG keypair step must precede the encrypt step"
+        )
+    env = dict(os.environ)
+    env["GNUPGHOME"] = str(gnupghome)
+    result = subprocess.run(
+        [
+            "gpg",
+            "--batch",
+            "--yes",
+            "--quiet",
+            "--trust-model", "always",
+            "--encrypt",
+            "--recipient", real_fp,
+            "-o", str(target),
+        ],
+        input=value.encode("utf-8"),
+        env=env,
+        capture_output=True,
+        timeout=10,
+        check=True,
+    )
+    context._gpg_last_stderr = result.stderr.decode("utf-8", errors="replace")
+
+
+@given('the file "{path}" exists and was produced by the same recipient')
+def step_gpg_file_exists_same_recipient(context: Context, path: str) -> None:
+    """For the wrong-passphrase scenario: the file is encrypted by
+    the same recipient as the keypair step. We re-use the encrypt
+    step over a fixed plaintext."""
+    step_gpg_encrypt_exact(
+        context, path,
+        getattr(context, "_gpg_real_fp", "") or "",
+        "correct-horse-battery",
+    )
+    # Then nuke the secret keys so decryption fails. The
+    # wrong-passphrase scenario actually tests a configuration where
+    # the gnupghome doesn't contain the secret key — modelling
+    # operator key-rotation. Cheaper than wiring a stub pinentry.
+    import subprocess
+    env = dict(os.environ)
+    env["GNUPGHOME"] = str(context._gpg_gnupghome)
+    subprocess.run(
+        ["gpg", "--batch", "--yes", "--quiet", "--delete-secret-keys",
+         context._gpg_real_fp],
+        env=env,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+@then("the audit record does NOT contain any line from the gpg subprocess' stderr")
+def step_audit_no_gpg_stderr(context: Context) -> None:
+    """Verify that no audit record contains any line from the gpg
+    encryption stderr captured during the prior step."""
+    import json as _json
+
+    captured = (getattr(context, "_gpg_last_stderr", "") or "").strip()
+    if not captured:
+        return
+    audit_dir = getattr(context, "audit_dir", None)
+    if audit_dir is None or not audit_dir.exists():
+        return
+    audit_lines: list[str] = []
+    for f in sorted(audit_dir.iterdir()):
+        if f.suffix == ".jsonl":
+            audit_lines.extend(f.read_text(encoding="utf-8").splitlines())
+    for line in captured.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for record_line in audit_lines:
+            try:
+                record = _json.loads(record_line)
+            except Exception:
+                continue
+            if any(line in str(v) for v in record.values()):
+                raise AssertionError(
+                    f"Audit record leaked gpg stderr line: {line!r} "
+                    f"in record {record!r}"
+                )
+
+
+@then('the server process environment still has no variable for "{ref}"')
+def step_env_still_no_var(context: Context, ref: str) -> None:
+    """Assertion variant: after a step that should NOT have written
+    any new env vars (e.g. a refused oauth_bootstrap), confirm that
+    none of the variables matching the prefix derived from `ref` were
+    populated. Mapping rule mirrors `EnvVarSecretStore.env_name` in
+    the server (uppercase, `/` → `__`, `-` → `_`)."""
+    expected = "IMAP_MCP_SECRET__" + ref.upper().replace("/", "__").replace("-", "_")
+    extra = getattr(context, "mcp_extra_env", None) or {}
+    if expected in extra or expected in os.environ:
+        raise AssertionError(
+            f"Env var {expected!r} unexpectedly present after refused bootstrap"
+        )
+
+
 def _start_imap_proxy(
     context: Context,
     account_id: str,
@@ -2367,6 +2619,100 @@ def _run_bootstrap_probe(context: Context) -> BootstrapResult:
     caller = next(iter(context.policy_builder.callers), None)
     caller_id = caller.id if caller else "bootstrap-probe"
     return try_bootstrap_server(server_binary, context.config_dir, caller_id)
+
+
+@given(
+    'account "{account_id}" is configured with provider "{provider}" '
+    'and oauth_scope "{scope}"'
+)
+def step_account_with_oauth(
+    context: Context, account_id: str, provider: str, scope: str
+) -> None:
+    """Register an account that uses OAuth2 against the given provider.
+    No password is set — the bootstrap CLI is the path that mints the
+    token in production."""
+    builder = _ensure_builder(context)
+    builder.add_account(
+        id=account_id,
+        provider=provider,
+        host="oauth.example.invalid",
+        port=993,
+        auth_type="xoauth2",
+        secret_ref=f"secret://accounts/{account_id}/refresh_token",
+        oauth_scope=scope,
+        password_literal=None,
+    )
+    builder.write()
+
+
+@when('the operator runs `imap-mcp-oauth-bootstrap --account {account_id}`')
+def step_run_oauth_bootstrap(context: Context, account_id: str) -> None:
+    """Invoke the bootstrap CLI as a subprocess, capturing stdout/
+    stderr/returncode into `context.startup_proc` so the existing
+    `the server refuses to start` assertion can read it."""
+    import subprocess
+    from types import SimpleNamespace
+
+    cli = Path(
+        os.environ.get(
+            "IMAP_MCP_OAUTH_BOOTSTRAP_BINARY",
+            context.bdd_root.parent
+            / "server"
+            / ".venv"
+            / "bin"
+            / "imap-mcp-oauth-bootstrap",
+        )
+    )
+    builder = getattr(context, "policy_builder", None)
+    if builder is not None:
+        builder.write()
+    env = dict(os.environ)
+    env["IMAP_MCP_CONFIG_DIR"] = str(context.config_dir)
+    extra = getattr(context, "mcp_extra_env", None) or {}
+    env.update(extra)
+    result = subprocess.run(
+        [str(cli), "--account", account_id],
+        capture_output=True,
+        env=env,
+        timeout=10,
+        check=False,
+    )
+    context.startup_proc = SimpleNamespace(
+        returncode=result.returncode,
+        stderr=result.stderr.decode("utf-8", errors="replace"),
+        stdout=result.stdout.decode("utf-8", errors="replace"),
+    )
+
+
+@then("the bootstrap refuses to start")
+def step_bootstrap_refuses(context: Context) -> None:
+    """Alias for `the server refuses to start` — the bootstrap CLI's
+    startup_proc has the same shape."""
+    proc = getattr(context, "startup_proc", None)
+    if proc is None:
+        raise AssertionError(
+            "No startup_proc captured — did `the operator runs …` step run?"
+        )
+    if proc.returncode == 0:
+        raise AssertionError(
+            f"Expected bootstrap to refuse, but it exited 0. "
+            f"Stdout: {proc.stdout!r}, stderr: {proc.stderr!r}"
+        )
+    context.startup_error = (proc.stderr or "") + (proc.stdout or "")
+
+
+@then('the startup error indicates "{expected}"')
+def step_startup_error_indicates_substring(
+    context: Context, expected: str
+) -> None:
+    """Generic substring check — used by bootstrap-CLI scenarios that
+    don't fit the structured `policy/folder/rule`-shape patterns."""
+    err = getattr(context, "startup_error", "")
+    if expected not in err:
+        raise AssertionError(
+            f"Startup error does not contain expected substring "
+            f"{expected!r}. Full message:\n{err}"
+        )
 
 
 @given('policy "{policy_name}" has sender rules:')

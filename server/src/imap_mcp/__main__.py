@@ -7,7 +7,6 @@ import asyncio
 import os
 
 from .server import (
-    _caller_id_from_env_or_exit,
     _config_dir_from_env_or_exit,
     run_http,
     run_stdio,
@@ -43,7 +42,13 @@ def main() -> None:
     args = _parse_args()
     config_dir = _config_dir_from_env_or_exit()
     if args.transport == "stdio":
-        caller_id = _caller_id_from_env_or_exit()
+        # ADR-0015: caller_id is the orchestrator-supplied identity.
+        # Missing or unknown values are NOT a startup failure — the
+        # server must accept the connection, run the Initialize
+        # handshake, return a structured JSON-RPC error, and exit
+        # cleanly. SystemExit-before-Initialize would surface as a
+        # broken pipe to the orchestrator.
+        caller_id = os.environ.get("IMAP_MCP_CALLER_ID") or None
         asyncio.run(run_stdio(config_dir, caller_id))
         return
     if args.transport == "http":

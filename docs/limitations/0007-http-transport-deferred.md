@@ -1,9 +1,10 @@
 # LIM 0007: HTTP transport deferred
 
-- **Status:** Accepted
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
+- **Date resolved:** 2026-04-29
 - **Proposed by:** claude (imap-mcp BDD phase D)
 - **Approved by:** Randy N. Gupta
 - **Related ADRs:** [ADR-0015](../adr/0015-caller-identity.md),
@@ -97,8 +98,70 @@ any HTTP-transport deployment, of which there are none today.
 - An MCP SDK release materially changes the HTTP transport API.
 - A regression in the audit `auth_failed` event is reported.
 
+## Resolution
+
+Resolved 2026-04-29 by closing all 12 residual `@pending_LIM_0007`
+scenarios across `caller_authentication.feature` (4),
+`secret_store_backends.feature` (7), and `reason_code_contract.feature`
+(1). Concrete changes:
+
+1. **Stdio Initialize-failure path** — `__main__.main()` no longer
+   `SystemExit`s when `IMAP_MCP_CALLER_ID` is missing or unknown.
+   Validation moves to a new `_stdio_deny_initialize` helper in
+   `server.py` that reads the JSON-RPC `initialize` request, audits
+   `tool=auth_failed` with `auth_failure_reason=no_caller_identity`
+   or `unknown_caller_id`, writes a JSON-RPC error response keyed to
+   the request id, and exits cleanly. The MCP client sees a
+   structured error, not a broken pipe.
+
+2. **HTTP identity-immutability** — `BearerAuthMiddleware` now
+   detects "this bearer matches a different configured caller than
+   the one being claimed" and emits `error: identity_immutable`
+   (audit reason `identity_immutable`) instead of the generic
+   `wrong_token` / `unknown_caller_id`. Constant-time scan over all
+   configured callers preserves timing properties.
+
+3. **HTTP `auth_failed` audit** — already-implemented path, just
+   activated by removing the `@pending` tag.
+
+4. **`env_var` SecretStore backend** — new class `EnvVarSecretStore`
+   in `secrets.py`. Maps `secret://callers/X/token` →
+   `IMAP_MCP_SECRET__CALLERS__X__TOKEN`. Read-only (`put`
+   raises `NotImplementedError`).
+
+5. **`gpg_file` SecretStore backend** — new class
+   `GpgFileSecretStore` in `secrets.py`. Subprocess-based decryption
+   via `gpg --decrypt --batch --yes --quiet --no-tty`. A custom
+   `SecretDecryptionFailed` exception keeps gpg's stderr off the
+   audit channel; the `BearerAuthMiddleware` maps it to
+   `auth_failure_reason=secret_decryption_failed` (audit `reason`
+   field surfaces it as a distinct top-level category to make
+   operator triage easier).
+
+6. **`imap-mcp-oauth-bootstrap` CLI stub** — new
+   `server/src/imap_mcp/auth/oauth_bootstrap.py`. Validates the
+   secret store backend; aborts with `env_var backend is read-only;
+   bootstrap requires a writable secret store` when run against an
+   `env_var`-configured deployment. Full interactive bootstrap stays
+   gated by LIM-0003.
+
+BDD-side additions: ~7 new given-/then-steps in `policy_steps.py`
+(secret_store config block parser, env-var manipulation, GPG
+keypair fixture with a real generated key whose fingerprint is
+substituted for the feature-file's hardcoded label), plus the stdio
+Initialize-handshake-without-arguments step in `mcp_steps.py`. The
+HTTP harness now auto-promotes inline-Given stdio_trusted callers to
+shared_token for HTTP scenarios that don't explicitly test the
+ADR-0015 fatal-startup case.
+
+Suite-Total: **174 passed / 0 failed / 18 skipped** (the remaining
+18 skipped are LIM-0002 Mock-Gmail and LIM-0003 Mock-OAuth).
+
 ## References
 
-- Scenarios: see list above.
+- Scenarios: see list above (now all green).
+- Server: `server/src/imap_mcp/secrets.py`, `server/src/imap_mcp/server.py`
+  (`_stdio_deny_initialize`, `BearerAuthMiddleware`),
+  `server/src/imap_mcp/auth/oauth_bootstrap.py`.
 - ADR 0015, ADR 0018, ADR 0021.
-- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase D)
+- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase D-Rest)

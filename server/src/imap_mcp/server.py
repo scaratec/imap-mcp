@@ -1709,6 +1709,8 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
     secret_store = build_secret_store(
         store_cfg.backend,
         Path(store_cfg.path) if store_cfg.path else None,
+        recipient=store_cfg.recipient,
+        gnupghome=Path(store_cfg.gnupghome) if store_cfg.gnupghome else None,
     )
     audit_cfg = configuration.accounts_file.audit
     audit_writer: AuditWriter | None = None
@@ -1834,17 +1836,79 @@ def _install_sighup_handler(context: ServerContext, config_dir: Path) -> None:
     loop.add_signal_handler(signal.SIGHUP, _on_sighup)
 
 
-async def run_stdio(config_dir: Path, caller_id: str) -> None:
-    context, _configuration = _build_context(config_dir, default_caller_id=caller_id)
+async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
+    # ADR-0015: caller validation runs on EVERY stdio start. The two
+    # invalid cases — None or a value not present in callers.yaml —
+    # must surface as a structured JSON-RPC error during the
+    # Initialize handshake, NOT as a SystemExit before the MCP loop
+    # starts. Otherwise the orchestrator sees a broken pipe.
+    context, configuration = _build_context(
+        config_dir, default_caller_id=caller_id or "<no-caller>"
+    )
+    auth_failure_reason: str | None = None
+    if not caller_id:
+        auth_failure_reason = "no_caller_identity"
+    elif configuration.caller_by_id(caller_id) is None:
+        auth_failure_reason = "unknown_caller_id"
+
+    if auth_failure_reason is not None:
+        await _stdio_deny_initialize(context, caller_id, auth_failure_reason)
+        return
+
     _install_sighup_handler(context, config_dir)
     app = build_server(context)
-
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
             write_stream,
             app.create_initialization_options(),
         )
+
+
+async def _stdio_deny_initialize(
+    context: ServerContext, caller_id: str | None, reason: str
+) -> None:
+    """Read one JSON-RPC line from stdin, write a JSON-RPC error
+    response keyed to the request id, and exit cleanly. The audit
+    record uses `tool=auth_failed` with `auth_failure_reason=reason`.
+
+    The MCP client's `initialize()` reads the response, raises an
+    `MCPRPCError` with the message matching `reason`, then sees EOF
+    when the server exits."""
+    import asyncio as _asyncio
+    import json as _json
+    import sys as _sys
+
+    # Audit the failure first so the BDD harness's assertions can read
+    # the JSONL record after the server exits.
+    if context.audit is not None:
+        record: dict[str, Any] = {
+            "caller_id": caller_id,
+            "caller_addr": f"stdio:pid={os.getpid()}",
+            "tool": "auth_failed",
+            "decision": "DENY",
+            "reason": "auth_failed",
+            "auth_failure_reason": reason,
+        }
+        context.audit.write(record)
+
+    loop = _asyncio.get_running_loop()
+    line = await loop.run_in_executor(None, _sys.stdin.readline)
+    request_id: Any = None
+    if line.strip():
+        try:
+            request = _json.loads(line)
+            request_id = request.get("id")
+        except _json.JSONDecodeError:
+            request_id = None
+
+    error_payload = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": -32001, "message": reason},
+    }
+    _sys.stdout.write(_json.dumps(error_payload, separators=(",", ":")) + "\n")
+    _sys.stdout.flush()
 
 
 async def run_http(config_dir: Path, host: str, port: int) -> None:
@@ -1902,23 +1966,40 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
     ) -> None:
         if context.audit is None:
             return
+        # `secret_decryption_failed` is a configuration-class failure
+        # (the secret store could not decrypt the configured value),
+        # not a wrong-credential failure. The audit `reason` field
+        # surfaces it as a distinct category so operators can tell
+        # them apart at a glance.
+        top_reason = (
+            "secret_decryption_failed"
+            if reason == "secret_decryption_failed"
+            else "auth_failed"
+        )
         record: dict[str, Any] = {
             "caller_id": caller_id_claim,
             "caller_addr": addr,
             "tool": "auth_failed",
             "decision": "DENY",
-            "reason": "auth_failed",
+            "reason": top_reason,
             "auth_failure_reason": reason,
         }
         context.audit.write(record)
 
-    def _resolve_token(secret_ref: str | None) -> str | None:
+    from .secrets import SecretDecryptionFailed
+
+    def _resolve_token(secret_ref: str | None) -> tuple[str | None, str | None]:
+        """Return `(value, error_reason)`. `error_reason` is non-None
+        only on a recoverable lookup failure that the audit layer
+        should distinguish from a plain "missing secret"."""
         if secret_ref is None:
-            return None
+            return None, None
         try:
-            return context.secret_store.get(secret_ref)  # type: ignore[attr-defined]
+            return context.secret_store.get(secret_ref), None  # type: ignore[attr-defined]
+        except SecretDecryptionFailed:
+            return None, "secret_decryption_failed"
         except Exception:
-            return None
+            return None, None
 
     class BearerAuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
@@ -1944,6 +2025,30 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
                 )
             caller = configuration.caller_by_id(caller_id_claim)
             if caller is None:
+                # ADR-0015 identity-immutability: if the bearer
+                # matches a configured caller's token, the client is
+                # masquerading as someone else. Surface that as
+                # `identity_immutable` rather than the generic
+                # `unknown_caller_id`. Constant-time scan over all
+                # callers.
+                masquerade = False
+                for other in configuration.callers_file.callers:
+                    if other.auth.type != "shared_token":
+                        continue
+                    other_expected, _ = _resolve_token(
+                        other.auth.token_secret_ref
+                    )
+                    if other_expected is not None and hmac.compare_digest(
+                        token, other_expected
+                    ):
+                        masquerade = True
+                if masquerade:
+                    _audit_auth_failed(
+                        caller_id_claim, "identity_immutable", f"http:{addr}"
+                    )
+                    return JSONResponse(
+                        {"error": "identity_immutable"}, status_code=401
+                    )
                 _audit_auth_failed(
                     caller_id_claim, "unknown_caller_id", f"http:{addr}"
                 )
@@ -1957,8 +2062,42 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
                 return JSONResponse(
                     {"error": "auth_failed"}, status_code=401
                 )
-            expected = _resolve_token(caller.auth.token_secret_ref)
+            expected, lookup_error = _resolve_token(caller.auth.token_secret_ref)
+            if lookup_error is not None:
+                _audit_auth_failed(
+                    caller_id_claim, lookup_error, f"http:{addr}"
+                )
+                return JSONResponse(
+                    {"error": "auth_failed"}, status_code=401
+                )
             if expected is None or not hmac.compare_digest(token, expected):
+                # Identity-immutability check (ADR-0015): if the token
+                # actually matches a DIFFERENT configured caller, the
+                # client is trying to "switch" identity while keeping
+                # an existing bearer. That is a distinct error class
+                # — call it `identity_immutable`. Run the loop fully
+                # for constant-time comparison.
+                token_matches_other = False
+                for other in configuration.callers_file.callers:
+                    if (
+                        other.id == caller_id_claim
+                        or other.auth.type != "shared_token"
+                    ):
+                        continue
+                    other_expected, _ = _resolve_token(
+                        other.auth.token_secret_ref
+                    )
+                    if other_expected is not None and hmac.compare_digest(
+                        token, other_expected
+                    ):
+                        token_matches_other = True
+                if token_matches_other:
+                    _audit_auth_failed(
+                        caller_id_claim, "identity_immutable", f"http:{addr}"
+                    )
+                    return JSONResponse(
+                        {"error": "identity_immutable"}, status_code=401
+                    )
                 _audit_auth_failed(
                     caller_id_claim, "wrong_token", f"http:{addr}"
                 )

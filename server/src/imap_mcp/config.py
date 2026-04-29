@@ -54,6 +54,8 @@ class SecretStore(BaseModel):
 
     backend: Literal["file_dir", "env_var", "gpg_file"] = "file_dir"
     path: str | None = None
+    recipient: str | None = None
+    gnupghome: str | None = None
 
 
 class AuditConfig(BaseModel):
