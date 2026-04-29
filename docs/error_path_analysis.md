@@ -33,7 +33,7 @@ corresponding layer here.
 | L2 | MCP protocol                            | 8     | 4       | 4        | 0   |
 | L3 | Caller authentication                   | 8     | 0 (+7 covered_by_LIM-0007) | 1 | 0 |
 | L4 | Policy evaluation                       | 22    | 16      | 6        | 0   |
-| L5 | IMAP communication (per account)        | 14    | 10 (+2 covered_by_LIM-0005) | 2 | 0 |
+| L5 | IMAP communication (per account)        | 14    | 12      | 2        | 0   |
 | L6 | IMAP response parsing                   | 9     | 2       | 7        | 0   |
 | L7 | Data integrity (IMAP content)           | 11    | 5       | 6        | 0   |
 | L8 | OAuth2 lifecycle                        | 10    | 0 (+6 covered_by_LIM-0003) | 4 | 0 |
@@ -43,7 +43,7 @@ corresponding layer here.
 | L12| Configuration loading                   | 13    | 12      | 1        | 0   |
 | L13| Connection pool / IMAP session          | 8     | 0       | 8        | 0   |
 | L14| Gmail-specific semantics                | 10    | 0 (+7 covered_by_LIM-0002) | 3 | 0 |
-|    | **Total**                               | 171   | 100 (+7 LIM-0002, +6 LIM-0003, +7 LIM-0007, +2 LIM-0005, +2 LIM-0006, +3 LIM-0009) | 44 | 0 |
+|    | **Total**                               | 171   | 102 (+7 LIM-0002, +6 LIM-0003, +7 LIM-0007, +2 LIM-0006, +3 LIM-0009) | 44 | 0 |
 
 Counts are best-effort enumerations. They are updated by the author of
 any change that adds or removes a failure mode, and reviewed as part of

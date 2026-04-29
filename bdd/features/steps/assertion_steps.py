@@ -2065,6 +2065,45 @@ def step_hidden_folders_count_decreases(context: Context) -> None:
         )
 
 
+@then('the IMAP command log for "{account_id}" contains in order:')
+def step_imap_command_log_in_order(context: Context, account_id: str) -> None:
+    """Read the per-account proxy log and assert that each `command`
+    cell appears, in the given order, somewhere in the recorded
+    client→upstream traffic. Substring match per cell — adjacent
+    matches need not be contiguous in the log because aioimaplib
+    emits its own bookkeeping (NOOP, LOGOUT, etc.) between the
+    business commands."""
+    log_path = (getattr(context, "imap_proxy_log_paths", None) or {}).get(account_id)
+    if log_path is None or not log_path.exists():
+        raise AssertionError(
+            f"No IMAP proxy log captured for account {account_id!r}; "
+            "did a prior step start the MITM proxy?"
+        )
+    log = log_path.read_text(encoding="utf-8", errors="replace")
+    expected_lines = [row["command"] for row in context.table]
+    cursor = 0
+    upper_log = log.upper()
+    for needle in expected_lines:
+        # Each cell is a sequence of whitespace-separated tokens that
+        # must appear in order on the wire — but the wire form can
+        # interleave IMAP framing (`UID `, tag prefix, `+FLAGS (...)`)
+        # between them. Match token-by-token so feature cells stay in
+        # the user-meaningful "STORE \Deleted" form rather than the
+        # wire-literal "UID STORE 1 +FLAGS (\Deleted)".
+        tokens = needle.upper().split()
+        sub_cursor = cursor
+        for token in tokens:
+            idx = upper_log.find(token, sub_cursor)
+            if idx < 0:
+                raise AssertionError(
+                    f"IMAP command log missing/out-of-order: {needle!r} "
+                    f"(token {token!r} not found) after position "
+                    f"{cursor}.\nFull log:\n{log}"
+                )
+            sub_cursor = idx + len(token)
+        cursor = sub_cursor
+
+
 @then('the IMAP server has no folder named "{folder_path}" that now holds uid {uid:d}')
 def step_imap_server_no_folder_holding_uid(
     context: Context, folder_path: str, uid: int

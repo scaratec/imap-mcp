@@ -1502,6 +1502,116 @@ def step_secret_store_value(context: Context, value: str, path: str) -> None:
     target.write_text(value, encoding="utf-8")
 
 
+def _start_imap_proxy(
+    context: Context,
+    account_id: str,
+    *,
+    strip_capabilities: list[str] | None = None,
+    uidvalidity_change_after: str | None = None,
+    uidvalidity_new_value: str | None = None,
+) -> int:
+    """Spawn the BDD MITM proxy in front of the Dovecot instance for
+    `account_id` and rewire the registered Account to point at it.
+
+    Returns the proxy's listening port. Idempotent within a scenario:
+    a second call replaces the config without restarting the proxy."""
+    import json as _json
+    import os
+    import socket
+    import subprocess
+    import sys
+    import time
+    from support.imap_fixture import resolve_account
+
+    builder = _ensure_builder(context)
+    _ensure_account_registered(context, builder, account_id)
+
+    instance, _user = resolve_account(account_id)
+    upstream_host, upstream_port = context.imap_instances[instance]
+
+    log_path = context.scratch_dir / f"imap-proxy-{account_id}.log"
+    config_path = context.scratch_dir / f"imap-proxy-{account_id}.json"
+    config = {
+        "upstream_host": upstream_host,
+        "upstream_port": upstream_port,
+        "command_log_path": str(log_path),
+        "strip_capabilities": list(strip_capabilities or []),
+        "uidvalidity_change_after": uidvalidity_change_after or "",
+        "uidvalidity_new_value": uidvalidity_new_value or "",
+    }
+    config_path.write_text(_json.dumps(config), encoding="utf-8")
+
+    proxy_proc = getattr(context, "imap_proxy_proc", None)
+    proxy_port = getattr(context, "imap_proxy_port", None)
+    if proxy_proc is None or proxy_proc.poll() is not None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            proxy_port = int(probe.getsockname()[1])
+        cmd = [
+            sys.executable, "-u", "-m", "support.imap_proxy",
+            "--host", "127.0.0.1",
+            "--port", str(proxy_port),
+            "--config", str(config_path),
+        ]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(context.bdd_root)
+        proc = subprocess.Popen(
+            cmd, cwd=context.bdd_root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline() if proc.stdout else b""
+            if not line:
+                if proc.poll() is not None:
+                    err = b""
+                    if proc.stderr is not None:
+                        try:
+                            err = proc.stderr.read()
+                        except Exception:
+                            err = b""
+                    raise AssertionError(
+                        f"imap_proxy exited prematurely (rc={proc.returncode}); "
+                        f"stderr={err!r}"
+                    )
+                continue
+            if line.startswith(b"LISTEN"):
+                break
+        else:
+            proc.terminate()
+            raise AssertionError("imap_proxy did not announce LISTEN within 5s")
+        context.imap_proxy_proc = proc
+        context.imap_proxy_port = proxy_port
+        context.imap_proxy_log_paths = {}
+    context.imap_proxy_log_paths[account_id] = log_path
+    context.imap_proxy_config_path = config_path
+    for account in builder.accounts:
+        if account.id == account_id:
+            account.port = proxy_port
+            break
+    builder.write()
+    return proxy_port
+
+
+@given('the IMAP server for "{account_id}" does not advertise the MOVE capability')
+def step_imap_server_no_move(context: Context, account_id: str) -> None:
+    _start_imap_proxy(context, account_id, strip_capabilities=["MOVE"])
+
+
+@given('the UIDVALIDITY of "{folder}" changes between the caller\'s SEARCH and the server\'s MOVE')
+def step_uidvalidity_changes_mid_call(context: Context, folder: str) -> None:
+    """Trigger the MITM proxy to inject `* OK [UIDVALIDITY <new>]`
+    after the next `UID SEARCH` response. The server's NOOP between
+    SEARCH and MOVE then sees the new UIDVALIDITY in untagged
+    responses and raises `UidStale`."""
+    _ = folder
+    _start_imap_proxy(
+        context, "gupta-scaratec",
+        uidvalidity_change_after="UID SEARCH",
+        uidvalidity_new_value="999999",
+    )
+
+
 @given('the server is configured to crash after WAL BEGIN persistence')
 def step_crash_at_post_begin(context: Context) -> None:
     context.mcp_extra_env = getattr(context, "mcp_extra_env", {})

@@ -39,7 +39,7 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 | ~~14~~ | ~~Phase E — SIGHUP policy reload~~ | Plan Phase E | **Mitigiert 2026-04-28** — 5/7 Szenarien grün; OAuth-Scope-Szenario unter LIM-0003, in-flight-Saga unter LIM-0008 (Saga-Pause-Mechanismus fehlt). |
 | ~~15~~ | ~~Phase F-Rest — Audit day-roll & retention~~ | Plan Phase F | **Mitigiert 2026-04-28** — Rotation/gzip/Retention/eof_day grün; external-hook + manual-deletion-detection bleiben unter LIM-0009. |
 | ~~16~~ | ~~Phase B-Rest — 5-Tupel-Fallback identity~~ | Plan Phase B | **Resolved 2026-04-28** — beide Szenarien grün; LIM-0006 geschlossen. |
-| 17 | Phase C-Rest — UIDVALIDITY + CAPABILITY-Strip via MITM | Plan Phase C | [LIM-0005](limitations/0005-imap-mitm-scenarios-deferred.md) |
+| ~~17~~ | ~~Phase C-Rest — UIDVALIDITY + CAPABILITY-Strip via MITM~~ | Plan Phase C-Rest | **Resolved 2026-04-22** — `bdd/support/imap_proxy.py` + Server-UIDVALIDITY-Check via NOOP; LIM-0005 geschlossen. |
 
 ## Querschnitt
 

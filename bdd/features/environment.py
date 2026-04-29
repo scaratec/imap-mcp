@@ -102,6 +102,17 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
     if mcp_http is not None:
         mcp_http.close()
         context.mcp_http = None
+    proxy_proc = getattr(context, "imap_proxy_proc", None)
+    if proxy_proc is not None:
+        try:
+            proxy_proc.terminate()
+            proxy_proc.wait(timeout=2)
+        except Exception:
+            try:
+                proxy_proc.kill()
+            except Exception:
+                pass
+        context.imap_proxy_proc = None
     scratch = getattr(context, "scratch_dir", None)
     if scratch is not None and scratch.exists():
         shutil.rmtree(scratch, ignore_errors=True)

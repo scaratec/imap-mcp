@@ -41,6 +41,7 @@ from .config import load_configuration
 from .imap_core import (
     TargetFolderMissing,
     UidNotFound,
+    UidStale,
     append_message as imap_append_message,
     copy_message as imap_copy_message,
     fetch_body as imap_fetch_body,
@@ -1426,6 +1427,15 @@ async def _handle_move(
                 "account": src_account,
                 "source_folder": src_folder,
                 "target_folder": dst_folder,
+                "uid": src_uid,
+            }
+        except UidStale:
+            return {
+                "decision": "ALLOW",
+                "result": "ERROR",
+                "error_type": "uid_stale",
+                "account": src_account,
+                "folder": src_folder,
                 "uid": src_uid,
             }
         except UidNotFound:

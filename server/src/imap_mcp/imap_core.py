@@ -344,6 +344,30 @@ class UidNotFound(RuntimeError):
     """The source UID is not present in the selected folder."""
 
 
+class UidStale(RuntimeError):
+    """UIDVALIDITY changed between SELECT and the next mutating
+    command. A new MOVE/COPY against the original UID would target a
+    different message; the saga must re-resolve before retrying."""
+
+
+def _extract_uidvalidity(lines: "list[bytes | bytearray] | None") -> int | None:
+    """Pull `UIDVALIDITY <n>` from the untagged response lines of a
+    SELECT or NOOP. Returns None if absent."""
+    if not lines:
+        return None
+    pattern = re.compile(rb"\[UIDVALIDITY\s+(\d+)\]")
+    for raw in lines:
+        if not isinstance(raw, (bytes, bytearray)):
+            continue
+        m = pattern.search(bytes(raw))
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                continue
+    return None
+
+
 async def move_message(
     account: Account,
     password: str,
@@ -361,9 +385,10 @@ async def move_message(
         status, _ = await imap.select(target_folder)
         if status != "OK":
             raise TargetFolderMissing(target_folder)
-        status, _ = await imap.select(folder)
+        status, lines = await imap.select(folder)
         if status != "OK":
             raise RuntimeError(f"cannot SELECT source {folder!r}")
+        uidvalidity_before = _extract_uidvalidity(lines)
         # Confirm the UID actually exists before MOVE — again for
         # error-type attribution.
         status, response = await imap.uid_search(f"UID {uid}")
@@ -373,14 +398,32 @@ async def move_message(
         hits = bytes(raw).split() if raw else []
         if not hits:
             raise UidNotFound(uid)
-        # Try native MOVE first; fall back to COPY+STORE+EXPUNGE on
-        # servers that do not advertise RFC 6851.
+        # NOOP between SEARCH and MOVE so the server has a chance to
+        # surface a UIDVALIDITY change as an untagged response. ADR
+        # 0006 §uidvalidity_consistency.
         try:
-            status, _ = await imap.uid("move", str(uid), target_folder)
-            if status == "OK":
-                return "native_move"
+            _, noop_lines = await imap.noop()
         except Exception:
-            pass
+            noop_lines = None
+        uidvalidity_after = _extract_uidvalidity(noop_lines)
+        if (
+            uidvalidity_before is not None
+            and uidvalidity_after is not None
+            and uidvalidity_before != uidvalidity_after
+        ):
+            raise UidStale(uid)
+        # Honour the IMAP CAPABILITY advertisement: only try native
+        # MOVE when the server announced it. Otherwise go straight to
+        # COPY + STORE + EXPUNGE so the wire-level command sequence
+        # matches the server's stated abilities (RFC 6851 §3).
+        has_move = bool(imap.has_capability("MOVE"))
+        if has_move:
+            try:
+                status, _ = await imap.uid("move", str(uid), target_folder)
+                if status == "OK":
+                    return "native_move"
+            except Exception:
+                pass
         status, _ = await imap.uid("copy", str(uid), target_folder)
         if status != "OK":
             raise RuntimeError(f"COPY failed: {status}")

@@ -43,7 +43,6 @@ Feature: Intra-account move via native IMAP MOVE
     And a direct IMAP SEARCH on "Archiv/Rechnungen-2026" for message-id "<m-701@gupta-scaratec.com>" returns exactly one result
     And the WAL contains no entries for this operation
 
-  @pending @pending_LIM_0005
   Scenario: On an IMAP server without the MOVE extension the server falls back to COPY+STORE+EXPUNGE
     Given the IMAP server for "gupta-scaratec" does not advertise the MOVE capability
     And the folder "INBOX/Rechnungen" holds a message with:
@@ -88,7 +87,6 @@ Feature: Intra-account move via native IMAP MOVE
     And the response field error_type equals "same_source_and_target"
     And the folder "INBOX/Rechnungen" still contains uid 705
 
-  @pending @pending_LIM_0005
   Scenario: A UIDVALIDITY change during the call is detected and reported as uid_stale
     Given the folder "INBOX/Rechnungen" holds a message with:
       | uid | message_id                 |

@@ -1,9 +1,10 @@
 # LIM 0005: IMAP MITM scenarios deferred
 
-- **Status:** Accepted
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
+- **Date resolved:** 2026-04-22
 - **Proposed by:** claude (imap-mcp BDD phase C)
 - **Approved by:** Randy N. Gupta
 - **Related ADRs:** [ADR-0006](../adr/0006-cross-account-move-saga.md)
@@ -113,8 +114,50 @@ and is covered by a unit test, but not end-to-end.
 - The mock-gmail subproject (LIM-0002) lands, making the MITM-style
   build-out template reusable.
 
+## Resolution
+
+Resolved 2026-04-22 by adding a tightly-scoped IMAP MITM proxy under
+`bdd/support/imap_proxy.py` (~290 lines, pure asyncio). The proxy
+binds on a free local port per scenario, forwards bytes upstream to
+the real Dovecot listener, and applies three keyhole rewrites:
+
+1. **`strip_capabilities`** — removes a configurable token list (e.g.
+   `MOVE`) from any `* CAPABILITY` line and from `[CAPABILITY …]`
+   bracket forms inside OK status responses, so the server sees a
+   server that does not advertise MOVE.
+2. **`uidvalidity_change_after`** — a small state machine that, after
+   a configurable trigger command (e.g. `UID SEARCH`), injects an
+   extra `* OK [UIDVALIDITY <new>] UIDs invalidated` untagged
+   response immediately before the next upstream→client burst. The
+   state machine forwards the trigger command's tagged completion
+   normally, then prepends the injection to the very next response
+   line.
+3. **Per-account command log** — every client→upstream command line
+   is timestamped (UTC, ISO-8601) and appended to a per-scenario log
+   file. Read by `Then the IMAP command log for "{account_id}"
+   contains in order` as a second verification channel that satisfies
+   BDD Guidelines §13.2.
+
+Synchronous IMAP literals (`{N}`-trailers) are honoured byte-exact in
+both directions; the proxy parses only the framing it needs for these
+three rewrites and is otherwise transparent.
+
+The matching server-side change adds a `UidStale` exception in
+`server/src/imap_mcp/imap_core.move_message`. The flow is now:
+SELECT → capture `UIDVALIDITY` → UID SEARCH → NOOP → re-capture
+`UIDVALIDITY` → if changed, raise `UidStale` (mapped to
+`error_type="uid_stale"` in `_handle_move`). The MOVE-vs-fallback
+choice is gated on `imap.has_capability("MOVE")`, so when the proxy
+strips MOVE the server goes straight to COPY + STORE + EXPUNGE.
+
+The two pending scenarios at `intra_account_move.feature:47,91` are
+now first-class members of the green suite.
+
 ## References
 
 - Scenarios: `bdd/features/transactions/intra_account_move.feature:47,91`
-- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase C)
+- Proxy: `bdd/support/imap_proxy.py`
+- Server: `server/src/imap_mcp/imap_core.py` (`UidStale`,
+  `_extract_uidvalidity`, `move_message`)
+- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase C-Rest)
 - ADR 0006
