@@ -4,6 +4,56 @@ Index der offenen Schulden. Jeder Eintrag verweist auf das ausführliche
 Artefakt (LIM, ADR, Task) — Inhalte werden hier nicht dupliziert.
 Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
+## Status (Stand 2026-04-29)
+
+- **BDD-Suite:** 174 passed · 0 failed · 18 skipped (alle 18 skipped
+  hängen an LIM-0002 / LIM-0003 — externe Mock-Subprojekte fehlen).
+- **Server-Property-Tests:** 8 passed (`server/tests/policy/`).
+- **HEAD:** `5ccfe91` (LIM-0004 + LIM-0007), gepusht zu origin/main.
+
+### LIM-Übersicht
+
+| LIM | Status     | Resolution-Intent | Datum                          |
+|-----|------------|-------------------|--------------------------------|
+| 0001 | Mitigated  | must-resolve      | 2026-04-27 (Steady-State-Beob.) |
+| 0002 | **Accepted** | must-resolve   | offen — Mock-Gmail-Subprojekt  |
+| 0003 | **Accepted** | must-resolve   | offen — Mock-OAuth-Subprojekt  |
+| 0004 | Resolved   | must-resolve      | 2026-04-29                     |
+| 0005 | Resolved   | must-resolve      | 2026-04-22                     |
+| 0006 | Resolved   | must-resolve      | 2026-04-28                     |
+| 0007 | Resolved   | must-resolve      | 2026-04-29                     |
+| 0008 | Mitigated  | must-resolve      | 2026-04-28 (Saga-Pause offen)  |
+| 0009 | Mitigated  | must-resolve      | 2026-04-28 (Hook + manual-del. offen) |
+
+### Nächster Block
+
+**Roadmap-Punkt #9 — LIM-0003 Phase 1: Mock-OAuth-Container.**
+LIM-0003 muss vor LIM-0002 stehen, weil Gmail-XOAUTH2 den OAuth-Mock
+braucht. Konkrete Schritte:
+
+1. `navikt/mock-oauth2-server` Service in
+   `bdd/docker/docker-compose.yml` ergänzen, Port-Exposition für die
+   Admin-API.
+2. `bdd/features/environment.py` `before_all` ergänzen: warten bis
+   `/.well-known/openid-configuration` antwortet.
+3. Sanity-Check: `curl` gegen die Discovery-URL liefert ein OIDC-
+   Doc.
+
+Doku-Pflichtlektüre vor Einstieg:
+[LIM-0003](limitations/0003-oauth2-scenarios-not-runnable.md).
+
+### Smoke-Test beim Wieder-Einstieg
+
+```sh
+cd /home/randy/Projekte/scaratec/imap-mcp/bdd
+.venv/bin/behave --no-color --format=progress features/
+# erwartet: 174 passed, 0 failed, 18 skipped
+
+cd /home/randy/Projekte/scaratec/imap-mcp/server
+.venv/bin/pytest tests/policy/ -q
+# erwartet: 8 passed
+```
+
 ## Sofort (foundation)
 
 | # | Titel | Verweis | Begründung |
@@ -35,7 +85,7 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
 | # | Titel | Verweis | LIM |
 |---|---|---|---|
-| 13 | Phase D — HTTP transport + shared_token | Plan `noble-prancing-glacier.md` Phase D | [LIM-0007](limitations/0007-http-transport-deferred.md) |
+| ~~13~~ | ~~Phase D — HTTP transport + shared_token~~ | Plan Phase D | **Resolved 2026-04-29** — Streamable-HTTP + shared_token-Bearer-Auth landeten in Phase D; die residualen 12 Szenarien wurden in Phase D-Rest geschlossen. LIM-0007 Resolved. |
 | ~~14~~ | ~~Phase E — SIGHUP policy reload~~ | Plan Phase E | **Mitigiert 2026-04-28** — 5/7 Szenarien grün; OAuth-Scope-Szenario unter LIM-0003, in-flight-Saga unter LIM-0008 (Saga-Pause-Mechanismus fehlt). |
 | ~~15~~ | ~~Phase F-Rest — Audit day-roll & retention~~ | Plan Phase F | **Mitigiert 2026-04-28** — Rotation/gzip/Retention/eof_day grün; external-hook + manual-deletion-detection bleiben unter LIM-0009. |
 | ~~16~~ | ~~Phase B-Rest — 5-Tupel-Fallback identity~~ | Plan Phase B | **Resolved 2026-04-28** — beide Szenarien grün; LIM-0006 geschlossen. |
