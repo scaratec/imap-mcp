@@ -172,18 +172,24 @@ class IMAPFixture:
         flags: Iterable[str] = (),
         extra_headers: dict[str, str] | None = None,
         attachments: Iterable[tuple[str, str, bytes]] = (),
+        omit_message_id: bool = False,
     ) -> SeededMessage:
         """Append a message to `folder` and return metadata for assertions.
 
         `attachments` is a sequence of (filename, mime_type, bytes) tuples.
+
+        Setting `omit_message_id=True` skips the Message-ID header
+        entirely — used by 5-tuple-fallback scenarios that need a
+        message identified solely by from/date/subject/size/4kb-hash.
         """
         msg = EmailMessage()
         msg["From"] = sender
         msg["To"] = to
         msg["Subject"] = subject
-        if message_id is None:
-            message_id = email.utils.make_msgid(domain="bdd.local")
-        msg["Message-ID"] = message_id
+        if not omit_message_id:
+            if message_id is None:
+                message_id = email.utils.make_msgid(domain="bdd.local")
+            msg["Message-ID"] = message_id
         msg["Date"] = date or email.utils.formatdate(localtime=False)
         for header, value in (extra_headers or {}).items():
             msg[header] = value
@@ -204,13 +210,37 @@ class IMAPFixture:
         if status != "OK":
             raise RuntimeError(f"APPEND to {folder} failed: {response!r}")
 
-        uid = self._lookup_uid_by_message_id(conn, folder, message_id)
+        if omit_message_id:
+            uid = self._lookup_uid_by_subject_and_from(conn, folder, subject, sender)
+            message_id = ""
+        else:
+            assert message_id is not None
+            uid = self._lookup_uid_by_message_id(conn, folder, message_id)
         return SeededMessage(
             uid=uid,
             message_id=message_id,
             subject=subject,
             flags=tuple(flags),
         )
+
+    def _lookup_uid_by_subject_and_from(
+        self, conn: imaplib.IMAP4, folder: str, subject: str, sender: str
+    ) -> int:
+        """UID lookup for messages without a Message-ID — returns the
+        highest UID currently in the folder.
+
+        For the BDD scenarios that exercise `omit_message_id` the
+        message we just appended is the most recent one in the
+        folder; that's the simplest reliable identifier when no
+        Message-ID is available.
+        """
+        _ = (subject, sender)
+        conn.select(folder)
+        status, data = conn.uid("SEARCH", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            return 0
+        uids = [int(x) for x in data[0].split()]
+        return max(uids) if uids else 0
 
     def _lookup_uid_by_message_id(
         self, conn: imaplib.IMAP4, folder: str, message_id: str

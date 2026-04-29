@@ -93,7 +93,6 @@ Feature: Saga crash recovery and idempotency
     And the WAL entry reaches status "committed"
     And the folder "personal:Archiv/Belege" contains exactly one message with message-id "<m-905@gupta-scaratec.com>"
 
-  @pending @pending_LIM_0006
   Scenario: Fallback key — message without Message-ID identified uniquely by 5-tuple
     Given the folder "gupta-scaratec:INBOX/Rechnungen" holds a message with:
       | uid | message_id | from                  | subject         | date                 | size_bytes |
@@ -108,7 +107,6 @@ Feature: Saga crash recovery and idempotency
     And that result has a size of 48213 bytes
     And a direct IMAP SEARCH on "gupta-scaratec:INBOX/Rechnungen" for FROM "rechnung@hornbach.de" SENTON "2026-04-01" returns zero results
 
-  @pending @pending_LIM_0006
   Scenario: Fallback key ambiguous — two identical candidates trigger escalation to needs_operator
     Given the folder "personal:Archiv/Belege" contains two pre-existing messages with:
       | uid | message_id | from                  | subject         | date                 | size_bytes |

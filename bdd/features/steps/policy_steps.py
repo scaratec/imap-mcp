@@ -533,11 +533,16 @@ def flush_staged_messages(context: Context) -> None:
         extra_headers = {
             name: value for name, value in staged["extra_headers"]
         }
-        message_id = staged["message_id_override"] or f"<scenario-{uid_hint}@bdd.local>"
+        omit_msgid = staged["message_id_override"] == "(absent)"
+        message_id = (
+            None if omit_msgid
+            else (staged["message_id_override"] or f"<scenario-{uid_hint}@bdd.local>")
+        )
         seeded = context.imap.seed_message(
             instance,
             user,
             folder,
+            omit_message_id=omit_msgid,
             sender=sender,
             to=to_addr,
             subject=subject,
@@ -1565,6 +1570,155 @@ def step_folder_already_contains(context: Context, folder: str) -> None:
 
     # Delegate to the existing message-seed step.
     step_folder_holds_message_implicit(context, folder)
+
+
+@given('the folder "{folder}" contains two pre-existing messages with:')
+def step_folder_contains_two_preexisting(context: Context, folder: str) -> None:
+    """Stage two messages with the same 5-tuple (from + subject +
+    sent date + size_bytes), no Message-ID. Used by the ambiguous-
+    fallback recovery scenario."""
+    if ":" in folder:
+        account_id, _, folder = folder.partition(":")
+    else:
+        account_id = _find_account_for_folder(context, folder)
+    context.staged_messages = getattr(context, "staged_messages", [])
+    for row in context.table:
+        msgid = row["message_id"] if "message_id" in row.headings else None
+        context.staged_messages.append({
+            "_account_id": account_id,
+            "_folder": folder,
+            "uid_hint": int(row["uid"]),
+            "from": row["from"],
+            "to": None,
+            "subject": row["subject"],
+            "message_id_override": msgid,
+            "has_attachment": False,
+            "size_hint": int(row["size_bytes"]) if "size_bytes" in row.headings else 0,
+            "date": row["date"] if "date" in row.headings else None,
+            "extra_attachments": [],
+            "extra_headers": [],
+            "body_override": None,
+        })
+
+
+@given(
+    "the WAL has an in-progress transaction with fallback-key "
+    "(from={from_value}, date={date_value}, subject={subject_value}, "
+    "size={size_value:d}, first_4kb_sha256={sha_value}) and status \"{status}\""
+)
+def step_wal_seed_fallback(
+    context: Context, from_value: str, date_value: str,
+    subject_value: str, size_value: int, sha_value: str, status: str,
+) -> None:
+    """Insert a WAL row pre-loaded with the 5-tuple fallback identity.
+
+    `sha_value=same-as-both` is a sentinel meaning "compute the
+    SHA-256 from the just-staged matching messages". When the BDD
+    fixture has staged two identical placeholder messages, both will
+    have the same first-4 KiB hash; we compute it once from one of
+    them and pin that value into the WAL.
+    """
+    import sqlite3
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    flush_staged_messages(context)
+
+    # Materialise sha_value (and overwrite size) from the actual
+    # on-disk first-4-KiB SHA-256 / total RFC822 size of the target
+    # account's pre-staged message — both stagings share the same
+    # bytes, so either UID is fine. The feature file's literal
+    # `48213` is a logical placeholder; the BDD harness substitutes
+    # the realised values so the WAL row matches what the IMAP
+    # server actually serves.
+    from support.imap_fixture import resolve_account
+    import imaplib
+    import hashlib as _h
+
+    sha = sha_value
+    actual_size = size_value
+    instance, user = resolve_account("personal")
+    uids = context.imap.folder_uids(instance, user, "Archiv/Belege")
+    if not uids:
+        raise AssertionError(
+            "No pre-staged messages on personal:Archiv/Belege; "
+            "the prior Given step did not seed them."
+        )
+    conn = context.imap.connect(instance, user)
+    conn.select("Archiv/Belege")
+    status_imap, data = conn.uid("FETCH", str(uids[0]), "(RFC822)")
+    if status_imap != "OK" or not data or data[0] is None:
+        raise AssertionError("Could not FETCH RFC822 for hash seed")
+    raw = data[0][1] if isinstance(data[0], tuple) else b""
+    if sha == "same-as-both":
+        sha = _h.sha256(raw[:4096]).hexdigest()
+    actual_size = len(raw)
+
+    # Translate `2026-04-01` to ISO-with-Z form for the WAL.
+    if "T" not in date_value:
+        try:
+            from datetime import datetime as _dt
+            iso = _dt.fromisoformat(date_value).replace(
+                tzinfo=timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            iso = date_value
+    else:
+        iso = date_value
+
+    context.wal_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(context.wal_path, isolation_level=None)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            tx_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            committed_at TEXT,
+            caller_id TEXT,
+            src_account TEXT,
+            src_folder TEXT,
+            src_uid INTEGER,
+            dst_account TEXT,
+            dst_folder TEXT,
+            message_id TEXT,
+            content_hash TEXT,
+            target_uid INTEGER,
+            retry_count INTEGER DEFAULT 0,
+            last_error TEXT,
+            fallback_from TEXT,
+            fallback_date TEXT,
+            fallback_subject TEXT,
+            fallback_size INTEGER,
+            fallback_4kb_sha256 TEXT
+        );
+        CREATE TABLE IF NOT EXISTS transaction_events (
+            tx_id TEXT NOT NULL,
+            step TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            outcome TEXT,
+            detail TEXT
+        );
+    """)
+    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    tx_id = f"tx-{_uuid.uuid4().hex[:16]}"
+    conn.execute(
+        "INSERT INTO transactions ("
+        "tx_id, status, created_at, caller_id, src_account, src_folder, "
+        "src_uid, dst_account, dst_folder, message_id, "
+        "fallback_from, fallback_date, fallback_subject, fallback_size, "
+        "fallback_4kb_sha256) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            tx_id, status, now, "invoice-agent",
+            "gupta-scaratec", "INBOX/Rechnungen", 0,
+            "personal", "Archiv/Belege",
+            None,
+            from_value, iso, subject_value, actual_size, sha,
+        ),
+    )
+    conn.close()
+    context.last_tx_id = tx_id
+    context.last_response = {"tx_id": tx_id}
 
 
 @given('the WAL contains an in-progress transaction with status "{status}" referencing uid {uid:d} and Message-ID "{msgid}"')

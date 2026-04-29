@@ -76,7 +76,13 @@ class SagaManager:
         self.retry_limit = retry_limit
         self.account_resolver = account_resolver
 
-    def _audit_step(self, tx_id: str, step: str, outcome: str | None = "OK") -> None:
+    def _audit_step(
+        self,
+        tx_id: str,
+        step: str,
+        outcome: str | None = "OK",
+        reason: str = "saga_step",
+    ) -> None:
         if self.audit is None:
             return
         self.audit.write(
@@ -86,10 +92,95 @@ class SagaManager:
                 "tx_id": tx_id,
                 "step": step,
                 "decision": "ALLOW",
-                "reason": "saga_step",
+                "reason": reason,
                 "result": outcome or "OK",
             }
         )
+
+    async def _search_target_for_existing(
+        self,
+        dst_account: Account,
+        dst_password: str,
+        dst_folder: str,
+        *,
+        message_id: str | None,
+        raw: bytes | None,
+        fallback: dict[str, Any] | None = None,
+    ) -> "list[int] | str":
+        """Idempotency lookup. Returns:
+        - `[]`        if the message is not yet on target,
+        - `[uid]`     if exactly one match (Message-ID or unique 5-tuple),
+        - `"ambiguous"` if the 5-tuple matches ≥ 2 candidates with
+          identical first-4-KiB SHA-256 (ADR 0008 §fallback ambiguity).
+        """
+        # Primary key: Message-ID.
+        if message_id is not None:
+            try:
+                hits = await search_uids(
+                    dst_account, dst_password, dst_folder,
+                    f'HEADER "Message-Id" "{message_id}"',
+                )
+            except Exception:
+                hits = []
+            return list(hits)
+
+        # Fallback key: 5-tuple. Read either from `raw` (live FETCH)
+        # or from a pre-staged WAL row (`fallback` dict).
+        key = fallback if fallback is not None else (
+            _extract_fallback_key(raw) if raw is not None else None
+        )
+        if key is None or key.get("fallback_from") is None:
+            return []
+        sender = str(key["fallback_from"])
+        sent_iso = str(key.get("fallback_date") or "")
+        subject = str(key.get("fallback_subject") or "")
+        size = int(key.get("fallback_size") or 0)
+        sha = str(key.get("fallback_4kb_sha256") or "")
+        # Build IMAP SEARCH for FROM + SUBJECT + (SENTON YYYY-MM-DD).
+        terms: list[str] = []
+        if sender:
+            terms.append(f'FROM "{sender}"')
+        if subject:
+            terms.append(f'SUBJECT "{subject}"')
+        sent_date = sent_iso[:10] if sent_iso else ""
+        if sent_date:
+            try:
+                from datetime import datetime
+                d = datetime.fromisoformat(sent_date)
+                terms.append(f'SENTON "{d.strftime("%d-%b-%Y")}"')
+            except ValueError:
+                pass
+        if not terms:
+            return []
+        criteria = " ".join(terms)
+        try:
+            candidates = await search_uids(
+                dst_account, dst_password, dst_folder, criteria
+            )
+        except Exception:
+            return []
+        # Confirm size + 4-KiB hash for each candidate. Same size +
+        # same 4-KiB SHA-256 = the same payload to the precision the
+        # spec accepts; ≥ 2 such matches = ambiguous → escalate.
+        confirmed: list[int] = []
+        for uid in candidates:
+            try:
+                payload = await fetch_full_message(
+                    dst_account, dst_password, dst_folder, uid
+                )
+            except Exception:
+                continue
+            if payload is None:
+                continue
+            if size and len(payload) != size:
+                continue
+            payload_sha = hashlib.sha256(payload[:4096]).hexdigest()
+            if sha and payload_sha != sha:
+                continue
+            confirmed.append(uid)
+        if len(confirmed) >= 2:
+            return "ambiguous"
+        return confirmed
 
     async def run_cross_account_move(
         self,
@@ -176,32 +267,42 @@ class SagaManager:
             content_hash = hashlib.sha256(raw).hexdigest()
             message_id = _extract_message_id(raw)
             self.wal.record_fetch(tx_id, message_id, content_hash)
+            # When Message-ID is absent, capture the 5-tuple fallback
+            # identity so recovery can re-locate the message on the
+            # target without it (ADR 0008 §fallback_key).
+            if message_id is None:
+                fallback = _extract_fallback_key(raw)
+                self.wal.record_fallback(tx_id, **fallback)
             self._audit_step(tx_id, "fetched")
             _maybe_crash("post_fetch")
 
             # VERIFY idempotency: is the message already at the target?
-            if message_id is not None:
-                try:
-                    existing = await search_uids(
-                        dst_account,
-                        dst_password,
-                        dst_folder,
-                        f'HEADER "Message-Id" "{message_id}"',
-                    )
-                except Exception:
-                    existing = []
-                if existing:
-                    target_uid = existing[0]
-                    self.wal.mark_staged(tx_id, target_uid)
-                    self._audit_step(tx_id, "staged")
-                    return await self._finish_delete_and_commit(
-                        tx_id=tx_id,
-                        src_account=src_account,
-                        src_password=src_password,
-                        src_folder=src_folder,
-                        src_uid=src_uid,
-                        delete_source=delete_source,
-                    )
+            existing = await self._search_target_for_existing(
+                dst_account, dst_password, dst_folder,
+                message_id=message_id, raw=raw,
+            )
+            if existing == "ambiguous":
+                self.wal.mark_needs_operator(tx_id)
+                self._audit_step(
+                    tx_id, "escalated", outcome="ERROR",
+                    reason="ambiguous_fallback_match",
+                )
+                return SagaResult(
+                    tx_id=tx_id, mechanism="saga", result="ERROR",
+                    error_type="ambiguous_fallback_match",
+                )
+            if existing:
+                target_uid = existing[0]
+                self.wal.mark_staged(tx_id, target_uid)
+                self._audit_step(tx_id, "staged")
+                return await self._finish_delete_and_commit(
+                    tx_id=tx_id,
+                    src_account=src_account,
+                    src_password=src_password,
+                    src_folder=src_folder,
+                    src_uid=src_uid,
+                    delete_source=delete_source,
+                )
 
             # APPEND target
             try:
@@ -329,6 +430,41 @@ class SagaManager:
             dst_account, dst_password = await self.account_resolver(tx["dst_account"])
         except Exception:
             return None
+
+        # Staged-but-no-target_uid: a Message-ID-less message whose
+        # `target_uid` was never observed. Use the 5-tuple fallback
+        # to locate it; ambiguity (two identical candidates on the
+        # target) escalates per ADR 0008.
+        if (
+            tx["status"] == "staged"
+            and not tx.get("target_uid")
+            and not tx.get("message_id")
+            and tx.get("fallback_from")
+        ):
+            fallback = {
+                "fallback_from": tx.get("fallback_from"),
+                "fallback_date": tx.get("fallback_date"),
+                "fallback_subject": tx.get("fallback_subject"),
+                "fallback_size": tx.get("fallback_size"),
+                "fallback_4kb_sha256": tx.get("fallback_4kb_sha256"),
+            }
+            existing = await self._search_target_for_existing(
+                dst_account, dst_password, tx["dst_folder"],
+                message_id=None, raw=None, fallback=fallback,
+            )
+            if existing == "ambiguous":
+                self.wal.mark_needs_operator(tx["tx_id"])
+                self._audit_step(
+                    tx["tx_id"], "escalated", outcome="ERROR",
+                    reason="ambiguous_fallback_match",
+                )
+                return SagaResult(
+                    tx_id=tx["tx_id"], mechanism="saga", result="ERROR",
+                    error_type="ambiguous_fallback_match",
+                )
+            if existing:
+                self.wal.mark_staged(tx["tx_id"], existing[0])
+
         return await self._run_from_fetch(
             tx_id=tx["tx_id"],
             src_account=src_account,
@@ -361,6 +497,38 @@ def _extract_message_id(raw: bytes) -> str | None:
 
     msg = email.message_from_bytes(raw)
     return msg.get("Message-ID")
+
+
+def _extract_fallback_key(raw: bytes) -> dict[str, Any]:
+    """Extract the 5-tuple fallback identity (ADR 0008) from RFC822
+    bytes: From, Date (parsed to ISO 8601), Subject, byte size,
+    SHA-256 of the first 4 KiB."""
+    import email
+    from datetime import timezone
+    from email.utils import parsedate_to_datetime
+
+    msg = email.message_from_bytes(raw)
+    sender = msg.get("From") or ""
+    subject = msg.get("Subject") or ""
+    date_iso: str | None = None
+    raw_date = msg.get("Date")
+    if raw_date:
+        try:
+            parsed = parsedate_to_datetime(raw_date)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            date_iso = parsed.astimezone(timezone.utc).isoformat().replace(
+                "+00:00", "Z"
+            )
+        except (TypeError, ValueError):
+            date_iso = None
+    return {
+        "fallback_from": sender,
+        "fallback_date": date_iso,
+        "fallback_subject": subject,
+        "fallback_size": len(raw),
+        "fallback_4kb_sha256": hashlib.sha256(raw[:4096]).hexdigest(),
+    }
 
 
 async def _delete_source(

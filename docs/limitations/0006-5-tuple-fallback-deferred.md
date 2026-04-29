@@ -1,9 +1,17 @@
 # LIM 0006: 5-tuple fallback identity deferred
 
-- **Status:** Accepted
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
+- **Date resolved:** 2026-04-28 — WAL-Schema um fünf Fallback-
+  Spalten erweitert; `_extract_fallback_key` (FROM, Date,
+  Subject, RFC822-Size, SHA-256 erste 4 KiB) wird beim FETCH
+  persistiert wenn Message-ID fehlt; `_search_target_for_existing`
+  findet Kandidaten via `FROM`+`SUBJECT`+`SENTON` und bestätigt sie
+  per Größe + 4-KiB-SHA; ≥ 2 Bestätigungen → `needs_operator` mit
+  Audit-Reason `ambiguous_fallback_match`. Beide Szenarien in
+  `saga_crash_recovery.feature:96,111` jetzt grün.
 - **Proposed by:** claude (imap-mcp BDD phase B)
 - **Approved by:** Randy N. Gupta
 - **Related ADRs:** [ADR-0008](../adr/0008-saga-idempotency.md)

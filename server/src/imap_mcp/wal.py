@@ -57,7 +57,12 @@ CREATE TABLE IF NOT EXISTS transactions (
     content_hash TEXT,
     target_uid INTEGER,
     retry_count INTEGER DEFAULT 0,
-    last_error TEXT
+    last_error TEXT,
+    fallback_from TEXT,
+    fallback_date TEXT,
+    fallback_subject TEXT,
+    fallback_size INTEGER,
+    fallback_4kb_sha256 TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transaction_events (
@@ -122,6 +127,36 @@ class WAL:
                 (message_id, content_hash, tx_id),
             )
             self._event(conn, tx_id, "fetched", "OK", None)
+
+    def record_fallback(
+        self,
+        tx_id: str,
+        *,
+        fallback_from: str | None,
+        fallback_date: str | None,
+        fallback_subject: str | None,
+        fallback_size: int | None,
+        fallback_4kb_sha256: str | None,
+    ) -> None:
+        """Persist the 5-tuple fallback identity (ADR 0008). Called
+        when a fetched message has no Message-ID header so recovery
+        can re-locate it on the target by from + sent-date + subject
+        + size + first-4-KiB SHA-256."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE transactions SET "
+                "fallback_from = ?, fallback_date = ?, fallback_subject = ?, "
+                "fallback_size = ?, fallback_4kb_sha256 = ? "
+                "WHERE tx_id = ?",
+                (
+                    fallback_from,
+                    fallback_date,
+                    fallback_subject,
+                    fallback_size,
+                    fallback_4kb_sha256,
+                    tx_id,
+                ),
+            )
 
     def mark_staged(self, tx_id: str, target_uid: int | None) -> None:
         with self._conn() as conn:
