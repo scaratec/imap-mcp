@@ -30,31 +30,39 @@ jobs:
       - name: Install tools
         run: pip install python-semantic-release build
 
-      - name: Semantic release — version
-        id: semver
+      - name: Check if release is needed
+        id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          semantic-release version || true
-          VERSION=$(semantic-release version --print 2>/dev/null || echo "")
-          if [ -n "$VERSION" ]; then
-            echo "released=true" >> "$GITHUB_OUTPUT"
+          BEFORE=$(git tag --list 'v*' | wc -l)
+          semantic-release version --no-push --no-commit || true
+          AFTER=$(git tag --list 'v*' | wc -l)
+          if [ "$AFTER" -gt "$BEFORE" ]; then
+            echo "new_version=true" >> "$GITHUB_OUTPUT"
           else
-            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
           fi
+          git checkout -- . 2>/dev/null || true
+
+      - name: Run semantic-release
+        if: steps.check.outputs.new_version == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: semantic-release version
 
       - name: Build package
-        if: steps.semver.outputs.released == 'true'
+        if: steps.check.outputs.new_version == 'true'
         run: python -m build
 
       - name: Publish to PyPI
-        if: steps.semver.outputs.released == 'true'
+        if: steps.check.outputs.new_version == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: server/dist/
 
-      - name: Semantic release — GitHub release
-        if: steps.semver.outputs.released == 'true'
+      - name: Create GitHub release
+        if: steps.check.outputs.new_version == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: semantic-release publish
