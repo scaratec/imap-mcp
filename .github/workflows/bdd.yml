@@ -1,0 +1,53 @@
+name: BDD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  bdd:
+    if: github.repository_owner == 'scaratec'
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install server
+        run: |
+          cd server
+          python -m venv .venv
+          .venv/bin/pip install -e .
+
+      - name: Install BDD harness
+        run: |
+          cd bdd
+          python -m venv .venv
+          .venv/bin/pip install -r <(grep -v "^#" pyproject.toml | python -c "
+          import sys, tomllib
+          data = tomllib.loads(sys.stdin.read())
+          for dep in data['project']['dependencies']:
+              print(dep)
+          ")
+          .venv/bin/pip install behave httpx
+
+      - name: Start fixtures
+        run: |
+          cd bdd/docker
+          docker compose up -d
+          sleep 5
+
+      - name: Run BDD suite
+        run: |
+          cd bdd
+          .venv/bin/behave --no-color --format=progress features/
+
+      - name: Tear down fixtures
+        if: always()
+        run: |
+          cd bdd/docker
+          docker compose down -v

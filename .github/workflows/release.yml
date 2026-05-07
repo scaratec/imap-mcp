@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi
+    concurrency: release
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install python-semantic-release build
+
+      - name: Semantic release — version
+        id: semver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          semantic-release version
+          echo "released=$(semantic-release version --print 2>/dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Build package
+        if: steps.semver.outputs.released == 'true'
+        run: python -m build
+
+      - name: Publish to PyPI
+        if: steps.semver.outputs.released == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: server/dist/
+
+      - name: Semantic release — GitHub release
+        if: steps.semver.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: semantic-release publish
