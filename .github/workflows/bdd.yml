@@ -9,7 +9,7 @@ on:
 jobs:
   bdd:
     if: github.repository_owner == 'scaratec'
-    runs-on: self-hosted
+    runs-on: imap-mcp-runner
     steps:
       - uses: actions/checkout@v4
 
