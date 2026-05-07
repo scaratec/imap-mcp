@@ -1,9 +1,15 @@
 # LIM 0003: OAuth2 scenarios reference a nonexistent mock provider
 
-- **Status:** Accepted
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
+- **Date resolved:** 2026-05-06 — Mock-OAuth-Server
+  (`navikt/mock-oauth2-server`) im Docker-Stack, OAuth-Bootstrap,
+  Token-Lifecycle und Scope-Minimization Szenarien grün.
+  Scope-Change-Detection bei SIGHUP-Reload implementiert: Account
+  wechselt zu `needs_rebootstrap`, IMAP-Handler verweigern
+  Verbindungen. Alle `@pending_LIM_0003`-Szenarien aufgelöst.
 - **Proposed by:** Claude (implementation agent)
 - **Approved by:** Randy Nel Gupta
 - **Related ADRs:** [ADR-0009](../adr/0009-oauth2-authorization-code-with-scope-minimization.md), [ADR-0010](../adr/0010-configurable-token-cache-strategy.md), [ADR-0011](../adr/0011-pluggable-secret-store-backend.md)

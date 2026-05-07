@@ -1,8 +1,8 @@
 Feature: MCP tool discovery
 
   A connected client enumerates the server's tools via the standard
-  MCP list_tools handshake. V1 exposes exactly sixteen tools
-  partitioned into eight read, five write, and three meta. The
+  MCP list_tools handshake. V1 exposes exactly seventeen tools
+  partitioned into nine read, five write, and three meta. The
   advertised shape matches ADR 0016.
 
   Covered error layers (per BDD Guidelines §4.5):
@@ -16,7 +16,7 @@ Feature: MCP tool discovery
     Given the server is started with a minimal caller configuration
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The V1 tool set consists of exactly these 16 tools
+  Scenario: The V1 tool set consists of exactly these 17 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
       | tool                      |
@@ -36,6 +36,7 @@ Feature: MCP tool discovery
       | describe_policy           |
       | get_transaction_status    |
       | get_caller_identity       |
+      | list_labels               |
 
   Scenario: Non-goal tool names are never advertised
     When invoice-agent calls the MCP list_tools method

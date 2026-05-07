@@ -24,9 +24,13 @@ from typing import Iterable
 TEST_PASSWORD = "test123"
 
 # Per-instance user list. Keep in sync with docker/dovecot/users/*.passwd.
+# mock-gmail is an in-process mock that resets via GmailState.reset(),
+# not via IMAP commands — its user entry is listed for completeness but
+# reset_user skips it (see guard below).
 _USERS_BY_INSTANCE: dict[str, list[str]] = {
     "imap-a": ["gupta", "osthues"],
     "imap-b": ["personal", "archive"],
+    "mock-gmail": ["test"],
 }
 
 # Mapping from the `account_id` used in feature files to a concrete
@@ -39,6 +43,10 @@ _ACCOUNT_ID_TO_INSTANCE_USER: dict[str, tuple[str, str]] = {
     "osthues-mail": ("imap-a", "osthues"),
     "personal": ("imap-b", "personal"),
     "archive": ("imap-b", "archive"),
+    "gmail-archive": ("imap-a", "gupta"), # Alias to gupta for oauth tests
+    "gmail-ronly": ("imap-b", "archive"), # Alias to archive for oauth tests
+    "scaratec-gmail": ("mock-gmail", "test"),
+    "archive-srv": ("imap-b", "archive"),
 }
 
 
@@ -117,6 +125,9 @@ class IMAPFixture:
 
     def reset_user(self, instance: str, user: str) -> None:
         """Delete every non-system folder and empty all system folders."""
+        # mock-gmail resets via GmailState.reset(), not via IMAP commands.
+        if instance == "mock-gmail":
+            return
         conn = self.connect(instance, user)
         _, folder_lines = conn.list()
         folders = [self._parse_folder_name(line) for line in folder_lines or []]

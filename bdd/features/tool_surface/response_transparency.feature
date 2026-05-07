@@ -28,7 +28,7 @@ Feature: Response transparency for policy-filtered data
 
   Scenario: list_accounts exposes hidden_accounts_count without naming the hidden accounts
     When invoice-agent calls list_accounts
-    Then the response field accounts equals ["gupta-scaratec"]
+    Then the visible account ids equal ["gupta-scaratec"]
     And the response field hidden_accounts_count equals 1
     And the response does not contain any field named "hidden_accounts"
     And the response does not contain any field naming "osthues-mail"

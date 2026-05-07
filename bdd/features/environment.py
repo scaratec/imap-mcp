@@ -22,12 +22,22 @@ from behave.model import Feature, Scenario
 from behave.runner import Context
 
 import sys
+import threading
+
+import urllib.request
+import urllib.error
 
 # This file lives at bdd/features/environment.py; the `bdd/` dir holds
 # the `support/` package that the steps import from.
 BDD_ROOT = Path(__file__).resolve().parent.parent
 if str(BDD_ROOT) not in sys.path:
     sys.path.insert(0, str(BDD_ROOT))
+
+# The mock-gmail package lives outside the BDD venv; add its src dir
+# to sys.path so `from mock_gmail.server import ...` works.
+_MOCK_GMAIL_SRC = BDD_ROOT / "mock-gmail" / "src"
+if str(_MOCK_GMAIL_SRC) not in sys.path:
+    sys.path.insert(0, str(_MOCK_GMAIL_SRC))
 
 from support.imap_fixture import IMAPFixture
 from support.mcp_client import MCPClient
@@ -44,10 +54,11 @@ SERVER_BINARY = Path(
     )
 ).resolve()
 
-# Host-port mapping per docker-compose.yml.
+# Host-port mapping per docker-compose.yml (plus in-process mock-gmail).
 IMAP_INSTANCES: dict[str, tuple[str, int]] = {
     "imap-a": ("127.0.0.1", 11143),
     "imap-b": ("127.0.0.1", 12143),
+    "mock-gmail": ("127.0.0.1", 13143),
 }
 
 READINESS_TIMEOUT_SECONDS = 30
@@ -58,6 +69,31 @@ def before_all(context: Context) -> None:
     _compose("down", "-v", check=False)
     _compose("up", "-d")
     _wait_for_imap_ready()
+    _wait_for_oauth_ready()
+
+    # Start the in-process Gmail mock IMAP server.
+    from mock_gmail.server import start_gmail_mock
+    from mock_gmail.state import GmailState
+
+    gmail_state = GmailState()
+
+    def _run_gmail_mock(state: GmailState, port: int) -> None:
+        import asyncio
+
+        async def _serve() -> None:
+            server, actual_port = await start_gmail_mock(state, port=port)
+            async with server:
+                await server.serve_forever()
+
+        asyncio.run(_serve())
+
+    gmail_thread = threading.Thread(
+        target=_run_gmail_mock, args=(gmail_state, 13143), daemon=True
+    )
+    gmail_thread.start()
+    _wait_for_port("mock-gmail", "127.0.0.1", 13143)
+    context.gmail_state = gmail_state
+
     context.imap_instances = IMAP_INSTANCES
     context.bdd_root = BDD_ROOT
 
@@ -88,6 +124,10 @@ def before_scenario(context: Context, scenario: Scenario) -> None:
 
     context.imap = IMAPFixture(IMAP_INSTANCES)
     context.imap.reset_all_users()
+
+    gmail_state = getattr(context, "gmail_state", None)
+    if gmail_state is not None:
+        gmail_state.reset()
 
     context.mcp: MCPClient | None = None  # step files create it lazily
 
@@ -130,10 +170,16 @@ def _compose(*args: str, check: bool = True) -> None:
     subprocess.run(cmd, cwd=DOCKER_DIR, check=check, capture_output=True)
 
 
+# Instances started by docker compose (not in-process mocks).
+_DOCKER_IMAP_INSTANCES = {"imap-a", "imap-b"}
+
+
 def _wait_for_imap_ready() -> None:
     """Block until both dovecot instances accept IMAP LOGIN."""
     deadline = time.monotonic() + READINESS_TIMEOUT_SECONDS
     for name, (host, port) in IMAP_INSTANCES.items():
+        if name not in _DOCKER_IMAP_INSTANCES:
+            continue
         while True:
             if time.monotonic() > deadline:
                 raise RuntimeError(
@@ -148,3 +194,38 @@ def _wait_for_imap_ready() -> None:
             except (OSError, socket.timeout):
                 pass
             time.sleep(0.5)
+
+def _wait_for_port(name: str, host: str, port: int) -> None:
+    """Block until a TCP connection to (host, port) succeeds."""
+    deadline = time.monotonic() + READINESS_TIMEOUT_SECONDS
+    while True:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"{name} at {host}:{port} not ready within "
+                f"{READINESS_TIMEOUT_SECONDS}s"
+            )
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                break
+        except (OSError, socket.timeout):
+            pass
+        time.sleep(0.3)
+
+
+def _wait_for_oauth_ready() -> None:
+    """Block until the mock-oauth2-server discovery endpoint answers."""
+    deadline = time.monotonic() + READINESS_TIMEOUT_SECONDS
+    url = "http://127.0.0.1:19080/default/.well-known/openid-configuration"
+    while True:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"OAuth mock at {url} not ready within {READINESS_TIMEOUT_SECONDS}s"
+            )
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=1.0) as response:
+                if response.status == 200:
+                    break
+        except (urllib.error.URLError, socket.timeout, ConnectionError):
+            pass
+        time.sleep(0.5)

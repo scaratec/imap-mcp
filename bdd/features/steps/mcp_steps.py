@@ -244,6 +244,15 @@ def step_caller_calls_mark_tagged(
 
 
 @when(
+    '{caller_id} starts a new move with source {src_raw}, target {dst_raw}'
+)
+def step_caller_starts_new_move(
+    context: Context, caller_id: str, src_raw: str, dst_raw: str
+) -> None:
+    step_caller_calls_move_structured(context, caller_id, src_raw, dst_raw)
+
+
+@when(
     '{caller_id} calls move with source {src_raw}, target {dst_raw}'
 )
 def step_caller_calls_move_structured(

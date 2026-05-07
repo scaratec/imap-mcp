@@ -1,15 +1,16 @@
 # LIM 0001: Reason-code symmetry in BDD contract tests
 
-- **Status:** Mitigated
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
 - **Date mitigated:** 2026-04-27 — Mitigations 1 (canonical table in
   ADR-0017 §2.1), 3 (`reason_code_contract.feature`), and 6
-  (`server/tests/policy/test_pdp_properties.py`) implemented. The
-  symmetry is structurally bounded but the LIM remains open until the
-  spec-audit cycles confirm steady-state coverage (Triggers for
-  revisit unchanged).
+  (`server/tests/policy/test_pdp_properties.py`) implemented.
+- **Date resolved:** 2026-05-06 — Spec-Audit-Zyklus vom 2026-05-06
+  bestätigt Steady-State: 184 Szenarien grün, alle Reason-Codes in
+  ADR-0017 §2.1 durch mindestens zwei nicht-pending Szenarien
+  abgedeckt, kein undokumentierter Code emittiert.
 - **Proposed by:** Claude (implementation agent)
 - **Approved by:** Randy Nel Gupta
 - **Related ADRs:** [ADR-0001](../adr/0001-default-deny-hierarchical-policy.md), [ADR-0017](../adr/0017-response-transparency-for-filtered-data.md)

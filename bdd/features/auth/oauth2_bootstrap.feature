@@ -1,4 +1,3 @@
-@pending @pending_LIM_0003
 Feature: OAuth2 bootstrap and token lifecycle
 
   The server authenticates against IMAP providers via XOAUTH2. A
@@ -46,7 +45,7 @@ Feature: OAuth2 bootstrap and token lifecycle
     Given the secret store contains a valid refresh token for "gmail-ronly"
     And policy "ronly-policy" grants capability "mark_seen" on folder "INBOX"
     And caller "reader-agent" uses policy "ronly-policy"
-    And the folder "INBOX" on "gmail-ronly" holds a message with uid 1001
+    And the folder "gmail-ronly:INBOX" holds a message with uid 1001
     When reader-agent calls mark_seen with account "gmail-ronly", folder "INBOX", uid 1001, seen true
     Then the response decision is DENY
     And the response field reason equals "oauth_scope_insufficient"
@@ -90,5 +89,6 @@ Feature: OAuth2 bootstrap and token lifecycle
   Scenario: PKCE verifier mismatch — bootstrap fails and no secret is written
     Given the mock OAuth2 provider is primed to tamper with the code_challenge
     When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive`
+    And the bootstrap opens the provider consent URL and the browser returns authorization code "authcode-xyz"
     Then the bootstrap reports failure with reason "pkce_verification_failed"
     And the secret store has no value under key "accounts/gmail-archive/refresh_token"

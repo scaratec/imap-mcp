@@ -42,7 +42,7 @@ class Account(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     id: str
-    provider: Literal["imap-standard", "google"] = "imap-standard"
+    provider: Literal["imap-standard", "google", "google-mock"] = "imap-standard"
     host: str = "127.0.0.1"
     port: int = 143
     auth: AccountAuth | None = None

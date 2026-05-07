@@ -1,0 +1,17 @@
+Banner: * OK Gimap ready for requests from 5.100.143.252 5c2dc8763939e-49cd9fd7be0mb27846442122
+
+CAPABILITY: IMAP4rev1 UNSELECT IDLE NAMESPACE QUOTA ID XLIST CHILDREN X-GM-EXT-1 XYZZY SASL-IR AUTH=XOAUTH2 AUTH=PLAIN AUTH=PLAIN-CLIENTTOKEN AUTH=OAUTHBEARER
+
+LOGIN: OK [b'scimapmcp@gmail.com authenticated (Success)']
+
+LIST:
+  (\HasNoChildren) "/" "INBOX"
+  (\HasChildren \Noselect) "/" "[Gmail]"
+  (\All \HasNoChildren) "/" "[Gmail]/All Mail"
+  (\Drafts \HasNoChildren) "/" "[Gmail]/Drafts"
+  (\HasNoChildren \Important) "/" "[Gmail]/Important"
+  (\HasNoChildren \Sent) "/" "[Gmail]/Sent Mail"
+  (\HasNoChildren \Junk) "/" "[Gmail]/Spam"
+  (\Flagged \HasNoChildren) "/" "[Gmail]/Starred"
+  (\HasNoChildren \Trash) "/" "[Gmail]/Trash"
+

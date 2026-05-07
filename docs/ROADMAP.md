@@ -6,24 +6,23 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
 ## Status (Stand 2026-04-29)
 
-- **BDD-Suite:** 174 passed · 0 failed · 18 skipped (alle 18 skipped
-  hängen an LIM-0002 / LIM-0003 — externe Mock-Subprojekte fehlen).
+- **BDD-Suite:** 192 passed · 0 failed · 0 skipped.
 - **Server-Property-Tests:** 8 passed (`server/tests/policy/`).
-- **HEAD:** `5ccfe91` (LIM-0004 + LIM-0007), gepusht zu origin/main.
+- **HEAD:** ausstehend (LIM-0009 resolved, Spec-Audit-Fixes).
 
 ### LIM-Übersicht
 
 | LIM | Status     | Resolution-Intent | Datum                          |
 |-----|------------|-------------------|--------------------------------|
-| 0001 | Mitigated  | must-resolve      | 2026-04-27 (Steady-State-Beob.) |
-| 0002 | **Accepted** | must-resolve   | offen — Mock-Gmail-Subprojekt  |
-| 0003 | **Accepted** | must-resolve   | offen — Mock-OAuth-Subprojekt  |
+| 0001 | Resolved   | must-resolve      | 2026-05-06                     |
+| 0002 | Resolved   | must-resolve      | 2026-05-07                     |
+| 0003 | Resolved   | must-resolve      | 2026-05-06                     |
 | 0004 | Resolved   | must-resolve      | 2026-04-29                     |
 | 0005 | Resolved   | must-resolve      | 2026-04-22                     |
 | 0006 | Resolved   | must-resolve      | 2026-04-28                     |
 | 0007 | Resolved   | must-resolve      | 2026-04-29                     |
-| 0008 | Mitigated  | must-resolve      | 2026-04-28 (Saga-Pause offen)  |
-| 0009 | Mitigated  | must-resolve      | 2026-04-28 (Hook + manual-del. offen) |
+| 0008 | Resolved   | must-resolve      | 2026-05-06                     |
+| 0009 | Resolved   | must-resolve      | 2026-05-06                     |
 
 ### Nächster Block
 

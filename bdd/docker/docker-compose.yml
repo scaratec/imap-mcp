@@ -47,6 +47,16 @@ services:
     # rather than a container-side probe. The upstream dovecot image
     # does not include netcat or a dovecot-side probe binary.
 
+  oauth-mock:
+    image: ghcr.io/navikt/mock-oauth2-server:2.1.2
+    container_name: imap-mcp-bdd-oauth-mock
+    ports:
+      - "127.0.0.1:19080:8080"
+    volumes:
+      - ../mock-oauth/config:/app/config:ro
+    environment:
+      - JSON_CONFIG_PATH=/app/config/oauth-mock.yaml
+
 volumes:
   imap-a-maildir:
   imap-b-maildir:

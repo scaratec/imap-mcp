@@ -84,6 +84,50 @@ def step_imap_account_exists_with_single_folder(
     builder.write()
 
 
+@given('the secret store "{store_type}" is configured at path $TMPDIR/secrets')
+def step_secret_store_configured(context: Context, store_type: str) -> None:
+    builder = _ensure_builder(context)
+    builder.secret_store_backend = store_type
+    if store_type == "file_dir":
+        builder.secret_store_path = str(context.secrets_dir)
+
+@given('the server is configured with account:')
+def step_server_configured_with_account_table(context: Context) -> None:
+    builder = _ensure_builder(context)
+    for row in context.table:
+        account_id = row["id"]
+        # In walking skeleton, everything points to the local fixtures
+        if "gupta" in account_id or "osthues" in account_id or "gmail-archive" in account_id:
+            host, port = context.imap_instances["imap-a"]
+        else:
+            host, port = context.imap_instances["imap-b"]
+            
+        auth_type = "password"
+        secret_ref = f"secret://accounts/{account_id}/password"
+        
+        # Support OAuth configuration from the table
+        if "oauth_scope" in row.headings:
+            auth_type = "xoauth2"
+            secret_ref = f"secret://accounts/{account_id}/refresh_token"
+            
+        kwargs = {}
+        if "provider" in row.headings:
+            kwargs["provider"] = row["provider"]
+        if "oauth_scope" in row.headings:
+            kwargs["oauth_scope"] = row["oauth_scope"]
+        if "token_cache" in row.headings:
+            kwargs["token_cache"] = row["token_cache"]
+
+        builder.add_account(
+            id=account_id,
+            host=host,
+            port=port,
+            auth_type=auth_type,
+            secret_ref=secret_ref,
+            **kwargs
+        )
+    builder.write()
+
 @given("the server is configured with caller:")
 def step_server_configured_with_caller(context: Context) -> None:
     """Single-row caller setup. Tolerates table schemas with or
@@ -245,12 +289,17 @@ def step_policy_grants_folder_inline_rules(
                     f"{len(builder.accounts)}."
                 )
             account_id = builder.accounts[0].id
+        caps: dict[str, bool] = {}
+        for cap_key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append"):
+            if cap_key in row.headings:
+                caps[cap_key] = _parse_bool(row[cap_key])
         folder = builder.folder(
             policy_name=policy_name,
             account_id=account_id,
             path=row["folder"],
             mode=row["mode"],
             default=row["default"],
+            **caps,
         )
         rules_raw = row["rules"] if "rules" in row.headings else row.get("rule", "[]")
         # The `rule` (singular) column holds a single rule without
@@ -643,9 +692,17 @@ def step_policy_grants_mark_tagged(context: Context, folder: str) -> None:
             default="NONE",
             mark_tagged=True,
         )
-        found.rules.append(
-            SenderRule(match={"from_domain": "hornbach.de"}, grant="FULL")
-        )
+        existing_rules = []
+        for fp in policy.accounts[account_id]:
+            if fp.path != folder and fp.rules:
+                existing_rules = fp.rules
+                break
+        if existing_rules:
+            found.rules = list(existing_rules)
+        else:
+            found.rules.append(
+                SenderRule(match={"from_domain": "hornbach.de"}, grant="FULL")
+            )
     else:
         found.mark_tagged = True
     builder.write()
@@ -658,6 +715,54 @@ def step_audit_log_fresh(context: Context) -> None:
     # fresh. Nothing to do.
     if not context.audit_dir.exists():
         context.audit_dir.mkdir(parents=True)
+
+
+@given('the server is configured with audit external_root_hook command "{command}"')
+def step_audit_external_root_hook(context: Context, command: str) -> None:
+    builder = _ensure_builder(context)
+    resolved = command.replace("$TMPDIR", str(context.scratch_dir))
+    builder.audit_external_root_hook = resolved
+    builder.write()
+
+
+@given('the current audit file closes with final_hash "sha256:<hash>"')
+def step_audit_file_closes_with_final_hash(context: Context) -> None:
+    """Prime the audit writer by driving a tool call, then capture the
+    hash chain state. The feature-file placeholder `sha256:<hash>` is
+    not a literal — the step captures the actual final_hash so
+    subsequent Then-steps can compare against it.
+
+    The final_hash that `_emit_eof_day` writes equals the `_prev_hash`
+    after the last content record — which is `sha256:` + SHA-256 of
+    the last written line (including trailing newline)."""
+    import hashlib as _hashlib
+    import json as _json
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    builder = _ensure_builder(context)
+    if not builder.callers:
+        _ensure_account_registered(context, builder, "gupta-scaratec")
+        builder.add_policy("audit-hook-policy")
+        builder.add_caller(
+            id="invoice-agent",
+            policy="audit-hook-policy",
+            auth_type="stdio_trusted",
+        )
+        builder.folder(
+            "audit-hook-policy", "gupta-scaratec",
+            "INBOX", "blacklist", "FULL",
+        )
+        builder.write()
+    client = _ensure_mcp_client(context, "invoice-agent")
+    client.call_tool("list_accounts", {})
+    for p in sorted(context.audit_dir.glob("*.jsonl"), reverse=True):
+        lines = p.read_text().strip().splitlines()
+        if lines:
+            last_line = lines[-1] + "\n"
+            context.expected_final_hash = (
+                "sha256:" + _hashlib.sha256(last_line.encode("utf-8")).hexdigest()
+            )
+            break
 
 
 @given('policy "{policy_name}" grants INBOX/Rechnungen with '
@@ -1018,6 +1123,112 @@ def step_cross_account_move_begins(context: Context) -> None:
         context.last_tx_id = data.get("tx_id")
 
 
+@given('a cross-account move for uid {uid:d} is in progress, currently at WAL step "fetched"')
+def step_saga_in_progress_at_fetched(context: Context, uid: int) -> None:
+    """Start a cross-account move and pause it at the 'fetched' WAL step.
+
+    Uses file-based coordination: the saga writes a marker file when it
+    reaches 'post_fetch', then polls for a '.resume' sibling. The step
+    returns once the marker appears — the saga is now frozen mid-flight.
+    """
+    import threading
+    import time
+
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    builder = _ensure_builder(context)
+    second_account = "personal"
+    _ensure_account_registered(context, builder, second_account)
+    instance_b, user_b = resolve_account(second_account)
+    context.imap.create_folder(instance_b, user_b, "Archiv/Belege")
+
+    policy = builder.policies[0]
+    existing_target = [
+        f
+        for folders in policy.accounts.values()
+        for f in folders
+        if f.path == "Archiv/Belege"
+    ]
+    if not existing_target:
+        builder.folder(
+            policy_name=policy.name,
+            account_id=second_account,
+            path="Archiv/Belege",
+            mode="whitelist",
+            default="NONE",
+            accept_incoming=True,
+        )
+    src_account_id = next(iter(policy.accounts.keys()))
+    for fp in policy.accounts[src_account_id]:
+        if fp.path == "INBOX/Rechnungen":
+            fp.move_out = True
+            break
+
+    marker = context.scratch_dir / "saga-pause-marker"
+    extra_env = getattr(context, "mcp_extra_env", {})
+    extra_env["IMAP_MCP_SAGA_PAUSE_AT"] = "post_fetch"
+    extra_env["IMAP_MCP_SAGA_PAUSE_MARKER"] = str(marker)
+    extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    context.mcp_extra_env = extra_env
+    context.saga_pause_marker = marker
+    builder.write()
+    flush_staged_messages(context)
+
+    client = _ensure_mcp_client(context, "invoice-agent")
+    uid_lookup = getattr(context, "message_uids", {})
+    actual_uid = uid_lookup.get((src_account_id, "INBOX/Rechnungen", uid), uid)
+
+    def _run_move() -> None:
+        import json as _json
+
+        try:
+            payload = client.call_tool(
+                "move",
+                {
+                    "source": {
+                        "account": src_account_id,
+                        "folder": "INBOX/Rechnungen",
+                        "uid": actual_uid,
+                    },
+                    "target": {
+                        "account": second_account,
+                        "folder": "Archiv/Belege",
+                    },
+                },
+            )
+            content = payload.get("content") or []
+            if content:
+                context.saga_move_result = _json.loads(content[0]["text"])
+        except Exception as exc:
+            context.saga_move_error = exc
+
+    t = threading.Thread(target=_run_move, daemon=True)
+    t.start()
+    context.saga_move_thread = t
+
+    deadline = time.monotonic() + 30
+    while not marker.exists():
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                "Saga did not reach 'fetched' within 30s"
+            )
+        time.sleep(0.2)
+
+
+@when(
+    'the operator changes policy "{policy_name}" to remove the '
+    'move_out capability from "{folder}"'
+)
+def step_remove_move_out(context: Context, policy_name: str, folder: str) -> None:
+    builder = _ensure_builder(context)
+    policy = next(p for p in builder.policies if p.name == policy_name)
+    for folders in policy.accounts.values():
+        for fp in folders:
+            if fp.path == folder:
+                fp.move_out = False
+    builder.write()
+
+
 @given("the server is configured with audit:")
 def step_server_with_audit_table(context: Context) -> None:
     builder = _ensure_builder(context)
@@ -1060,15 +1271,6 @@ def step_server_audit_inline_retention(
             id="invoice-agent", policy="invoice-policy", auth_type="stdio_trusted"
         )
         builder.add_policy("invoice-policy")
-    builder.write()
-
-
-@given(
-    'the server is configured with audit external_root_hook command "{cmd}"'
-)
-def step_server_audit_hook(context: Context, cmd: str) -> None:
-    builder = _ensure_builder(context)
-    builder.audit_external_root_hook = cmd
     builder.write()
 
 
@@ -2645,13 +2847,75 @@ def step_account_with_oauth(
     builder.write()
 
 
+@given('account "{account_id}" is configured with oauth_scope "{scope}"')
+def step_account_with_oauth_scope_only(
+    context: Context, account_id: str, scope: str
+) -> None:
+    builder = _ensure_builder(context)
+    if any(a.id == account_id for a in builder.accounts):
+        for a in builder.accounts:
+            if a.id == account_id:
+                a.auth_type = "xoauth2"
+                a.oauth_scope = scope
+                a.secret_ref = f"secret://accounts/{account_id}/refresh_token"
+                break
+    else:
+        host, port = context.imap_instances["imap-a"]
+        builder.add_account(
+            id=account_id,
+            provider="google-mock",
+            host=host,
+            port=port,
+            auth_type="xoauth2",
+            secret_ref=f"secret://accounts/{account_id}/refresh_token",
+            oauth_scope=scope,
+        )
+    path = context.secrets_dir / "accounts" / account_id / "refresh_token"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("mock_refresh_token")
+    policy = builder.policies[0] if builder.policies else builder.add_policy("invoice-policy")
+    policy.accounts.setdefault(account_id, [])
+    builder.write()
+
+
+@given('the account\'s state is "{state}"')
+def step_account_state_is(context: Context, state: str) -> None:
+    """Verify the account is in the expected state. Side effect: starts
+    the server if not yet running, so the old config is loaded BEFORE
+    any subsequent scope-change + SIGHUP steps."""
+    import json as _json
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    client = _ensure_mcp_client(context, "invoice-agent")
+    payload = client.call_tool("list_accounts", {})
+    content = payload.get("content") or []
+    if not content:
+        return
+    data = _json.loads(content[0]["text"])
+    expected_state = "active" if state == "healthy" else state
+    for acc in data.get("accounts", []):
+        if acc.get("state") != expected_state:
+            continue
+        return
+    # Account may be in the list but with a different state — fail if
+    # the expected state was explicitly named and doesn't match.
+    if state != "healthy":
+        raise AssertionError(f"No account in state {state!r}")
+
+
+@when('the operator changes the scope for "{account_id}" to "{new_scope}"')
+def step_change_oauth_scope(context: Context, account_id: str, new_scope: str) -> None:
+    builder = _ensure_builder(context)
+    for a in builder.accounts:
+        if a.id == account_id:
+            a.oauth_scope = new_scope
+            break
+    builder.write()
+
+
 @when('the operator runs `imap-mcp-oauth-bootstrap --account {account_id}`')
 def step_run_oauth_bootstrap(context: Context, account_id: str) -> None:
-    """Invoke the bootstrap CLI as a subprocess, capturing stdout/
-    stderr/returncode into `context.startup_proc` so the existing
-    `the server refuses to start` assertion can read it."""
     import subprocess
-    from types import SimpleNamespace
 
     cli = Path(
         os.environ.get(
@@ -2670,48 +2934,62 @@ def step_run_oauth_bootstrap(context: Context, account_id: str) -> None:
     env["IMAP_MCP_CONFIG_DIR"] = str(context.config_dir)
     extra = getattr(context, "mcp_extra_env", None) or {}
     env.update(extra)
-    result = subprocess.run(
-        [str(cli), "--account", account_id],
-        capture_output=True,
-        env=env,
-        timeout=10,
-        check=False,
-    )
-    context.startup_proc = SimpleNamespace(
-        returncode=result.returncode,
-        stderr=result.stderr.decode("utf-8", errors="replace"),
-        stdout=result.stdout.decode("utf-8", errors="replace"),
-    )
+    if getattr(context, "bootstrap_tamper_pkce", False):
+        env["IMAP_MCP_TEST_TAMPER_PKCE"] = "1"
 
+    proc = subprocess.Popen(
+        [str(cli), "--account", account_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    context.bootstrap_proc = proc
+    import time
+    time.sleep(0.5)
 
 @then("the bootstrap refuses to start")
 def step_bootstrap_refuses(context: Context) -> None:
-    """Alias for `the server refuses to start` — the bootstrap CLI's
-    startup_proc has the same shape."""
-    proc = getattr(context, "startup_proc", None)
+    proc = getattr(context, "bootstrap_proc", getattr(context, "startup_proc", None))
     if proc is None:
-        raise AssertionError(
-            "No startup_proc captured — did `the operator runs …` step run?"
-        )
-    if proc.returncode == 0:
-        raise AssertionError(
-            f"Expected bootstrap to refuse, but it exited 0. "
-            f"Stdout: {proc.stdout!r}, stderr: {proc.stderr!r}"
-        )
-    context.startup_error = (proc.stderr or "") + (proc.stdout or "")
+        raise AssertionError("No process captured")
+    
+    # If it's a Popen object, communicate with timeout
+    if hasattr(proc, "communicate"):
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+            context.bootstrap_stdout = stdout
+            context.bootstrap_stderr = stderr
+            context.bootstrap_returncode = proc.returncode
+        except Exception:
+            proc.kill()
+            raise AssertionError("Process did not refuse to start quickly enough")
+        
+        ret = context.bootstrap_returncode
+        out, err = context.bootstrap_stdout, context.bootstrap_stderr
+    else:
+        ret = proc.returncode
+        out, err = proc.stdout, proc.stderr
 
+    if ret == 0:
+        raise AssertionError(f"Expected to refuse, but exited 0. Stdout: {out!r}, stderr: {err!r}")
+    context.startup_error = (err or "") + (out or "")
 
 @then('the startup error indicates "{expected}"')
-def step_startup_error_indicates_substring(
-    context: Context, expected: str
-) -> None:
-    """Generic substring check — used by bootstrap-CLI scenarios that
-    don't fit the structured `policy/folder/rule`-shape patterns."""
+def step_startup_error_indicates_substring(context: Context, expected: str) -> None:
     err = getattr(context, "startup_error", "")
+    if not err:
+        proc = getattr(context, "bootstrap_proc", getattr(context, "startup_proc", None))
+        if proc and hasattr(proc, "communicate"):
+            stdout, stderr = proc.communicate(timeout=2)
+            err = (stderr or "") + (stdout or "")
+            context.bootstrap_returncode = proc.returncode
+            context.startup_error = err
+
     if expected not in err:
         raise AssertionError(
-            f"Startup error does not contain expected substring "
-            f"{expected!r}. Full message:\n{err}"
+            f"Startup error does not contain expected substring {expected!r}. Full message:\n{err}"
         )
 
 

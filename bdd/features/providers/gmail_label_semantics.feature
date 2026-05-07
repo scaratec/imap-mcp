@@ -1,4 +1,3 @@
-@pending @pending_LIM_0002
 Feature: Gmail label semantics
 
   Accounts declared with provider: google get explicit
@@ -27,23 +26,23 @@ Feature: Gmail label semantics
       | [Gmail]/All Mail     |
       | [Gmail]/Drafts       |
       | [Gmail]/Trash        |
-    And the IMAP account "dovecot-srv" exists with provider "imap-standard" and folder "Archiv"
+    And the IMAP account "archive-srv" exists with provider "imap-standard" and folder "Archiv"
     And the server is configured with caller "invoice-agent" using policy "invoice-policy"
     And policy "invoice-policy" grants account access:
       | account        |
       | scaratec-gmail |
-      | dovecot-srv    |
+      | archive-srv    |
     And policy "invoice-policy" grants folder:
       | account        | folder        | mode      | default | move_out | accept_incoming | rules                                        |
       | scaratec-gmail | INBOX         | whitelist | NONE    | true     | false           | [{from_domain=hornbach.de -> FULL}]          |
       | scaratec-gmail | Rechnungen    | whitelist | NONE    | true     | true            | [{from_domain=hornbach.de -> FULL}]          |
       | scaratec-gmail | Hornbach      | whitelist | NONE    | false    | true            | [{from_domain=hornbach.de -> FULL}]          |
-      | dovecot-srv    | Archiv        | whitelist | NONE    | false    | true            | []                                           |
+      | archive-srv    | Archiv        | whitelist | NONE    | false    | true            | []                                           |
 
   Scenario: describe_policy flags a Google account with semantics gmail-labels
     When invoice-agent calls describe_policy
     Then the accounts entry for "scaratec-gmail" contains field semantics with value "gmail-labels"
-    And the accounts entry for "dovecot-srv" contains field semantics with value "imap-standard"
+    And the accounts entry for "archive-srv" contains field semantics with value "imap-standard"
 
   Scenario: A message with multiple labels appears once per label in search but carries a stable canonical_all_mail_uid
     Given the Gmail account has a single message with:
@@ -71,12 +70,12 @@ Feature: Gmail label semantics
 
   Scenario: list_labels is available only for Google accounts
     When invoice-agent calls list_labels with account "scaratec-gmail"
-    Then the response field labels contains at least:
+    Then the labels response includes at least:
       | label      |
       | INBOX      |
       | Rechnungen |
       | Hornbach   |
-    When invoice-agent calls list_labels with account "dovecot-srv"
+    When invoice-agent calls list_labels with account "archive-srv"
     Then the response decision is DENY
     And the response field reason equals "tool_not_applicable_for_provider"
 
@@ -85,10 +84,10 @@ Feature: Gmail label semantics
       | x_gm_msgid | message_id             | from                  | subject      |
       | 10003      | <m-10003@gmail.com>    | rechnung@hornbach.de  | Rechnung Y   |
     And the message has UID 510 under "Rechnungen", UID 10003 under "[Gmail]/All Mail"
-    When invoice-agent calls move with source {"account":"scaratec-gmail","folder":"Rechnungen","uid":510}, target {"account":"dovecot-srv","folder":"Archiv"}
+    When invoice-agent calls move with source {"account":"scaratec-gmail","folder":"Rechnungen","uid":510}, target {"account":"archive-srv","folder":"Archiv"}
     Then the saga's FETCH step retrieves RFC822 bytes from "scaratec-gmail:[Gmail]/All Mail" uid 10003, not from "scaratec-gmail:Rechnungen" uid 510
     And the transaction reaches state committed within 60 seconds
-    And a direct IMAP SEARCH on "dovecot-srv:Archiv" for message-id "<m-10003@gmail.com>" returns exactly one result
+    And a direct IMAP SEARCH on "archive-srv:Archiv" for message-id "<m-10003@gmail.com>" returns exactly one result
     And a direct IMAP SEARCH on "scaratec-gmail:Rechnungen" for X-GM-MSGID 10003 returns zero results
 
   Scenario: [Gmail]/Trash is an ordinary policy-addressable folder — default-deny still applies

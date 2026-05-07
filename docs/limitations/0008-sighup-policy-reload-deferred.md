@@ -1,6 +1,6 @@
 # LIM 0008: SIGHUP policy reload deferred
 
-- **Status:** Mitigated
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
@@ -8,7 +8,13 @@
   + `_reload_configuration` with atomic `_LiveState` swap. 5 of 7
   scenarios in `policy_reload.feature` now pass; remaining 2 are
   re-tagged: OAuth-scope-change → `@pending_LIM_0003`, in-flight saga
-  capability change → `@pending_LIM_0008` (still here, see below).
+  capability change → `@pending_LIM_0008`.
+- **Date resolved:** 2026-05-06 — `_maybe_pause()` test-only saga
+  pause mechanism (file-based coordination, ADR-0023). In-flight saga
+  scenario now green: move paused at 'fetched', SIGHUP swaps policy,
+  saga resumes and commits under original capabilities, new move
+  denied with `capability_missing`. 6 of 7 scenarios green; remaining
+  1 (OAuth-scope-change) depends on LIM-0003.
 - **Proposed by:** claude (imap-mcp BDD phase E)
 - **Approved by:** Randy N. Gupta
 - **Related ADRs:** [ADR-0014](../adr/0014-policy-reload.md)

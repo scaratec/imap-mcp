@@ -48,6 +48,10 @@ from .imap_core import (
     fetch_envelope as imap_fetch_envelope,
     fetch_full_message as imap_fetch_full_message,
     folder_stats as imap_folder_stats,
+    gmail_fetch_msgid as imap_gmail_fetch_msgid,
+    gmail_label_swap as imap_gmail_label_swap,
+    gmail_list_labels as imap_gmail_list_labels,
+    gmail_search_by_msgid as imap_gmail_search_by_msgid,
     list_folders as imap_list_folders,
     move_message as imap_move_message,
     search_uids as imap_search_uids,
@@ -79,6 +83,7 @@ class _LiveState:
 
     pdp: PolicyDecisionPoint
     configuration: "object"  # Configuration; intentionally untyped here
+    oauth_manager: "object | None" = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,12 @@ class ServerContext:
     def configuration(self):  # type: ignore[no-untyped-def]
         """Live configuration. Replaced atomically by SIGHUP reload."""
         return self._live.configuration
+
+    @property
+    def oauth_manager(self):  # type: ignore[no-untyped-def]
+        if self._live.oauth_manager is None:
+            raise RuntimeError("OAuthManager not initialized")
+        return self._live.oauth_manager
 
     def account_by_id(self, account_id: str) -> "object | None":
         from .config import Configuration
@@ -373,6 +384,23 @@ def build_server(context: ServerContext) -> Server:
                     "additionalProperties": False,
                 },
             ),
+            Tool(
+                name="list_labels",
+                description=(
+                    "List Gmail labels for a Google account. Returns "
+                    "label names, flags, and hierarchy separators. "
+                    "Only applicable for google/google-mock providers; "
+                    "returns DENY for non-Google accounts."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "account": {"type": "string"},
+                    },
+                    "required": ["account"],
+                    "additionalProperties": False,
+                },
+            ),
         ]
 
     known_tools = (
@@ -436,6 +464,8 @@ def build_server(context: ServerContext) -> Server:
             return _handle_list_accounts(context, arguments)
         if name == "list_folders":
             return await _handle_list_folders(context, arguments)
+        if name == "list_labels":
+            return await _handle_list_labels(context, arguments)
         if name == "fetch_envelope":
             return await _handle_fetch_envelope(context, arguments)
         if name == "search":
@@ -586,8 +616,15 @@ def _handle_list_accounts(
 ) -> dict[str, Any]:
     _ = arguments
     visibility = context.pdp.visible_accounts_for(context.caller_id)
+    accounts = []
+    for aid in visibility.visible_account_ids:
+        state = "active"
+        if getattr(context.oauth_manager, "_needs_rebootstrap", {}).get(aid):
+            state = "needs_rebootstrap"
+        accounts.append({"id": aid, "state": state})
+        
     return {
-        "accounts": list(visibility.visible_account_ids),
+        "accounts": accounts,
         "hidden_accounts_count": int(visibility.hidden_account_count),
     }
 
@@ -614,7 +651,12 @@ async def _known_folders_for(
             "the Walking-Skeleton fixture must set auth.type=password "
             "and a secret_ref."
         )
-    password = context.secret_store.get(account_model.auth.password_secret_ref())
+        
+    if account_model.auth.type == "xoauth2":
+        password = await context.oauth_manager.get_access_token(account_model)
+    else:
+        password = context.secret_store.get(account_model.auth.password_secret_ref())
+        
     if password is None:
         raise RuntimeError(
             f"Secret store could not resolve {account_model.auth.secret_ref!r} "
@@ -641,11 +683,50 @@ async def _handle_list_folders(
             "folders": [],
             "hidden_folders_count": 0,
         }
+    if getattr(context.oauth_manager, "_needs_rebootstrap", {}).get(account_id):
+        return {
+            "decision": "DENY",
+            "reason": "needs_rebootstrap",
+            "account": account_id,
+        }
     known = await _known_folders_for(context, account_id)
     visibility = context.pdp.visible_folders_for(context.caller_id, account_id, known)
     return {
         "folders": list(visibility.visible_folder_paths),
         "hidden_folders_count": int(visibility.hidden_folder_count),
+    }
+
+
+def _is_google_provider(account: Any) -> bool:
+    """True when the account uses Google/Gmail IMAP semantics."""
+    return getattr(account, "provider", "imap-standard") in ("google", "google-mock")
+
+
+async def _handle_list_labels(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    account_id = str(arguments["account"])
+    # Provider gate: list_labels is only meaningful for Google accounts.
+    account = context.account_by_id(account_id)
+    if account is None or not _is_google_provider(account):
+        return {
+            "decision": "DENY",
+            "reason": "tool_not_applicable_for_provider",
+            "account": account_id,
+        }
+    visible = context.pdp.visible_accounts_for(context.caller_id)
+    if account_id not in visible.visible_account_ids:
+        return {
+            "decision": "DENY",
+            "reason": "account_hidden",
+            "account": account_id,
+        }
+    account_model, password = await _password_for(context, account_id)
+    labels = await imap_gmail_list_labels(account_model, password)
+    return {
+        "decision": "ALLOW",
+        "account": account_id,
+        "labels": labels,
     }
 
 
@@ -658,9 +739,14 @@ async def _password_for(context: ServerContext, account_id: str) -> tuple[Any, s
         raise RuntimeError(
             f"Account {account_id!r} has no auth configuration"
         )
-    password = context.secret_store.get(
-        account.auth.password_secret_ref()  # type: ignore[attr-defined]
-    )
+        
+    if account.auth.type == "xoauth2":  # type: ignore[attr-defined]
+        password = await context.oauth_manager.get_access_token(account)
+    else:
+        password = context.secret_store.get(
+            account.auth.password_secret_ref()  # type: ignore[attr-defined]
+        )
+        
     if password is None:
         raise RuntimeError(f"Password not resolvable for {account_id!r}")
     return account, password
@@ -1068,6 +1154,7 @@ TOOL_SET_VERSION = "1.0.0"
 READ_TOOL_MIN_VIS = {
     "list_accounts": None,
     "list_folders": "COUNT",
+    "list_labels": "COUNT",
     "folder_stats": "COUNT",
     "search": "METADATA",
     "fetch_envelope": "ENVELOPE",
@@ -1207,7 +1294,7 @@ async def _handle_describe_policy(
             {
                 "id": account.id,
                 "semantics": "gmail-labels"
-                if account.provider == "google"
+                if account.provider in ("google", "google-mock")
                 else "imap-standard",
                 "token_cache": account.token_cache,
                 "folders_visible": folders_visible,
@@ -1253,6 +1340,21 @@ async def _handle_mark_seen(
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
     seen = bool(arguments["seen"])
+    
+    account = context.account_by_id(account_id)
+    if account and account.auth and account.auth.type == "xoauth2":
+        scope = account.auth.oauth_scope or ""
+        if "readonly" in scope:
+            return {
+                "decision": "DENY",
+                "reason": "oauth_scope_insufficient",
+                "required_scope": "https://mail.google.com/",
+                "granted_scope": scope,
+                "account": account_id,
+                "folder": folder_path,
+                "uid": uid,
+            }
+
     folder_decision = context.pdp.decide_folder_access(
         context.caller_id, account_id, folder_path
     )
@@ -1415,6 +1517,44 @@ async def _handle_move(
         }
     if src_account == dst_account:
         account, password = await _password_for(context, src_account)
+        # Gmail label-swap: for Google accounts, intra-account moves
+        # are implemented as label remove + label add instead of IMAP
+        # MOVE, because Gmail folders are label projections over a
+        # single [Gmail]/All Mail store.
+        account_obj = context.account_by_id(src_account)
+        if account_obj is not None and _is_google_provider(account_obj):
+            from .imap_core import _LABEL_TO_FOLDER  # noqa: F811
+
+            # Build the reverse map: folder -> label
+            _folder_to_label: dict[str, str] = {
+                v: k for k, v in _LABEL_TO_FOLDER.items()
+            }
+            # Custom labels map to themselves
+            src_label = _folder_to_label.get(src_folder, src_folder)
+            dst_label = _folder_to_label.get(dst_folder, dst_folder)
+            try:
+                await imap_gmail_label_swap(
+                    account, password, src_uid, src_label, dst_label
+                )
+            except RuntimeError:
+                return {
+                    "decision": "ALLOW",
+                    "result": "ERROR",
+                    "error_type": "uid_not_found",
+                    "account": src_account,
+                    "folder": src_folder,
+                    "uid": src_uid,
+                }
+            return {
+                "decision": "ALLOW",
+                "result": "OK",
+                "mechanism": "gmail_label_swap",
+                "tx_id": None,
+                "account": src_account,
+                "source_folder": src_folder,
+                "target_folder": dst_folder,
+                "uid": src_uid,
+            }
         try:
             mechanism = await imap_move_message(
                 account, password, src_folder, src_uid, dst_folder
@@ -1678,7 +1818,31 @@ async def _handle_search(
             visible_uids.append(candidate_uid)
     filtered_out = matched_total - len(visible_uids)
     _ = criteria_raw  # criteria parsing (ADR 0004) lands with its own scenarios
-    return {
+
+    # Gmail enrichment: for Google accounts, fetch X-GM-MSGID for each
+    # visible UID and look up the canonical UID in [Gmail]/All Mail.
+    results_with_gmail: list[dict[str, Any]] | None = None
+    account_obj = context.account_by_id(account_id)
+    if account_obj is not None and _is_google_provider(account_obj) and visible_uids:
+        results_with_gmail = []
+        for vuid in visible_uids:
+            entry: dict[str, Any] = {"uid": vuid}
+            try:
+                gm_msgid = await imap_gmail_fetch_msgid(
+                    account, password, folder_path, vuid
+                )
+                if gm_msgid is not None:
+                    entry["gm_msgid"] = gm_msgid
+                    all_mail_hits = await imap_gmail_search_by_msgid(
+                        account, password, "[Gmail]/All Mail", gm_msgid
+                    )
+                    if all_mail_hits:
+                        entry["canonical_all_mail_uid"] = all_mail_hits[0]
+            except Exception:
+                pass
+            results_with_gmail.append(entry)
+
+    result: dict[str, Any] = {
         "decision": "ALLOW",
         "reason": "rule_matched" if visible_uids else "folder_default_applied",
         "account": account_id,
@@ -1688,6 +1852,9 @@ async def _handle_search(
         "matched_visible": len(visible_uids),
         "filtered_out": filtered_out,
     }
+    if results_with_gmail is not None:
+        result["gmail_results"] = results_with_gmail
+    return result
 
 
 def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerContext, "Configuration"]:
@@ -1731,7 +1898,11 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
         saga_mgr = SagaManager(
             wal=wal, audit_emitter=audit_writer, retry_limit=retry_limit
         )
-    live = _LiveState(pdp=pdp, configuration=configuration)
+        
+    from .auth.oauth_manager import OAuthManager
+    oauth_manager = OAuthManager(configuration, secret_store)
+    
+    live = _LiveState(pdp=pdp, configuration=configuration, oauth_manager=oauth_manager)
     context = ServerContext(
         default_caller_id=default_caller_id,
         _live=live,
@@ -1787,6 +1958,30 @@ def _reload_configuration(
     # of one method call. ADR 0014 declares that acceptable.
     context._live.pdp = new_pdp
     context._live.configuration = new_config
+
+    # Detect oauth_scope changes → needs_rebootstrap (ADR 0014).
+    old_scopes = {
+        a.id: (a.auth.oauth_scope if a.auth else None)
+        for a in old_config.accounts_file.accounts
+    }
+    for new_acct in new_config.accounts_file.accounts:
+        new_scope = new_acct.auth.oauth_scope if new_acct.auth else None
+        old_scope = old_scopes.get(new_acct.id)
+        if old_scope is not None and new_scope != old_scope:
+            rebootstrap = getattr(context.oauth_manager, "_needs_rebootstrap", None)
+            if rebootstrap is None:
+                context.oauth_manager._needs_rebootstrap = {}
+                rebootstrap = context.oauth_manager._needs_rebootstrap
+            rebootstrap[new_acct.id] = True
+            if audit is not None:
+                audit.write({
+                    "caller_id": context.caller_id,
+                    "tool": "policy_reload",
+                    "decision": "ALLOW",
+                    "reason": "reload_applied",
+                    "result": "OK",
+                    "detail": f"oauth_scope changed; rebootstrap required for {new_acct.id}",
+                })
 
     # Pool-drain audit per removed account (no actual pool today;
     # ADR 0013's pool will hook in here when its scenarios activate).
@@ -1845,6 +2040,8 @@ async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
     context, configuration = _build_context(
         config_dir, default_caller_id=caller_id or "<no-caller>"
     )
+    
+    import sys
     auth_failure_reason: str | None = None
     if not caller_id:
         auth_failure_reason = "no_caller_identity"

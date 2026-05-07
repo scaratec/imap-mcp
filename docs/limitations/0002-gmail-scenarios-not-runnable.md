@@ -1,9 +1,14 @@
 # LIM 0002: Gmail scenarios not runnable against current fixture
 
-- **Status:** Accepted
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
+- **Date resolved:** 2026-05-07 — In-process Gmail IMAP mock
+  (`bdd/mock-gmail/`) mit X-GM-EXT-1 Extensions, validiert gegen
+  echte Gmail-Traces. Server-Gmail-Handler: `list_labels`,
+  `canonical_all_mail_uid` in search, label-swap move, cross-account
+  [Gmail]/All Mail fetch. Alle 6 Szenarien grün.
 - **Proposed by:** Claude (implementation agent)
 - **Approved by:** Randy Nel Gupta
 - **Related ADRs:** [ADR-0019](../adr/0019-gmail-label-semantics.md)

@@ -1,0 +1,1 @@
+bdd/mock-gmail/credentials/*.secret filter=git-crypt diff=git-crypt

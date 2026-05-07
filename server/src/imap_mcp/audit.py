@@ -21,6 +21,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -29,6 +30,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 
 FORBIDDEN_FIELDS = frozenset(
@@ -215,6 +218,7 @@ class AuditWriter:
         if missing_name in self._missing_file_reported:
             return
         self._missing_file_reported.add(missing_name)
+        _log.critical("Active audit file disappeared: %s", missing_name)
         # Recreate the file (as if from scratch) and mark the missing event.
         self._current_path.touch()
         try:

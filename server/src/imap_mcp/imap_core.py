@@ -90,10 +90,22 @@ async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
     return imap
 
 
+async def _authenticate_imap(imap: IMAP4, account: Account, password: str) -> None:
+    user = _imap_user_for(account)
+    if account.auth and account.auth.type == "xoauth2":
+        try:
+            await imap.xoauth2(user, password)
+        except Exception as e:
+            raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}")
+    else:
+        await imap.login(user, password)
+
+
 async def list_folders(account: Account, password: str) -> list[str]:
     """Connect, authenticate, LIST, logout. Return folder paths."""
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
+        
     try:
         status, response = await imap.list('""', "*")
         if status != "OK":
@@ -145,7 +157,7 @@ async def fetch_envelope(
     from email.utils import getaddresses, parsedate_to_datetime
 
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await imap.select(folder)
         if status != "OK":
@@ -217,7 +229,7 @@ async def fetch_full_message(
 ) -> "bytes | None":
     """Return the raw RFC822 bytes for a UID."""
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await imap.select(folder)
         if status != "OK":
@@ -237,7 +249,7 @@ async def fetch_body(
     import email
 
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await imap.select(folder)
         if status != "OK":
@@ -290,7 +302,7 @@ async def folder_stats(
 ) -> tuple[int, list[int]] | None:
     """Return (exists, uid_list) for a folder."""
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, data = await imap.select(folder)
         if status != "OK":
@@ -317,7 +329,7 @@ async def store_flag(
     add: bool,
 ) -> bool:
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await imap.select(folder)
         if status != "OK":
@@ -339,7 +351,7 @@ async def store_keywords(
     mode: str,
 ) -> bool:
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await imap.select(folder)
         if status != "OK":
@@ -394,7 +406,7 @@ async def move_message(
 ) -> str:
     """Intra-account move via RFC 6851 MOVE. Returns 'native_move' or 'copy_store_expunge'."""
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         # Confirm target exists before attempting the move; otherwise
         # distinguishing uid_not_found from target_folder_missing after
@@ -459,7 +471,7 @@ async def copy_message(
     target_folder: str,
 ) -> bool:
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await imap.select(folder)
         if status != "OK":
@@ -481,7 +493,7 @@ async def append_message(
 
     timeout = _append_timeout()
     imap = await _open_imap(account, timeout=timeout)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await asyncio.wait_for(
             imap.append(
@@ -504,7 +516,7 @@ async def search_uids(
 ) -> list[int]:
     """Execute a SEARCH in `folder` and return the matching UIDs."""
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await imap.select(folder)
         if status != "OK":
@@ -543,3 +555,209 @@ def _first_header_index(data: bytes) -> int | None:
 
     match = re.search(rb"^[A-Za-z][A-Za-z0-9-]*:", data, flags=re.MULTILINE)
     return match.start() if match else 0
+
+
+# ---------------------------------------------------------- Gmail extensions
+
+
+async def gmail_search_by_msgid(
+    account: Account, password: str, folder: str, gm_msgid: int
+) -> list[int]:
+    """SEARCH X-GM-MSGID <id> in the given folder."""
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return []
+        status, response = await imap.uid_search(f"X-GM-MSGID {gm_msgid}")
+        if status != "OK":
+            return []
+        if not response:
+            return []
+        raw = response[0] if isinstance(response[0], bytes) else b""
+        if not raw:
+            return []
+        return [int(token) for token in raw.split()]
+    finally:
+        await imap.logout()
+
+
+async def gmail_fetch_labels(
+    account: Account, password: str, folder: str, uid: int
+) -> list[str]:
+    """FETCH (X-GM-LABELS) for a single UID."""
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return []
+        status, response = await imap.uid(
+            "fetch", str(uid), "(X-GM-LABELS)"
+        )
+        if status != "OK":
+            return []
+        # Parse X-GM-LABELS (label1 label2 "label with spaces") from response
+        for item in response:
+            if not isinstance(item, (bytes, bytearray)):
+                continue
+            text = bytes(item).decode("utf-8", errors="replace")
+            m = re.search(r"X-GM-LABELS\s+\(([^)]*)\)", text)
+            if m:
+                return _parse_gmail_label_list(m.group(1))
+        return []
+    finally:
+        await imap.logout()
+
+
+async def gmail_fetch_msgid(
+    account: Account, password: str, folder: str, uid: int
+) -> int | None:
+    """FETCH (X-GM-MSGID) for a single UID."""
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return None
+        status, response = await imap.uid(
+            "fetch", str(uid), "(X-GM-MSGID)"
+        )
+        if status != "OK":
+            return None
+        for item in response:
+            if not isinstance(item, (bytes, bytearray)):
+                continue
+            text = bytes(item).decode("utf-8", errors="replace")
+            m = re.search(r"X-GM-MSGID\s+(\d+)", text)
+            if m:
+                return int(m.group(1))
+        return None
+    finally:
+        await imap.logout()
+
+
+async def gmail_label_swap(
+    account: Account,
+    password: str,
+    uid: int,
+    remove_label: str,
+    add_label: str,
+) -> None:
+    """STORE -X-GM-LABELS (remove) then +X-GM-LABELS (add).
+
+    Both operations are performed on the same connection with the
+    source folder selected. The message stays in [Gmail]/All Mail;
+    only its label set changes — which is the Gmail-native way to
+    "move" between virtual folders.
+    """
+    # Select the folder that corresponds to the label being removed so
+    # that the UID is valid in the selected mailbox.
+    folder = _label_to_folder(remove_label)
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            raise RuntimeError(f"cannot SELECT {folder!r}")
+        # Remove the source label
+        status, _ = await imap.uid(
+            "store", str(uid), "-X-GM-LABELS", f"({_quote_gmail_label(remove_label)})"
+        )
+        if status != "OK":
+            raise RuntimeError(f"STORE -X-GM-LABELS failed: {status}")
+        # Add the target label
+        status, _ = await imap.uid(
+            "store", str(uid), "+X-GM-LABELS", f"({_quote_gmail_label(add_label)})"
+        )
+        if status != "OK":
+            raise RuntimeError(f"STORE +X-GM-LABELS failed: {status}")
+    finally:
+        await imap.logout()
+
+
+async def gmail_list_labels(
+    account: Account, password: str
+) -> list[dict]:
+    """LIST all folders and return label info dicts.
+
+    Each dict contains: ``name`` (folder path), ``flags`` (raw IMAP
+    flags string), ``separator`` (hierarchy delimiter).
+    """
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, response = await imap.list('""', "*")
+        if status != "OK":
+            raise RuntimeError(f"IMAP LIST failed: {status} {response!r}")
+        labels: list[dict] = []
+        for raw in response:
+            if isinstance(raw, bytes) is False:
+                continue
+            line = raw.strip()
+            if not line or line.endswith(b"LIST completed") or line == b"Done":
+                continue
+            match = _LIST_LINE.search(line)
+            if not match:
+                continue
+            flags_raw = match.group("flags").decode("utf-8", errors="replace")
+            sep_raw = match.group("sep").decode("utf-8", errors="replace")
+            name_raw = match.group("name").strip()
+            if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
+                name_raw = name_raw[1:-1]
+            name = name_raw.decode("utf-8")
+            labels.append({
+                "name": name,
+                "flags": flags_raw,
+                "separator": sep_raw,
+            })
+        return labels
+    finally:
+        await imap.logout()
+
+
+def _parse_gmail_label_list(raw: str) -> list[str]:
+    """Parse a parenthesised X-GM-LABELS value into a Python list."""
+    labels: list[str] = []
+    i = 0
+    while i < len(raw):
+        if raw[i] == '"':
+            j = raw.index('"', i + 1)
+            labels.append(raw[i + 1 : j])
+            i = j + 1
+        elif raw[i] == ' ':
+            i += 1
+        else:
+            j = raw.find(' ', i)
+            if j == -1:
+                j = len(raw)
+            labels.append(raw[i:j])
+            i = j
+    return labels
+
+
+def _quote_gmail_label(label: str) -> str:
+    """Quote a label for use in an IMAP STORE X-GM-LABELS command."""
+    if label.startswith("\\"):
+        return f'"{label}"'
+    if " " in label or '"' in label:
+        return f'"{label}"'
+    return label
+
+
+# Maps Gmail system labels back to IMAP folder paths.
+_LABEL_TO_FOLDER: dict[str, str] = {
+    "\\Inbox": "INBOX",
+    "\\Sent": "[Gmail]/Sent Mail",
+    "\\Drafts": "[Gmail]/Drafts",
+    "\\Trash": "[Gmail]/Trash",
+    "\\Spam": "[Gmail]/Spam",
+    "\\Starred": "[Gmail]/Starred",
+    "\\Important": "[Gmail]/Important",
+}
+
+
+def _label_to_folder(label: str) -> str:
+    """Map a Gmail label to the corresponding IMAP folder name."""
+    return _LABEL_TO_FOLDER.get(label, label)

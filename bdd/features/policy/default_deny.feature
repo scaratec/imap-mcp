@@ -37,7 +37,7 @@ Feature: Default-deny hierarchical policy
 
   Scenario: An account without AccountPolicy is invisible
     When invoice-agent calls list_accounts
-    Then the response field accounts equals ["gupta-scaratec"]
+    Then the visible account ids equal ["gupta-scaratec"]
     And the response field hidden_accounts_count equals 1
 
   Scenario: A folder without FolderPolicy is invisible within a granted account

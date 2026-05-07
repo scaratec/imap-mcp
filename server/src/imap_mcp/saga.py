@@ -22,15 +22,23 @@ import hashlib
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .config import Account
 from .imap_core import (
     append_message,
     fetch_full_message,
+    gmail_fetch_msgid,
+    gmail_search_by_msgid,
     search_uids,
 )
 from .wal import WAL
+
+
+def _is_google_provider(account: Account) -> bool:
+    """True when the account uses Google/Gmail IMAP semantics."""
+    return getattr(account, "provider", "imap-standard") in ("google", "google-mock")
 
 
 def _maybe_crash(at: str) -> None:
@@ -48,6 +56,26 @@ def _maybe_crash(at: str) -> None:
     except Exception:
         pass
     os._exit(1)
+
+
+async def _maybe_pause(at: str) -> None:
+    """Test-only saga pause (ADR-0023).
+
+    If `IMAP_MCP_SAGA_PAUSE_AT` matches `at`, write the step name to
+    the marker file and poll for a `.resume` sibling. Used by
+    policy_reload.feature to hold a saga mid-flight while SIGHUP swaps
+    the policy.
+    """
+    if os.environ.get("IMAP_MCP_SAGA_PAUSE_AT") != at:
+        return
+    marker = os.environ.get("IMAP_MCP_SAGA_PAUSE_MARKER")
+    if not marker:
+        return
+    Path(marker).write_text(at)
+    resume = Path(marker + ".resume")
+    while not resume.exists():
+        await asyncio.sleep(0.1)
+    resume.unlink(missing_ok=True)
 
 
 @dataclass
@@ -244,10 +272,32 @@ class SagaManager:
         # Skip FETCH/APPEND when resuming from `staged`: the message is
         # already on target; only the DELETE/COMMIT phase remains.
         if resume_from_status == "pending":
+            # Gmail cross-account: resolve the canonical
+            # [Gmail]/All Mail UID via X-GM-MSGID so the FETCH reads
+            # the full message from All Mail (which always has the
+            # complete RFC822 payload regardless of label state).
+            fetch_folder = src_folder
+            fetch_uid = src_uid
+            if _is_google_provider(src_account):
+                try:
+                    gm_msgid = await gmail_fetch_msgid(
+                        src_account, src_password, src_folder, src_uid
+                    )
+                    if gm_msgid is not None:
+                        all_mail_hits = await gmail_search_by_msgid(
+                            src_account, src_password,
+                            "[Gmail]/All Mail", gm_msgid,
+                        )
+                        if all_mail_hits:
+                            fetch_folder = "[Gmail]/All Mail"
+                            fetch_uid = all_mail_hits[0]
+                except Exception:
+                    pass  # fall back to direct fetch from source folder
+
             # FETCH
             try:
                 raw = await fetch_full_message(
-                    src_account, src_password, src_folder, src_uid
+                    src_account, src_password, fetch_folder, fetch_uid
                 )
             except Exception as exc:
                 count = self.wal.bump_retry(tx_id, f"fetch_failed: {exc}")
@@ -275,6 +325,7 @@ class SagaManager:
                 self.wal.record_fallback(tx_id, **fallback)
             self._audit_step(tx_id, "fetched")
             _maybe_crash("post_fetch")
+            await _maybe_pause("post_fetch")
 
             # VERIFY idempotency: is the message already at the target?
             existing = await self._search_target_for_existing(
@@ -539,10 +590,10 @@ async def _delete_source(
     Uses MOVE-to-trash-folder-emulation via STORE \\Deleted + EXPUNGE,
     which is the DELETE component of the saga.
     """
-    from .imap_core import _imap_user_for, _open_imap
+    from .imap_core import _authenticate_imap, _open_imap
 
     imap = await _open_imap(account)
-    await imap.login(_imap_user_for(account), password)
+    await _authenticate_imap(imap, account, password)
     try:
         status, _ = await imap.select(folder)
         if status != "OK":

@@ -61,7 +61,6 @@ Feature: Audit retention and access model
     Then none of the responses contains any field whose value matches a record from the audit file
     And no MCP tool exists with name "get_audit_log"
 
-  @pending @pending_LIM_0009
   Scenario: External root-hash hook is invoked with the final_hash at day roll
     Given the server is configured with audit external_root_hook command "echo %FINAL_HASH% >> $TMPDIR/roots.txt"
     And the current audit file closes with final_hash "sha256:<hash>"
@@ -69,7 +68,6 @@ Feature: Audit retention and access model
     Then the hook command is invoked exactly once
     And "$TMPDIR/roots.txt" contains a line equal to "sha256:<hash>"
 
-  @pending @pending_LIM_0009
   Scenario: An audit file manually removed during runtime is detected and reported
     Given the server is actively writing to "2026-04-21.jsonl"
     When the file "2026-04-21.jsonl" is deleted out-of-band

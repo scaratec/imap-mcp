@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from behave import then
+from behave import then, when
 from behave.runner import Context
 
 
@@ -69,6 +69,18 @@ def step_response_field_equals(context: Context, field: str, expected: str) -> N
     if actual != expected_value:
         raise AssertionError(
             f"Field {field!r}: expected {expected_value!r}, got {actual!r}"
+        )
+
+
+@then("the visible account ids equal {expected}")
+def step_visible_account_ids_equal(context: Context, expected: str) -> None:
+    response = _last_response(context)
+    accounts = response.get("accounts", [])
+    actual = [a["id"] if isinstance(a, dict) else a for a in accounts]
+    expected_value = _parse_expected(expected)
+    if actual != expected_value:
+        raise AssertionError(
+            f"Visible account IDs: expected {expected_value!r}, got {actual!r}"
         )
 
 
@@ -352,12 +364,23 @@ def step_folder_still_contains_uid(
 
 @then('the folder "{folder}" is unchanged')
 def step_folder_is_unchanged(context: Context, folder: str) -> None:
-    # Heuristic: no previous step captured the state; we treat this as
-    # an asserton that the folder exists on IMAP and contains the
-    # same message set it did when the scenario started. Since the
-    # failing paths in question are all DENY-at-PDP (no IMAP write),
-    # the folder is guaranteed unchanged by construction.
-    _ = folder
+    account_id = _account_for_folder(context, folder)
+    from support.imap_fixture import resolve_account
+
+    instance, user = resolve_account(account_id)
+    uids_now = context.imap.folder_uids(instance, user, folder)
+    lookup = getattr(context, "message_uids", {})
+    seeded = [
+        uid for (acct, fld, _hint), uid in lookup.items()
+        if acct == account_id and fld == folder
+    ]
+    if seeded:
+        for uid in seeded:
+            if uid not in uids_now:
+                raise AssertionError(
+                    f"Folder {folder!r} changed: seeded uid {uid} is missing. "
+                    f"Present uids: {uids_now!r}"
+                )
 
 
 @then('the IMAP folder "{folder}" does not contain uid {uid:d}')
@@ -765,6 +788,53 @@ def _assert_no_string_anywhere(obj: Any, needle: str) -> None:
     if needle in text:
         raise AssertionError(
             f"Structure unexpectedly contains string {needle!r}: {text!r}"
+        )
+
+
+@then(
+    'the audit log contains a record with tool "{tool}", '
+    'detail containing "{substring}"'
+)
+def step_audit_record_detail_containing(
+    context: Context, tool: str, substring: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    matches = [
+        rec for rec in reader.find(tool=tool)
+        if substring in str(rec.record.get("detail", ""))
+    ]
+    if not matches:
+        present = [rec.record for rec in reader.find(tool=tool)]
+        raise AssertionError(
+            f"No audit record with tool={tool!r} and detail containing "
+            f"{substring!r}. Records with that tool: {present!r}"
+        )
+    context.last_matching_audit_record = matches[0].record
+
+
+@then(
+    'new IMAP connection attempts to "{account}" are refused '
+    'with reason "{reason}"'
+)
+def step_imap_connection_refused_with_reason(
+    context: Context, account: str, reason: str
+) -> None:
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    client = _ensure_mcp_client(context, "invoice-agent")
+    payload = client.call_tool("list_folders", {"account": account})
+    import json as _json
+    content = payload.get("content") or []
+    if not content:
+        raise AssertionError("list_folders returned no content")
+    data = _json.loads(content[0]["text"])
+    actual_reason = data.get("reason")
+    if actual_reason != reason:
+        raise AssertionError(
+            f"Expected reason {reason!r}, got {actual_reason!r}. "
+            f"Full response: {data!r}"
         )
 
 
@@ -2403,4 +2473,110 @@ def step_audit_log_saga_transition_steps(context: Context) -> None:
         raise AssertionError(
             f"Audit log missing saga_transition steps {missing!r} for tx {tx_id!r}. "
             f"Present: {saga_steps!r}"
+        )
+
+
+@then("the hook command is invoked exactly once")
+def step_hook_invoked_exactly_once(context: Context) -> None:
+    roots = context.scratch_dir / "roots.txt"
+    if not roots.exists():
+        raise AssertionError(
+            f"Hook output file {roots} does not exist — hook was never invoked"
+        )
+    lines = [l for l in roots.read_text().splitlines() if l.strip()]
+    if len(lines) != 1:
+        raise AssertionError(
+            f"Hook invoked {len(lines)} times, expected exactly 1. "
+            f"Lines: {lines!r}"
+        )
+
+
+@then('"$TMPDIR/roots.txt" contains a line equal to "sha256:<hash>"')
+def step_roots_txt_contains_final_hash(context: Context) -> None:
+    roots = context.scratch_dir / "roots.txt"
+    if not roots.exists():
+        raise AssertionError(f"Hook output file {roots} does not exist")
+    lines = [l.strip() for l in roots.read_text().splitlines() if l.strip()]
+    expected = getattr(context, "expected_final_hash", None)
+    if expected is None:
+        raise AssertionError(
+            "No expected_final_hash captured — step ordering bug"
+        )
+    if expected not in lines:
+        raise AssertionError(
+            f"roots.txt does not contain {expected!r}. Lines: {lines!r}"
+        )
+
+
+@then(
+    "the server on the next audit-write attempt logs a critical error "
+    "to its structured log"
+)
+def step_server_logs_critical_on_audit_write(context: Context) -> None:
+    from features.steps.mcp_steps import _ensure_mcp_client
+
+    client = _ensure_mcp_client(context, "invoice-agent")
+    client.call_tool("list_accounts", {})
+    stderr = client.stderr_text if hasattr(client, "stderr_text") else ""
+    if "Active audit file disappeared" not in stderr:
+        raise AssertionError(
+            f"Server stderr does not contain the critical log message. "
+            f"Stderr (last 500 chars): {stderr[-500:]!r}"
+        )
+
+
+@then(
+    'the server emits a record to the next available audit file with '
+    'tool "audit_file_missing" and the expected filename'
+)
+def step_audit_file_missing_record(context: Context) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    matches = reader.find(tool="audit_file_missing")
+    if not matches:
+        all_records = list(reader.records())
+        raise AssertionError(
+            f"No audit_file_missing record found. "
+            f"All records: {[r.record for r in all_records]!r}"
+        )
+    rec = matches[0].record
+    filename = rec.get("filename")
+    if not filename:
+        raise AssertionError(
+            f"audit_file_missing record has no 'filename' field: {rec!r}"
+        )
+
+
+@then(
+    'the in-flight transaction completes under the original '
+    'capabilities and reaches state "committed"'
+)
+def step_inflight_saga_completes(context: Context) -> None:
+    from pathlib import Path as _Path
+
+    marker = getattr(context, "saga_pause_marker", None)
+    if marker is None:
+        raise AssertionError("No saga_pause_marker set — step ordering bug")
+    resume = _Path(str(marker) + ".resume")
+    resume.write_text("resume")
+    thread = getattr(context, "saga_move_thread", None)
+    if thread is not None:
+        thread.join(timeout=60)
+        if thread.is_alive():
+            raise AssertionError("Saga move thread did not complete within 60s")
+    err = getattr(context, "saga_move_error", None)
+    if err is not None:
+        raise AssertionError(f"Saga move call raised: {err}")
+    result = getattr(context, "saga_move_result", None)
+    if result is not None:
+        context.last_response = result
+    from support.wal_reader import WALReader
+    reader = WALReader(context.wal_path)
+    txs = reader.all_transactions()
+    committed = [t for t in txs if t.status == "committed"]
+    if not committed:
+        raise AssertionError(
+            f"No committed transaction in WAL. "
+            f"States: {[(t.tx_id, t.status) for t in txs]!r}"
         )

@@ -1,6 +1,6 @@
 # LIM 0009: Audit day-roll and retention deferred
 
-- **Status:** Mitigated
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-04-21
 - **Date approved:** 2026-04-21
@@ -10,8 +10,11 @@
   `_test_run_audit_rotation` exposed via `IMAP_MCP_TEST_MODE`. Day-
   rotation, file-mode-transitions, retention-deletion, gzip-integrity,
   retention-parameter-overrides und no-MCP-tool-reads-audit Szenarien
-  laufen grün. Verbleibend: external-root-hash-hook (subprocess-Test
-  fragil) und manual-deletion-detection (braucht structured logger).
+  laufen grün.
+- **Date resolved:** 2026-05-06 — external-root-hash-hook und
+  manual-deletion-detection implementiert. Structured logging via
+  `logging.critical()` bei out-of-band-Löschung. Alle 7 Szenarien
+  in `audit_retention.feature` grün.
 - **Proposed by:** claude (imap-mcp BDD phase F)
 - **Approved by:** Randy N. Gupta
 - **Related ADRs:** [ADR-0021](../adr/0021-audit-format.md),
@@ -85,6 +88,23 @@ can be manually verified.
 - The retention parameters are exposed in a configuration surface
   that admins edit (higher likelihood of regression).
 - Phase F of the BDD plan is re-opened.
+
+## Resolution
+
+**Date:** 2026-05-06
+
+The two remaining scenarios are now green:
+
+1. **External root-hash hook** — `_invoke_hook(final_hash)` was already
+   implemented in `AuditWriter`; the BDD step now configures the hook
+   via `PolicyBuilder.audit_external_root_hook`, drives a day roll, and
+   verifies the output file contains the expected `final_hash`.
+
+2. **Manual-deletion detection** — `_detect_missing_active_file()` was
+   already implemented; added `logging.critical()` at detection time so
+   the "logs a critical error to its structured log" Then-step can
+   verify via server stderr. The `audit_file_missing` record is emitted
+   to the recreated file and verified via `AuditReader`.
 
 ## References
 
