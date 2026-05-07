@@ -60,6 +60,7 @@ from .imap_core import (
 from .policy import (
     MessageFacts,
     PolicyDecisionPoint,
+    _match_single_predicate,
     evaluate_message_against_folder,
     level_rank,
 )
@@ -198,6 +199,8 @@ def build_server(context: ServerContext) -> Server:
                         "account": {"type": "string"},
                         "folder": {"type": "string"},
                         "criteria": {"type": "object"},
+                        "limit": {"type": "integer", "minimum": 1, "default": 50},
+                        "offset": {"type": "integer", "minimum": 0, "default": 0},
                     },
                     "required": ["account", "folder"],
                     "additionalProperties": False,
@@ -648,16 +651,31 @@ async def _known_folders_for(context: ServerContext, account_id: str) -> list[st
             f"Secret store could not resolve {account_model.auth.secret_ref!r} "
             f"for account {account_id!r}."
         )
-    return await imap_list_folders(account_model, password)
+    folder_infos = await imap_list_folders(account_model, password)
+    return [fi.path for fi in folder_infos]
+
+
+async def _password_for_account(context: ServerContext, account_id: str) -> tuple[Any, str]:
+    """Resolve account model and password. Raises on missing config."""
+    account = context.account_by_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id!r} not configured")
+    if account.auth is None:
+        raise RuntimeError(f"Account {account_id!r} has no auth configuration")
+    if account.auth.type == "xoauth2":
+        password = await context.oauth_manager.get_access_token(account)
+    else:
+        password = context.secret_store.get(account.auth.password_secret_ref())
+    if password is None:
+        raise RuntimeError(
+            f"Secret store could not resolve {account.auth.secret_ref!r} "
+            f"for account {account_id!r}."
+        )
+    return account, password
 
 
 async def _handle_list_folders(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
-    # When the account isn't in the caller's policy at all (or the
-    # account vanished after a SIGHUP reload), surface a DENY with
-    # `account_hidden` rather than an empty-list ALLOW. The caller
-    # learns "you cannot reach this account" instead of being misled
-    # into thinking the account exists but is empty.
     visible = context.pdp.visible_accounts_for(context.caller_id)
     if account_id not in visible.visible_account_ids:
         return {
@@ -673,10 +691,17 @@ async def _handle_list_folders(context: ServerContext, arguments: dict[str, Any]
             "reason": "needs_rebootstrap",
             "account": account_id,
         }
-    known = await _known_folders_for(context, account_id)
-    visibility = context.pdp.visible_folders_for(context.caller_id, account_id, known)
+    account_model, password = await _password_for_account(context, account_id)
+    folder_infos = await imap_list_folders(account_model, password)
+    all_paths = [fi.path for fi in folder_infos]
+    count_by_path = {fi.path: fi.message_count for fi in folder_infos}
+    visibility = context.pdp.visible_folders_for(context.caller_id, account_id, all_paths)
+    folders_result = [
+        {"path": p, "message_count": count_by_path.get(p, 0)}
+        for p in visibility.visible_folder_paths
+    ]
     return {
-        "folders": list(visibility.visible_folder_paths),
+        "folders": folders_result,
         "hidden_folders_count": int(visibility.hidden_folder_count),
     }
 
@@ -1223,13 +1248,13 @@ async def _handle_describe_policy(
         try:
             from .imap_core import list_folders as _list_folders
 
-            all_folders = await _list_folders(
+            all_folder_infos = await _list_folders(
                 account,
                 context.secret_store.get(account.auth.password_secret_ref() if account.auth else "")
                 or "",
             )
             visible_paths = {fp.path for fp in folder_policies}
-            hidden_folders = len([f for f in all_folders if f not in visible_paths])
+            hidden_folders = len([fi for fi in all_folder_infos if fi.path not in visible_paths])
         except Exception:
             hidden_folders = 0
         visible_accounts.append(
@@ -1672,10 +1697,58 @@ async def _handle_create_draft(context: ServerContext, arguments: dict[str, Any]
     }
 
 
+def _criteria_match(criteria: dict[str, Any], facts: MessageFacts) -> bool:
+    """Post-filter: check all MCP criteria against envelope facts.
+
+    Catches predicates that cannot be expressed as IMAP SEARCH terms
+    (e.g. has_attachment) and refines inexact IMAP matches.
+    """
+    return all(
+        _match_single_predicate(key, value, facts=facts)
+        for key, value in criteria.items()
+    )
+
+
+def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
+    """Translate MCP search criteria dict to an IMAP SEARCH string.
+
+    Empty criteria (after this function returns "ALL") receive a 7-day
+    default scope in the caller — this function only handles explicit
+    predicates.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    parts: list[str] = []
+    for key, value in criteria.items():
+        if key == "from":
+            parts.append(f'FROM "{value}"')
+        elif key == "from_domain":
+            parts.append(f'FROM "@{value}"')
+        elif key == "to":
+            parts.append(f'TO "{value}"')
+        elif key == "to_contains":
+            parts.append(f'TO "{value}"')
+        elif key == "subject_contains":
+            parts.append(f'SUBJECT "{value}"')
+        elif key in ("newer_than", "older_than"):
+            pass
+        elif key == "size_gt":
+            parts.append(f"LARGER {int(value)}")
+        elif key == "size_lt":
+            parts.append(f"SMALLER {int(value)}")
+        elif key == "has_attachment":
+            pass
+    if not parts:
+        return "ALL"
+    return " ".join(parts)
+
+
 async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     criteria_raw = arguments.get("criteria") or {}
+    limit = int(arguments.get("limit") or 50)
+    offset = int(arguments.get("offset") or 0)
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
@@ -1691,10 +1764,6 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
         for rule in folder_decision.folder_policy.rules
         if rule.grant is not None
     ):
-        # Only take this early-out for whitelist folders where no rule
-        # can possibly raise the level to METADATA. A folder whose
-        # default is below METADATA but has rules granting higher is
-        # still entered — per-message filtering decides.
         if folder_decision.folder_policy.mode == "whitelist":
             return {
                 "decision": "DENY",
@@ -1702,8 +1771,16 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
                 "account": account_id,
                 "folder": folder_path,
             }
+
+    imap_criteria = _criteria_to_imap_search(criteria_raw)
+    if imap_criteria == "ALL" and not criteria_raw:
+        from datetime import datetime, timedelta, timezone
+
+        since = datetime.now(timezone.utc) - timedelta(days=7)
+        imap_criteria = f'SINCE {since.strftime("%d-%b-%Y")}'
+
     account, password = await _password_for(context, account_id)
-    all_uids = await imap_search_uids(account, password, folder_path)
+    all_uids = await imap_search_uids(account, password, folder_path, imap_criteria)
     matched_total = len(all_uids)
     visible_uids: list[int] = []
     for candidate_uid in all_uids:
@@ -1711,21 +1788,24 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
         if envelope is None:
             continue
         facts = _facts_from_envelope(envelope)
+        if criteria_raw and not _criteria_match(criteria_raw, facts):
+            continue
         message_decision = evaluate_message_against_folder(
             folder_decision.folder_policy, facts=facts
         )
         if message_decision.allowed and level_rank(message_decision.visibility) >= minimum_for_tool:
             visible_uids.append(candidate_uid)
     filtered_out = matched_total - len(visible_uids)
-    _ = criteria_raw  # criteria parsing (ADR 0004) lands with its own scenarios
 
-    # Gmail enrichment: for Google accounts, fetch X-GM-MSGID for each
-    # visible UID and look up the canonical UID in [Gmail]/All Mail.
+    all_visible = visible_uids
+    page = all_visible[offset : offset + limit]
+    has_more = (offset + limit) < len(all_visible)
+
     results_with_gmail: list[dict[str, Any]] | None = None
     account_obj = context.account_by_id(account_id)
-    if account_obj is not None and _is_google_provider(account_obj) and visible_uids:
+    if account_obj is not None and _is_google_provider(account_obj) and page:
         results_with_gmail = []
-        for vuid in visible_uids:
+        for vuid in page:
             entry: dict[str, Any] = {"uid": vuid}
             try:
                 gm_msgid = await imap_gmail_fetch_msgid(account, password, folder_path, vuid)
@@ -1742,13 +1822,16 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
 
     result: dict[str, Any] = {
         "decision": "ALLOW",
-        "reason": "rule_matched" if visible_uids else "folder_default_applied",
+        "reason": "rule_matched" if all_visible else "folder_default_applied",
         "account": account_id,
         "folder": folder_path,
-        "uids": visible_uids,
+        "uids": page,
         "matched_total": matched_total,
-        "matched_visible": len(visible_uids),
+        "matched_visible": len(all_visible),
         "filtered_out": filtered_out,
+        "page_offset": offset,
+        "page_limit": limit,
+        "has_more": has_more,
     }
     if results_with_gmail is not None:
         result["gmail_results"] = results_with_gmail

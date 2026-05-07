@@ -103,8 +103,16 @@ async def _authenticate_imap(imap: IMAP4, account: Account, password: str) -> No
         await imap.login(user, password)
 
 
-async def list_folders(account: Account, password: str) -> list[str]:
-    """Connect, authenticate, LIST, logout. Return folder paths."""
+@dataclass(frozen=True)
+class FolderInfo:
+    """Folder path with message count from IMAP STATUS."""
+
+    path: str
+    message_count: int
+
+
+async def list_folders(account: Account, password: str) -> list[FolderInfo]:
+    """Connect, authenticate, LIST + STATUS per folder, logout."""
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
 
@@ -124,17 +132,36 @@ async def list_folders(account: Account, password: str) -> list[str]:
                 continue
             flags_raw = match.group("flags").decode("utf-8", errors="replace")
             if "\\Noselect" in flags_raw:
-                # Noselect placeholders never hold messages; a "parent
-                # namespace" exists conceptually but the caller cannot
-                # interact with it.
                 continue
             name_raw = match.group("name").strip()
             if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
                 name_raw = name_raw[1:-1]
             paths.append(name_raw.decode("utf-8"))
-        return paths
+
+        result: list[FolderInfo] = []
+        for folder_path in paths:
+            count = await _folder_message_count(imap, folder_path)
+            result.append(FolderInfo(path=folder_path, message_count=count))
+        return result
     finally:
         await imap.logout()
+
+
+_STATUS_MESSAGES = re.compile(rb"MESSAGES\s+(\d+)")
+
+
+async def _folder_message_count(imap: IMAP4, folder: str) -> int:
+    """Issue IMAP STATUS for a folder and return its MESSAGES count."""
+    quoted = f'"{folder}"'
+    status, response = await imap.status(quoted, "(MESSAGES)")
+    if status != "OK":
+        return 0
+    for part in response:
+        if isinstance(part, bytes):
+            m = _STATUS_MESSAGES.search(part)
+            if m:
+                return int(m.group(1))
+    return 0
 
 
 def _imap_user_for(account: Account) -> str:

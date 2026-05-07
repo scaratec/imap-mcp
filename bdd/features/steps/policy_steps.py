@@ -449,7 +449,10 @@ use_step_matcher("re")
 
 @given(r'the folder "(?P<folder>[^"]+)" holds messages:')
 def step_folder_holds_messages_plural(context: Context, folder: str) -> None:
-    account_id = _find_account_for_folder(context, folder)
+    if ":" in folder:
+        account_id, _, folder = folder.partition(":")
+    else:
+        account_id = _find_account_for_folder(context, folder)
     _seed_message(context, account_id, folder)
 
 

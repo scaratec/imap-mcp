@@ -212,7 +212,11 @@ class IMAPFixture:
             )
 
         raw = msg.as_bytes()
-        internaldate = imaplib.Time2Internaldate(time.time())
+        if date:
+            parsed_date = email.utils.parsedate_to_datetime(date)
+            internaldate = imaplib.Time2Internaldate(parsed_date.timestamp())
+        else:
+            internaldate = imaplib.Time2Internaldate(time.time())
         flag_literal = "(" + " ".join(flags) + ")" if flags else None
 
         conn = self.connect(instance, user)

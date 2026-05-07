@@ -1067,25 +1067,34 @@ def step_caller_calls_search_shortcut(
 
 
 @when(
-    '{caller_id} calls search with account "{account}", folder "{folder}", criteria {criteria_raw}'
+    '{caller_id} calls search with account "{account}", folder "{folder}", criteria {tail}'
 )
 def step_caller_calls_search(
     context: Context,
     caller_id: str,
     account: str,
     folder: str,
-    criteria_raw: str,
+    tail: str,
 ) -> None:
     import json as _json
+    import re as _re
 
-    client = _ensure_mcp_client(context, caller_id)
-    criteria = _json.loads(criteria_raw)
+    limit_m = _re.search(r",\s*limit\s+(\d+)", tail)
+    offset_m = _re.search(r",\s*offset\s+(\d+)", tail)
+    if limit_m:
+        criteria_str = tail[: limit_m.start()]
+    else:
+        criteria_str = tail
+    criteria = _json.loads(criteria_str)
     context.last_call_account = account
     context.last_call_folder = folder
-    payload = client.call_tool(
-        "search",
-        {"account": account, "folder": folder, "criteria": criteria},
-    )
+    args: dict[str, object] = {"account": account, "folder": folder, "criteria": criteria}
+    if limit_m:
+        args["limit"] = int(limit_m.group(1))
+    if offset_m:
+        args["offset"] = int(offset_m.group(1))
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("search", args)
     _store_result(context, payload)
 
 

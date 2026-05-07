@@ -39,6 +39,18 @@ def _last_response(context: Context) -> dict[str, Any]:
     return response
 
 
+def _folder_paths(entries: list[Any]) -> list[str]:
+    """Extract folder path strings from a folders list.
+
+    Handles both the legacy string format ``["INBOX"]`` and the new
+    object format ``[{"path": "INBOX", "message_count": 5}]``.
+    """
+    return [
+        e["path"] if isinstance(e, dict) else e
+        for e in entries
+    ]
+
+
 def _parse_expected(raw: str) -> Any:
     try:
         return json.loads(raw)
@@ -66,6 +78,8 @@ def step_response_field_equals(context: Context, field: str, expected: str) -> N
     # the feature file stays readable.
     if field == "uids" and isinstance(expected_value, list):
         expected_value = _resolve_uid_hints(context, expected_value)
+    if field == "folders" and isinstance(actual, list) and isinstance(expected_value, list):
+        actual = _folder_paths(actual)
     if actual != expected_value:
         raise AssertionError(
             f"Field {field!r}: expected {expected_value!r}, got {actual!r}"
@@ -1143,9 +1157,10 @@ def step_response_field_contains_exactly(
         raise AssertionError(
             f"Field {field!r} is not a list; 'contains exactly' requires a list."
         )
-    if sorted(actual) != sorted(expected_value):
+    comparable = _folder_paths(actual) if field == "folders" else actual
+    if sorted(comparable) != sorted(expected_value):
         raise AssertionError(
-            f"Field {field!r}: expected exactly {expected_value!r}, got {actual!r}"
+            f"Field {field!r}: expected exactly {expected_value!r}, got {comparable!r}"
         )
 
 
@@ -1167,9 +1182,10 @@ def step_response_field_contains(
         if field == "uids" and isinstance(expected_value, int):
             resolved = _resolve_uid_hints(context, [expected_value])
             to_check = resolved[0]
-        if to_check not in actual:
+        searchable = _folder_paths(actual) if field == "folders" else actual
+        if to_check not in searchable:
             raise AssertionError(
-                f"Field {field!r}: {to_check!r} is not in {actual!r}"
+                f"Field {field!r}: {to_check!r} is not in {searchable!r}"
             )
         return
     if isinstance(actual, str) and isinstance(expected_value, str):
@@ -2579,4 +2595,66 @@ def step_inflight_saga_completes(context: Context) -> None:
         raise AssertionError(
             f"No committed transaction in WAL. "
             f"States: {[(t.tx_id, t.status) for t in txs]!r}"
+        )
+
+
+# ------------------------------------------------------------------
+# list_folders message-count assertions
+# ------------------------------------------------------------------
+
+
+@then(
+    'the folder entry "{folder}" has message_count {count:d}'
+)
+def step_folders_entry_with_message_count(
+    context: Context, folder: str, count: int
+) -> None:
+    response = _last_response(context)
+    folders = response.get("folders")
+    if folders is None:
+        raise AssertionError(
+            f"Response has no 'folders' field. "
+            f"Available fields: {sorted(response.keys())}"
+        )
+    for entry in folders:
+        if isinstance(entry, dict) and entry.get("path") == folder:
+            actual = entry.get("message_count")
+            if actual != count:
+                raise AssertionError(
+                    f"Folder {folder!r}: expected message_count={count}, "
+                    f"got {actual!r}"
+                )
+            return
+    names = [
+        e.get("path") if isinstance(e, dict) else e for e in folders
+    ]
+    raise AssertionError(
+        f"No folder entry {folder!r} found in response. "
+        f"Available: {names!r}"
+    )
+
+
+# ------------------------------------------------------------------
+# Generic list-length assertion
+# ------------------------------------------------------------------
+
+
+@then("the response field {field} has length {length:d}")
+def step_response_field_has_length(
+    context: Context, field: str, length: int
+) -> None:
+    response = _last_response(context)
+    if field not in response:
+        raise AssertionError(
+            f"Response has no field {field!r}. "
+            f"Available fields: {sorted(response.keys())}"
+        )
+    actual = response[field]
+    if not isinstance(actual, list):
+        raise AssertionError(
+            f"Field {field!r} is not a list; 'has length' requires a list."
+        )
+    if len(actual) != length:
+        raise AssertionError(
+            f"Field {field!r}: expected length {length}, got {len(actual)}"
         )

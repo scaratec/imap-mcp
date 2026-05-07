@@ -30,7 +30,7 @@ Feature: Sender rule matcher grammar
       | 401 | alice@example.com       | me@gupta-scaratec.com      | Project update            | false          | 1024       | 2026-04-20T09:00:00Z |
       | 402 | bob@hornbach.de         | me@gupta-scaratec.com      | Rechnung 42               | true           | 48000      | 2026-04-15T09:00:00Z |
       | 403 | newsletter@shop.example | friends@gupta-scaratec.com | Grosse Aktion             | false          | 2048       | 2026-01-01T09:00:00Z |
-    When inbox-agent calls search with account "gupta-scaratec", folder "INBOX", criteria {}
+    When inbox-agent calls search with account "gupta-scaratec", folder "INBOX", criteria {"newer_than": "365d"}
     Then the response field uids contains exactly <matching_uids>
 
     Examples:
