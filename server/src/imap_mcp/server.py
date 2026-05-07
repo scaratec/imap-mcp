@@ -223,8 +223,7 @@ def build_server(context: ServerContext) -> Server:
             Tool(
                 name="fetch_attachment",
                 description=(
-                    "Fetch a single MIME attachment. Requires FULL "
-                    "visibility (ADR 0002)."
+                    "Fetch a single MIME attachment. Requires FULL visibility (ADR 0002)."
                 ),
                 inputSchema={
                     "type": "object",
@@ -443,16 +442,12 @@ def build_server(context: ServerContext) -> Server:
                         "latency_ms": 0,
                     }
                 )
-            raise McpError(
-                ErrorData(code=-32601, message=f"Unknown tool: {name!r}")
-            )
+            raise McpError(ErrorData(code=-32601, message=f"Unknown tool: {name!r}"))
         start = _time.monotonic()
         result = await _dispatch(context, name, arguments)
         elapsed_ms = int((_time.monotonic() - start) * 1000)
         _audit_tool_call(context, name, arguments, result, latency_ms=elapsed_ms)
-        return ServerResult(
-            CallToolResult(content=_emit(result), isError=False)
-        )
+        return ServerResult(CallToolResult(content=_emit(result), isError=False))
 
     app.request_handlers[CallToolRequest] = _raw_call_tool_handler
 
@@ -559,9 +554,7 @@ def _audit_tool_call(
         import hashlib
 
         domain = str(matched_sender).rsplit("@", 1)[-1]
-        record["from_domain_sha256"] = hashlib.sha256(
-            domain.encode("utf-8")
-        ).hexdigest()
+        record["from_domain_sha256"] = hashlib.sha256(domain.encode("utf-8")).hexdigest()
     context.audit.write(record)
 
 
@@ -575,9 +568,7 @@ def _sanitise_args(arguments: dict[str, Any]) -> dict[str, Any]:
             safe[key] = value
             continue
         if key in ("source", "target") and isinstance(value, dict):
-            safe[key] = {
-                k: v for k, v in value.items() if k in ("account", "folder", "uid")
-            }
+            safe[key] = {k: v for k, v in value.items() if k in ("account", "folder", "uid")}
             continue
         if key == "criteria" and isinstance(value, dict):
             import hashlib
@@ -610,9 +601,7 @@ def _facts_from_envelope(envelope: Any) -> MessageFacts:
     )
 
 
-def _handle_list_accounts(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+def _handle_list_accounts(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     _ = arguments
     visibility = context.pdp.visible_accounts_for(context.caller_id)
     accounts = []
@@ -621,16 +610,14 @@ def _handle_list_accounts(
         if getattr(context.oauth_manager, "_needs_rebootstrap", {}).get(aid):
             state = "needs_rebootstrap"
         accounts.append({"id": aid, "state": state})
-        
+
     return {
         "accounts": accounts,
         "hidden_accounts_count": int(visibility.hidden_account_count),
     }
 
 
-async def _known_folders_for(
-    context: ServerContext, account_id: str
-) -> list[str]:
+async def _known_folders_for(context: ServerContext, account_id: str) -> list[str]:
     """Ask IMAP for the full folder list on a configured account.
 
     Returns an empty list when the account is not configured at all —
@@ -650,12 +637,12 @@ async def _known_folders_for(
             "the Walking-Skeleton fixture must set auth.type=password "
             "and a secret_ref."
         )
-        
+
     if account_model.auth.type == "xoauth2":
         password = await context.oauth_manager.get_access_token(account_model)
     else:
         password = context.secret_store.get(account_model.auth.password_secret_ref())
-        
+
     if password is None:
         raise RuntimeError(
             f"Secret store could not resolve {account_model.auth.secret_ref!r} "
@@ -664,9 +651,7 @@ async def _known_folders_for(
     return await imap_list_folders(account_model, password)
 
 
-async def _handle_list_folders(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_list_folders(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     # When the account isn't in the caller's policy at all (or the
     # account vanished after a SIGHUP reload), surface a DENY with
@@ -701,9 +686,7 @@ def _is_google_provider(account: Any) -> bool:
     return getattr(account, "provider", "imap-standard") in ("google", "google-mock")
 
 
-async def _handle_list_labels(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_list_labels(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     # Provider gate: list_labels is only meaningful for Google accounts.
     account = context.account_by_id(account_id)
@@ -735,17 +718,15 @@ async def _password_for(context: ServerContext, account_id: str) -> tuple[Any, s
     if account is None:
         raise RuntimeError(f"Account {account_id!r} is not configured")
     if account.auth is None:  # type: ignore[attr-defined]
-        raise RuntimeError(
-            f"Account {account_id!r} has no auth configuration"
-        )
-        
+        raise RuntimeError(f"Account {account_id!r} has no auth configuration")
+
     if account.auth.type == "xoauth2":  # type: ignore[attr-defined]
         password = await context.oauth_manager.get_access_token(account)
     else:
         password = context.secret_store.get(
             account.auth.password_secret_ref()  # type: ignore[attr-defined]
         )
-        
+
     if password is None:
         raise RuntimeError(f"Password not resolvable for {account_id!r}")
     return account, password
@@ -757,9 +738,7 @@ async def _handle_fetch_envelope(
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -782,9 +761,7 @@ async def _handle_fetch_envelope(
             "error_type": "uid_not_found",
         }
     facts = _facts_from_envelope(envelope)
-    message_decision = evaluate_message_against_folder(
-        folder_decision.folder_policy, facts=facts
-    )
+    message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
         return {
             "decision": "DENY",
@@ -813,9 +790,7 @@ async def _handle_fetch_envelope(
         redacted.append("attachments")
     redaction_reason = None
     if redacted:
-        redaction_reason = (
-            "visibility_below_BODY" if not body_visible else "visibility_below_FULL"
-        )
+        redaction_reason = "visibility_below_BODY" if not body_visible else "visibility_below_FULL"
     return {
         "decision": "ALLOW",
         "reason": message_decision.reason,
@@ -836,15 +811,11 @@ async def _handle_fetch_envelope(
     }
 
 
-async def _handle_fetch_body(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_fetch_body(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -868,9 +839,7 @@ async def _handle_fetch_body(
         }
     envelope, body_text = result
     facts = _facts_from_envelope(envelope)
-    message_decision = evaluate_message_against_folder(
-        folder_decision.folder_policy, facts=facts
-    )
+    message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
         return {
             "decision": "DENY",
@@ -899,13 +868,9 @@ async def _handle_fetch_body(
         "subject": envelope.subject,
         "text_body": body_text,
         "matched_rule_index": message_decision.matched_rule_index,
-        "attachments": None
-        if level_rank(message_decision.visibility) < level_rank("FULL")
-        else [],
+        "attachments": None if level_rank(message_decision.visibility) < level_rank("FULL") else [],
         "redacted_fields": (
-            ["attachments"]
-            if level_rank(message_decision.visibility) < level_rank("FULL")
-            else []
+            ["attachments"] if level_rank(message_decision.visibility) < level_rank("FULL") else []
         ),
         "redaction_reason": (
             "visibility_below_FULL"
@@ -923,9 +888,7 @@ async def _handle_fetch_headers(
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -947,9 +910,7 @@ async def _handle_fetch_headers(
             "uid": uid,
         }
     facts = _facts_from_envelope(envelope)
-    message_decision = evaluate_message_against_folder(
-        folder_decision.folder_policy, facts=facts
-    )
+    message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
         return {
             "decision": "DENY",
@@ -993,9 +954,7 @@ async def _handle_fetch_attachment(
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
     part_id = arguments.get("part_id")
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -1017,9 +976,7 @@ async def _handle_fetch_attachment(
             "uid": uid,
         }
     facts = _facts_from_envelope(envelope)
-    message_decision = evaluate_message_against_folder(
-        folder_decision.folder_policy, facts=facts
-    )
+    message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
         return {
             "decision": "DENY",
@@ -1082,14 +1039,10 @@ async def _handle_fetch_attachment(
     }
 
 
-async def _handle_folder_stats(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_folder_stats(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -1104,11 +1057,7 @@ async def _handle_folder_stats(
     # exists that could grant >= COUNT. Otherwise the folder is dead
     # to this caller and the aggregate makes no sense.
     effective_ceiling = max(
-        (
-            level_rank(r.grant)
-            for r in folder_decision.folder_policy.rules
-            if r.grant is not None
-        ),
+        (level_rank(r.grant) for r in folder_decision.folder_policy.rules if r.grant is not None),
         default=level_rank(folder_decision.folder_policy.default),
     )
     if effective_ceiling < level_rank("COUNT"):
@@ -1233,9 +1182,7 @@ async def _handle_test_run_audit_rotation(
     test-only control surface.
     """
     if os.environ.get("IMAP_MCP_TEST_MODE") != "1":
-        raise McpError(
-            ErrorData(code=-32601, message="Unknown tool: '_test_run_audit_rotation'")
-        )
+        raise McpError(ErrorData(code=-32601, message="Unknown tool: '_test_run_audit_rotation'"))
     _ = arguments
     if context.audit is None:
         return {"reason": "audit_not_configured"}
@@ -1251,9 +1198,7 @@ async def _handle_describe_policy(
 
     config: Configuration = context.configuration  # type: ignore[assignment]
     caller = config.caller_by_id(context.caller_id)
-    policy = (
-        config.policy_by_name(caller.policy) if caller is not None else None
-    )
+    policy = config.policy_by_name(caller.policy) if caller is not None else None
     granted_accounts = set(policy.accounts.keys()) if policy is not None else set()
     all_accounts = [a.id for a in config.accounts_file.accounts]
     visible_accounts: list[dict[str, Any]] = []
@@ -1280,9 +1225,7 @@ async def _handle_describe_policy(
 
             all_folders = await _list_folders(
                 account,
-                context.secret_store.get(
-                    account.auth.password_secret_ref() if account.auth else ""
-                )
+                context.secret_store.get(account.auth.password_secret_ref() if account.auth else "")
                 or "",
             )
             visible_paths = {fp.path for fp in folder_policies}
@@ -1332,14 +1275,12 @@ def _granted_caps(fp: "Any") -> list[str]:
     return caps
 
 
-async def _handle_mark_seen(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_mark_seen(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
     seen = bool(arguments["seen"])
-    
+
     account = context.account_by_id(account_id)
     if account and account.auth and account.auth.type == "xoauth2":
         scope = account.auth.oauth_scope or ""
@@ -1354,9 +1295,7 @@ async def _handle_mark_seen(
                 "uid": uid,
             }
 
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -1376,9 +1315,7 @@ async def _handle_mark_seen(
             "uid": uid,
         }
     account, password = await _password_for(context, account_id)
-    ok = await imap_store_flag(
-        account, password, folder_path, uid, r"\Seen", add=seen
-    )
+    ok = await imap_store_flag(account, password, folder_path, uid, r"\Seen", add=seen)
     if not ok:
         return {
             "decision": "ALLOW",
@@ -1399,17 +1336,13 @@ async def _handle_mark_seen(
     }
 
 
-async def _handle_mark_tagged(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_mark_tagged(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
     tags = list(arguments["tags"])
     mode = str(arguments["mode"])
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -1450,9 +1383,7 @@ async def _handle_mark_tagged(
     }
 
 
-async def _handle_move(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_move(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     src = arguments["source"]
     dst = arguments["target"]
     src_account = str(src["account"])
@@ -1474,9 +1405,7 @@ async def _handle_move(
             "uid": src_uid,
         }
 
-    src_dec = context.pdp.decide_folder_access(
-        context.caller_id, src_account, src_folder
-    )
+    src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
     if not src_dec.allowed:
         return {
             "decision": "DENY",
@@ -1495,9 +1424,7 @@ async def _handle_move(
             "folder": src_folder,
             "uid": src_uid,
         }
-    dst_dec = context.pdp.decide_folder_access(
-        context.caller_id, dst_account, dst_folder
-    )
+    dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
     if not dst_dec.allowed:
         return {
             "decision": "DENY",
@@ -1525,16 +1452,12 @@ async def _handle_move(
             from .imap_core import _LABEL_TO_FOLDER  # noqa: F811
 
             # Build the reverse map: folder -> label
-            _folder_to_label: dict[str, str] = {
-                v: k for k, v in _LABEL_TO_FOLDER.items()
-            }
+            _folder_to_label: dict[str, str] = {v: k for k, v in _LABEL_TO_FOLDER.items()}
             # Custom labels map to themselves
             src_label = _folder_to_label.get(src_folder, src_folder)
             dst_label = _folder_to_label.get(dst_folder, dst_folder)
             try:
-                await imap_gmail_label_swap(
-                    account, password, src_uid, src_label, dst_label
-                )
+                await imap_gmail_label_swap(account, password, src_uid, src_label, dst_label)
             except RuntimeError:
                 return {
                     "decision": "ALLOW",
@@ -1555,9 +1478,7 @@ async def _handle_move(
                 "uid": src_uid,
             }
         try:
-            mechanism = await imap_move_message(
-                account, password, src_folder, src_uid, dst_folder
-            )
+            mechanism = await imap_move_message(account, password, src_folder, src_uid, dst_folder)
         except TargetFolderMissing:
             return {
                 "decision": "ALLOW",
@@ -1638,9 +1559,7 @@ async def _handle_move(
     }
 
 
-async def _handle_copy(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_copy(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     src = arguments["source"]
     dst = arguments["target"]
     src_account = str(src["account"])
@@ -1649,9 +1568,7 @@ async def _handle_copy(
     dst_account = str(dst["account"])
     dst_folder = str(dst["folder"])
 
-    src_dec = context.pdp.decide_folder_access(
-        context.caller_id, src_account, src_folder
-    )
+    src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
     if not src_dec.allowed:
         return {
             "decision": "DENY",
@@ -1660,9 +1577,7 @@ async def _handle_copy(
             "folder": src_folder,
             "uid": src_uid,
         }
-    dst_dec = context.pdp.decide_folder_access(
-        context.caller_id, dst_account, dst_folder
-    )
+    dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
     if not dst_dec.allowed:
         return {
             "decision": "DENY",
@@ -1725,15 +1640,11 @@ async def _handle_copy(
     }
 
 
-async def _handle_create_draft(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_create_draft(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     rfc822_text = str(arguments["rfc822"])
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -1751,9 +1662,7 @@ async def _handle_create_draft(
             "folder": folder_path,
         }
     account, password = await _password_for(context, account_id)
-    ok = await imap_append_message(
-        account, password, folder_path, rfc822_text.encode("utf-8")
-    )
+    ok = await imap_append_message(account, password, folder_path, rfc822_text.encode("utf-8"))
     return {
         "decision": "ALLOW",
         "result": "OK" if ok else "ERROR",
@@ -1763,15 +1672,11 @@ async def _handle_create_draft(
     }
 
 
-async def _handle_search(
-    context: ServerContext, arguments: dict[str, Any]
-) -> dict[str, Any]:
+async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     criteria_raw = arguments.get("criteria") or {}
-    folder_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, folder_path
-    )
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return {
             "decision": "DENY",
@@ -1802,18 +1707,14 @@ async def _handle_search(
     matched_total = len(all_uids)
     visible_uids: list[int] = []
     for candidate_uid in all_uids:
-        envelope = await imap_fetch_envelope(
-            account, password, folder_path, candidate_uid
-        )
+        envelope = await imap_fetch_envelope(account, password, folder_path, candidate_uid)
         if envelope is None:
             continue
         facts = _facts_from_envelope(envelope)
         message_decision = evaluate_message_against_folder(
             folder_decision.folder_policy, facts=facts
         )
-        if message_decision.allowed and level_rank(
-            message_decision.visibility
-        ) >= minimum_for_tool:
+        if message_decision.allowed and level_rank(message_decision.visibility) >= minimum_for_tool:
             visible_uids.append(candidate_uid)
     filtered_out = matched_total - len(visible_uids)
     _ = criteria_raw  # criteria parsing (ADR 0004) lands with its own scenarios
@@ -1827,9 +1728,7 @@ async def _handle_search(
         for vuid in visible_uids:
             entry: dict[str, Any] = {"uid": vuid}
             try:
-                gm_msgid = await imap_gmail_fetch_msgid(
-                    account, password, folder_path, vuid
-                )
+                gm_msgid = await imap_gmail_fetch_msgid(account, password, folder_path, vuid)
                 if gm_msgid is not None:
                     entry["gm_msgid"] = gm_msgid
                     all_mail_hits = await imap_gmail_search_by_msgid(
@@ -1894,13 +1793,12 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
         wal = WAL(path=Path(wal_cfg.path))
         retry_limit_env = os.environ.get("IMAP_MCP_RETRY_LIMIT")
         retry_limit = int(retry_limit_env) if retry_limit_env else 3
-        saga_mgr = SagaManager(
-            wal=wal, audit_emitter=audit_writer, retry_limit=retry_limit
-        )
-        
+        saga_mgr = SagaManager(wal=wal, audit_emitter=audit_writer, retry_limit=retry_limit)
+
     from .auth.oauth_manager import OAuthManager
+
     oauth_manager = OAuthManager(configuration, secret_store)
-    
+
     live = _LiveState(pdp=pdp, configuration=configuration, oauth_manager=oauth_manager)
     context = ServerContext(
         default_caller_id=default_caller_id,
@@ -1910,15 +1808,15 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
         saga=saga_mgr,
     )
     if saga_mgr is not None:
+
         async def _resolver(account_id: str) -> tuple[Any, str]:
             return await _password_for(context, account_id)
+
         saga_mgr.account_resolver = _resolver
     return context, configuration
 
 
-def _reload_configuration(
-    context: ServerContext, config_dir: Path
-) -> None:
+def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
     """SIGHUP-driven atomic reload (ADR 0014).
 
     Re-parses every YAML file in `config_dir` into a temporary
@@ -1937,15 +1835,21 @@ def _reload_configuration(
         new_config: Configuration = load_configuration(config_dir)
     except Exception as exc:
         if audit is not None:
-            reason = "parse_error" if "yaml" in type(exc).__module__.lower() or "yaml" in str(exc).lower() else "validation_error"
-            audit.write({
-                "caller_id": context.caller_id,
-                "tool": "policy_reload",
-                "decision": "DENY",
-                "reason": reason,
-                "result": "ERROR",
-                "detail": str(exc),
-            })
+            reason = (
+                "parse_error"
+                if "yaml" in type(exc).__module__.lower() or "yaml" in str(exc).lower()
+                else "validation_error"
+            )
+            audit.write(
+                {
+                    "caller_id": context.caller_id,
+                    "tool": "policy_reload",
+                    "decision": "DENY",
+                    "reason": reason,
+                    "result": "ERROR",
+                    "detail": str(exc),
+                }
+            )
         return
 
     new_pdp = PolicyDecisionPoint(new_config)
@@ -1960,8 +1864,7 @@ def _reload_configuration(
 
     # Detect oauth_scope changes → needs_rebootstrap (ADR 0014).
     old_scopes = {
-        a.id: (a.auth.oauth_scope if a.auth else None)
-        for a in old_config.accounts_file.accounts
+        a.id: (a.auth.oauth_scope if a.auth else None) for a in old_config.accounts_file.accounts
     }
     for new_acct in new_config.accounts_file.accounts:
         new_scope = new_acct.auth.oauth_scope if new_acct.auth else None
@@ -1973,14 +1876,16 @@ def _reload_configuration(
                 rebootstrap = context.oauth_manager._needs_rebootstrap
             rebootstrap[new_acct.id] = True
             if audit is not None:
-                audit.write({
-                    "caller_id": context.caller_id,
-                    "tool": "policy_reload",
-                    "decision": "ALLOW",
-                    "reason": "reload_applied",
-                    "result": "OK",
-                    "detail": f"oauth_scope changed; rebootstrap required for {new_acct.id}",
-                })
+                audit.write(
+                    {
+                        "caller_id": context.caller_id,
+                        "tool": "policy_reload",
+                        "decision": "ALLOW",
+                        "reason": "reload_applied",
+                        "result": "OK",
+                        "detail": f"oauth_scope changed; rebootstrap required for {new_acct.id}",
+                    }
+                )
 
     # Pool-drain audit per removed account (no actual pool today;
     # ADR 0013's pool will hook in here when its scenarios activate).
@@ -1988,26 +1893,30 @@ def _reload_configuration(
         old_ids = {a.id for a in old_config.accounts_file.accounts}
         new_ids = {a.id for a in new_config.accounts_file.accounts}
         for removed in sorted(old_ids - new_ids):
-            audit.write({
+            audit.write(
+                {
+                    "caller_id": context.caller_id,
+                    "tool": "pool_drain",
+                    "decision": "ALLOW",
+                    "reason": "account_removed",
+                    "account": removed,
+                    "result": "OK",
+                }
+            )
+        audit.write(
+            {
                 "caller_id": context.caller_id,
-                "tool": "pool_drain",
+                "tool": "policy_reload",
                 "decision": "ALLOW",
-                "reason": "account_removed",
-                "account": removed,
+                "reason": "reload_applied",
                 "result": "OK",
-            })
-        audit.write({
-            "caller_id": context.caller_id,
-            "tool": "policy_reload",
-            "decision": "ALLOW",
-            "reason": "reload_applied",
-            "result": "OK",
-            "detail": (
-                f"old_callers={len(old_config.callers_file.callers)}, "
-                f"new_callers={len(new_config.callers_file.callers)}, "
-                f"removed_accounts={sorted(old_ids - new_ids)}"
-            ),
-        })
+                "detail": (
+                    f"old_callers={len(old_config.callers_file.callers)}, "
+                    f"new_callers={len(new_config.callers_file.callers)}, "
+                    f"removed_accounts={sorted(old_ids - new_ids)}"
+                ),
+            }
+        )
 
 
 def _install_sighup_handler(context: ServerContext, config_dir: Path) -> None:
@@ -2039,7 +1948,7 @@ async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
     context, configuration = _build_context(
         config_dir, default_caller_id=caller_id or "<no-caller>"
     )
-    
+
     auth_failure_reason: str | None = None
     if not caller_id:
         auth_failure_reason = "no_caller_identity"
@@ -2129,9 +2038,7 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
     # `default_caller_id` is unused on HTTP — every request supplies its
     # own. We still need a non-empty placeholder because the dataclass
     # frozen-default guard expects a string.
-    context, configuration = _build_context(
-        config_dir, default_caller_id="<http-no-default>"
-    )
+    context, configuration = _build_context(config_dir, default_caller_id="<http-no-default>")
     _install_sighup_handler(context, config_dir)
 
     # ADR 0015 invariant: stdio_trusted callers cannot authenticate
@@ -2141,24 +2048,16 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
     # stdio_trusted caller in the configured set therefore makes the
     # config invalid for HTTP, fatal at startup.
     stdio_trusted = [
-        c.id for c in configuration.callers_file.callers
-        if c.auth.type == "stdio_trusted"
+        c.id for c in configuration.callers_file.callers if c.auth.type == "stdio_trusted"
     ]
     if stdio_trusted:
         names = ", ".join(f'"{c}"' for c in stdio_trusted)
-        raise SystemExit(
-            f"caller {names} as \"stdio_trusted not permitted on "
-            "non-stdio transport\""
-        )
+        raise SystemExit(f'caller {names} as "stdio_trusted not permitted on non-stdio transport"')
 
     app_mcp = build_server(context)
-    session_manager = StreamableHTTPSessionManager(
-        app=app_mcp, json_response=True, stateless=True
-    )
+    session_manager = StreamableHTTPSessionManager(app=app_mcp, json_response=True, stateless=True)
 
-    def _audit_auth_failed(
-        caller_id_claim: str | None, reason: str, addr: str
-    ) -> None:
+    def _audit_auth_failed(caller_id_claim: str | None, reason: str, addr: str) -> None:
         if context.audit is None:
             return
         # `secret_decryption_failed` is a configuration-class failure
@@ -2167,9 +2066,7 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
         # surfaces it as a distinct category so operators can tell
         # them apart at a glance.
         top_reason = (
-            "secret_decryption_failed"
-            if reason == "secret_decryption_failed"
-            else "auth_failed"
+            "secret_decryption_failed" if reason == "secret_decryption_failed" else "auth_failed"
         )
         record: dict[str, Any] = {
             "caller_id": caller_id_claim,
@@ -2207,17 +2104,11 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
             authz = request.headers.get("authorization", "")
             scheme, _, token = authz.partition(" ")
             if scheme.lower() != "bearer" or not token:
-                _audit_auth_failed(
-                    caller_id_claim, "no_bearer_token", f"http:{addr}"
-                )
-                return JSONResponse(
-                    {"error": "auth_failed"}, status_code=401
-                )
+                _audit_auth_failed(caller_id_claim, "no_bearer_token", f"http:{addr}")
+                return JSONResponse({"error": "auth_failed"}, status_code=401)
             if not caller_id_claim:
                 _audit_auth_failed(None, "no_caller_id", f"http:{addr}")
-                return JSONResponse(
-                    {"error": "no_caller_identity"}, status_code=401
-                )
+                return JSONResponse({"error": "no_caller_identity"}, status_code=401)
             caller = configuration.caller_by_id(caller_id_claim)
             if caller is None:
                 # ADR-0015 identity-immutability: if the bearer
@@ -2230,41 +2121,21 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
                 for other in configuration.callers_file.callers:
                     if other.auth.type != "shared_token":
                         continue
-                    other_expected, _ = _resolve_token(
-                        other.auth.token_secret_ref
-                    )
-                    if other_expected is not None and hmac.compare_digest(
-                        token, other_expected
-                    ):
+                    other_expected, _ = _resolve_token(other.auth.token_secret_ref)
+                    if other_expected is not None and hmac.compare_digest(token, other_expected):
                         masquerade = True
                 if masquerade:
-                    _audit_auth_failed(
-                        caller_id_claim, "identity_immutable", f"http:{addr}"
-                    )
-                    return JSONResponse(
-                        {"error": "identity_immutable"}, status_code=401
-                    )
-                _audit_auth_failed(
-                    caller_id_claim, "unknown_caller_id", f"http:{addr}"
-                )
-                return JSONResponse(
-                    {"error": "unknown_caller_id"}, status_code=401
-                )
+                    _audit_auth_failed(caller_id_claim, "identity_immutable", f"http:{addr}")
+                    return JSONResponse({"error": "identity_immutable"}, status_code=401)
+                _audit_auth_failed(caller_id_claim, "unknown_caller_id", f"http:{addr}")
+                return JSONResponse({"error": "unknown_caller_id"}, status_code=401)
             if caller.auth.type != "shared_token":
-                _audit_auth_failed(
-                    caller_id_claim, "wrong_auth_type", f"http:{addr}"
-                )
-                return JSONResponse(
-                    {"error": "auth_failed"}, status_code=401
-                )
+                _audit_auth_failed(caller_id_claim, "wrong_auth_type", f"http:{addr}")
+                return JSONResponse({"error": "auth_failed"}, status_code=401)
             expected, lookup_error = _resolve_token(caller.auth.token_secret_ref)
             if lookup_error is not None:
-                _audit_auth_failed(
-                    caller_id_claim, lookup_error, f"http:{addr}"
-                )
-                return JSONResponse(
-                    {"error": "auth_failed"}, status_code=401
-                )
+                _audit_auth_failed(caller_id_claim, lookup_error, f"http:{addr}")
+                return JSONResponse({"error": "auth_failed"}, status_code=401)
             if expected is None or not hmac.compare_digest(token, expected):
                 # Identity-immutability check (ADR-0015): if the token
                 # actually matches a DIFFERENT configured caller, the
@@ -2274,31 +2145,16 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
                 # for constant-time comparison.
                 token_matches_other = False
                 for other in configuration.callers_file.callers:
-                    if (
-                        other.id == caller_id_claim
-                        or other.auth.type != "shared_token"
-                    ):
+                    if other.id == caller_id_claim or other.auth.type != "shared_token":
                         continue
-                    other_expected, _ = _resolve_token(
-                        other.auth.token_secret_ref
-                    )
-                    if other_expected is not None and hmac.compare_digest(
-                        token, other_expected
-                    ):
+                    other_expected, _ = _resolve_token(other.auth.token_secret_ref)
+                    if other_expected is not None and hmac.compare_digest(token, other_expected):
                         token_matches_other = True
                 if token_matches_other:
-                    _audit_auth_failed(
-                        caller_id_claim, "identity_immutable", f"http:{addr}"
-                    )
-                    return JSONResponse(
-                        {"error": "identity_immutable"}, status_code=401
-                    )
-                _audit_auth_failed(
-                    caller_id_claim, "wrong_token", f"http:{addr}"
-                )
-                return JSONResponse(
-                    {"error": "auth_failed"}, status_code=401
-                )
+                    _audit_auth_failed(caller_id_claim, "identity_immutable", f"http:{addr}")
+                    return JSONResponse({"error": "identity_immutable"}, status_code=401)
+                _audit_auth_failed(caller_id_claim, "wrong_token", f"http:{addr}")
+                return JSONResponse({"error": "auth_failed"}, status_code=401)
             token_var = _CURRENT_CALLER_ID.set(caller_id_claim)
             try:
                 return await call_next(request)
@@ -2327,9 +2183,7 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
     starlette_app.add_middleware(BearerAuthMiddleware)
 
     async with session_manager.run():
-        config = uvicorn.Config(
-            starlette_app, host=host, port=port, log_level="warning"
-        )
+        config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
         await uvicorn.Server(config).serve()
 
 

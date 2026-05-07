@@ -149,9 +149,7 @@ class AuditWriter:
             return False
         if "seq" not in record or "prev_hash" not in record:
             return False
-        self._prev_hash = (
-            "sha256:" + hashlib.sha256(last_line).hexdigest()
-        )
+        self._prev_hash = "sha256:" + hashlib.sha256(last_line).hexdigest()
         seq = record.get("seq")
         self._seq = int(seq) + 1 if isinstance(seq, int) else 0
         return True
@@ -172,8 +170,7 @@ class AuditWriter:
         seq = self._seq
         self._seq += 1
         full = {
-            "ts": now.strftime("%Y-%m-%dT%H:%M:%S.")
-            + f"{now.microsecond // 1000:03d}Z",
+            "ts": now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
             "seq": seq,
             "prev_hash": self._prev_hash,
             **record,
@@ -230,8 +227,7 @@ class AuditWriter:
         now = _now_utc()
         self._seq += 1
         full = {
-            "ts": now.strftime("%Y-%m-%dT%H:%M:%S.")
-            + f"{now.microsecond // 1000:03d}Z",
+            "ts": now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
             "seq": self._seq,
             "prev_hash": self._prev_hash,
             "tool": "audit_file_missing",
@@ -283,8 +279,7 @@ class AuditWriter:
         seq = self._seq
         self._seq += 1
         full = {
-            "ts": now.strftime("%Y-%m-%dT%H:%M:%S.")
-            + f"{now.microsecond // 1000:03d}Z",
+            "ts": now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
             "seq": seq,
             "prev_hash": self._prev_hash,
             "tool": "eof_day",
@@ -359,22 +354,16 @@ class AuditWriter:
     def _delete_expired(self) -> int:
         cutoff = _now_utc() - timedelta(days=self.delete_after_days)
         n = 0
-        candidates = list(self.directory.glob("*.jsonl.gz")) + list(
-            self.directory.glob("*.jsonl")
-        )
+        candidates = list(self.directory.glob("*.jsonl.gz")) + list(self.directory.glob("*.jsonl"))
         for path in sorted(candidates):
             if self._current_path is not None and path == self._current_path:
                 continue
             try:
-                mtime = datetime.fromtimestamp(
-                    path.stat().st_mtime, tz=timezone.utc
-                )
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
             except OSError:
                 continue
             if mtime < cutoff:
-                age_days = int(
-                    (_now_utc() - mtime).total_seconds() / 86400
-                )
+                age_days = int((_now_utc() - mtime).total_seconds() / 86400)
                 filename = path.name
                 path.unlink()
                 # Emit retention_delete *after* the file is removed so
@@ -383,14 +372,16 @@ class AuditWriter:
                 # path (which honours day-roll itself).
                 self._lock.release()
                 try:
-                    self.write({
-                        "tool": "retention_delete",
-                        "decision": "ALLOW",
-                        "reason": "warm_period_elapsed",
-                        "result": "OK",
-                        "filename": filename,
-                        "age_days": age_days,
-                    })
+                    self.write(
+                        {
+                            "tool": "retention_delete",
+                            "decision": "ALLOW",
+                            "reason": "warm_period_elapsed",
+                            "result": "OK",
+                            "filename": filename,
+                            "age_days": age_days,
+                        }
+                    )
                 finally:
                     self._lock.acquire()
                 n += 1

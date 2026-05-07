@@ -130,9 +130,7 @@ def _match_single_predicate(key: str, expected: object, *, facts: MessageFacts) 
     from datetime import datetime, timezone
 
     if key == "from":
-        return (
-            isinstance(expected, str) and facts.from_address.lower() == expected.lower()
-        )
+        return isinstance(expected, str) and facts.from_address.lower() == expected.lower()
     if key == "from_domain":
         if not isinstance(expected, str):
             return False
@@ -192,8 +190,7 @@ def evaluate_message_against_folder(
     any_rule_matched_in_blacklist = False
     for idx, rule in enumerate(folder_policy.rules):
         matched = all(
-            _match_single_predicate(key, val, facts=facts)
-            for key, val in rule.match.items()
+            _match_single_predicate(key, val, facts=facts) for key, val in rule.match.items()
         )
         if not matched:
             continue
@@ -240,7 +237,9 @@ def evaluate_message_against_folder(
         raise AssertionError(f"Unknown rank {effective!r}")
     reason = "rule_matched" if matched_rule_idx is not None else "folder_default_applied"
     return MessageDecision(
-        allowed=True, reason=reason, visibility=visibility,
+        allowed=True,
+        reason=reason,
+        visibility=visibility,
         matched_rule_index=matched_rule_idx,
     )
 
@@ -268,9 +267,7 @@ class PolicyDecisionPoint:
 
     def visible_accounts_for(self, caller_id: str) -> AccountVisibility:
         granted_ids, _ = self._policy_for(caller_id)
-        configured_ids = [
-            account.id for account in self._configuration.accounts_file.accounts
-        ]
+        configured_ids = [account.id for account in self._configuration.accounts_file.accounts]
         visible = [aid for aid in configured_ids if aid in granted_ids]
         hidden = len(configured_ids) - len(visible)
         return AccountVisibility(

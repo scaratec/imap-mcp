@@ -10,6 +10,7 @@ from ..secrets import SecretStore
 
 logger = logging.getLogger(__name__)
 
+
 class OAuthManager:
     def __init__(self, config: Configuration, secret_store: SecretStore):
         self.config = config
@@ -33,7 +34,7 @@ class OAuthManager:
     async def _refresh_token(self, account: Account) -> str:
         if not account.auth or account.auth.type != "xoauth2":
             raise ValueError("Not an OAuth account")
-            
+
         secret_ref = account.auth.secret_ref
         if not secret_ref:
             raise ValueError("No secret_ref for OAuth account")
@@ -50,8 +51,9 @@ class OAuthManager:
             token_uri = "http://127.0.0.1:19080/default/token"
 
         import os
+
         client_id = os.environ.get("IMAP_MCP_OAUTH_CLIENT_ID", "test-client-id")
-        
+
         # Test error injection
         injected_error = os.environ.get("IMAP_MCP_TEST_OAUTH_INJECT_ERROR")
         if injected_error:
@@ -70,9 +72,9 @@ class OAuthManager:
                     "grant_type": "refresh_token",
                     "client_id": client_id,
                     "refresh_token": refresh_token,
-                }
+                },
             )
-            
+
             if resp.status_code != 200:
                 err = resp.json().get("error", "unknown_error")
                 self._log_audit(account.id, "DENY", err)
@@ -81,20 +83,20 @@ class OAuthManager:
                         self._needs_rebootstrap = {}
                     self._needs_rebootstrap[account.id] = True
                 raise RuntimeError(f"OAuth refresh failed: {err}")
-                
+
             data = resp.json()
             access_token = data["access_token"]
             expires_in = data.get("expires_in", 3600)
-            
+
             # Allow test override
             if "IMAP_MCP_TEST_TOKEN_LIFETIME" in os.environ:
                 expires_in = int(os.environ["IMAP_MCP_TEST_TOKEN_LIFETIME"])
-                
+
             self._tokens[account.id] = {
                 "access_token": access_token,
-                "expires_at": time.time() + expires_in
+                "expires_at": time.time() + expires_in,
             }
-            
+
             if account.token_cache == "persist_all":
                 access_ref = secret_ref.replace("refresh_token", "access_token")
                 # Need to use the raw path to write, but SecretStore in server doesn't have a write method
@@ -102,26 +104,31 @@ class OAuthManager:
                 store_cfg = self.config.accounts_file.secret_store
                 if store_cfg and store_cfg.backend == "file_dir" and store_cfg.path:
                     import pathlib
+
                     rel_path = access_ref[len("secret://") :].lstrip("/")
                     target = pathlib.Path(store_cfg.path) / rel_path
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(access_token, encoding="utf-8")
-            
+
             self._log_audit(account.id, "ALLOW", "OK")
             return access_token
 
     def _log_audit(self, account_id: str, decision: str, reason_or_result: str):
         from datetime import datetime, timezone
         import json
-        audit_dir = self.config.accounts_file.audit.directory if self.config.accounts_file.audit else None
+
+        audit_dir = (
+            self.config.accounts_file.audit.directory if self.config.accounts_file.audit else None
+        )
         if not audit_dir:
             return
-            
+
         import pathlib
+
         today = datetime.now(timezone.utc).date().isoformat()
         path = pathlib.Path(audit_dir) / f"{today}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": "token_refresh",
@@ -132,6 +139,6 @@ class OAuthManager:
             entry["result"] = reason_or_result
         else:
             entry["reason"] = reason_or_result
-            
+
         with open(path, "a") as f:
             f.write(json.dumps(entry) + "\n")

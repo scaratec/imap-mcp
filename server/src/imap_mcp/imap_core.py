@@ -41,9 +41,7 @@ class Envelope:
 # RFC 3501 LIST response format:  * LIST (flags) "sep" "name"
 # aioimaplib returns the untagged responses as bytes strings with the
 # `* LIST ` prefix already stripped: `(flags) "sep" "name"`.
-_LIST_LINE = re.compile(
-    rb'\s*\((?P<flags>[^)]*)\)\s+"(?P<sep>[^"]*)"\s+(?P<name>.+?)\s*$'
-)
+_LIST_LINE = re.compile(rb'\s*\((?P<flags>[^)]*)\)\s+"(?P<sep>[^"]*)"\s+(?P<name>.+?)\s*$')
 
 
 def _append_timeout() -> int:
@@ -71,6 +69,7 @@ async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
     # directly first lets the saga's `except ConnectionRefusedError`
     # branch distinguish "target_unreachable" from "target_append_timeout".
     import asyncio as _asyncio
+
     try:
         _r, _w = await _asyncio.wait_for(
             _asyncio.open_connection(account.host, account.port),
@@ -105,7 +104,7 @@ async def list_folders(account: Account, password: str) -> list[str]:
     """Connect, authenticate, LIST, logout. Return folder paths."""
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
-        
+
     try:
         status, response = await imap.list('""', "*")
         if status != "OK":
@@ -148,9 +147,7 @@ def _imap_user_for(account: Account) -> str:
     return account.id.split("-", 1)[0]
 
 
-async def fetch_envelope(
-    account: Account, password: str, folder: str, uid: int
-) -> Envelope | None:
+async def fetch_envelope(account: Account, password: str, folder: str, uid: int) -> Envelope | None:
     """Fetch ENVELOPE fields of a single UID. Returns None if absent."""
     import email
     from datetime import timezone
@@ -173,9 +170,7 @@ async def fetch_envelope(
         size_bytes, has_attachment = _extract_meta(response)
         message = email.message_from_bytes(raw_header)
         from_addrs = getaddresses(message.get_all("From", []))
-        to_addrs = getaddresses(
-            message.get_all("To", []) + message.get_all("Cc", [])
-        )
+        to_addrs = getaddresses(message.get_all("To", []) + message.get_all("Cc", []))
         date_iso: str | None = None
         date_header = message.get("Date")
         if date_header:
@@ -264,9 +259,7 @@ async def fetch_body(
         from email.utils import getaddresses
 
         from_addrs = getaddresses(message.get_all("From", []))
-        to_addrs = getaddresses(
-            message.get_all("To", []) + message.get_all("Cc", [])
-        )
+        to_addrs = getaddresses(message.get_all("To", []) + message.get_all("Cc", []))
         body_text = ""
         if message.is_multipart():
             for part in message.walk():
@@ -278,9 +271,7 @@ async def fetch_body(
         else:
             payload = message.get_payload(decode=True)
             if isinstance(payload, bytes):
-                body_text = payload.decode(
-                    message.get_content_charset("utf-8"), errors="replace"
-                )
+                body_text = payload.decode(message.get_content_charset("utf-8"), errors="replace")
         # Strip trailing CRLF / whitespace that IMAP servers add during
         # APPEND; the caller expects the body as authored.
         body_text = body_text.rstrip("\r\n")
@@ -583,9 +574,7 @@ async def gmail_search_by_msgid(
         await imap.logout()
 
 
-async def gmail_fetch_labels(
-    account: Account, password: str, folder: str, uid: int
-) -> list[str]:
+async def gmail_fetch_labels(account: Account, password: str, folder: str, uid: int) -> list[str]:
     """FETCH (X-GM-LABELS) for a single UID."""
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
@@ -593,9 +582,7 @@ async def gmail_fetch_labels(
         status, _ = await imap.select(folder)
         if status != "OK":
             return []
-        status, response = await imap.uid(
-            "fetch", str(uid), "(X-GM-LABELS)"
-        )
+        status, response = await imap.uid("fetch", str(uid), "(X-GM-LABELS)")
         if status != "OK":
             return []
         # Parse X-GM-LABELS (label1 label2 "label with spaces") from response
@@ -611,9 +598,7 @@ async def gmail_fetch_labels(
         await imap.logout()
 
 
-async def gmail_fetch_msgid(
-    account: Account, password: str, folder: str, uid: int
-) -> int | None:
+async def gmail_fetch_msgid(account: Account, password: str, folder: str, uid: int) -> int | None:
     """FETCH (X-GM-MSGID) for a single UID."""
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
@@ -621,9 +606,7 @@ async def gmail_fetch_msgid(
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
-        status, response = await imap.uid(
-            "fetch", str(uid), "(X-GM-MSGID)"
-        )
+        status, response = await imap.uid("fetch", str(uid), "(X-GM-MSGID)")
         if status != "OK":
             return None
         for item in response:
@@ -677,9 +660,7 @@ async def gmail_label_swap(
         await imap.logout()
 
 
-async def gmail_list_labels(
-    account: Account, password: str
-) -> list[dict]:
+async def gmail_list_labels(account: Account, password: str) -> list[dict]:
     """LIST all folders and return label info dicts.
 
     Each dict contains: ``name`` (folder path), ``flags`` (raw IMAP
@@ -707,11 +688,13 @@ async def gmail_list_labels(
             if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
                 name_raw = name_raw[1:-1]
             name = name_raw.decode("utf-8")
-            labels.append({
-                "name": name,
-                "flags": flags_raw,
-                "separator": sep_raw,
-            })
+            labels.append(
+                {
+                    "name": name,
+                    "flags": flags_raw,
+                    "separator": sep_raw,
+                }
+            )
         return labels
     finally:
         await imap.logout()
@@ -726,10 +709,10 @@ def _parse_gmail_label_list(raw: str) -> list[str]:
             j = raw.index('"', i + 1)
             labels.append(raw[i + 1 : j])
             i = j + 1
-        elif raw[i] == ' ':
+        elif raw[i] == " ":
             i += 1
         else:
-            j = raw.find(' ', i)
+            j = raw.find(" ", i)
             if j == -1:
                 j = len(raw)
             labels.append(raw[i:j])

@@ -30,9 +30,7 @@ class AccountAuth(BaseModel):
 
     def password_secret_ref(self) -> str:
         if self.type != "password":
-            raise ValueError(
-                f"Cannot derive a password secret ref from auth.type={self.type!r}"
-            )
+            raise ValueError(f"Cannot derive a password secret ref from auth.type={self.type!r}")
         if self.secret_ref is None:
             raise ValueError("password auth requires secret_ref to be set")
         return self.secret_ref
@@ -104,9 +102,7 @@ class CallersFile(BaseModel):
     callers: list[Caller] = Field(default_factory=list)
 
 
-VisibilityLevel = Literal[
-    "NONE", "COUNT", "METADATA", "ENVELOPE", "HEADERS", "BODY", "FULL"
-]
+VisibilityLevel = Literal["NONE", "COUNT", "METADATA", "ENVELOPE", "HEADERS", "BODY", "FULL"]
 
 
 # V1 matcher grammar (ADR 0004). Any key outside this set is a
@@ -148,9 +144,7 @@ class SenderRule(BaseModel):
         unknown = set(self.match.keys()) - _CORE_MATCHER_KEYS
         if unknown:
             for key in sorted(unknown):
-                raise ValueError(
-                    f'rule predicate "{key}": not in V1 core grammar'
-                )
+                raise ValueError(f'rule predicate "{key}": not in V1 core grammar')
         return self
 
 
@@ -186,7 +180,7 @@ class FolderPolicy(BaseModel):
             if self.default != "NONE":
                 raise ValueError(
                     f'folder "{self.path}": whitelist mode requires '
-                    f'default=NONE (got default={self.default})'
+                    f"default=NONE (got default={self.default})"
                 )
         else:  # blacklist
             if self.default == "NONE":
@@ -198,8 +192,7 @@ class FolderPolicy(BaseModel):
             if self.mode == "whitelist":
                 if rule.cap is not None:
                     raise ValueError(
-                        f'folder "{self.path}": whitelist mode forbids '
-                        f"'cap'; use 'grant'"
+                        f"folder \"{self.path}\": whitelist mode forbids 'cap'; use 'grant'"
                     )
                 if rule.grant == "NONE":
                     raise ValueError(
@@ -209,8 +202,7 @@ class FolderPolicy(BaseModel):
             else:
                 if rule.grant is not None:
                     raise ValueError(
-                        f'folder "{self.path}": blacklist mode forbids '
-                        f"'grant'; use 'cap'"
+                        f"folder \"{self.path}\": blacklist mode forbids 'grant'; use 'cap'"
                     )
         return self
 

@@ -113,14 +113,21 @@ class WAL:
                 "(tx_id, status, created_at, caller_id, "
                 "src_account, src_folder, src_uid, dst_account, dst_folder) "
                 "VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
-                (tx_id, _now(), caller_id, src_account, src_folder, src_uid, dst_account, dst_folder),
+                (
+                    tx_id,
+                    _now(),
+                    caller_id,
+                    src_account,
+                    src_folder,
+                    src_uid,
+                    dst_account,
+                    dst_folder,
+                ),
             )
             self._event(conn, tx_id, "begin", "OK", None)
         return tx_id
 
-    def record_fetch(
-        self, tx_id: str, message_id: str | None, content_hash: str
-    ) -> None:
+    def record_fetch(self, tx_id: str, message_id: str | None, content_hash: str) -> None:
         with self._conn() as conn:
             conn.execute(
                 "UPDATE transactions SET message_id = ?, content_hash = ? WHERE tx_id = ?",
@@ -209,9 +216,7 @@ class WAL:
 
     def get(self, tx_id: str) -> dict | None:
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM transactions WHERE tx_id = ?", (tx_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM transactions WHERE tx_id = ?", (tx_id,)).fetchone()
             return dict(row) if row else None
 
     def pending_transactions(self) -> list[dict]:

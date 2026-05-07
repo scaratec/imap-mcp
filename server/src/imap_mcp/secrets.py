@@ -43,10 +43,8 @@ _PREFIX = "secret://"
 
 def _relpath(reference: str) -> str:
     if not reference.startswith(_PREFIX):
-        raise ValueError(
-            f"Secret reference must start with {_PREFIX!r}; got {reference!r}"
-        )
-    return reference[len(_PREFIX):].lstrip("/")
+        raise ValueError(f"Secret reference must start with {_PREFIX!r}; got {reference!r}")
+    return reference[len(_PREFIX) :].lstrip("/")
 
 
 class FileDirSecretStore:
@@ -85,8 +83,7 @@ class EnvVarSecretStore:
 
     def put(self, reference: str, value: str) -> None:
         raise NotImplementedError(
-            "env_var backend is read-only; bootstrap requires a writable "
-            "secret store"
+            "env_var backend is read-only; bootstrap requires a writable secret store"
         )
 
 
@@ -103,9 +100,7 @@ class GpgFileSecretStore:
         # Smoke check at construction so a missing gpg binary surfaces
         # at startup, not at first decrypt.
         if shutil.which("gpg") is None:
-            raise RuntimeError(
-                "gpg_file backend requires the `gpg` binary on PATH"
-            )
+            raise RuntimeError("gpg_file backend requires the `gpg` binary on PATH")
 
     def get(self, reference: str) -> str | None:
         rel = _relpath(reference)

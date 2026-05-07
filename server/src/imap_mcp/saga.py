@@ -145,7 +145,9 @@ class SagaManager:
         if message_id is not None:
             try:
                 hits = await search_uids(
-                    dst_account, dst_password, dst_folder,
+                    dst_account,
+                    dst_password,
+                    dst_folder,
                     f'HEADER "Message-Id" "{message_id}"',
                 )
             except Exception:
@@ -154,8 +156,10 @@ class SagaManager:
 
         # Fallback key: 5-tuple. Read either from `raw` (live FETCH)
         # or from a pre-staged WAL row (`fallback` dict).
-        key = fallback if fallback is not None else (
-            _extract_fallback_key(raw) if raw is not None else None
+        key = (
+            fallback
+            if fallback is not None
+            else (_extract_fallback_key(raw) if raw is not None else None)
         )
         if key is None or key.get("fallback_from") is None:
             return []
@@ -174,6 +178,7 @@ class SagaManager:
         if sent_date:
             try:
                 from datetime import datetime
+
                 d = datetime.fromisoformat(sent_date)
                 terms.append(f'SENTON "{d.strftime("%d-%b-%Y")}"')
             except ValueError:
@@ -182,9 +187,7 @@ class SagaManager:
             return []
         criteria = " ".join(terms)
         try:
-            candidates = await search_uids(
-                dst_account, dst_password, dst_folder, criteria
-            )
+            candidates = await search_uids(dst_account, dst_password, dst_folder, criteria)
         except Exception:
             return []
         # Confirm size + 4-KiB hash for each candidate. Same size +
@@ -193,9 +196,7 @@ class SagaManager:
         confirmed: list[int] = []
         for uid in candidates:
             try:
-                payload = await fetch_full_message(
-                    dst_account, dst_password, dst_folder, uid
-                )
+                payload = await fetch_full_message(dst_account, dst_password, dst_folder, uid)
             except Exception:
                 continue
             if payload is None:
@@ -285,8 +286,10 @@ class SagaManager:
                     )
                     if gm_msgid is not None:
                         all_mail_hits = await gmail_search_by_msgid(
-                            src_account, src_password,
-                            "[Gmail]/All Mail", gm_msgid,
+                            src_account,
+                            src_password,
+                            "[Gmail]/All Mail",
+                            gm_msgid,
                         )
                         if all_mail_hits:
                             fetch_folder = "[Gmail]/All Mail"
@@ -296,22 +299,24 @@ class SagaManager:
 
             # FETCH
             try:
-                raw = await fetch_full_message(
-                    src_account, src_password, fetch_folder, fetch_uid
-                )
+                raw = await fetch_full_message(src_account, src_password, fetch_folder, fetch_uid)
             except Exception as exc:
                 count = self.wal.bump_retry(tx_id, f"fetch_failed: {exc}")
                 if count >= self.retry_limit:
                     self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
                 return SagaResult(
-                    tx_id=tx_id, mechanism="saga", result="ERROR",
+                    tx_id=tx_id,
+                    mechanism="saga",
+                    result="ERROR",
                     error_type="fetch_failed",
                 )
             if raw is None:
                 self.wal.bump_retry(tx_id, "fetch_failed: uid_not_found")
                 return SagaResult(
-                    tx_id=tx_id, mechanism="saga", result="ERROR",
+                    tx_id=tx_id,
+                    mechanism="saga",
+                    result="ERROR",
                     error_type="uid_not_found",
                 )
             content_hash = hashlib.sha256(raw).hexdigest()
@@ -329,17 +334,24 @@ class SagaManager:
 
             # VERIFY idempotency: is the message already at the target?
             existing = await self._search_target_for_existing(
-                dst_account, dst_password, dst_folder,
-                message_id=message_id, raw=raw,
+                dst_account,
+                dst_password,
+                dst_folder,
+                message_id=message_id,
+                raw=raw,
             )
             if existing == "ambiguous":
                 self.wal.mark_needs_operator(tx_id)
                 self._audit_step(
-                    tx_id, "escalated", outcome="ERROR",
+                    tx_id,
+                    "escalated",
+                    outcome="ERROR",
                     reason="ambiguous_fallback_match",
                 )
                 return SagaResult(
-                    tx_id=tx_id, mechanism="saga", result="ERROR",
+                    tx_id=tx_id,
+                    mechanism="saga",
+                    result="ERROR",
                     error_type="ambiguous_fallback_match",
                 )
             if existing:
@@ -364,7 +376,9 @@ class SagaManager:
                     self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
                 return SagaResult(
-                    tx_id=tx_id, mechanism="saga", result="ERROR",
+                    tx_id=tx_id,
+                    mechanism="saga",
+                    result="ERROR",
                     error_type="target_append_timeout",
                 )
             except ConnectionRefusedError as exc:
@@ -373,7 +387,9 @@ class SagaManager:
                     self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
                 return SagaResult(
-                    tx_id=tx_id, mechanism="saga", result="ERROR",
+                    tx_id=tx_id,
+                    mechanism="saga",
+                    result="ERROR",
                     error_type="target_unreachable",
                 )
             except Exception as exc:
@@ -382,7 +398,9 @@ class SagaManager:
                     self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
                 return SagaResult(
-                    tx_id=tx_id, mechanism="saga", result="ERROR",
+                    tx_id=tx_id,
+                    mechanism="saga",
+                    result="ERROR",
                     error_type="target_append_failed",
                 )
             if not ok:
@@ -391,7 +409,9 @@ class SagaManager:
                     self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
                 return SagaResult(
-                    tx_id=tx_id, mechanism="saga", result="ERROR",
+                    tx_id=tx_id,
+                    mechanism="saga",
+                    result="ERROR",
                     error_type="target_append_failed",
                 )
             _maybe_crash("post_append_pre_staged")
@@ -449,7 +469,9 @@ class SagaManager:
                         self.wal.mark_needs_operator(tx_id)
                         self._audit_step(tx_id, "escalated", outcome="ERROR")
                     return SagaResult(
-                        tx_id=tx_id, mechanism="saga", result="ERROR",
+                        tx_id=tx_id,
+                        mechanism="saga",
+                        result="ERROR",
                         error_type="source_delete_failed",
                     )
             self.wal.mark_deleted(tx_id)
@@ -473,7 +495,9 @@ class SagaManager:
             self.wal.abort(tx["tx_id"], "crashed_before_fetch")
             self._audit_step(tx["tx_id"], "aborted", outcome="ERROR")
             return SagaResult(
-                tx_id=tx["tx_id"], mechanism="saga", result="ERROR",
+                tx_id=tx["tx_id"],
+                mechanism="saga",
+                result="ERROR",
                 error_type="crashed_before_fetch",
             )
         try:
@@ -500,17 +524,25 @@ class SagaManager:
                 "fallback_4kb_sha256": tx.get("fallback_4kb_sha256"),
             }
             existing = await self._search_target_for_existing(
-                dst_account, dst_password, tx["dst_folder"],
-                message_id=None, raw=None, fallback=fallback,
+                dst_account,
+                dst_password,
+                tx["dst_folder"],
+                message_id=None,
+                raw=None,
+                fallback=fallback,
             )
             if existing == "ambiguous":
                 self.wal.mark_needs_operator(tx["tx_id"])
                 self._audit_step(
-                    tx["tx_id"], "escalated", outcome="ERROR",
+                    tx["tx_id"],
+                    "escalated",
+                    outcome="ERROR",
                     reason="ambiguous_fallback_match",
                 )
                 return SagaResult(
-                    tx_id=tx["tx_id"], mechanism="saga", result="ERROR",
+                    tx_id=tx["tx_id"],
+                    mechanism="saga",
+                    result="ERROR",
                     error_type="ambiguous_fallback_match",
                 )
             if existing:
@@ -568,9 +600,7 @@ def _extract_fallback_key(raw: bytes) -> dict[str, Any]:
             parsed = parsedate_to_datetime(raw_date)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            date_iso = parsed.astimezone(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            )
+            date_iso = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         except (TypeError, ValueError):
             date_iso = None
     return {
@@ -582,9 +612,7 @@ def _extract_fallback_key(raw: bytes) -> dict[str, Any]:
     }
 
 
-async def _delete_source(
-    account: Account, password: str, folder: str, uid: int
-) -> None:
+async def _delete_source(account: Account, password: str, folder: str, uid: int) -> None:
     """Detach the message at `uid` from `folder`.
 
     Uses MOVE-to-trash-folder-emulation via STORE \\Deleted + EXPUNGE,
