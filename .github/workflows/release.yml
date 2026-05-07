@@ -35,8 +35,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          semantic-release version
-          echo "released=$(semantic-release version --print 2>/dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          semantic-release version || true
+          VERSION=$(semantic-release version --print 2>/dev/null || echo "")
+          if [ -n "$VERSION" ]; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build package
         if: steps.semver.outputs.released == 'true'

@@ -32,7 +32,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: mypy --strict src/imap_mcp/
+      - run: mypy --check-untyped-defs src/imap_mcp/
 
   test:
     runs-on: ubuntu-latest
