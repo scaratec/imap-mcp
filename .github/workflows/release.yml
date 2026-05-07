@@ -6,12 +6,10 @@ on:
 
 permissions:
   contents: write
-  id-token: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    environment: pypi
     concurrency: release
     defaults:
       run:
@@ -27,42 +25,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install tools
-        run: pip install python-semantic-release build
+      - name: Install semantic-release
+        run: pip install python-semantic-release
 
-      - name: Check if release is needed
-        id: check
+      - name: Semantic release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          BEFORE=$(git tag --list 'v*' | wc -l)
-          semantic-release version --no-push --no-commit || true
-          AFTER=$(git tag --list 'v*' | wc -l)
-          if [ "$AFTER" -gt "$BEFORE" ]; then
-            echo "new_version=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "new_version=false" >> "$GITHUB_OUTPUT"
-          fi
-          git checkout -- . 2>/dev/null || true
-
-      - name: Run semantic-release
-        if: steps.check.outputs.new_version == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: semantic-release version
-
-      - name: Build package
-        if: steps.check.outputs.new_version == 'true'
-        run: python -m build
-
-      - name: Publish to PyPI
-        if: steps.check.outputs.new_version == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: server/dist/
-
-      - name: Create GitHub release
-        if: steps.check.outputs.new_version == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: semantic-release publish
+        run: semantic-release version --no-vcs-release || true
