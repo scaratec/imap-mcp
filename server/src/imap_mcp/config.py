@@ -15,7 +15,7 @@ discipline.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -306,7 +306,10 @@ def load_configuration(config_dir: Path) -> Configuration:
     )
 
 
-def _load_yaml[T: BaseModel](path: Path, model: type[T]) -> T:
+_T = TypeVar("_T", bound=BaseModel)
+
+
+def _load_yaml(path: Path, model: type[_T]) -> _T:
     with path.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
     return model.model_validate(raw)

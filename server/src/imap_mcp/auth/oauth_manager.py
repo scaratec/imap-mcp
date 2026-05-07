@@ -77,7 +77,6 @@ class OAuthManager:
                 err = resp.json().get("error", "unknown_error")
                 self._log_audit(account.id, "DENY", err)
                 if err == "invalid_grant":
-                    import sys
                     if not hasattr(self, "_needs_rebootstrap"):
                         self._needs_rebootstrap = {}
                     self._needs_rebootstrap[account.id] = True

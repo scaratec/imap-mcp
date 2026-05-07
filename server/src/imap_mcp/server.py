@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from mcp.server import Server
-from mcp.server.lowlevel.server import RequestContext
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
 from mcp.types import (
@@ -884,7 +883,7 @@ async def _handle_fetch_body(
     if level_rank(message_decision.visibility) < minimum_for_tool:
         return {
             "decision": "DENY",
-            "reason": f"visibility_below_BODY",
+            "reason": "visibility_below_BODY",
             "account": account_id,
             "folder": folder_path,
             "uid": uid,
@@ -1857,7 +1856,7 @@ async def _handle_search(
     return result
 
 
-def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerContext, "Configuration"]:
+def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerContext, object]:
     """Load configuration and assemble a ServerContext.
 
     Shared by `run_stdio` and `run_http`. The transport-specific code
@@ -2041,7 +2040,6 @@ async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
         config_dir, default_caller_id=caller_id or "<no-caller>"
     )
     
-    import sys
     auth_failure_reason: str | None = None
     if not caller_id:
         auth_failure_reason = "no_caller_identity"
