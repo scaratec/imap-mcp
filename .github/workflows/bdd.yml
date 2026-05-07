@@ -17,6 +17,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install docker compose plugin
+        run: |
+          DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
+          mkdir -p "$DOCKER_CONFIG/cli-plugins"
+          curl -SL https://github.com/docker/compose/releases/download/v2.29.1/docker-compose-linux-x86_64 \
+            -o "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          docker compose version
+
       - name: Install server
         run: |
           cd server
@@ -27,19 +36,13 @@ jobs:
         run: |
           cd bdd
           python -m venv .venv
-          .venv/bin/pip install -r <(grep -v "^#" pyproject.toml | python -c "
-          import sys, tomllib
-          data = tomllib.loads(sys.stdin.read())
-          for dep in data['project']['dependencies']:
-              print(dep)
-          ")
-          .venv/bin/pip install behave httpx
+          .venv/bin/pip install behave httpx PyYAML
 
       - name: Start fixtures
         run: |
           cd bdd/docker
           docker compose up -d
-          sleep 5
+          sleep 10
 
       - name: Run BDD suite
         run: |
