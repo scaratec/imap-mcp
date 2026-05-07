@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -25,10 +26,36 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install semantic-release
-        run: pip install python-semantic-release
+      - name: Install tools
+        run: pip install python-semantic-release build
 
-      - name: Semantic release
+      - name: Semantic release — version
+        id: semver
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: semantic-release version --no-vcs-release || true
+        run: |
+          OUTPUT=$(semantic-release version 2>&1) || true
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q "No release will be made"; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          elif git tag --points-at HEAD | grep -q "^v"; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build package
+        if: steps.semver.outputs.released == 'true'
+        run: python -m build
+
+      - name: Publish to PyPI
+        if: steps.semver.outputs.released == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: server/dist/
+
+      - name: Create GitHub release
+        if: steps.semver.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: semantic-release publish
