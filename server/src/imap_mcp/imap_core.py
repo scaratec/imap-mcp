@@ -19,7 +19,7 @@ import re
 
 from dataclasses import dataclass
 
-from aioimaplib import IMAP4
+from aioimaplib import IMAP4, IMAP4_SSL
 
 from .config import Account
 
@@ -70,21 +70,24 @@ async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
     # branch distinguish "target_unreachable" from "target_append_timeout".
     import asyncio as _asyncio
 
-    try:
-        _r, _w = await _asyncio.wait_for(
-            _asyncio.open_connection(account.host, account.port),
-            timeout=timeout,
-        )
-        _w.close()
+    if account.port == 993:
+        imap = IMAP4_SSL(host=account.host, port=account.port, timeout=timeout)
+    else:
         try:
-            await _w.wait_closed()
-        except Exception:
-            pass
-    except ConnectionRefusedError:
-        raise
-    except OSError as exc:
-        raise ConnectionRefusedError(*exc.args) from exc
-    imap = IMAP4(host=account.host, port=account.port, timeout=timeout)
+            _r, _w = await _asyncio.wait_for(
+                _asyncio.open_connection(account.host, account.port),
+                timeout=timeout,
+            )
+            _w.close()
+            try:
+                await _w.wait_closed()
+            except Exception:
+                pass
+        except ConnectionRefusedError:
+            raise
+        except OSError as exc:
+            raise ConnectionRefusedError(*exc.args) from exc
+        imap = IMAP4(host=account.host, port=account.port, timeout=timeout)
     await imap.wait_hello_from_server()
     return imap
 

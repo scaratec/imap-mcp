@@ -139,11 +139,13 @@ def main(argv: list[str] | None = None) -> int:
         print("pkce_verification_failed", file=sys.stderr)
         return 1
 
+    client_secret = os.environ.get("IMAP_MCP_OAUTH_CLIENT_SECRET", "")
     resp = httpx.post(
         token_uri,
         data={
             "grant_type": "authorization_code",
             "client_id": client_id,
+            "client_secret": client_secret,
             "code": code,
             "redirect_uri": "http://localhost:8080/callback",
             "code_verifier": verifier,

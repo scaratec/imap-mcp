@@ -53,6 +53,7 @@ class OAuthManager:
         import os
 
         client_id = os.environ.get("IMAP_MCP_OAUTH_CLIENT_ID", "test-client-id")
+        client_secret = os.environ.get("IMAP_MCP_OAUTH_CLIENT_SECRET", "")
 
         # Test error injection
         injected_error = os.environ.get("IMAP_MCP_TEST_OAUTH_INJECT_ERROR")
@@ -71,6 +72,7 @@ class OAuthManager:
                 data={
                     "grant_type": "refresh_token",
                     "client_id": client_id,
+                    "client_secret": client_secret,
                     "refresh_token": refresh_token,
                 },
             )
