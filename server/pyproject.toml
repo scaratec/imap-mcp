@@ -50,3 +50,11 @@ target-version = "py311"
 python_version = "3.11"
 strict = true
 packages = ["imap_mcp"]
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+branch = "main"
+major_on_zero = false
+allow_zero_version = true
+tag_format = "v{version}"
+build_command = "python -m build"

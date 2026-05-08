@@ -657,21 +657,24 @@ async def _known_folders_for(context: ServerContext, account_id: str) -> list[st
 
 async def _password_for_account(context: ServerContext, account_id: str) -> tuple[Any, str]:
     """Resolve account model and password. Raises on missing config."""
+    from .config import Account
+
     account = context.account_by_id(account_id)
     if account is None:
         raise RuntimeError(f"Account {account_id!r} not configured")
-    if account.auth is None:
+    account_model: Account = account  # type: ignore[assignment]
+    if account_model.auth is None:
         raise RuntimeError(f"Account {account_id!r} has no auth configuration")
-    if account.auth.type == "xoauth2":
-        password = await context.oauth_manager.get_access_token(account)
+    if account_model.auth.type == "xoauth2":
+        password = await context.oauth_manager.get_access_token(account_model)
     else:
-        password = context.secret_store.get(account.auth.password_secret_ref())
+        password = context.secret_store.get(account_model.auth.password_secret_ref())
     if password is None:
         raise RuntimeError(
-            f"Secret store could not resolve {account.auth.secret_ref!r} "
+            f"Secret store could not resolve {account_model.auth.secret_ref!r} "
             f"for account {account_id!r}."
         )
-    return account, password
+    return account_model, password
 
 
 async def _handle_list_folders(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1716,8 +1719,6 @@ def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
     default scope in the caller — this function only handles explicit
     predicates.
     """
-    from datetime import datetime, timedelta, timezone
-
     parts: list[str] = []
     for key, value in criteria.items():
         if key == "from":

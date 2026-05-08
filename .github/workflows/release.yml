@@ -12,9 +12,6 @@ jobs:
   release:
     runs-on: ubuntu-latest
     concurrency: release
-    defaults:
-      run:
-        working-directory: server
 
     steps:
       - uses: actions/checkout@v4
@@ -29,10 +26,25 @@ jobs:
       - name: Install tools
         run: pip install python-semantic-release build
 
+      - name: Ensure baseline tag exists
+        run: |
+          if ! git tag --list 'v*' | grep -q .; then
+            VERSION=$(python -c "
+          import tomllib, pathlib
+          d = tomllib.loads(pathlib.Path('server/pyproject.toml').read_text())
+          print(d['project']['version'])
+          ")
+            FIRST=$(git rev-list --max-parents=0 HEAD)
+            git tag "v${VERSION}" "$FIRST"
+            git push origin "v${VERSION}"
+            echo "Created baseline tag v${VERSION} on ${FIRST}"
+          fi
+
       - name: Semantic release — version
         id: semver
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: server
         run: |
           OUTPUT=$(semantic-release version 2>&1) || true
           echo "$OUTPUT"
@@ -46,6 +58,7 @@ jobs:
 
       - name: Build package
         if: steps.semver.outputs.released == 'true'
+        working-directory: server
         run: python -m build
 
       - name: Publish to PyPI
@@ -53,9 +66,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: server/dist/
+          skip-existing: true
 
       - name: Create GitHub release
         if: steps.semver.outputs.released == 'true'
+        working-directory: server
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: semantic-release publish
