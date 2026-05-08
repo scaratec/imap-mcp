@@ -1706,10 +1706,7 @@ def _criteria_match(criteria: dict[str, Any], facts: MessageFacts) -> bool:
     Catches predicates that cannot be expressed as IMAP SEARCH terms
     (e.g. has_attachment) and refines inexact IMAP matches.
     """
-    return all(
-        _match_single_predicate(key, value, facts=facts)
-        for key, value in criteria.items()
-    )
+    return all(_match_single_predicate(key, value, facts=facts) for key, value in criteria.items())
 
 
 def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
@@ -1778,7 +1775,7 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
         from datetime import datetime, timedelta, timezone
 
         since = datetime.now(timezone.utc) - timedelta(days=7)
-        imap_criteria = f'SINCE {since.strftime("%d-%b-%Y")}'
+        imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
 
     account, password = await _password_for(context, account_id)
     all_uids = await imap_search_uids(account, password, folder_path, imap_criteria)
