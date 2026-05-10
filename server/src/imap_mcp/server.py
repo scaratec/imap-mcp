@@ -1782,19 +1782,31 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
     account, password = await _password_for(context, account_id)
     all_uids = await imap_search_uids(account, password, folder_path, imap_criteria)
     matched_total = len(all_uids)
-    visible_uids: list[int] = []
-    for candidate_uid in all_uids:
-        envelope = await imap_fetch_envelope(account, password, folder_path, candidate_uid)
-        if envelope is None:
-            continue
-        facts = _facts_from_envelope(envelope)
-        if criteria_raw and not _criteria_match(criteria_raw, facts):
-            continue
-        message_decision = evaluate_message_against_folder(
-            folder_decision.folder_policy, facts=facts
-        )
-        if message_decision.allowed and level_rank(message_decision.visibility) >= minimum_for_tool:
-            visible_uids.append(candidate_uid)
+
+    fp = folder_decision.folder_policy
+    skip_per_message = (
+        not criteria_raw
+        and fp.mode == "blacklist"
+        and not fp.rules
+        and level_rank(fp.default) >= minimum_for_tool
+    )
+
+    if skip_per_message:
+        visible_uids = list(all_uids)
+    else:
+        visible_uids = []
+        for candidate_uid in all_uids:
+            envelope = await imap_fetch_envelope(account, password, folder_path, candidate_uid)
+            if envelope is None:
+                continue
+            facts = _facts_from_envelope(envelope)
+            if criteria_raw and not _criteria_match(criteria_raw, facts):
+                continue
+            message_decision = evaluate_message_against_folder(
+                fp, facts=facts
+            )
+            if message_decision.allowed and level_rank(message_decision.visibility) >= minimum_for_tool:
+                visible_uids.append(candidate_uid)
     filtered_out = matched_total - len(visible_uids)
 
     all_visible = visible_uids

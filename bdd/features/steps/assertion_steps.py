@@ -2690,3 +2690,24 @@ def step_audit_file_has_mode(context: Context, filename: str, mode: str) -> None
         raise AssertionError(
             f"{filename} mode is {oct(actual)}, expected {oct(expected)}"
         )
+
+
+@then('the audit log does not contain any entry with tool "{tool}"')
+def step_audit_log_no_entry_with_tool(
+    context: Context, tool: str
+) -> None:
+    import json as _json
+
+    audit_dir = getattr(context, "audit_dir", None)
+    if audit_dir is None:
+        raise AssertionError("No audit_dir on context")
+    for path in audit_dir.glob("*.jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = _json.loads(line)
+            if record.get("tool") == tool:
+                raise AssertionError(
+                    f"Audit log contains entry with tool={tool!r}: "
+                    f"{record!r}"
+                )
