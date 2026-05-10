@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.2.1 (2026-05-10)
+
+### Bug Fixes
+
+- Reopen stale read-only audit files on server restart
+  ([`69a3e05`](https://github.com/scaratec/imap-mcp/commit/69a3e05098c2632da9a7ed38005fa5a1543b1f60))
+
+
 ## v0.2.0 (2026-05-10)
 
 ### Bug Fixes
