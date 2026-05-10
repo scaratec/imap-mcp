@@ -1,0 +1,114 @@
+# CHANGELOG
+
+<!-- version list -->
+
+## v0.2.0 (2026-05-10)
+
+### Bug Fixes
+
+- Add IMAPS (port 993) support and client_secret to OAuth flows
+  ([`e6941f3`](https://github.com/scaratec/imap-mcp/commit/e6941f341e56475eadf2e0f965d41d1b50aec696))
+
+- Resolve ruff lint and mypy strict errors for CI
+  ([`280024f`](https://github.com/scaratec/imap-mcp/commit/280024f6c4decd6d61841e85d2371bfcafd0b094))
+
+- **ci**: Install docker compose plugin in BDD runner, simplify pip install
+  ([`b0300a8`](https://github.com/scaratec/imap-mcp/commit/b0300a811e91b4a5d0d452d699371075d56efa69))
+
+- **ci**: Make typecheck non-blocking until type migration is complete
+  ([`1425a9a`](https://github.com/scaratec/imap-mcp/commit/1425a9a5de4394530c08c920063b1f7f4c318a9c))
+
+- **ci**: Relax mypy to check-untyped-defs, tolerate no-op releases
+  ([`26f5ed2`](https://github.com/scaratec/imap-mcp/commit/26f5ed23ed24b285511eb1a319005b988fbc59c9))
+
+- **ci**: Repair release pipeline and lint errors
+  ([`cb90227`](https://github.com/scaratec/imap-mcp/commit/cb90227636719bf8655cedcb5f6e68ec3f4a2b35))
+
+- **ci**: Simplify release workflow, defer PyPI publish
+  ([`d805482`](https://github.com/scaratec/imap-mcp/commit/d805482728405506de4421734209178fbace04fc))
+
+- **ci**: Skip release workflow when no new version is needed
+  ([`2696637`](https://github.com/scaratec/imap-mcp/commit/2696637e3800b61e1ae65fe1e12494d752dc4278))
+
+- **ci**: Use ARC scale set name as runs-on label for BDD workflow
+  ([`5276d61`](https://github.com/scaratec/imap-mcp/commit/5276d61d214323871cfc57044ba6f9d45804131f))
+
+- **ci**: Use RELEASE_TOKEN PAT to bypass branch protection
+  ([`d01f33e`](https://github.com/scaratec/imap-mcp/commit/d01f33ebcd045cd19d5bd62d2baf8f66ef673756))
+
+### Chores
+
+- Relicense under GPL-3.0 and rewrite README for V1 scope
+  ([`7248cdd`](https://github.com/scaratec/imap-mcp/commit/7248cdd13f228694534769c7e8409715c9f8d38f))
+
+### Code Style
+
+- Apply ruff format to all server source files
+  ([`8a5eeea`](https://github.com/scaratec/imap-mcp/commit/8a5eeea6c7003a1b2e7b51b9eec9c918253cc97f))
+
+- Apply ruff format to server.py
+  ([`a829572`](https://github.com/scaratec/imap-mcp/commit/a82957251217ffd1bb5bc4b5d3fc85a5e97b25cf))
+
+### Continuous Integration
+
+- Add GitHub Actions pipelines and ARC runner setup
+  ([`d72076a`](https://github.com/scaratec/imap-mcp/commit/d72076a64cd5a7d7412084e3f15f82e3b621dcff))
+
+### Documentation
+
+- Add CLAUDE.md and ROADMAP status snapshot for resumption
+  ([`880d44f`](https://github.com/scaratec/imap-mcp/commit/880d44f29325fe5da9e3fbc32f3b628dca82b896))
+
+- Add LIM-0010 (production IMAP BDD gaps) and LIM-0011 (search performance)
+  ([`ae03535`](https://github.com/scaratec/imap-mcp/commit/ae03535c3167b2668c755db6017cceb050825311))
+
+- Rewrite README for V1 release, rename package to sc-imap-mcp
+  ([`a8f8398`](https://github.com/scaratec/imap-mcp/commit/a8f83984df1add40087f20a8236675dd951ca639))
+
+- **adr**: Add 21 architecture decision records covering V1 scope
+  ([`b4fbb16`](https://github.com/scaratec/imap-mcp/commit/b4fbb1647c09ba5fce8642b83bcb7eb5ea2c4954))
+
+- **LIM-0011**: Sharpen search performance fix — IMAP pre-filter, pagination, default scope
+  ([`abdb6fc`](https://github.com/scaratec/imap-mcp/commit/abdb6fc6680b4e45b297ec6c57c03c84d38ffe1d))
+
+### Features
+
+- Close all remaining LIMs — Gmail mock, OAuth scope reload, audit hooks, saga pause, spec-audit
+  fixes
+  ([`2c71770`](https://github.com/scaratec/imap-mcp/commit/2c717703b2679105bdaa197af0479b9f862587be))
+
+- V1 implementation – BDD-grüne Suite, Saga, Audit, PDP
+  ([`96c2b5c`](https://github.com/scaratec/imap-mcp/commit/96c2b5c758200d7356140b227f74ba8cbe2e7ec8))
+
+- **audit**: Retention rotation, eof_day day-roll, fake-now (LIM-0009)
+  ([`a95e86e`](https://github.com/scaratec/imap-mcp/commit/a95e86efa9aeb74f0063c8494701e4e3718b693a))
+
+- **auth+mitm**: Close LIM-0004 and LIM-0007 — wire-level fault injection, env_var/gpg_file
+  backends, stdio Initialize, identity_immutable
+  ([`5ccfe91`](https://github.com/scaratec/imap-mcp/commit/5ccfe9190d39aef1827429e153d8b3e21e96374f))
+
+- **ci**: Enable PyPI publishing via Trusted Publisher on release
+  ([`c65bfe9`](https://github.com/scaratec/imap-mcp/commit/c65bfe9a800c15b179d4fe6cbc3a3c253b7c830b))
+
+- **mitm**: IMAP MITM-Proxy für CAPABILITY-Strip + UIDVALIDITY-Inject (LIM-0005)
+  ([`a28f609`](https://github.com/scaratec/imap-mcp/commit/a28f60937b6698c1d702e95bb484e803a72d5e06))
+
+- **mitm**: Lift IMAP fault injection from env-var registry onto the wire proxy (LIM-0004)
+  ([`7d64926`](https://github.com/scaratec/imap-mcp/commit/7d649266d35e309398bca336ee5a4aae42617881))
+
+- **reload**: SIGHUP policy reload mit atomarem Live-State-Swap (LIM-0008)
+  ([`8e7e128`](https://github.com/scaratec/imap-mcp/commit/8e7e128c8aa40837570babfb900ed9868a14425d))
+
+- **saga**: 5-Tupel-Fallback-Idempotenz für Message-ID-lose Recoveries (LIM-0006)
+  ([`9855d45`](https://github.com/scaratec/imap-mcp/commit/9855d45e671a980bce8fa9b91561472c6f19f844))
+
+- **search**: Add criteria pre-filtering, pagination,
+  ([`7738dc1`](https://github.com/scaratec/imap-mcp/commit/7738dc1a3a50385e8465de0e53d2ebbd91127101))
+
+- **transport**: Streamable HTTP + shared_token bearer auth (LIM-0007)
+  ([`44c4967`](https://github.com/scaratec/imap-mcp/commit/44c4967bc23aff2d5b5ac5f972127f5255a05dd2))
+
+
+## v0.1.0 (2026-04-20)
+
+- Initial Release
