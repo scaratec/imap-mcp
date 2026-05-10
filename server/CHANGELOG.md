@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-05-10)
+
+### Features
+
+- Expose package version in serverInfo and add
+  ([`8486f8a`](https://github.com/scaratec/imap-mcp/commit/8486f8a699f299b78f157fa156a7aae8b6fe1803))
+
+
 ## v0.3.0 (2026-05-10)
 
 ### Features
