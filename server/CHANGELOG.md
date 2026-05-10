@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0 (2026-05-10)
+
+### Features
+
+- **search**: Skip per-message envelope fetch on
+  ([`8a60e0d`](https://github.com/scaratec/imap-mcp/commit/8a60e0d1f3df43e364b6f0de50aceed29ded600c))
+
+
 ## v0.2.1 (2026-05-10)
 
 ### Bug Fixes
