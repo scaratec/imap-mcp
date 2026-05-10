@@ -10,7 +10,8 @@ Feature: MCP tool discovery
     - Tool absence            : 1 (no extras, especially no non-goals)
     - Tool metadata           : 3 (read: minimum-level, write: capability, meta: none)
     - Version advertisement   : 1
-    Total enumerated          : 6   covered by this feature: 6
+    - Package version in serverInfo : 1
+    Total enumerated          : 7   covered by this feature: 7
 
   Background:
     Given the server is started with a minimal caller configuration
@@ -91,3 +92,6 @@ Feature: MCP tool discovery
     When invoice-agent calls the MCP list_tools method
     Then the server metadata contains "tool_set_version" matching the regex "^\d+\.\d+\.\d+$"
     And the major version equals 1
+
+  Scenario: serverInfo.version matches the installed package version
+    Then the server info version matches the installed sc-imap-mcp package version

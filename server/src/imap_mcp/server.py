@@ -131,8 +131,26 @@ class ServerContext:
         return None
 
 
+def _package_version() -> str:
+    from importlib.metadata import version
+
+    try:
+        return version("sc-imap-mcp")
+    except Exception:
+        pass
+    import re
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    if pyproject.is_file():
+        m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(), re.MULTILINE)
+        if m:
+            return m.group(1)
+    return "0.0.0-dev"
+
+
 def build_server(context: ServerContext) -> Server:
-    app: Server = Server("imap-mcp")
+    app: Server = Server("imap-mcp", version=_package_version())
 
     @app.list_tools()
     async def _list_tools() -> list[Tool]:

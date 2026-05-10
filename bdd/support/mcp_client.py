@@ -139,7 +139,7 @@ class MCPClient:
     # --------------------------------------------------------- internals
 
     def _initialize(self) -> None:
-        self._rpc(
+        result = self._rpc(
             "initialize",
             {
                 "protocolVersion": "2024-11-05",
@@ -147,6 +147,7 @@ class MCPClient:
                 "clientInfo": {"name": "imap-mcp-bdd", "version": "0.1.0"},
             },
         )
+        self.server_info = result.get("serverInfo", {})
         self._notify("notifications/initialized", {})
         self._initialized = True
 

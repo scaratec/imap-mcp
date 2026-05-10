@@ -2692,6 +2692,28 @@ def step_audit_file_has_mode(context: Context, filename: str, mode: str) -> None
         )
 
 
+@then("the server info version matches the installed sc-imap-mcp package version")
+def step_server_info_version_matches_package(context: Context) -> None:
+    import re as _re
+    from pathlib import Path as _Path
+
+    pyproject = _Path(__file__).resolve().parents[3] / "server" / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8")
+    m = _re.search(r'^version\s*=\s*"([^"]+)"', text, _re.MULTILINE)
+    if not m:
+        raise AssertionError(f"Cannot parse version from {pyproject}")
+    expected = m.group(1)
+    client = context.mcp
+    if client is None:
+        raise AssertionError("No MCP client on context")
+    actual = getattr(client, "server_info", {}).get("version")
+    if actual != expected:
+        raise AssertionError(
+            f"serverInfo.version={actual!r}, expected package "
+            f"version {expected!r}"
+        )
+
+
 @then('the audit log does not contain any entry with tool "{tool}"')
 def step_audit_log_no_entry_with_tool(
     context: Context, tool: str
