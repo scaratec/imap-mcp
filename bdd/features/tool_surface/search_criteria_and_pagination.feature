@@ -19,7 +19,8 @@ Feature: Search criteria pre-filtering and pagination
     Total enumerated                                : 18   covered by this feature: 18
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folder "INBOX"
+    Given the server date is pinned to "2026-05-07"
+    And the IMAP account "gupta-scaratec" exists with folder "INBOX"
     And the server is configured with caller "inbox-agent" using policy "inbox-policy"
     And policy "inbox-policy" grants account "gupta-scaratec"
     And policy "inbox-policy" folder defaults for "INBOX" are:

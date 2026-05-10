@@ -84,6 +84,13 @@ def step_imap_account_exists_with_single_folder(
     builder.write()
 
 
+@given('the server date is pinned to "{date}"')
+def step_server_date_pinned(context: Context, date: str) -> None:
+    env = getattr(context, "mcp_extra_env", None) or {}
+    env["IMAP_MCP_FAKE_NOW_UTC"] = f"{date}T12:00:00+00:00"
+    context.mcp_extra_env = env
+
+
 @given('the secret store "{store_type}" is configured at path $TMPDIR/secrets')
 def step_secret_store_configured(context: Context, store_type: str) -> None:
     builder = _ensure_builder(context)

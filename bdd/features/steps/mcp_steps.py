@@ -717,6 +717,21 @@ def step_server_restarted(context: Context) -> None:
     context.crash_expected = False
 
 
+@when('the server is restarted with fake date "{date}"')
+def step_server_restarted_with_fake_date(
+    context: Context, date: str
+) -> None:
+    if context.mcp is not None:
+        context.mcp.close()
+        context.mcp = None
+    env = getattr(context, "mcp_extra_env", None) or {}
+    env.pop("IMAP_MCP_CRASH_AT", None)
+    env["IMAP_MCP_TEST_MODE"] = "1"
+    env["IMAP_MCP_FAKE_NOW_UTC"] = f"{date}T12:00:00+00:00"
+    context.mcp_extra_env = env
+    context.crash_expected = False
+
+
 @when("{caller_id} calls get_transaction_status with the returned tx_id")
 def step_caller_calls_get_transaction_status(
     context: Context, caller_id: str

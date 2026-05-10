@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from behave import then, when
+from behave import given, then, when
 from behave.runner import Context
 
 
@@ -2657,4 +2657,36 @@ def step_response_field_has_length(
     if len(actual) != length:
         raise AssertionError(
             f"Field {field!r}: expected length {length}, got {len(actual)}"
+        )
+
+
+# ------------------------------------------------------------------
+# Audit file permission steps (Given + Then)
+# ------------------------------------------------------------------
+
+
+@given('the audit file "{filename}" is set to mode {mode}')
+@when('the audit file "{filename}" is set to mode {mode}')
+def step_set_audit_file_mode(context: Context, filename: str, mode: str) -> None:
+    import os as _os
+
+    path = context.audit_dir / filename
+    if not path.exists():
+        raise AssertionError(f"Audit file {filename!r} does not exist")
+    _os.chmod(path, int(mode, 8))
+
+
+@then('the audit file "{filename}" has mode {mode}')
+def step_audit_file_has_mode(context: Context, filename: str, mode: str) -> None:
+    import os as _os
+    import stat as _stat
+
+    path = context.audit_dir / filename
+    if not path.exists():
+        raise AssertionError(f"Audit file {filename!r} does not exist")
+    expected = int(mode, 8)
+    actual = _stat.S_IMODE(_os.stat(path).st_mode)
+    if actual != expected:
+        raise AssertionError(
+            f"{filename} mode is {oct(actual)}, expected {oct(expected)}"
         )

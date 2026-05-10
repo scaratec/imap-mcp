@@ -1772,9 +1772,11 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
     if imap_criteria == "ALL" and not criteria_raw:
-        from datetime import datetime, timedelta, timezone
+        from datetime import timedelta
 
-        since = datetime.now(timezone.utc) - timedelta(days=7)
+        from .audit import _now_utc
+
+        since = _now_utc() - timedelta(days=7)
         imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
 
     account, password = await _password_for(context, account_id)

@@ -108,7 +108,18 @@ class AuditWriter:
                 continue
             try:
                 stat_before = path.stat()
+                was_readonly = stat_before.st_mode & 0o200 == 0
+                if was_readonly:
+                    try:
+                        os.chmod(path, 0o600)
+                    except OSError:
+                        continue
                 if not self._restore_chain_state_from(path):
+                    if was_readonly:
+                        try:
+                            os.chmod(path, stat_before.st_mode & 0o777)
+                        except OSError:
+                            pass
                     continue
                 self._current_path = path
                 self._current_day = day

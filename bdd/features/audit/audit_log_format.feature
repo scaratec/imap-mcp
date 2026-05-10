@@ -18,7 +18,8 @@ Feature: Audit log format
     - Search query hashing                : 1
     - Auth-failed records                 : 1
     - Record permissions (0600)           : 1
-    Total enumerated                       : 11   covered by this feature: 11
+    - Stale 0400 file reopened on restart  : 1
+    Total enumerated                       : 12   covered by this feature: 12
 
   Background:
     Given the audit log directory is a fresh $TMPDIR/audit
@@ -120,3 +121,13 @@ Feature: Audit log format
     When the UTC day rolls
     Then the just-closed file has mode 0400
     And the audit directory has mode 0700
+
+  Scenario: Server restart with a stale read-only audit file from a previous run
+    Given the server is actively writing to "2026-03-15.jsonl"
+    When the server terminates ungracefully
+    And the audit file "2026-03-15.jsonl" is set to mode 0400
+    And the server is restarted with fake date "2026-03-16"
+    And invoice-agent calls list_accounts
+    Then file "2026-03-15.jsonl" ends with a record of tool "eof_day" carrying field final_hash
+    And the audit file "2026-03-15.jsonl" has mode 0400
+    And the audit file "2026-03-16.jsonl" has mode 0600
