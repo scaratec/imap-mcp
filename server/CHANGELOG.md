@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-05-11)
+
+### Documentation
+
+- Resolve LIM-0011 — search pagination and IMAP pre-filter already implemented
+  ([`26bc165`](https://github.com/scaratec/imap-mcp/commit/26bc1653e5bff94c3380b2afbd20b3051b8a98b3))
+
+### Features
+
+- Add OpenTelemetry tracing with Jaeger backend
+  ([`096c833`](https://github.com/scaratec/imap-mcp/commit/096c83395be6073b7b5dd98937803495674bb070))
+
+
 ## v0.5.0 (2026-05-11)
 
 ### Features
