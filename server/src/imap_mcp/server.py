@@ -1860,7 +1860,7 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
 
     results_with_gmail: list[dict[str, Any]] | None = None
     account_obj = context.account_by_id(account_id)
-    if account_obj is not None and _is_google_provider(account_obj) and page:
+    if account_obj is not None and _is_google_provider(account_obj) and page and len(page) <= 10:
         results_with_gmail = []
         for vuid in page:
             entry: dict[str, Any] = {"uid": vuid}
