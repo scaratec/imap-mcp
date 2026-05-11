@@ -1817,12 +1817,21 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
 
     fp = folder_decision.folder_policy
     pdp_predetermined = (
-        fp.mode == "blacklist"
-        and not fp.rules
-        and level_rank(fp.default) >= minimum_for_tool
+        fp.mode == "blacklist" and not fp.rules and level_rank(fp.default) >= minimum_for_tool
     )
     criteria_needs_envelope = criteria_raw and any(
-        k not in ("newer_than", "older_than", "from", "from_domain", "to", "to_contains", "subject_contains", "size_gt", "size_lt")
+        k
+        not in (
+            "newer_than",
+            "older_than",
+            "from",
+            "from_domain",
+            "to",
+            "to_contains",
+            "subject_contains",
+            "size_gt",
+            "size_lt",
+        )
         for k in criteria_raw
     )
 
@@ -1837,10 +1846,11 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
             facts = _facts_from_envelope(envelope)
             if criteria_raw and not _criteria_match(criteria_raw, facts):
                 continue
-            message_decision = evaluate_message_against_folder(
-                fp, facts=facts
-            )
-            if message_decision.allowed and level_rank(message_decision.visibility) >= minimum_for_tool:
+            message_decision = evaluate_message_against_folder(fp, facts=facts)
+            if (
+                message_decision.allowed
+                and level_rank(message_decision.visibility) >= minimum_for_tool
+            ):
                 visible_uids.append(candidate_uid)
     filtered_out = matched_total - len(visible_uids)
 
