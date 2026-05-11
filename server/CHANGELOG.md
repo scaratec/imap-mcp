@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.7.0 (2026-05-11)
+
+### Features
+
+- **tracing**: Add request/response attributes to tool spans
+  ([`973c0a7`](https://github.com/scaratec/imap-mcp/commit/973c0a7d28a23af979338437b77e8fffaf7b76c8))
+
+
 ## v0.6.0 (2026-05-11)
 
 ### Documentation
