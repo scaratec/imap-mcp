@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.4.2 (2026-05-11)
+
+### Bug Fixes
+
+- **search**: Skip Gmail enrichment on large result pages
+  ([`5ecbc7d`](https://github.com/scaratec/imap-mcp/commit/5ecbc7d501eeacbfc0dde417a0de21bf8c79db46))
+
+### Code Style
+
+- Apply ruff format to server.py
+  ([`69dd9cc`](https://github.com/scaratec/imap-mcp/commit/69dd9cc44937753d067f4a5a238f2242fe690c3d))
+
+
 ## v0.4.1 (2026-05-11)
 
 ### Bug Fixes
