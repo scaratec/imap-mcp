@@ -504,6 +504,15 @@ def build_server(context: ServerContext) -> Server:
             span.set_attribute("mcp.decision", result.get("decision", ""))
             span.set_attribute("mcp.reason", result.get("reason", ""))
             span.set_attribute("mcp.latency_ms", elapsed_ms)
+            import json as _json
+
+            _safe = {
+                k: v
+                for k, v in result.items()
+                if k not in ("messages", "body", "headers", "attachment", "rfc822")
+            }
+            span.set_attribute("mcp.response", _json.dumps(_safe, default=str))
+            span.set_attribute("mcp.request", _json.dumps(arguments, default=str))
             _audit_tool_call(context, name, arguments, result, latency_ms=elapsed_ms)
             return ServerResult(CallToolResult(content=_emit(result), isError=False))
 
