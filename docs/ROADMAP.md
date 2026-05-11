@@ -24,7 +24,7 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 | 0008 | Resolved   | must-resolve      | 2026-05-06                     |
 | 0009 | Resolved   | must-resolve      | 2026-05-06                     |
 | 0010 | Accepted   | must-resolve      | offen — Production IMAP BDD gaps |
-| 0011 | Accepted   | must-resolve      | offen — Search Performance     |
+| 0011 | Resolved   | must-resolve      | 2026-05-07                     |
 
 ### Nächster Block
 

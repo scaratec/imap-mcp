@@ -1,8 +1,12 @@
 # LIM 0011: Search performance on large mailboxes
 
-- **Status:** Accepted
+- **Status:** Resolved
 - **Resolution intent:** must-resolve (user-facing)
 - **Date proposed:** 2026-05-07
+- **Date resolved:** 2026-05-07 — IMAP pre-filtering, 7-day default
+  scope, limit/offset pagination, and blacklist fast-path were already
+  implemented. Production verification against Gmail (53k messages)
+  confirmed search completes in seconds with 7-day scope (689 matches).
 - **Proposed by:** Production deployment test
 - **Related ADRs:** ADR-0004, ADR-0016, ADR-0017
 
