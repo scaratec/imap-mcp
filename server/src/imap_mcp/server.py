@@ -159,9 +159,9 @@ def build_server(context: ServerContext) -> Server:
             Tool(
                 name="list_accounts",
                 description=(
-                    "List the IMAP accounts visible to the authenticated "
-                    "caller. Returns visible account ids and the count of "
-                    "accounts hidden by policy (ADR 0001, ADR 0017)."
+                    "List available email accounts. Call this FIRST to "
+                    "discover which accounts you can access. Returns "
+                    "account ids and their state (active/needs_rebootstrap)."
                 ),
                 inputSchema={
                     "type": "object",
@@ -173,9 +173,8 @@ def build_server(context: ServerContext) -> Server:
             Tool(
                 name="list_folders",
                 description=(
-                    "List the folders of one account that are visible to "
-                    "the caller. Account-level denies surface as an empty "
-                    "list with hidden_folders_count=0 (ADR 0001, 0017)."
+                    "List visible folders in an email account. "
+                    "Returns folder names and hidden_folders_count."
                 ),
                 inputSchema={
                     "type": "object",
@@ -187,10 +186,9 @@ def build_server(context: ServerContext) -> Server:
             Tool(
                 name="fetch_envelope",
                 description=(
-                    "Fetch the envelope fields of a single message. The "
-                    "PDP decides whether the caller may access this "
-                    "(account, folder, uid) tuple; message-level fields "
-                    "are returned on ALLOW (ADR 0002, 0017)."
+                    "Fetch from/to/subject/date for a single message by "
+                    "UID. Use list_messages instead when you need multiple "
+                    "messages — it is much faster."
                 ),
                 inputSchema={
                     "type": "object",
@@ -206,11 +204,10 @@ def build_server(context: ServerContext) -> Server:
             Tool(
                 name="search",
                 description=(
-                    "Search for messages in a folder. UIDs returned are "
-                    "filtered by the per-sender-rule visibility; the "
-                    "response exposes matched_total / matched_visible / "
-                    "filtered_out so callers know their view is partial "
-                    "(ADR 0004, 0017)."
+                    "Search for message UIDs in a folder. Returns UIDs "
+                    "only (no envelope data). Use list_messages instead "
+                    "if you need from/subject/date. This tool is for "
+                    "counting or for feeding UIDs into fetch_envelope."
                 ),
                 inputSchema={
                     "type": "object",
@@ -228,11 +225,15 @@ def build_server(context: ServerContext) -> Server:
             Tool(
                 name="list_messages",
                 description=(
-                    "List messages with envelope data (from, subject, "
-                    "date) in a single call. Combines IMAP SEARCH + "
-                    "FETCH ENVELOPE. Use this instead of search + "
-                    "N x fetch_envelope for overview queries like "
-                    "'show me today's emails'."
+                    "THE PRIMARY TOOL for reading emails. Returns from, "
+                    "subject, date for each message in one call. "
+                    "Use this for: 'show me my emails', 'what arrived "
+                    "today', 'recent messages'. Supports criteria: "
+                    '{"newer_than": "1d"} for today, '
+                    '{"from_domain": "example.com"} for sender filter, '
+                    '{"subject_contains": "invoice"} for subject search. '
+                    "Always call list_accounts first to get the account id, "
+                    "then call this with account, folder='INBOX'."
                 ),
                 inputSchema={
                     "type": "object",
