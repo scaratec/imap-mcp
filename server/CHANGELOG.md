@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.7.1 (2026-05-11)
+
+### Bug Fixes
+
+- Batch envelope fetch eliminates N+1 connection bug
+  ([`e94f308`](https://github.com/scaratec/imap-mcp/commit/e94f3087ac163a134a1dba2f62841d6673803cfd))
+
+### Testing
+
+- Prove connection-per-message bug via mock connection counter
+  ([`0ca6261`](https://github.com/scaratec/imap-mcp/commit/0ca6261ff6bd7b1b02e1c924f5fc0dacf03df302))
+
+
 ## v0.7.0 (2026-05-11)
 
 ### Features
