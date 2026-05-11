@@ -63,44 +63,51 @@ def _append_timeout() -> int:
 
 
 async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
-    # Pre-flight TCP probe: aioimaplib swallows ConnectionRefusedError
-    # from its internal create_connection task and surfaces a generic
-    # TimeoutError after the wait_hello deadline. Probing the port
-    # directly first lets the saga's `except ConnectionRefusedError`
-    # branch distinguish "target_unreachable" from "target_append_timeout".
-    import asyncio as _asyncio
+    from .tracing import tracer
 
-    if account.port == 993:
-        imap = IMAP4_SSL(host=account.host, port=account.port, timeout=timeout)
-    else:
-        try:
-            _r, _w = await _asyncio.wait_for(
-                _asyncio.open_connection(account.host, account.port),
-                timeout=timeout,
-            )
-            _w.close()
+    with tracer.start_as_current_span(
+        "imap.connect",
+        attributes={"imap.host": account.host, "imap.port": account.port},
+    ):
+        import asyncio as _asyncio
+
+        if account.port == 993:
+            imap = IMAP4_SSL(host=account.host, port=account.port, timeout=timeout)
+        else:
             try:
-                await _w.wait_closed()
-            except Exception:
-                pass
-        except ConnectionRefusedError:
-            raise
-        except OSError as exc:
-            raise ConnectionRefusedError(*exc.args) from exc
-        imap = IMAP4(host=account.host, port=account.port, timeout=timeout)
-    await imap.wait_hello_from_server()
-    return imap
+                _r, _w = await _asyncio.wait_for(
+                    _asyncio.open_connection(account.host, account.port),
+                    timeout=timeout,
+                )
+                _w.close()
+                try:
+                    await _w.wait_closed()
+                except Exception:
+                    pass
+            except ConnectionRefusedError:
+                raise
+            except OSError as exc:
+                raise ConnectionRefusedError(*exc.args) from exc
+            imap = IMAP4(host=account.host, port=account.port, timeout=timeout)
+        await imap.wait_hello_from_server()
+        return imap
 
 
 async def _authenticate_imap(imap: IMAP4, account: Account, password: str) -> None:
-    user = _imap_user_for(account)
-    if account.auth and account.auth.type == "xoauth2":
-        try:
-            await imap.xoauth2(user, password)
-        except Exception as e:
-            raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}")
-    else:
-        await imap.login(user, password)
+    from .tracing import tracer
+
+    auth_type = account.auth.type if account.auth else "password"
+    with tracer.start_as_current_span(
+        "imap.authenticate", attributes={"imap.auth_type": auth_type}
+    ):
+        user = _imap_user_for(account)
+        if account.auth and account.auth.type == "xoauth2":
+            try:
+                await imap.xoauth2(user, password)
+            except Exception as e:
+                raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}")
+        else:
+            await imap.login(user, password)
 
 
 @dataclass(frozen=True)

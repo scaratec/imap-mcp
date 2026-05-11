@@ -471,6 +471,8 @@ def build_server(context: ServerContext) -> Server:
         """
         import time as _time
 
+        from .tracing import tracer
+
         name = req.params.name
         arguments = req.params.arguments or {}
         if name not in known_tools:
@@ -487,11 +489,23 @@ def build_server(context: ServerContext) -> Server:
                     }
                 )
             raise McpError(ErrorData(code=-32601, message=f"Unknown tool: {name!r}"))
-        start = _time.monotonic()
-        result = await _dispatch(context, name, arguments)
-        elapsed_ms = int((_time.monotonic() - start) * 1000)
-        _audit_tool_call(context, name, arguments, result, latency_ms=elapsed_ms)
-        return ServerResult(CallToolResult(content=_emit(result), isError=False))
+        with tracer.start_as_current_span(
+            f"tool.{name}",
+            attributes={
+                "mcp.tool": name,
+                "mcp.caller_id": context.caller_id,
+                "mcp.account": arguments.get("account", ""),
+                "mcp.folder": arguments.get("folder", ""),
+            },
+        ) as span:
+            start = _time.monotonic()
+            result = await _dispatch(context, name, arguments)
+            elapsed_ms = int((_time.monotonic() - start) * 1000)
+            span.set_attribute("mcp.decision", result.get("decision", ""))
+            span.set_attribute("mcp.reason", result.get("reason", ""))
+            span.set_attribute("mcp.latency_ms", elapsed_ms)
+            _audit_tool_call(context, name, arguments, result, latency_ms=elapsed_ms)
+            return ServerResult(CallToolResult(content=_emit(result), isError=False))
 
     app.request_handlers[CallToolRequest] = _raw_call_tool_handler
 

@@ -39,6 +39,10 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from .tracing import init_tracer
+
+    init_tracer()
+
     args = _parse_args()
     config_dir = _config_dir_from_env_or_exit()
     if args.transport == "stdio":
