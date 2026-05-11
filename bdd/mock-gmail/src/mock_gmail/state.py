@@ -62,12 +62,14 @@ class GmailState:
         self._uidvalidity: dict[str, int] = {}
         self._created_folders: set[str] = set()
         self.password: str = "test"
+        self.total_connections: int = 0
 
     def reset(self) -> None:
         self.messages.clear()
         self._uid_maps.clear()
         self._uid_counters.clear()
         self._created_folders.clear()
+        self.total_connections = 0
 
     def create_folder(self, name: str) -> None:
         self._created_folders.add(name)

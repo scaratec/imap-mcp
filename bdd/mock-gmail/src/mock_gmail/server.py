@@ -27,6 +27,7 @@ class GmailIMAPHandler:
         self._state = state
         self._authed = False
         self._selected_folder: str | None = None
+        state.total_connections += 1
 
     async def run(self) -> None:
         self._send_untagged("OK Gimap ready for requests (mock-gmail)")

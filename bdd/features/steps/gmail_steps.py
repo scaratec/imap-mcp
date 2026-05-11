@@ -691,3 +691,48 @@ def step_response_uids_equals(context: Context, expected_raw: str) -> None:
         raise AssertionError(
             f"Response uids: expected {expected!r}, got {actual!r}"
         )
+
+
+# ---------------------------------------- connection-count instrumentation
+
+
+@given('the folder "{folder}" on "{account_id}" holds {n:d} messages')
+def step_seed_n_messages(context: Context, folder: str, account_id: str, n: int) -> None:
+    from datetime import datetime, timezone
+    from mock_gmail.state import Message, FOLDER_TO_LABEL, _msgid_counter
+
+    state = _gmail_state(context)
+    label = FOLDER_TO_LABEL.get(folder, folder)
+    now = datetime.now(tz=timezone.utc)
+    date_str = now.strftime("%a, %d %b %Y %H:%M:%S +0000")
+    for i in range(n):
+        gm_msgid = next(_msgid_counter)
+        rfc822 = (
+            f"From: sender-{i}@example.com\r\n"
+            f"To: test@scaratec.com\r\n"
+            f"Subject: Test message {i}\r\n"
+            f"Date: {date_str}\r\n"
+            f"Message-ID: <perf-{gm_msgid}@example.com>\r\n"
+            f"\r\nBody {i}\r\n"
+        ).encode()
+        msg = Message(
+            gm_msgid=gm_msgid,
+            gm_thrid=gm_msgid,
+            rfc822=rfc822,
+            labels={"\\Inbox"} if label == "\\Inbox" else {label},
+            message_id=f"<perf-{gm_msgid}@example.com>",
+            from_addr=f"sender-{i}@example.com",
+            to_addr="test@scaratec.com",
+            subject=f"Test message {i}",
+            date=date_str,
+        )
+        state.add_message(msg)
+
+
+@then("the mock-gmail server received at most {n:d} IMAP connections")
+def step_assert_max_connections(context: Context, n: int) -> None:
+    state = _gmail_state(context)
+    actual = state.total_connections
+    assert actual <= n, (
+        f"Expected at most {n} IMAP connections, got {actual}"
+    )
