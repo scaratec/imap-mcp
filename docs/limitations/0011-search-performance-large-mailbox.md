@@ -3,10 +3,15 @@
 - **Status:** Resolved
 - **Resolution intent:** must-resolve (user-facing)
 - **Date proposed:** 2026-05-07
-- **Date resolved:** 2026-05-07 — IMAP pre-filtering, 7-day default
-  scope, limit/offset pagination, and blacklist fast-path were already
-  implemented. Production verification against Gmail (53k messages)
-  confirmed search completes in seconds with 7-day scope (689 matches).
+- **Date resolved:** 2026-05-11 — Two-phase fix:
+  (1) IMAP pre-filtering, 7-day default scope, limit/offset pagination,
+  and blacklist fast-path were already implemented (discovered 2026-05-07).
+  (2) N+1 connection bug found via OTEL tracing: per-message
+  imap_fetch_envelope() opened 199 IMAP connections for 700 messages
+  (270 seconds). Fixed by batch-fetching all envelopes in a single
+  IMAP session via imap_fetch_envelopes_batch(). Result: 2 connections,
+  2.8 seconds. Bug proven via connection_reuse.feature (42→4 connections
+  in mock, 199→2 against production Gmail).
 - **Proposed by:** Production deployment test
 - **Related ADRs:** ADR-0004, ADR-0016, ADR-0017
 
