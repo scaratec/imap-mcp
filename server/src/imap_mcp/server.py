@@ -1887,9 +1887,11 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
     if pdp_predetermined and not criteria_needs_envelope:
         visible_uids = list(all_uids)
     else:
+        all_envelopes = await imap_fetch_envelopes_batch(account, password, folder_path, all_uids)
+        envelope_by_uid = {e.uid: e for e in all_envelopes}
         visible_uids = []
         for candidate_uid in all_uids:
-            envelope = await imap_fetch_envelope(account, password, folder_path, candidate_uid)
+            envelope = envelope_by_uid.get(candidate_uid)
             if envelope is None:
                 continue
             facts = _facts_from_envelope(envelope)
@@ -2014,10 +2016,13 @@ async def _handle_list_messages(
 
     if pdp_predetermined and not criteria_needs_envelope:
         visible_uids = list(all_uids)
+        all_envelopes_map: dict[int, Any] = {}
     else:
+        all_envelopes = await imap_fetch_envelopes_batch(account, password, folder_path, all_uids)
+        all_envelopes_map = {e.uid: e for e in all_envelopes}
         visible_uids = []
         for candidate_uid in all_uids:
-            envelope = await imap_fetch_envelope(account, password, folder_path, candidate_uid)
+            envelope = all_envelopes_map.get(candidate_uid)
             if envelope is None:
                 continue
             facts = _facts_from_envelope(envelope)
@@ -2034,8 +2039,11 @@ async def _handle_list_messages(
     page_uids = visible_uids[offset : offset + limit]
     has_more = (offset + limit) < len(visible_uids)
 
-    envelopes = await imap_fetch_envelopes_batch(account, password, folder_path, page_uids)
-    envelope_by_uid = {e.uid: e for e in envelopes}
+    if all_envelopes_map:
+        envelope_by_uid = {u: all_envelopes_map[u] for u in page_uids if u in all_envelopes_map}
+    else:
+        envelopes = await imap_fetch_envelopes_batch(account, password, folder_path, page_uids)
+        envelope_by_uid = {e.uid: e for e in envelopes}
 
     messages = []
     for uid in page_uids:

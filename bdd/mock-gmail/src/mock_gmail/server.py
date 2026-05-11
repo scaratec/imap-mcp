@@ -77,8 +77,7 @@ class GmailIMAPHandler:
 
     async def _cmd_capability(self, tag: str, args: str) -> None:
         self._send_untagged(
-            "CAPABILITY IMAP4rev1 UNSELECT IDLE NAMESPACE "
-            "X-GM-EXT-1 SASL-IR AUTH=PLAIN UID MOVE"
+            "CAPABILITY IMAP4rev1 UNSELECT IDLE NAMESPACE X-GM-EXT-1 SASL-IR AUTH=PLAIN UID MOVE"
         )
         self._send(tag, "OK", "CAPABILITY completed")
 
@@ -162,7 +161,9 @@ class GmailIMAPHandler:
         )
         self._state.add_message(message)
         uid = self._state.uid_for(folder, gm_msgid) or 0
-        self._send(tag, "OK", f"[APPENDUID {self._state.uidvalidity(folder)} {uid}] APPEND completed")
+        self._send(
+            tag, "OK", f"[APPENDUID {self._state.uidvalidity(folder)} {uid}] APPEND completed"
+        )
 
     async def _cmd_uid(self, tag: str, args: str) -> None:
         parts = args.split(None, 1)
@@ -210,7 +211,16 @@ class GmailIMAPHandler:
 
         subject_match = re.search(r'SUBJECT\s+"([^"]+)"', args, re.IGNORECASE)
         from_match = re.search(r'FROM\s+"([^"]+)"', args, re.IGNORECASE)
-        uid_match = re.search(r'^UID\s+(\d+)', args.strip())
+        uid_match = re.search(r"^UID\s+(\d+)", args.strip())
+        since_match = re.search(r"SINCE\s+(\d{1,2}-\w{3}-\d{4})", args, re.IGNORECASE)
+        since_date = None
+        if since_match:
+            from datetime import datetime
+
+            try:
+                since_date = datetime.strptime(since_match.group(1), "%d-%b-%Y")
+            except ValueError:
+                pass
 
         uids = []
         for u, m in msgs:
@@ -219,6 +229,15 @@ class GmailIMAPHandler:
                     uids.append(str(u))
                 continue
             match = True
+            if since_date and m.date:
+                from email.utils import parsedate_to_datetime
+
+                try:
+                    msg_date = parsedate_to_datetime(m.date).replace(tzinfo=None)
+                    if msg_date < since_date:
+                        match = False
+                except (TypeError, ValueError):
+                    pass
             if subject_match and subject_match.group(1).lower() not in m.subject.lower():
                 match = False
             if from_match and from_match.group(1).lower() not in m.from_addr.lower():
@@ -231,31 +250,52 @@ class GmailIMAPHandler:
 
     async def _uid_fetch(self, tag: str, args: str) -> None:
         folder = self._selected_folder or "INBOX"
-        m = re.match(r"(\d+(?::\d+)?)\s+\((.+)\)", args)
+        m = re.match(r"([\d,:]+)\s+\((.+)\)", args)
         if not m:
             self._send(tag, "BAD", "FETCH parse error")
             return
         uid_spec = m.group(1)
         items = m.group(2).upper()
-        uid = int(uid_spec.split(":")[0])
-        msg = self._state.message_by_uid(folder, uid)
-        if msg is None:
-            self._send(tag, "OK", "FETCH completed")
-            return
-        needs_literal = "RFC822" in items or "BODY[]" in items or "BODY.PEEK[]" in items
-        if needs_literal and msg.rfc822:
-            parts = self._build_fetch_response(folder, uid, msg, items, skip_body=True)
-            body_key = "RFC822" if "RFC822" in items else "BODY[]"
-            literal_hdr = f"* {uid} FETCH ({parts} {body_key} {{{len(msg.rfc822)}}}\r\n"
-            self._w.write(literal_hdr.encode())
-            self._w.write(msg.rfc822)
-            self._w.write(b")\r\n")
-        else:
-            parts = self._build_fetch_response(folder, uid, msg, items)
-            self._send_untagged(f"{uid} FETCH ({parts})")
+        uids_to_fetch: list[int] = []
+        for part in uid_spec.split(","):
+            if ":" in part:
+                lo, hi = part.split(":", 1)
+                uids_to_fetch.extend(range(int(lo), int(hi) + 1))
+            else:
+                uids_to_fetch.append(int(part))
+        for uid in uids_to_fetch:
+            msg = self._state.message_by_uid(folder, uid)
+            if msg is None:
+                continue
+            needs_literal = (
+                "RFC822" in items
+                or "BODY[]" in items
+                or "BODY.PEEK[]" in items
+                or "BODY.PEEK[HEADER]" in items
+            )
+            if needs_literal and msg.rfc822:
+                parts = self._build_fetch_response(folder, uid, msg, items, skip_body=True)
+                if "BODY.PEEK[HEADER]" in items:
+                    hdr_end = msg.rfc822.find(b"\r\n\r\n")
+                    header_bytes = msg.rfc822[: hdr_end + 2] if hdr_end >= 0 else msg.rfc822
+                    body_key = "BODY[HEADER]"
+                    literal_hdr = f"* {uid} FETCH ({parts} {body_key} {{{len(header_bytes)}}}\r\n"
+                    self._w.write(literal_hdr.encode())
+                    self._w.write(header_bytes)
+                else:
+                    body_key = "RFC822" if "RFC822" in items else "BODY[]"
+                    literal_hdr = f"* {uid} FETCH ({parts} {body_key} {{{len(msg.rfc822)}}}\r\n"
+                    self._w.write(literal_hdr.encode())
+                    self._w.write(msg.rfc822)
+                self._w.write(b")\r\n")
+            else:
+                parts = self._build_fetch_response(folder, uid, msg, items)
+                self._send_untagged(f"{uid} FETCH ({parts})")
         self._send(tag, "OK", "UID FETCH completed")
 
-    def _build_fetch_response(self, folder: str, uid: int, msg: Message, items: str, skip_body: bool = False) -> str:
+    def _build_fetch_response(
+        self, folder: str, uid: int, msg: Message, items: str, skip_body: bool = False
+    ) -> str:
         parts: list[str] = []
         parts.append(f"UID {uid}")
         if "FLAGS" in items:
@@ -271,16 +311,30 @@ class GmailIMAPHandler:
             parts.append(f"X-GM-LABELS ({label_str})")
         if "ENVELOPE" in items:
             parts.append(f"ENVELOPE {_build_envelope(msg)}")
+        if "RFC822.SIZE" in items:
+            parts.append(f"RFC822.SIZE {len(msg.rfc822)}")
+        if "BODYSTRUCTURE" in items:
+            parts.append(
+                'BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" '
+                + str(len(msg.rfc822))
+                + " 1)"
+            )
         if not skip_body:
             if "RFC822" in items:
-                parts.append(f"RFC822 {{{len(msg.rfc822)}}}\r\n{msg.rfc822.decode('utf-8', errors='replace')}")
+                parts.append(
+                    f"RFC822 {{{len(msg.rfc822)}}}\r\n{msg.rfc822.decode('utf-8', errors='replace')}"
+                )
             if "BODY[]" in items or "BODY.PEEK[]" in items:
-                parts.append(f"BODY[] {{{len(msg.rfc822)}}}\r\n{msg.rfc822.decode('utf-8', errors='replace')}")
+                parts.append(
+                    f"BODY[] {{{len(msg.rfc822)}}}\r\n{msg.rfc822.decode('utf-8', errors='replace')}"
+                )
         return " ".join(parts)
 
     async def _uid_store(self, tag: str, args: str) -> None:
         folder = self._selected_folder or "INBOX"
-        m = re.match(r"(\d+)\s+([+-]?)(FLAGS|X-GM-LABELS)(?:\.SILENT)?\s+\(([^)]*)\)", args, re.IGNORECASE)
+        m = re.match(
+            r"(\d+)\s+([+-]?)(FLAGS|X-GM-LABELS)(?:\.SILENT)?\s+\(([^)]*)\)", args, re.IGNORECASE
+        )
         if not m:
             self._send(tag, "BAD", "STORE parse error")
             return
@@ -404,10 +458,10 @@ def _parse_label_list(raw: str) -> list[str]:
             j = raw.index('"', i + 1)
             labels.append(raw[i + 1 : j])
             i = j + 1
-        elif raw[i] == ' ':
+        elif raw[i] == " ":
             i += 1
         else:
-            j = raw.find(' ', i)
+            j = raw.find(" ", i)
             if j == -1:
                 j = len(raw)
             labels.append(raw[i:j])
@@ -446,7 +500,9 @@ def _addr_parts(addr: str) -> str:
     return f'{name_part} NIL "{local}" "{domain}"'
 
 
-async def start_gmail_mock(state: GmailState, host: str = "127.0.0.1", port: int = 0) -> tuple[asyncio.Server, int]:
+async def start_gmail_mock(
+    state: GmailState, host: str = "127.0.0.1", port: int = 0
+) -> tuple[asyncio.Server, int]:
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         handler = GmailIMAPHandler(reader, writer, state)
         await handler.run()

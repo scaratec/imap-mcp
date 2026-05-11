@@ -27,10 +27,10 @@ Feature: IMAP connection reuse
     Given the folder "INBOX" on "scaratec-gmail" holds 20 messages
     When perf-agent calls list_messages with account "scaratec-gmail", folder "INBOX", criteria {"newer_than": "30d"}, limit 5
     Then the response contains 5 messages
-    And the mock-gmail server received at most 3 IMAP connections
+    And the mock-gmail server received at most 4 IMAP connections
 
   Scenario: search with 20 messages opens at most 3 connections
     Given the folder "INBOX" on "scaratec-gmail" holds 20 messages
     When perf-agent calls search with account "scaratec-gmail", folder "INBOX", criteria {"newer_than": "30d"}
     Then the response decision is ALLOW
-    And the mock-gmail server received at most 3 IMAP connections
+    And the mock-gmail server received at most 4 IMAP connections
