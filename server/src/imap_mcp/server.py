@@ -1746,8 +1746,22 @@ def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
             parts.append(f'TO "{value}"')
         elif key == "subject_contains":
             parts.append(f'SUBJECT "{value}"')
-        elif key in ("newer_than", "older_than"):
-            pass
+        elif key == "newer_than":
+            from datetime import timedelta
+
+            from .audit import _now_utc
+
+            days = int(str(value).rstrip("d"))
+            since = _now_utc() - timedelta(days=days)
+            parts.append(f"SINCE {since.strftime('%d-%b-%Y')}")
+        elif key == "older_than":
+            from datetime import timedelta
+
+            from .audit import _now_utc
+
+            days = int(str(value).rstrip("d"))
+            before = _now_utc() - timedelta(days=days)
+            parts.append(f"BEFORE {before.strftime('%d-%b-%Y')}")
         elif key == "size_gt":
             parts.append(f"LARGER {int(value)}")
         elif key == "size_lt":
@@ -1802,14 +1816,17 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
     matched_total = len(all_uids)
 
     fp = folder_decision.folder_policy
-    skip_per_message = (
-        not criteria_raw
-        and fp.mode == "blacklist"
+    pdp_predetermined = (
+        fp.mode == "blacklist"
         and not fp.rules
         and level_rank(fp.default) >= minimum_for_tool
     )
+    criteria_needs_envelope = criteria_raw and any(
+        k not in ("newer_than", "older_than", "from", "from_domain", "to", "to_contains", "subject_contains", "size_gt", "size_lt")
+        for k in criteria_raw
+    )
 
-    if skip_per_message:
+    if pdp_predetermined and not criteria_needs_envelope:
         visible_uids = list(all_uids)
     else:
         visible_uids = []
