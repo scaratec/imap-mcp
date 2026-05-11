@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-05-11)
+
+### Features
+
+- Add list_messages tool for single-call mail overview
+  ([`46235eb`](https://github.com/scaratec/imap-mcp/commit/46235eb9315c8c4c7103be30ab757ba6b9792bd5))
+
+
 ## v0.4.2 (2026-05-11)
 
 ### Bug Fixes
