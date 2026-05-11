@@ -1114,6 +1114,40 @@ def step_caller_calls_search(
 
 
 @when(
+    '{caller_id} calls list_messages with account "{account}", folder "{folder}"'
+)
+def step_caller_calls_list_messages_no_criteria(
+    context: Context, caller_id: str, account: str, folder: str
+) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("list_messages", {"account": account, "folder": folder})
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls list_messages with account "{account}", folder "{folder}", criteria {tail}'
+)
+def step_caller_calls_list_messages(
+    context: Context, caller_id: str, account: str, folder: str, tail: str
+) -> None:
+    import json as _json
+    import re as _re
+
+    limit_m = _re.search(r",\s*limit\s+(\d+)", tail)
+    offset_m = _re.search(r",\s*offset\s+(\d+)", tail)
+    criteria_str = tail[: limit_m.start()] if limit_m else tail
+    criteria = _json.loads(criteria_str)
+    args: dict[str, object] = {"account": account, "folder": folder, "criteria": criteria}
+    if limit_m:
+        args["limit"] = int(limit_m.group(1))
+    if offset_m:
+        args["offset"] = int(offset_m.group(1))
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("list_messages", args)
+    _store_result(context, payload)
+
+
+@when(
     '{caller_id} calls fetch_envelope with account "{account}", '
     'folder "{folder}", uid {uid:d}'
 )

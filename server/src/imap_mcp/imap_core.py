@@ -225,6 +225,110 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
         await imap.logout()
 
 
+async def fetch_envelopes_batch(
+    account: Account, password: str, folder: str, uids: list[int]
+) -> list[Envelope]:
+    """Fetch ENVELOPE fields for multiple UIDs in a single IMAP session."""
+    import email
+    from datetime import timezone
+    from email.utils import getaddresses, parsedate_to_datetime
+
+    if not uids:
+        return []
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    results: list[Envelope] = []
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return []
+        uid_set = ",".join(str(u) for u in uids)
+        status, response = await imap.uid(
+            "fetch", uid_set, "(BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)"
+        )
+        if status != "OK":
+            return []
+        i = 0
+        while i < len(response):
+            raw_header = _extract_literal_at(response, i)
+            if raw_header is None:
+                i += 1
+                continue
+            uid_val = _extract_uid(response, i)
+            size_bytes, has_attachment = _extract_meta_at(response, i)
+            message = email.message_from_bytes(raw_header)
+            from_addrs = getaddresses(message.get_all("From", []))
+            to_addrs = getaddresses(message.get_all("To", []) + message.get_all("Cc", []))
+            date_iso: str | None = None
+            date_header = message.get("Date")
+            if date_header:
+                try:
+                    parsed = parsedate_to_datetime(date_header)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    date_iso = parsed.isoformat().replace("+00:00", "Z")
+                except (TypeError, ValueError):
+                    pass
+            results.append(
+                Envelope(
+                    uid=uid_val or 0,
+                    from_address=from_addrs[0][1] if from_addrs else "",
+                    to_addresses=[addr for _, addr in to_addrs if addr],
+                    subject=message.get("Subject", "") or "",
+                    message_id=message.get("Message-ID"),
+                    date=date_iso,
+                    size_bytes=size_bytes,
+                    has_attachment=has_attachment,
+                )
+            )
+            i += 2
+    finally:
+        await imap.logout()
+    return results
+
+
+def _extract_uid(response: list[bytes | bytearray], start: int) -> int | None:
+    """Extract UID from a FETCH response frame."""
+    import re
+
+    for j in range(start, min(start + 2, len(response))):
+        part = response[j]
+        if isinstance(part, (bytes, bytearray)):
+            m = re.search(rb"UID\s+(\d+)", part)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def _extract_literal_at(response: list[bytes | bytearray], start: int) -> bytes | None:
+    """Pick the header literal starting at position `start`."""
+    for j in range(start, min(start + 2, len(response))):
+        part = response[j]
+        if isinstance(part, (bytes, bytearray)) and (
+            b"From:" in part or b"Date:" in part or b"Subject:" in part
+        ):
+            return bytes(part)
+    return None
+
+
+def _extract_meta_at(response: list[bytes | bytearray], start: int) -> tuple[int, bool]:
+    """Pull RFC822.SIZE and attachment hint from a frame at `start`."""
+    import re
+
+    size_bytes = 0
+    has_attachment = False
+    for j in range(start, min(start + 3, len(response))):
+        part = response[j]
+        if not isinstance(part, (bytes, bytearray)):
+            continue
+        m = re.search(rb"RFC822\.SIZE\s+(\d+)", part)
+        if m:
+            size_bytes = int(m.group(1))
+        if re.search(rb'(?i)"attachment"', part):
+            has_attachment = True
+    return size_bytes, has_attachment
+
+
 def _extract_meta(response: list[bytes | bytearray]) -> tuple[int, bool]:
     """Pull RFC822.SIZE and a has-attachment hint out of a FETCH frame.
 

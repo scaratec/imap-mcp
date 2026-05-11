@@ -2733,3 +2733,61 @@ def step_audit_log_no_entry_with_tool(
                     f"Audit log contains entry with tool={tool!r}: "
                     f"{record!r}"
                 )
+
+
+# ------------------------------------------------------------------
+# list_messages assertions
+# ------------------------------------------------------------------
+
+
+@then("the response contains {count:d} messages")
+def step_response_contains_n_messages(context: Context, count: int) -> None:
+    response = _last_response(context)
+    messages = response.get("messages")
+    if messages is None:
+        raise AssertionError(
+            f"Response has no 'messages' field. "
+            f"Available: {sorted(response.keys())}"
+        )
+    if len(messages) != count:
+        raise AssertionError(
+            f"Expected {count} messages, got {len(messages)}"
+        )
+
+
+@then('message {idx:d} has field "{field}" equal to "{expected}"')
+def step_message_field_equals(
+    context: Context, idx: int, field: str, expected: str
+) -> None:
+    response = _last_response(context)
+    messages = response.get("messages", [])
+    if idx >= len(messages):
+        raise AssertionError(
+            f"Message index {idx} out of range "
+            f"(only {len(messages)} messages)"
+        )
+    actual = messages[idx].get(field)
+    if actual != expected:
+        raise AssertionError(
+            f"message[{idx}].{field}: expected {expected!r}, "
+            f"got {actual!r}"
+        )
+
+
+@then('message {idx:d} has field "{field}" matching the pattern "{pattern}"')
+def step_message_field_matches_pattern(
+    context: Context, idx: int, field: str, pattern: str
+) -> None:
+    response = _last_response(context)
+    messages = response.get("messages", [])
+    if idx >= len(messages):
+        raise AssertionError(
+            f"Message index {idx} out of range "
+            f"(only {len(messages)} messages)"
+        )
+    actual = str(messages[idx].get(field, ""))
+    if pattern not in actual:
+        raise AssertionError(
+            f"message[{idx}].{field}: {actual!r} does not "
+            f"contain {pattern!r}"
+        )

@@ -45,6 +45,7 @@ from .imap_core import (
     copy_message as imap_copy_message,
     fetch_body as imap_fetch_body,
     fetch_envelope as imap_fetch_envelope,
+    fetch_envelopes_batch as imap_fetch_envelopes_batch,
     fetch_full_message as imap_fetch_full_message,
     folder_stats as imap_folder_stats,
     gmail_fetch_msgid as imap_gmail_fetch_msgid,
@@ -218,6 +219,28 @@ def build_server(context: ServerContext) -> Server:
                         "folder": {"type": "string"},
                         "criteria": {"type": "object"},
                         "limit": {"type": "integer", "minimum": 1, "default": 50},
+                        "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    },
+                    "required": ["account", "folder"],
+                    "additionalProperties": False,
+                },
+            ),
+            Tool(
+                name="list_messages",
+                description=(
+                    "List messages with envelope data (from, subject, "
+                    "date) in a single call. Combines IMAP SEARCH + "
+                    "FETCH ENVELOPE. Use this instead of search + "
+                    "N x fetch_envelope for overview queries like "
+                    "'show me today's emails'."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "account": {"type": "string"},
+                        "folder": {"type": "string"},
+                        "criteria": {"type": "object"},
+                        "limit": {"type": "integer", "minimum": 1, "default": 20},
                         "offset": {"type": "integer", "minimum": 0, "default": 0},
                     },
                     "required": ["account", "folder"],
@@ -485,6 +508,8 @@ def build_server(context: ServerContext) -> Server:
             return await _handle_fetch_envelope(context, arguments)
         if name == "search":
             return await _handle_search(context, arguments)
+        if name == "list_messages":
+            return await _handle_list_messages(context, arguments)
         if name == "fetch_body":
             return await _handle_fetch_body(context, arguments)
         if name == "fetch_headers":
@@ -1151,6 +1176,7 @@ READ_TOOL_MIN_VIS = {
     "list_labels": "COUNT",
     "folder_stats": "COUNT",
     "search": "METADATA",
+    "list_messages": "METADATA",
     "fetch_envelope": "ENVELOPE",
     "fetch_headers": "HEADERS",
     "fetch_body": "BODY",
@@ -1893,6 +1919,131 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
     if results_with_gmail is not None:
         result["gmail_results"] = results_with_gmail
     return result
+
+
+async def _handle_list_messages(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+    criteria_raw = arguments.get("criteria") or {}
+    limit = int(arguments.get("limit") or 20)
+    offset = int(arguments.get("offset") or 0)
+
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    assert folder_decision.folder_policy is not None
+    minimum_for_tool = level_rank("METADATA")
+    fp = folder_decision.folder_policy
+    if (
+        level_rank(fp.default) < minimum_for_tool
+        and not any(
+            level_rank(rule.grant) >= minimum_for_tool
+            for rule in fp.rules
+            if rule.grant is not None
+        )
+        and fp.mode == "whitelist"
+    ):
+        return {
+            "decision": "DENY",
+            "reason": "visibility_below_METADATA",
+            "account": account_id,
+            "folder": folder_path,
+        }
+
+    imap_criteria = _criteria_to_imap_search(criteria_raw)
+    if imap_criteria == "ALL" and not criteria_raw:
+        from datetime import timedelta
+
+        from .audit import _now_utc
+
+        since = _now_utc() - timedelta(days=7)
+        imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
+
+    account, password = await _password_for(context, account_id)
+    all_uids = await imap_search_uids(account, password, folder_path, imap_criteria)
+    matched_total = len(all_uids)
+
+    pdp_predetermined = (
+        fp.mode == "blacklist" and not fp.rules and level_rank(fp.default) >= minimum_for_tool
+    )
+    criteria_needs_envelope = criteria_raw and any(
+        k
+        not in (
+            "newer_than",
+            "older_than",
+            "from",
+            "from_domain",
+            "to",
+            "to_contains",
+            "subject_contains",
+            "size_gt",
+            "size_lt",
+        )
+        for k in criteria_raw
+    )
+
+    if pdp_predetermined and not criteria_needs_envelope:
+        visible_uids = list(all_uids)
+    else:
+        visible_uids = []
+        for candidate_uid in all_uids:
+            envelope = await imap_fetch_envelope(account, password, folder_path, candidate_uid)
+            if envelope is None:
+                continue
+            facts = _facts_from_envelope(envelope)
+            if criteria_raw and not _criteria_match(criteria_raw, facts):
+                continue
+            message_decision = evaluate_message_against_folder(fp, facts=facts)
+            if (
+                message_decision.allowed
+                and level_rank(message_decision.visibility) >= minimum_for_tool
+            ):
+                visible_uids.append(candidate_uid)
+    filtered_out = matched_total - len(visible_uids)
+
+    page_uids = visible_uids[offset : offset + limit]
+    has_more = (offset + limit) < len(visible_uids)
+
+    envelopes = await imap_fetch_envelopes_batch(account, password, folder_path, page_uids)
+    envelope_by_uid = {e.uid: e for e in envelopes}
+
+    messages = []
+    for uid in page_uids:
+        env = envelope_by_uid.get(uid)
+        if env is None:
+            continue
+        messages.append(
+            {
+                "uid": env.uid,
+                "from": env.from_address,
+                "to": env.to_addresses,
+                "subject": env.subject,
+                "date": env.date,
+                "has_attachment": env.has_attachment,
+                "size_bytes": env.size_bytes,
+            }
+        )
+
+    return {
+        "decision": "ALLOW",
+        "reason": "rule_matched" if visible_uids else "folder_default_applied",
+        "account": account_id,
+        "folder": folder_path,
+        "messages": messages,
+        "matched_total": matched_total,
+        "matched_visible": len(visible_uids),
+        "filtered_out": filtered_out,
+        "page_offset": offset,
+        "page_limit": limit,
+        "has_more": has_more,
+    }
 
 
 def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerContext, object]:
