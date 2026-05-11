@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.4.1 (2026-05-11)
+
+### Bug Fixes
+
+- **search**: Map newer_than/older_than to IMAP SINCE/BEFORE
+  ([`0049297`](https://github.com/scaratec/imap-mcp/commit/00492979874bb6a9621fa0f96e6c815471e9d985))
+
+
 ## v0.4.0 (2026-05-10)
 
 ### Features
