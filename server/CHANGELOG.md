@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.7.2 (2026-05-11)
+
+### Bug Fixes
+
+- Improve tool descriptions for better agent tool selection
+  ([`ccb1a8b`](https://github.com/scaratec/imap-mcp/commit/ccb1a8bc74cac77ffdebfca22e14eed888bdc41d))
+
+### Documentation
+
+- Update LIM-0011 resolution with N+1 connection fix details
+  ([`720bedc`](https://github.com/scaratec/imap-mcp/commit/720bedc9a0cab6ef9e5e41b8bcadad93d7eaddf2))
+
+
 ## v0.7.1 (2026-05-11)
 
 ### Bug Fixes
