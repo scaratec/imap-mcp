@@ -26,7 +26,8 @@ Feature: fetch_attachment returns binary content via MCP EmbeddedResource
     And the response contains a blob resource with mime type "application/pdf"
     And the blob content decodes to the same sha256 as the response field content_hash
 
-  Scenario: fetch_attachment without part_id returns first attachment blob
+  Scenario: fetch_attachment without part_id lists attachments for discovery
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 601
     Then the response decision is ALLOW
-    And the response contains a blob resource with mime type "application/pdf"
+    And the response field attachments has 1 entries
+    And attachment 0 has field "part_id" equal to "report.pdf"

@@ -642,6 +642,7 @@ def flush_staged_messages(context: Context) -> None:
             date=date_header,
             flags=staged.get("flags", []),
             attachments=attachments,
+            inline_attachments=staged.get("inline_attachments", []),
             extra_headers=extra_headers,
         )
         context.message_uids = getattr(context, "message_uids", {})
@@ -2717,6 +2718,27 @@ def step_message_has_attachment(
             'holds a message with:")'
         )
     staged_list[-1]["extra_attachments"].append(
+        (filename, mime_type, b"x" * size)
+    )
+
+
+@given(
+    'the message has inline attachment "{filename}" of type "{mime_type}" '
+    "with size {size:d} bytes"
+)
+def step_message_has_inline_attachment(
+    context: Context, filename: str, mime_type: str, size: int
+) -> None:
+    """Attach an inline file to the most recently staged message."""
+    staged_list = getattr(context, "staged_messages", [])
+    if not staged_list:
+        raise AssertionError(
+            'the "message has inline attachment" step requires a prior '
+            'Given-step that stages a message'
+        )
+    if "inline_attachments" not in staged_list[-1]:
+        staged_list[-1]["inline_attachments"] = []
+    staged_list[-1]["inline_attachments"].append(
         (filename, mime_type, b"x" * size)
     )
 

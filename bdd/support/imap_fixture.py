@@ -184,6 +184,7 @@ class IMAPFixture:
         flags: Iterable[str] = (),
         extra_headers: dict[str, str] | None = None,
         attachments: Iterable[tuple[str, str, bytes]] = (),
+        inline_attachments: Iterable[tuple[str, str, bytes]] = (),
         omit_message_id: bool = False,
     ) -> SeededMessage:
         """Append a message to `folder` and return metadata for assertions.
@@ -210,6 +211,15 @@ class IMAPFixture:
             maintype, _, subtype = mime_type.partition("/")
             msg.add_attachment(
                 payload, maintype=maintype, subtype=subtype, filename=filename
+            )
+        for filename, mime_type, payload in inline_attachments:
+            maintype, _, subtype = mime_type.partition("/")
+            msg.add_attachment(
+                payload,
+                maintype=maintype,
+                subtype=subtype,
+                filename=filename,
+                disposition="inline",
             )
 
         raw = msg.as_bytes()

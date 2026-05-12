@@ -2838,3 +2838,60 @@ def step_blob_sha256_matches_content_hash(context: Context) -> None:
         raise AssertionError(
             f"Blob SHA-256 {blob_hash!r} != content_hash {expected!r}"
         )
+
+
+# ---------------------------------------- attachment discovery assertions
+
+
+@then("the response field attachments has {count:d} entries")
+def step_response_attachments_count(context: Context, count: int) -> None:
+    response = _last_response(context)
+    attachments = response.get("attachments")
+    if attachments is None:
+        raise AssertionError(
+            f"Response has no 'attachments' field. "
+            f"Keys: {sorted(response.keys())!r}"
+        )
+    if len(attachments) != count:
+        raise AssertionError(
+            f"Expected {count} attachments, got {len(attachments)}: "
+            f"{attachments!r}"
+        )
+
+
+@then('attachment {idx:d} has field "{field}" equal to "{expected}"')
+def step_attachment_field_str(
+    context: Context, idx: int, field: str, expected: str
+) -> None:
+    response = _last_response(context)
+    attachments = response.get("attachments", [])
+    if idx >= len(attachments):
+        raise AssertionError(
+            f"Attachment index {idx} out of range "
+            f"(only {len(attachments)} attachments)"
+        )
+    actual = attachments[idx].get(field)
+    if str(actual) != expected:
+        raise AssertionError(
+            f"attachment[{idx}].{field}: expected {expected!r}, "
+            f"got {actual!r}"
+        )
+
+
+@then("attachment {idx:d} has field \"{field}\" equal to {expected:d}")
+def step_attachment_field_int(
+    context: Context, idx: int, field: str, expected: int
+) -> None:
+    response = _last_response(context)
+    attachments = response.get("attachments", [])
+    if idx >= len(attachments):
+        raise AssertionError(
+            f"Attachment index {idx} out of range "
+            f"(only {len(attachments)} attachments)"
+        )
+    actual = attachments[idx].get(field)
+    if actual != expected:
+        raise AssertionError(
+            f"attachment[{idx}].{field}: expected {expected!r}, "
+            f"got {actual!r}"
+        )

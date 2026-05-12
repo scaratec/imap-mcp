@@ -1198,15 +1198,57 @@ async def _handle_fetch_attachment(
             "uid": uid,
         }
     msg = email.message_from_bytes(raw)
-    selected_part = None
+    all_parts = []
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
             continue
-        if part.get("Content-Disposition", "").lower().startswith("attachment"):
-            filename = part.get_filename()
-            if part_id is None or filename == part_id:
-                selected_part = part
-                break
+        disposition = (part.get("Content-Disposition") or "").lower()
+        is_attachment = disposition.startswith("attachment")
+        is_inline_file = (
+            disposition.startswith("inline")
+            and part.get_filename() is not None
+        )
+        is_named_binary = (
+            part.get_content_maintype() not in ("text", "multipart")
+            and part.get_filename() is not None
+        )
+        if is_attachment or is_inline_file or is_named_binary:
+            all_parts.append(part)
+
+    if not all_parts:
+        return {
+            "decision": "ALLOW",
+            "result": "ERROR",
+            "error_type": "attachment_not_found",
+            "account": account_id,
+            "folder": folder_path,
+            "uid": uid,
+        }
+
+    if part_id is None:
+        attachments_meta = []
+        for p in all_parts:
+            p_payload = p.get_payload(decode=True) or b""
+            attachments_meta.append({
+                "part_id": p.get_filename() or "attachment",
+                "mime_type": p.get_content_type(),
+                "size_bytes": len(p_payload),
+            })
+        return {
+            "decision": "ALLOW",
+            "reason": message_decision.reason,
+            "visibility_applied": message_decision.visibility,
+            "account": account_id,
+            "folder": folder_path,
+            "uid": uid,
+            "attachments": attachments_meta,
+        }
+
+    selected_part = None
+    for p in all_parts:
+        if p.get_filename() == part_id:
+            selected_part = p
+            break
     if selected_part is None:
         return {
             "decision": "ALLOW",
@@ -2023,6 +2065,7 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
             }
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
+    applied_default_scope = False
     if imap_criteria == "ALL" and not criteria_raw:
         from datetime import timedelta
 
@@ -2030,6 +2073,7 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
 
         since = _now_utc() - timedelta(days=7)
         imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
+        applied_default_scope = True
 
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
@@ -2116,6 +2160,8 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
         "page_limit": limit,
         "has_more": has_more,
     }
+    if applied_default_scope:
+        result["default_scope"] = "newer_than_7d"
     if results_with_gmail is not None:
         result["gmail_results"] = results_with_gmail
     return result
@@ -2158,6 +2204,7 @@ async def _handle_list_messages(
         }
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
+    applied_default_scope = False
     if imap_criteria == "ALL" and not criteria_raw:
         from datetime import timedelta
 
@@ -2165,6 +2212,7 @@ async def _handle_list_messages(
 
         since = _now_utc() - timedelta(days=7)
         imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
+        applied_default_scope = True
 
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
@@ -2238,7 +2286,7 @@ async def _handle_list_messages(
             }
         )
 
-    return {
+    result: dict[str, Any] = {
         "decision": "ALLOW",
         "reason": "rule_matched" if visible_uids else "folder_default_applied",
         "account": account_id,
@@ -2251,6 +2299,9 @@ async def _handle_list_messages(
         "page_limit": limit,
         "has_more": has_more,
     }
+    if applied_default_scope:
+        result["default_scope"] = "newer_than_7d"
+    return result
 
 
 def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerContext, object]:

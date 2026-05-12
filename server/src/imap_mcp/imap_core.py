@@ -367,7 +367,7 @@ def _extract_meta_at(response: list[bytes | bytearray], start: int) -> tuple[int
         m = re.search(rb"RFC822\.SIZE\s+(\d+)", part)
         if m:
             size_bytes = int(m.group(1))
-        if re.search(rb'(?i)"attachment"', part):
+        if re.search(rb'(?i)"(?:attachment|inline)"', part):
             has_attachment = True
     return size_bytes, has_attachment
 
@@ -391,7 +391,8 @@ def _extract_meta(response: list[bytes | bytearray]) -> tuple[int, bool]:
         size_match = re.search(rb"RFC822\.SIZE\s+(\d+)", text)
         if size_match:
             size_bytes = int(size_match.group(1))
-        if b"multipart/mixed" in text.lower() or b'"attachment"' in text.lower():
+        lower = text.lower()
+        if b"multipart/mixed" in lower or b'"attachment"' in lower or b'"inline"' in lower:
             has_attachment = True
     return size_bytes, has_attachment
 
