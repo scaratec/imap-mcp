@@ -313,7 +313,7 @@ Gmail), enabling rules like "grant full access to all starred messages":
 
 ## MCP tool surface
 
-Eighteen tools, each gated on exactly one visibility level or one
+Nineteen tools, each gated on exactly one visibility level or one
 capability.
 
 ### Read tools (10)
@@ -331,11 +331,12 @@ capability.
 | `fetch_body` | BODY | Plain-text and HTML bodies |
 | `fetch_attachment` | FULL | MIME attachment bytes |
 
-### Write tools (5)
+### Write tools (6)
 
 | Tool | Required capability | Description |
 |---|---|---|
-| `mark_seen` | `mark_seen` | Toggle `\Seen` flag |
+| `mark_seen` | `mark_seen` | Toggle `\Seen` flag on a single message |
+| `bulk_mark_seen` | `mark_seen` | Toggle `\Seen` on all messages matching criteria |
 | `mark_tagged` | `mark_tagged` | Add/remove keywords |
 | `move` | `move_out` + `accept_incoming` | Move message (intra-account: native MOVE; cross-account: saga) |
 | `copy` | `accept_incoming` | Copy message to target folder |
@@ -427,6 +428,8 @@ Accounts with `provider: google` get explicit Gmail semantics:
 - Intra-account `move` implemented as label swap (not physical MOVE)
 - Cross-account sagas fetch deterministically from `[Gmail]/All Mail`
 - `[Gmail]/Trash`, `[Gmail]/Drafts` etc. are policy-addressable folders
+- Localized folder names (e.g. `[Gmail]/Entwürfe` in German) are
+  resolved to canonical paths via RFC 6154 special-use flags
 
 ## Audit log
 
@@ -443,7 +446,7 @@ filenames, OAuth tokens, or cleartext sender addresses in DENY records.
 - **Validation:** `pydantic` v2 (strict mode)
 - **OAuth:** `httpx` + first-party flow implementation
 - **Tracing:** OpenTelemetry (optional, via `[tracing]` extra)
-- **Testing:** `pytest` (property tests) + `behave` (BDD, 228 scenarios)
+- **Testing:** `pytest` (property tests) + `behave` (BDD, 241 scenarios)
 
 ## Testing
 

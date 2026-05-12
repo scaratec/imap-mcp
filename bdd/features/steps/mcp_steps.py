@@ -102,6 +102,11 @@ def _store_result(context: Context, payload: dict[str, object]) -> None:
             f"MCP tool text payload is not valid JSON: {exc}. "
             f"Raw text: {text!r}"
         )
+    for block in content[1:]:
+        if isinstance(block, dict) and block.get("type") == "resource":
+            resource = block.get("resource", {})
+            if "blob" in resource:
+                context.last_blob = resource
 
 
 @when("{caller_id} calls the MCP list_tools method")

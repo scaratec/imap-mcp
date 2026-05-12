@@ -22,8 +22,10 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
 from mcp.types import (
+    BlobResourceContents,
     CallToolRequest,
     CallToolResult,
+    EmbeddedResource,
     ErrorData,
     ServerResult,
     TextContent,
@@ -539,7 +541,7 @@ def build_server(context: ServerContext) -> Server:
             _safe = {
                 k: v
                 for k, v in result.items()
-                if k not in ("messages", "body", "headers", "attachment", "rfc822")
+                if k not in ("messages", "body", "headers", "attachment", "rfc822", "_blob", "_blob_mime_type", "_blob_uri")
             }
             span.set_attribute("mcp.response", _json.dumps(_safe, default=str))
             span.set_attribute("mcp.request", _json.dumps(arguments, default=str))
@@ -613,10 +615,27 @@ def build_server(context: ServerContext) -> Server:
     return app
 
 
-def _emit(payload: dict[str, Any]) -> list[TextContent]:
+def _emit(payload: dict[str, Any]) -> list[TextContent | EmbeddedResource]:
     import json
 
-    return [TextContent(type="text", text=json.dumps(payload))]
+    blob = payload.pop("_blob", None)
+    blob_mime = payload.pop("_blob_mime_type", None)
+    blob_uri = payload.pop("_blob_uri", None)
+    result: list[TextContent | EmbeddedResource] = [
+        TextContent(type="text", text=json.dumps(payload))
+    ]
+    if blob is not None:
+        result.append(
+            EmbeddedResource(
+                type="resource",
+                resource=BlobResourceContents(
+                    uri=blob_uri or "attachment://unknown",
+                    mimeType=blob_mime,
+                    blob=blob,
+                ),
+            )
+        )
+    return result
 
 
 def _audit_tool_call(
@@ -1197,9 +1216,12 @@ async def _handle_fetch_attachment(
             "folder": folder_path,
             "uid": uid,
         }
+    import base64
+
     payload = selected_part.get_payload(decode=True) or b""
     mime_type = selected_part.get_content_type()
     content_hash = hashlib.sha256(payload).hexdigest()
+    filename = selected_part.get_filename() or "attachment"
     return {
         "decision": "ALLOW",
         "reason": message_decision.reason,
@@ -1207,10 +1229,13 @@ async def _handle_fetch_attachment(
         "account": account_id,
         "folder": folder_path,
         "uid": uid,
-        "part_id": selected_part.get_filename(),
+        "part_id": filename,
         "mime_type": mime_type,
         "size_bytes": len(payload),
         "content_hash": content_hash,
+        "_blob": base64.b64encode(payload).decode("ascii"),
+        "_blob_mime_type": mime_type,
+        "_blob_uri": f"attachment://{account_id}/{folder_path}/{uid}/{filename}",
     }
 
 

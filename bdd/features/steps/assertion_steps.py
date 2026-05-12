@@ -2791,3 +2791,50 @@ def step_message_field_matches_pattern(
             f"message[{idx}].{field}: {actual!r} does not "
             f"contain {pattern!r}"
         )
+
+
+# ---------------------------------------- blob resource assertions
+
+
+@then('the response contains a blob resource with mime type "{mime_type}"')
+def step_response_contains_blob(context: Context, mime_type: str) -> None:
+    import base64
+
+    blob = getattr(context, "last_blob", None)
+    if blob is None:
+        raise AssertionError(
+            "Response contains no EmbeddedResource with blob content."
+        )
+    actual_mime = blob.get("mimeType")
+    if actual_mime != mime_type:
+        raise AssertionError(
+            f"Blob mimeType: expected {mime_type!r}, got {actual_mime!r}"
+        )
+    raw = blob.get("blob", "")
+    try:
+        base64.b64decode(raw, validate=True)
+    except Exception as exc:
+        raise AssertionError(f"Blob content is not valid base64: {exc}")
+
+
+@then(
+    "the blob content decodes to the same sha256 as "
+    "the response field content_hash"
+)
+def step_blob_sha256_matches_content_hash(context: Context) -> None:
+    import base64
+    import hashlib
+
+    blob = getattr(context, "last_blob", None)
+    if blob is None:
+        raise AssertionError("No blob resource in response.")
+    raw_bytes = base64.b64decode(blob["blob"])
+    blob_hash = hashlib.sha256(raw_bytes).hexdigest()
+    response = _last_response(context)
+    expected = response.get("content_hash")
+    if expected is None:
+        raise AssertionError("Response has no content_hash field.")
+    if blob_hash != expected:
+        raise AssertionError(
+            f"Blob SHA-256 {blob_hash!r} != content_hash {expected!r}"
+        )
