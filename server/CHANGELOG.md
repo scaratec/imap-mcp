@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.10.0 (2026-05-12)
+
+### Features
+
+- Add flagged predicate and explicit IMAP user
+  ([`c5ea4d8`](https://github.com/scaratec/imap-mcp/commit/c5ea4d884e53f3594c03e1327450b7c666e10677))
+
+
 ## v0.9.0 (2026-05-12)
 
 ### Features
