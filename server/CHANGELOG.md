@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.11.1 (2026-05-12)
+
+### Bug Fixes
+
+- Silent 7-day filter, Apple Mail MIME detection,
+  ([`bdeb31c`](https://github.com/scaratec/imap-mcp/commit/bdeb31ca152f9d2182967f778acb6538342c998e))
+
+
 ## v0.11.0 (2026-05-12)
 
 ### Features
