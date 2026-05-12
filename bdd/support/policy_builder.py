@@ -25,6 +25,7 @@ class Account:
     provider: str = "imap-standard"
     host: str = "127.0.0.1"
     port: int = 11143
+    user: str | None = None
     auth_type: str = "password"
     secret_ref: str | None = None
     oauth_scope: str | None = None
@@ -159,6 +160,7 @@ class PolicyBuilder:
                                 "provider": a.provider,
                                 "host": a.host,
                                 "port": a.port,
+                                "user": a.user,
                                 "auth": _clean(
                                     {
                                         "type": a.auth_type,

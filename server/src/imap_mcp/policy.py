@@ -81,6 +81,7 @@ class MessageFacts:
     to_addresses: tuple[str, ...]
     subject: str
     has_attachment: bool
+    flagged: bool
     size_bytes: int
     date_iso: str | None  # RFC 3339 datetime string if parseable
 
@@ -100,6 +101,7 @@ _CORE_PREDICATES: frozenset[str] = frozenset(
         "to_contains",
         "subject_contains",
         "has_attachment",
+        "flagged",
         "newer_than",
         "older_than",
         "size_gt",
@@ -151,6 +153,8 @@ def _match_single_predicate(key: str, expected: object, *, facts: MessageFacts) 
         return expected.lower() in facts.subject.lower()
     if key == "has_attachment":
         return bool(expected) == facts.has_attachment
+    if key == "flagged":
+        return bool(expected) == facts.flagged
     if key == "newer_than" or key == "older_than":
         if not isinstance(expected, str) or facts.date_iso is None:
             return False

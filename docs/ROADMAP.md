@@ -4,11 +4,12 @@ Index der offenen Schulden. Jeder Eintrag verweist auf das ausführliche
 Artefakt (LIM, ADR, Task) — Inhalte werden hier nicht dupliziert.
 Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
-## Status (Stand 2026-04-29)
+## Status (Stand 2026-05-12)
 
-- **BDD-Suite:** 192 passed · 0 failed · 0 skipped.
+- **BDD-Suite:** 241 passed · 0 failed · 0 skipped.
 - **Server-Property-Tests:** 8 passed (`server/tests/policy/`).
-- **HEAD:** ausstehend (LIM-0009 resolved, Spec-Audit-Fixes).
+- **HEAD:** 0.8.1 + localized Gmail folders + explicit IMAP user +
+  flagged predicate.
 
 ### LIM-Übersicht
 

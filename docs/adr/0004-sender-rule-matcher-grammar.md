@@ -36,6 +36,7 @@ fails the whole rule.
 | `to_contains`        | substring                   | Any `To:`/`Cc:` recipient string contains the substring (case-insensitive) |
 | `subject_contains`   | substring                   | `Subject:` header contains the substring (case-insensitive, Unicode NFC normalized) |
 | `has_attachment`     | boolean                     | Message has at least one `Content-Disposition: attachment` part |
+| `flagged`            | boolean                     | Message carries the IMAP `\Flagged` flag (starred in Gmail) |
 | `newer_than`         | ISO 8601 duration           | `Date:` header newer than `now() - duration` |
 | `older_than`         | ISO 8601 duration           | `Date:` header older than `now() - duration` |
 | `size_gt`            | integer (bytes)             | RFC822 size greater than value |
@@ -45,10 +46,10 @@ Rules combine through the folder's rule list (OR across rules, AND within
 one rule). There is no per-rule `not` operator; the whitelist/blacklist
 mode distinction ([ADR 0003]) carries the polarity.
 
-Predicates run against **envelope and header data only** (plus RFC822 size
-and MIME structure summary). No body-content predicates. No full-text
-search. Envelope and headers are already fetched as part of any policy
-evaluation, so these predicates add no I/O.
+Predicates run against **envelope and header data only** (plus RFC822 size,
+MIME structure summary, and IMAP flags). No body-content predicates. No
+full-text search. Envelope, headers, and flags are already fetched as part
+of any policy evaluation, so these predicates add no I/O.
 
 ## Consequences
 
@@ -90,6 +91,10 @@ evaluation, so these predicates add no I/O.
 - **Regex deferred, not banned.** When added later, it will be RE2-backed
   (linear-time guaranteed), pattern-length-capped, and opt-in per folder.
   V1 simply does not have it.
+- **Flag manipulation.** The `flagged` predicate checks IMAP `\Flagged`.
+  On standard IMAP servers any authenticated user can set flags, so the
+  predicate trusts the user's flag choices. On Gmail, starred status is
+  user-controlled by design, which is the intended use case.
 - **Header spoofing.** `from` / `from_domain` predicates match the `From:`
   header, which is forgeable. DMARC/SPF/DKIM verification is out of scope
   for V1; the policy author must accept that envelope-based rules carry the

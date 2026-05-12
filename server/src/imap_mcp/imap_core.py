@@ -36,6 +36,7 @@ class Envelope:
     date: str | None
     size_bytes: int = 0
     has_attachment: bool = False
+    flags: tuple[str, ...] = ()
 
 
 # RFC 3501 LIST response format:  * LIST (flags) "sep" "name"
@@ -205,13 +206,13 @@ async def _folder_message_count(imap: IMAP4, folder: str) -> int:
 def _imap_user_for(account: Account) -> str:
     """Derive the IMAP username from an Account.
 
-    Walking-Skeleton convention: the BDD harness sets accounts
-    whose id is `<imap-user>-<tenant>` (e.g. `gupta-scaratec`,
-    `osthues-mail`, `personal`, `archive`). The user for IMAP auth
-    is the segment before the first dash, or the whole id if no
-    dash is present. The fixture's four users are fixed and tested;
-    this convention mirrors them.
+    If the account has an explicit ``user`` field, use it directly.
+    Otherwise fall back to the walking-skeleton convention: the id
+    is ``<imap-user>-<tenant>`` and the user is the segment before
+    the first dash, or the whole id if no dash is present.
     """
+    if account.user is not None:
+        return account.user
     return account.id.split("-", 1)[0]
 
 
@@ -228,7 +229,7 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
         if status != "OK":
             return None
         status, response = await imap.uid(
-            "fetch", str(uid), "(BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)"
+            "fetch", str(uid), "(FLAGS BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)"
         )
         if status != "OK":
             return None
@@ -236,6 +237,7 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
         if raw_header is None:
             return None
         size_bytes, has_attachment = _extract_meta(response)
+        flags = _extract_flags(response)
         message = email.message_from_bytes(raw_header)
         from_addrs = getaddresses(message.get_all("From", []))
         to_addrs = getaddresses(message.get_all("To", []) + message.get_all("Cc", []))
@@ -258,6 +260,7 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
             date=date_iso,
             size_bytes=size_bytes,
             has_attachment=has_attachment,
+            flags=flags,
         )
     finally:
         await imap.logout()
@@ -282,7 +285,7 @@ async def fetch_envelopes_batch(
             return []
         uid_set = ",".join(str(u) for u in uids)
         status, response = await imap.uid(
-            "fetch", uid_set, "(BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)"
+            "fetch", uid_set, "(FLAGS BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)"
         )
         if status != "OK":
             return []
@@ -294,6 +297,7 @@ async def fetch_envelopes_batch(
                 continue
             uid_val = _extract_uid(response, i)
             size_bytes, has_attachment = _extract_meta_at(response, i)
+            flags = _extract_flags_at(response, i)
             message = email.message_from_bytes(raw_header)
             from_addrs = getaddresses(message.get_all("From", []))
             to_addrs = getaddresses(message.get_all("To", []) + message.get_all("Cc", []))
@@ -317,6 +321,7 @@ async def fetch_envelopes_batch(
                     date=date_iso,
                     size_bytes=size_bytes,
                     has_attachment=has_attachment,
+                    flags=flags,
                 )
             )
             i += 2
@@ -389,6 +394,38 @@ def _extract_meta(response: list[bytes | bytearray]) -> tuple[int, bool]:
         if b"multipart/mixed" in text.lower() or b'"attachment"' in text.lower():
             has_attachment = True
     return size_bytes, has_attachment
+
+
+_FLAGS_RE = re.compile(rb"FLAGS\s+\(([^)]*)\)")
+
+
+def _extract_flags(response: list[bytes | bytearray]) -> tuple[str, ...]:
+    """Pull FLAGS from a FETCH response frame."""
+    for item in response:
+        if not isinstance(item, (bytes, bytearray)):
+            continue
+        m = _FLAGS_RE.search(bytes(item))
+        if m:
+            raw = m.group(1).decode("utf-8", errors="replace").strip()
+            if not raw:
+                return ()
+            return tuple(raw.split())
+    return ()
+
+
+def _extract_flags_at(response: list[bytes | bytearray], start: int) -> tuple[str, ...]:
+    """Pull FLAGS from a FETCH response frame at position `start`."""
+    for j in range(start, min(start + 3, len(response))):
+        part = response[j]
+        if not isinstance(part, (bytes, bytearray)):
+            continue
+        m = _FLAGS_RE.search(bytes(part))
+        if m:
+            raw = m.group(1).decode("utf-8", errors="replace").strip()
+            if not raw:
+                return ()
+            return tuple(raw.split())
+    return ()
 
 
 async def fetch_full_message(

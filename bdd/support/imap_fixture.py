@@ -47,6 +47,7 @@ _ACCOUNT_ID_TO_INSTANCE_USER: dict[str, tuple[str, str]] = {
     "gmail-ronly": ("imap-b", "archive"), # Alias to archive for oauth tests
     "scaratec-gmail": ("mock-gmail", "test"),
     "archive-srv": ("imap-b", "archive"),
+    "ext-user": ("imap-a", "gupta"),
 }
 
 

@@ -43,6 +43,7 @@ class Account(BaseModel):
     provider: Literal["imap-standard", "google", "google-mock"] = "imap-standard"
     host: str = "127.0.0.1"
     port: int = 143
+    user: str | None = None
     auth: AccountAuth | None = None
     token_cache: Literal["memory_only", "persist_all"] = "memory_only"
 
@@ -116,6 +117,7 @@ _CORE_MATCHER_KEYS: frozenset[str] = frozenset(
         "to_contains",
         "subject_contains",
         "has_attachment",
+        "flagged",
         "newer_than",
         "older_than",
         "size_gt",

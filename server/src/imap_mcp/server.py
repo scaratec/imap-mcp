@@ -697,6 +697,7 @@ def _facts_from_envelope(envelope: Any) -> MessageFacts:
         to_addresses=tuple(envelope.to_addresses),
         subject=envelope.subject,
         has_attachment=envelope.has_attachment,
+        flagged="\\Flagged" in envelope.flags,
         size_bytes=envelope.size_bytes,
         date_iso=envelope.date,
     )

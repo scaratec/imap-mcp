@@ -84,6 +84,28 @@ def step_imap_account_exists_with_single_folder(
     builder.write()
 
 
+@given('the IMAP account "{account_id}" exists with explicit user "{imap_user}" and folder "{folder}"')
+def step_imap_account_explicit_user_with_folder(
+    context: Context, account_id: str, imap_user: str, folder: str
+) -> None:
+    """Register an account whose IMAP login name differs from the id."""
+    builder = _ensure_builder(context)
+    instance, dovecot_user = resolve_account(account_id)
+    host, port = context.imap_instances[instance]
+    if not any(a.id == account_id for a in builder.accounts):
+        builder.add_account(
+            id=account_id,
+            host=host,
+            port=port,
+            user=imap_user,
+            auth_type="password",
+            secret_ref=f"secret://accounts/{account_id}/password",
+            password_literal="test123",
+        )
+    context.imap.create_folder(instance, dovecot_user, folder)
+    builder.write()
+
+
 @given('the server date is pinned to "{date}"')
 def step_server_date_pinned(context: Context, date: str) -> None:
     env = getattr(context, "mcp_extra_env", None) or {}
@@ -392,6 +414,15 @@ def _parse_bool(value: str) -> bool:
     raise ValueError(f"Cannot parse boolean: {value!r}")
 
 
+def _parse_flags(raw: str) -> list[str]:
+    """Parse a flag list like ``[\\Flagged]`` or ``[\\Seen, \\Flagged]``."""
+    raw = raw.strip()
+    if raw in ("[]", ""):
+        return []
+    inner = raw.strip("[]")
+    return [f.strip() for f in inner.split(",") if f.strip()]
+
+
 def _body_padded_to(target_size: int, subject: str) -> str:
     """Produce a body that, combined with standard headers, reaches ~target_size bytes.
 
@@ -545,6 +576,7 @@ def _seed_message(context: Context, account_id: str, folder: str) -> None:
             if "size_bytes" in headings
             else 0,
             "date": row["date"] if "date" in headings else None,
+            "flags": _parse_flags(row["flags"]) if "flags" in headings else [],
             "extra_attachments": [],
             "extra_headers": [],
             "body_override": None,
@@ -608,6 +640,7 @@ def flush_staged_messages(context: Context) -> None:
             body=body,
             message_id=message_id,
             date=date_header,
+            flags=staged.get("flags", []),
             attachments=attachments,
             extra_headers=extra_headers,
         )

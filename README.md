@@ -10,9 +10,10 @@ or leaving no trace of what they did.
 
 ## Status
 
-**V1 — 228 BDD scenarios green, 0 skipped.** The server is
-runnable on stdio and HTTP/SSE transports. Gmail and standard IMAP
-providers are supported. Optional OpenTelemetry tracing with Jaeger.
+**V1 — 241 BDD scenarios green, 0 skipped.** The server is
+runnable on stdio and HTTP/SSE transports. Gmail (with localized folder
+name resolution via RFC 6154) and standard IMAP providers are supported.
+Optional OpenTelemetry tracing with Jaeger.
 
 ## Quick start
 
@@ -135,6 +136,14 @@ accounts:
       oauth_scope: https://mail.google.com/
     token_cache: persist_all
 
+  - id: accounting@company.com
+    host: imap.company.com
+    port: 993
+    user: mail2223                  # explicit IMAP login (when != id)
+    auth:
+      type: password
+      secret_ref: secret://accounts/accounting@company.com/password
+
 secret_store:
   backend: file_dir               # or "env_var" or "gpg_file"
   path: /home/user/.config/imap-mcp/secrets
@@ -157,6 +166,7 @@ wal:
 | `provider` | no | `imap-standard` | `imap-standard`, `google`, or `google-mock` |
 | `host` | no | `127.0.0.1` | IMAP server hostname |
 | `port` | no | `143` | IMAP port. Use `993` for IMAPS (Gmail, most providers) |
+| `user` | no | derived from `id` | Explicit IMAP login username. Use when the IMAP user differs from the account id (e.g. `mail2223` for `accounting@example.com`) |
 | `auth.type` | yes | — | `password` or `xoauth2` |
 | `auth.secret_ref` | yes | — | Reference to the secret store (e.g. `secret://accounts/x/password`) |
 | `auth.oauth_scope` | no | — | OAuth2 scope for xoauth2 accounts |
@@ -279,6 +289,7 @@ AND-combined; multiple rules in a folder are OR-combined.
 | `to_contains` | substring | `team` |
 | `subject_contains` | substring (case-insensitive, NFC-normalized) | `rechnung` |
 | `has_attachment` | boolean | `true` |
+| `flagged` | boolean | `true` |
 | `newer_than` | duration | `30d` |
 | `older_than` | duration | `90d` |
 | `size_gt` | bytes | `10000` |
@@ -287,6 +298,18 @@ AND-combined; multiple rules in a folder are OR-combined.
 In `whitelist` mode, rules use `grant: <level>`. In `blacklist` mode,
 rules use `cap: <level>`. Mixing both in one folder is a parse-time
 error.
+
+The `flagged` predicate matches the IMAP `\Flagged` flag (starred in
+Gmail), enabling rules like "grant full access to all starred messages":
+
+```yaml
+- path: INBOX
+  mode: whitelist
+  default: NONE
+  rules:
+    - match: { flagged: true }
+      grant: FULL
+```
 
 ## MCP tool surface
 
