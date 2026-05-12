@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.11.0 (2026-05-12)
+
+### Features
+
+- Return attachment bytes via MCP EmbeddedResource
+  ([`82ac6ef`](https://github.com/scaratec/imap-mcp/commit/82ac6ef2e29fefa8d8e77a1cf85dbe1c9326a31b))
+
+
 ## v0.10.1 (2026-05-12)
 
 ### Bug Fixes
