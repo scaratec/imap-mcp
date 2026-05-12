@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.10.1 (2026-05-12)
+
+### Bug Fixes
+
+- **ci**: Make release pipeline idempotent for re-runs
+  ([`49291b2`](https://github.com/scaratec/imap-mcp/commit/49291b229288221b945d5fa6576a916ad9483bb6))
+
+
 ## v0.10.0 (2026-05-12)
 
 ### Features
