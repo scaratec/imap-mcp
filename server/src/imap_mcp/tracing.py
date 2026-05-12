@@ -65,6 +65,15 @@ _tracer: _NoOpTracer | Any = _NoOpTracer()
 _initialized = False
 
 
+def _get_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("sc-imap-mcp")
+    except Exception:
+        return "dev"
+
+
 def init_tracer(service_name: str = "imap-mcp") -> None:
     global _tracer, _initialized
     if _initialized:
@@ -81,7 +90,7 @@ def init_tracer(service_name: str = "imap-mcp") -> None:
     resource = Resource.create(
         {
             "service.name": os.environ.get("OTEL_SERVICE_NAME", service_name),
-            "service.version": "0.5.0",
+            "service.version": _get_version(),
         }
     )
     provider = TracerProvider(resource=resource)
