@@ -17,14 +17,20 @@ providers are supported. Optional OpenTelemetry tracing with Jaeger.
 ## Quick start
 
 ```bash
-# Install from PyPI
-pip install sc-imap-mcp
+# Install via pipx (recommended — isolated environment, global CLI)
+pipx install "sc-imap-mcp[tracing]"
 
-# With OpenTelemetry tracing support
+# Or via pip
 pip install sc-imap-mcp[tracing]
 
-# Or from source
+# Without tracing
+pipx install sc-imap-mcp
+
+# From source
 cd server && pip install -e ".[tracing]"
+
+# Upgrade
+pipx upgrade sc-imap-mcp
 ```
 
 ### Configure
