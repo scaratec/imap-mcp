@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.7.3 (2026-05-12)
+
+### Bug Fixes
+
+- Unfold RFC 5322 subject headers before returning to agent
+  ([`94e40cf`](https://github.com/scaratec/imap-mcp/commit/94e40cf4580947551ee1ce67c0539be292d6f8bc))
+
+
 ## v0.7.2 (2026-05-11)
 
 ### Bug Fixes
