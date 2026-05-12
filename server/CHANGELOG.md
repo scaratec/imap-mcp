@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.9.0 (2026-05-12)
+
+### Features
+
+- Resolve localized Gmail folder names via RFC 6154
+  ([`20a5324`](https://github.com/scaratec/imap-mcp/commit/20a53240d9141b8a6d6b7c2f1e41aee38d2f4f33))
+
+
 ## v0.8.2 (2026-05-12)
 
 ### Bug Fixes
