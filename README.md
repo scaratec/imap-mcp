@@ -10,28 +10,56 @@ or leaving no trace of what they did.
 
 ## Status
 
-**V1 — all 192 BDD scenarios green, 0 skipped.** The server is
+**V1 — 228 BDD scenarios green, 0 skipped.** The server is
 runnable on stdio and HTTP/SSE transports. Gmail and standard IMAP
-providers are supported.
+providers are supported. Optional OpenTelemetry tracing with Jaeger.
 
 ## Quick start
 
 ```bash
-# Install
+# Install from PyPI
 pip install sc-imap-mcp
-# Or from source:
-cd server && pip install -e .
 
-# Create a config directory (see Configuration below)
-mkdir -p /etc/imap-mcp/{policies}
+# With OpenTelemetry tracing support
+pip install sc-imap-mcp[tracing]
 
-# Run on stdio (for Claude Desktop, Cline, etc.)
-IMAP_MCP_CONFIG_DIR=/etc/imap-mcp \
+# Or from source
+cd server && pip install -e ".[tracing]"
+```
+
+### Configure
+
+```bash
+mkdir -p ~/.config/imap-mcp/{policies,secrets/accounts/my-account}
+
+# Create accounts.yaml, callers.yaml, policies/*.yaml
+# (see Configuration section below)
+
+# Store your IMAP password or OAuth refresh token
+echo -n 'your-password' > ~/.config/imap-mcp/secrets/accounts/my-account/password
+```
+
+### Run on stdio (for Claude Desktop, Claude Code, Cline)
+
+```bash
+IMAP_MCP_CONFIG_DIR=~/.config/imap-mcp \
 IMAP_MCP_CALLER_ID=my-agent \
   imap-mcp --transport stdio
+```
 
-# Run on HTTP (for multi-agent setups)
-IMAP_MCP_CONFIG_DIR=/etc/imap-mcp \
+### Register with Claude Code
+
+```bash
+claude mcp add --scope user imap-mcp \
+  --env IMAP_MCP_CONFIG_DIR=$HOME/.config/imap-mcp \
+  --env IMAP_MCP_CALLER_ID=my-agent \
+  -- imap-mcp --transport stdio
+```
+
+### Run on HTTP (for multi-agent setups)
+
+```bash
+IMAP_MCP_CONFIG_DIR=~/.config/imap-mcp \
   imap-mcp --transport http --host 127.0.0.1 --port 8080
 ```
 
@@ -48,12 +76,13 @@ IMAP_MCP_CONFIG_DIR=/etc/imap-mcp \
 │  │ Policy Decision Point  — default-deny           │ │
 │  │ Redaction / Transparency Layer                  │ │
 │  │ Transaction Manager (WAL + saga)                │ │
-│  │ IMAP Core · Connection Pool · OAuth2 adapters   │ │
+│  │ IMAP Core · Batch Fetch · OAuth2 adapters       │ │
 │  │ Pluggable Secret Store                          │ │
 │  │ Append-only Audit Log with hash chain           │ │
+│  │ OpenTelemetry Tracing (optional)                │ │
 │  └─────────────────────────────────────────────────┘ │
 └─────────┬───────────────────┬────────────────────────┘
-          │ IMAP              │ IMAP
+          │ IMAP/IMAPS        │ IMAP/IMAPS
 ┌─────────▼────┐   ┌──────────▼────┐
 │ Account A    │   │ Account B     │
 │ (e.g. Gmail) │   │ (e.g. Dovecot)│
@@ -90,39 +119,38 @@ accounts:
       secret_ref: secret://accounts/company-mail/password
     token_cache: memory_only      # or "persist_all" (OAuth only)
 
-  - id: gmail-invoices
+  - id: gmail-work
     provider: google
     host: imap.gmail.com
     port: 993
     auth:
       type: xoauth2
-      secret_ref: secret://accounts/gmail-invoices/refresh_token
+      secret_ref: secret://accounts/gmail-work/refresh_token
       oauth_scope: https://mail.google.com/
     token_cache: persist_all
 
 secret_store:
   backend: file_dir               # or "env_var" or "gpg_file"
-  path: /etc/imap-mcp/secrets
+  path: /home/user/.config/imap-mcp/secrets
 
 audit:
-  directory: /var/log/imap-mcp/audit
+  directory: /home/user/.config/imap-mcp/audit
   hot_days: 90                    # days before gzip compression
   warm_days: 275                  # additional days as .gz
   delete_after_days: 365          # total age before deletion
-  external_root_hook: /usr/local/bin/audit-root-notify
 
 wal:
-  path: /var/lib/imap-mcp/wal.db
+  path: /home/user/.config/imap-mcp/wal.db
 ```
 
 #### Account fields
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `id` | yes | — | Unique identifier referenced in policies |
+| `id` | yes | — | Unique identifier referenced in policies. For Gmail with OAuth, use the email address (e.g. `user@company.com`) |
 | `provider` | no | `imap-standard` | `imap-standard`, `google`, or `google-mock` |
 | `host` | no | `127.0.0.1` | IMAP server hostname |
-| `port` | no | `143` | IMAP port (993 for IMAPS) |
+| `port` | no | `143` | IMAP port. Use `993` for IMAPS (Gmail, most providers) |
 | `auth.type` | yes | — | `password` or `xoauth2` |
 | `auth.secret_ref` | yes | — | Reference to the secret store (e.g. `secret://accounts/x/password`) |
 | `auth.oauth_scope` | no | — | OAuth2 scope for xoauth2 accounts |
@@ -133,12 +161,11 @@ wal:
 | Backend | Description | Config fields |
 |---|---|---|
 | `file_dir` | Plaintext files; confidentiality from the surrounding system (git-crypt, SOPS, LUKS) | `path` |
-| `env_var` | Read-only from environment variables. Secret path segments become `UPPER_SNAKE_CASE` with `__` separators. Read-only — OAuth bootstrap refuses to start against this backend. | — |
+| `env_var` | Read-only from environment variables. | — |
 | `gpg_file` | Per-file GPG decryption using the operator's key | `path`, `recipient`, `gnupghome` |
 
 Secret references use the format `secret://path/segments`. For `file_dir`,
-this resolves to `{path}/path/segments`. For `env_var`, `secret://callers/invoice-agent/token`
-becomes the environment variable `IMAP_MCP_SECRET__CALLERS__INVOICE_AGENT__TOKEN`.
+this resolves to `{path}/path/segments`.
 
 ### callers.yaml
 
@@ -146,23 +173,23 @@ Defines every MCP caller (agent) that may connect to the server.
 
 ```yaml
 callers:
-  - id: invoice-agent
+  - id: my-agent
+    policy: my-policy
+    auth:
+      type: stdio_trusted
+
+  - id: invoice-bot
     policy: invoice-policy
     auth:
       type: shared_token
-      token_secret_ref: secret://callers/invoice-agent/token
-
-  - id: overview-bot
-    policy: overview-policy
-    auth:
-      type: stdio_trusted
+      token_secret_ref: secret://callers/invoice-bot/token
 ```
 
 #### Caller auth types
 
 | Type | Transport | Mechanism |
 |---|---|---|
-| `stdio_trusted` | stdio only | Caller ID set via `IMAP_MCP_CALLER_ID` env var by the orchestrator. Forbidden on HTTP transport (startup error). |
+| `stdio_trusted` | stdio only | Caller ID set via `IMAP_MCP_CALLER_ID` env var by the orchestrator. |
 | `shared_token` | stdio + HTTP | Bearer token verified with constant-time comparison. On HTTP: `Authorization: Bearer <token>` header. |
 
 Caller identity is immutable for the session duration. No impersonation
@@ -173,10 +200,17 @@ primitive exists.
 Each policy file defines what one caller may see and do.
 
 ```yaml
-name: invoice-policy
+name: my-policy
 accounts:
   company-mail:
-    - path: INBOX/Invoices
+    - path: INBOX
+      mode: blacklist
+      default: ENVELOPE
+      mark_seen: true
+      rules: []
+
+  gmail-work:
+    - path: INBOX
       mode: whitelist
       default: NONE
       mark_seen: true
@@ -187,21 +221,11 @@ accounts:
         - match: { from_domain: amazon.de }
           grant: FULL
 
-    - path: Archive/Invoices-2026
+    - path: Archive
       mode: whitelist
       default: NONE
       accept_incoming: true
       rules: []
-
-  gmail-invoices:
-    - path: Rechnungen
-      mode: whitelist
-      default: NONE
-      mark_seen: true
-      move_out: true
-      rules:
-        - match: { from_domain: hornbach.de }
-          grant: FULL
 ```
 
 #### Folder policy fields
@@ -231,7 +255,7 @@ NONE < COUNT < METADATA < ENVELOPE < HEADERS < BODY < FULL
 | `NONE` | Nothing (message is invisible) |
 | `COUNT` | Message count only (`folder_stats`) |
 | `METADATA` | UIDs, sizes, flags (`search`) |
-| `ENVELOPE` | From, To, Subject, Date (`fetch_envelope`) |
+| `ENVELOPE` | From, To, Subject, Date (`fetch_envelope`, `list_messages`) |
 | `HEADERS` | Full RFC 5322 header block (`fetch_headers`) |
 | `BODY` | Plain-text and HTML bodies (`fetch_body`) |
 | `FULL` | Everything including attachments (`fetch_attachment`) |
@@ -260,19 +284,20 @@ error.
 
 ## MCP tool surface
 
-Seventeen tools, each gated on exactly one visibility level or one
+Eighteen tools, each gated on exactly one visibility level or one
 capability.
 
-### Read tools (9)
+### Read tools (10)
 
 | Tool | Min visibility | Description |
 |---|---|---|
 | `list_accounts` | — | List visible accounts + `hidden_accounts_count` |
 | `list_folders` | COUNT | List visible folders + `hidden_folders_count` |
 | `list_labels` | COUNT | Gmail only: list labels with flags |
+| `list_messages` | ENVELOPE | **Primary tool for reading mail.** Returns from, subject, date per message. Supports criteria and pagination. |
 | `folder_stats` | COUNT | Message counts per visibility level |
-| `search` | METADATA | Search with `matched_total` / `matched_visible` / `filtered_out` |
-| `fetch_envelope` | ENVELOPE | From, To, Subject, Date + redaction metadata |
+| `search` | METADATA | Search for UIDs with `matched_total` / `matched_visible` / `filtered_out` |
+| `fetch_envelope` | ENVELOPE | From, To, Subject, Date for a single message by UID |
 | `fetch_headers` | HEADERS | Full RFC 5322 headers |
 | `fetch_body` | BODY | Plain-text and HTML bodies |
 | `fetch_attachment` | FULL | MIME attachment bytes |
@@ -307,34 +332,58 @@ See [ADR 0018](docs/adr/0018-non-goal-tool-surface.md).
 |---|---|---|
 | `IMAP_MCP_CONFIG_DIR` | yes | Path to the configuration directory |
 | `IMAP_MCP_CALLER_ID` | stdio_trusted only | Caller identity for stdio transport |
+| `IMAP_MCP_OAUTH_CLIENT_ID` | xoauth2 accounts | OAuth2 client ID from GCP Console |
+| `IMAP_MCP_OAUTH_CLIENT_SECRET` | xoauth2 accounts | OAuth2 client secret from GCP Console |
 | `IMAP_MCP_HTTP_HOST` | no | Bind address for HTTP (default: `127.0.0.1`) |
 | `IMAP_MCP_HTTP_PORT` | no | Port for HTTP (default: `0` = ephemeral) |
 | `IMAP_MCP_APPEND_TIMEOUT` | no | Timeout in seconds for IMAP APPEND |
-| `IMAP_MCP_OAUTH_CLIENT_ID` | no | OAuth2 client ID (default: built-in) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | OTLP endpoint for tracing (e.g. `http://localhost:4317`) |
 
 ## OAuth2 bootstrap
 
-For accounts with `auth.type: xoauth2`, run the interactive bootstrap
-once per account to obtain the refresh token:
+For accounts with `auth.type: xoauth2` (e.g. Gmail), run the
+interactive bootstrap once per account to obtain the refresh token:
 
 ```bash
-imap-mcp-oauth-bootstrap --account gmail-invoices
+IMAP_MCP_CONFIG_DIR=~/.config/imap-mcp \
+IMAP_MCP_OAUTH_CLIENT_ID=your-client-id.apps.googleusercontent.com \
+IMAP_MCP_OAUTH_CLIENT_SECRET=your-client-secret \
+  imap-mcp-oauth-bootstrap --account user@company.com
 ```
 
-This opens a browser for the OAuth consent flow. On success, the
-refresh token is stored in the secret store. The server then exchanges
-it for access tokens automatically.
+This prints a URL. Open it in a browser, complete the Google consent
+flow, then paste the redirect URL back into the terminal. On success,
+the refresh token is stored in the secret store. The server then
+exchanges it for access tokens automatically.
 
-PKCE is mandatory. Scope minimization is enforced: a readonly-scope
-account refuses write operations regardless of policy.
+### Setting up a GCP OAuth client
+
+1. Go to https://console.cloud.google.com/apis/credentials
+2. Create credentials > OAuth client ID > Desktop app
+3. Copy the Client ID and Client Secret
+4. Use them as `IMAP_MCP_OAUTH_CLIENT_ID` and `IMAP_MCP_OAUTH_CLIENT_SECRET`
+
+## Tracing (optional)
+
+Install with tracing support and start Jaeger:
+
+```bash
+pip install sc-imap-mcp[tracing]
+cd ops/tracing && docker compose up -d
+
+# Add to your MCP server config:
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
+Open http://localhost:16686 for the Jaeger UI. Every MCP tool call
+creates a trace with nested IMAP connection and authentication spans.
 
 ## Policy reload
 
 Send `SIGHUP` to the running server process. The server re-parses the
 entire config directory, validates it, and swaps the in-memory state
 atomically. Parse or validation errors preserve the previous policy
-and write an audit record with the error. In-flight saga transactions
-complete under their original policy; new requests see the new one.
+and write an audit record with the error.
 
 ```bash
 kill -HUP $(pidof imap-mcp)
@@ -356,25 +405,16 @@ Append-only JSONL with SHA-256 hash chain, one file per UTC day.
 Strict no-content-leak rule: no message bodies, subjects, attachment
 filenames, OAuth tokens, or cleartext sender addresses in DENY records.
 
-```
-/var/log/imap-mcp/audit/
-├── 2026-05-06.jsonl       # hot (plain, mode 0600)
-├── 2026-02-01.jsonl.gz    # warm (gzipped, mode 0400)
-└── ...
-```
-
-Each record contains: `ts`, `seq`, `prev_hash`, `tool`, `caller_id`,
-`decision` (ALLOW/DENY), `reason`, `result`, and tool-specific fields.
-
 ## Implementation stack
 
 - **Language:** Python 3.11+
-- **IMAP:** `aioimaplib`
+- **IMAP:** `aioimaplib` (IMAP4 and IMAP4_SSL)
 - **MCP:** the official `mcp` SDK (stdio + HTTP/SSE)
 - **Storage:** `aiosqlite` for WAL; YAML for config
 - **Validation:** `pydantic` v2 (strict mode)
 - **OAuth:** `httpx` + first-party flow implementation
-- **Testing:** `pytest` (property tests) + `behave` (BDD, 192 scenarios)
+- **Tracing:** OpenTelemetry (optional, via `[tracing]` extra)
+- **Testing:** `pytest` (property tests) + `behave` (BDD, 228 scenarios)
 
 ## Testing
 
@@ -390,8 +430,8 @@ cd server && .venv/bin/pytest tests/policy/ -q
 ## Documentation
 
 The design is captured in 23 ADRs under [`docs/adr/`](docs/adr/).
-Limitation records under [`docs/limitations/`](docs/limitations/)
-(all 9 resolved). Error-path analysis at
+Limitation records under [`docs/limitations/`](docs/limitations/).
+Error-path analysis at
 [`docs/error_path_analysis.md`](docs/error_path_analysis.md).
 
 ## License
