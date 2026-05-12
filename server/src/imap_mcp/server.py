@@ -286,9 +286,11 @@ def build_server(context: ServerContext) -> Server:
                 name="fetch_body",
                 description=(
                     "Fetch the plain/HTML body of a single message. "
-                    "Requires BODY-level visibility per ADR 0002; returns "
-                    "redaction metadata when the caller's grant does not "
-                    "reach FULL (attachments remain hidden)."
+                    "Only works if your visibility for this message is "
+                    "BODY or FULL. Will return DENY if the sender is "
+                    "not in your whitelist or your visibility is only "
+                    "ENVELOPE. Use list_messages first to see which "
+                    "messages you can access."
                 ),
                 inputSchema={
                     "type": "object",
@@ -381,7 +383,11 @@ def build_server(context: ServerContext) -> Server:
             ),
             Tool(
                 name="create_draft",
-                description="Append an RFC 5322 message to a folder as a draft (ADR 0005).",
+                description=(
+                    "Append an RFC 5322 message to a folder as a draft. "
+                    "Call list_folders first to get the correct folder "
+                    "path. Gmail uses '[Gmail]/Drafts', not 'Drafts'."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
