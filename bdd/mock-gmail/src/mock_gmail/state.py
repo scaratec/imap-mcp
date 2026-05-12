@@ -63,13 +63,29 @@ class GmailState:
         self._created_folders: set[str] = set()
         self.password: str = "test"
         self.total_connections: int = 0
+        self._localized_folders: dict[str, tuple[str, str]] = {}
 
     def reset(self) -> None:
         self.messages.clear()
         self._uid_maps.clear()
         self._uid_counters.clear()
         self._created_folders.clear()
+        self._localized_folders.clear()
         self.total_connections = 0
+
+    def set_localized_folders(
+        self, mapping: list[tuple[str, str, str]]
+    ) -> None:
+        """Configure folder localization.
+
+        Each entry is (canonical, localized, flags).  The LIST command
+        will emit `localized` instead of `canonical`, but carry the
+        same RFC 6154 special-use flags so the client can resolve
+        the canonical name.
+        """
+        self._localized_folders.clear()
+        for canonical, localized, flags in mapping:
+            self._localized_folders[canonical] = (localized, flags)
 
     def create_folder(self, name: str) -> None:
         self._created_folders.add(name)
@@ -83,7 +99,15 @@ class GmailState:
     def new_msgid(self) -> int:
         return next(_msgid_counter)
 
+    def _resolve_localized(self, folder: str) -> str:
+        """Map a localized folder name back to the canonical name."""
+        for canonical, (localized, _flags) in self._localized_folders.items():
+            if folder == localized:
+                return canonical
+        return folder
+
     def messages_in_folder(self, folder: str) -> list[tuple[int, Message]]:
+        folder = self._resolve_localized(folder)
         label = FOLDER_TO_LABEL.get(folder, folder)
         if label == "__ALL_MAIL__":
             result = []

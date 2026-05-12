@@ -116,6 +116,7 @@ class FolderInfo:
 
     path: str
     message_count: int
+    flags: str = ""
 
 
 async def list_folders(account: Account, password: str) -> list[FolderInfo]:
@@ -127,7 +128,7 @@ async def list_folders(account: Account, password: str) -> list[FolderInfo]:
         status, response = await imap.list('""', "*")
         if status != "OK":
             raise RuntimeError(f"IMAP LIST failed: {status} {response!r}")
-        paths: list[str] = []
+        entries: list[tuple[str, str]] = []
         for raw in response:
             if isinstance(raw, bytes) is False:
                 continue
@@ -143,15 +144,45 @@ async def list_folders(account: Account, password: str) -> list[FolderInfo]:
             name_raw = match.group("name").strip()
             if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
                 name_raw = name_raw[1:-1]
-            paths.append(name_raw.decode("utf-8"))
+            entries.append((name_raw.decode("utf-8"), flags_raw))
 
         result: list[FolderInfo] = []
-        for folder_path in paths:
+        for folder_path, flags in entries:
             count = await _folder_message_count(imap, folder_path)
-            result.append(FolderInfo(path=folder_path, message_count=count))
+            result.append(FolderInfo(path=folder_path, message_count=count, flags=flags))
         return result
     finally:
         await imap.logout()
+
+
+_SPECIAL_USE_TO_CANONICAL: dict[str, str] = {
+    "\\Drafts": "[Gmail]/Drafts",
+    "\\Sent": "[Gmail]/Sent Mail",
+    "\\Trash": "[Gmail]/Trash",
+    "\\Junk": "[Gmail]/Spam",
+    "\\Flagged": "[Gmail]/Starred",
+    "\\Important": "[Gmail]/Important",
+    "\\All": "[Gmail]/All Mail",
+}
+
+
+def build_folder_alias_map(folders: list[FolderInfo]) -> dict[str, str]:
+    """Build a mapping from canonical policy paths to actual IMAP paths.
+
+    Scans the RFC 6154 special-use flags from the IMAP LIST response.
+    When a folder carries a special-use flag but its path differs from
+    the canonical English name, a mapping entry is created so that
+    policy paths can be resolved to the actual IMAP path.
+
+    Returns: {canonical_path: actual_imap_path}
+    """
+    alias_map: dict[str, str] = {}
+    for fi in folders:
+        for token in fi.flags.split():
+            canonical = _SPECIAL_USE_TO_CANONICAL.get(token)
+            if canonical is not None and fi.path != canonical:
+                alias_map[canonical] = fi.path
+    return alias_map
 
 
 _STATUS_MESSAGES = re.compile(rb"MESSAGES\s+(\d+)")

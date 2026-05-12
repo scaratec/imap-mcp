@@ -29,6 +29,18 @@ class GmailIMAPHandler:
         self._selected_folder: str | None = None
         state.total_connections += 1
 
+    def _resolve_folder(self, folder: str) -> str:
+        """Map a localized folder name back to the canonical name.
+
+        When localization is active the IMAP client will use the
+        localized name it received from LIST.  The mock's internal
+        state uses canonical names, so we translate back here.
+        """
+        for canonical, (localized, _flags) in self._state._localized_folders.items():
+            if folder == localized:
+                return canonical
+        return folder
+
     async def run(self) -> None:
         self._send_untagged("OK Gimap ready for requests (mock-gmail)")
         await self._w.drain()
@@ -87,13 +99,18 @@ class GmailIMAPHandler:
 
     async def _cmd_list(self, tag: str, args: str) -> None:
         folders = self._state.all_folders()
+        localized = self._state._localized_folders
         for folder in folders:
-            attrs = _folder_attrs(folder)
-            self._send_untagged(f'LIST ({attrs}) "/" "{folder}"')
+            if folder in localized:
+                loc_name, loc_flags = localized[folder]
+                self._send_untagged(f'LIST ({loc_flags}) "/" "{loc_name}"')
+            else:
+                attrs = _folder_attrs(folder)
+                self._send_untagged(f'LIST ({attrs}) "/" "{folder}"')
         self._send(tag, "OK", "LIST completed")
 
     async def _cmd_select(self, tag: str, args: str) -> None:
-        folder = _unquote(args)
+        folder = self._resolve_folder(_unquote(args))
         self._selected_folder = folder
         msgs = self._state.messages_in_folder(folder)
         uidval = self._state.uidvalidity(folder)
@@ -139,7 +156,7 @@ class GmailIMAPHandler:
         if not m:
             self._send(tag, "BAD", "APPEND parse error")
             return
-        folder = m.group(1)
+        folder = self._resolve_folder(m.group(1))
         size = int(m.group(2))
         self._send_untagged_raw("+ Ready for literal data\r\n")
         data = await self._r.readexactly(size)
@@ -385,7 +402,7 @@ class GmailIMAPHandler:
             self._send(tag, "BAD", "COPY parse error")
             return
         uid = int(m.group(1))
-        target = m.group(2)
+        target = self._resolve_folder(m.group(2))
         msg = self._state.message_by_uid(folder, uid)
         if msg is None:
             self._send(tag, "NO", "Message not found")
@@ -401,7 +418,7 @@ class GmailIMAPHandler:
             self._send(tag, "BAD", "MOVE parse error")
             return
         uid = int(m.group(1))
-        target = m.group(2)
+        target = self._resolve_folder(m.group(2))
         msg = self._state.message_by_uid(folder, uid)
         if msg is None:
             self._send(tag, "NO", "Message not found")

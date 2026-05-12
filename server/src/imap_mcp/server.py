@@ -42,6 +42,7 @@ from .imap_core import (
     UidNotFound,
     UidStale,
     append_message as imap_append_message,
+    build_folder_alias_map,
     copy_message as imap_copy_message,
     fetch_body as imap_fetch_body,
     fetch_envelope as imap_fetch_envelope,
@@ -85,6 +86,7 @@ class _LiveState:
     pdp: PolicyDecisionPoint
     configuration: "object"  # Configuration; intentionally untyped here
     oauth_manager: "object | None" = None
+    folder_aliases: dict[str, dict[str, str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -792,8 +794,20 @@ async def _handle_list_folders(context: ServerContext, arguments: dict[str, Any]
         }
     account_model, password = await _password_for_account(context, account_id)
     folder_infos = await imap_list_folders(account_model, password)
-    all_paths = [fi.path for fi in folder_infos]
-    count_by_path = {fi.path: fi.message_count for fi in folder_infos}
+
+    alias_map: dict[str, str] = {}
+    if _is_google_provider(account_model):
+        alias_map = build_folder_alias_map(folder_infos)
+        if context._live.folder_aliases is None:
+            context._live.folder_aliases = {}
+        context._live.folder_aliases[account_id] = alias_map
+
+    reverse_map = {v: k for k, v in alias_map.items()}
+    all_paths = [reverse_map.get(fi.path, fi.path) for fi in folder_infos]
+    count_by_path = {
+        reverse_map.get(fi.path, fi.path): fi.message_count
+        for fi in folder_infos
+    }
     visibility = context.pdp.visible_folders_for(context.caller_id, account_id, all_paths)
     folders_result = [
         {"path": p, "message_count": count_by_path.get(p, 0)}
@@ -808,6 +822,38 @@ async def _handle_list_folders(context: ServerContext, arguments: dict[str, Any]
 def _is_google_provider(account: Any) -> bool:
     """True when the account uses Google/Gmail IMAP semantics."""
     return getattr(account, "provider", "imap-standard") in ("google", "google-mock")
+
+
+def _get_folder_aliases(
+    context: ServerContext, account_id: str
+) -> dict[str, str]:
+    """Return the cached folder alias map for a Google account.
+
+    The map is populated by ``_handle_list_folders`` as a side effect
+    of its IMAP LIST call — no extra connection is needed.  If
+    ``list_folders`` has not been called yet for this account the map
+    is empty and canonical paths pass through unchanged.
+    """
+    if context._live.folder_aliases is None:
+        return {}
+    return context._live.folder_aliases.get(account_id, {})
+
+
+async def _resolve_imap_folder(
+    context: ServerContext, account_id: str, canonical_path: str
+) -> str:
+    """Resolve a canonical policy path to the actual IMAP folder path.
+
+    For Google accounts with localized folder names the canonical path
+    (e.g. ``[Gmail]/Drafts``) is mapped to the localized IMAP path
+    (e.g. ``[Gmail]/Entwürfe``).  Non-Google accounts and paths
+    without an alias entry pass through unchanged.
+    """
+    account = context.account_by_id(account_id)
+    if account is None or not _is_google_provider(account):
+        return canonical_path
+    aliases = _get_folder_aliases(context, account_id)
+    return aliases.get(canonical_path, canonical_path)
 
 
 async def _handle_list_labels(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -873,7 +919,8 @@ async def _handle_fetch_envelope(
         }
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
-    envelope = await imap_fetch_envelope(account, password, folder_path, uid)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
         return {
             "decision": "ALLOW",
@@ -950,7 +997,8 @@ async def _handle_fetch_body(context: ServerContext, arguments: dict[str, Any]) 
         }
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
-    result = await imap_fetch_body(account, password, folder_path, uid)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    result = await imap_fetch_body(account, password, imap_folder, uid)
     if result is None:
         return {
             "decision": "ALLOW",
@@ -1023,7 +1071,8 @@ async def _handle_fetch_headers(
         }
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
-    envelope = await imap_fetch_envelope(account, password, folder_path, uid)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
         return {
             "decision": "ALLOW",
@@ -1051,7 +1100,7 @@ async def _handle_fetch_headers(
             "folder": folder_path,
             "uid": uid,
         }
-    raw = await imap_fetch_full_message(account, password, folder_path, uid)
+    raw = await imap_fetch_full_message(account, password, imap_folder, uid)
     headers: dict[str, str] = {}
     if raw is not None:
         msg = email.message_from_bytes(raw)
@@ -1089,7 +1138,8 @@ async def _handle_fetch_attachment(
         }
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
-    envelope = await imap_fetch_envelope(account, password, folder_path, uid)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
         return {
             "decision": "ALLOW",
@@ -1117,7 +1167,7 @@ async def _handle_fetch_attachment(
             "folder": folder_path,
             "uid": uid,
         }
-    raw = await imap_fetch_full_message(account, password, folder_path, uid)
+    raw = await imap_fetch_full_message(account, password, imap_folder, uid)
     if raw is None:
         return {
             "decision": "ALLOW",
@@ -1192,7 +1242,8 @@ async def _handle_folder_stats(context: ServerContext, arguments: dict[str, Any]
             "folder": folder_path,
         }
     account, password = await _password_for(context, account_id)
-    result = await imap_folder_stats(account, password, folder_path)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    result = await imap_folder_stats(account, password, imap_folder)
     if result is None:
         return {
             "decision": "ALLOW",
@@ -1441,7 +1492,8 @@ async def _handle_mark_seen(context: ServerContext, arguments: dict[str, Any]) -
             "uid": uid,
         }
     account, password = await _password_for(context, account_id)
-    ok = await imap_store_flag(account, password, folder_path, uid, r"\Seen", add=seen)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    ok = await imap_store_flag(account, password, imap_folder, uid, r"\Seen", add=seen)
     if not ok:
         return {
             "decision": "ALLOW",
@@ -1492,7 +1544,8 @@ async def _handle_bulk_mark_seen(
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
     account, password = await _password_for(context, account_id)
-    uids = await imap_search_uids(account, password, folder_path, imap_criteria)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    uids = await imap_search_uids(account, password, imap_folder, imap_criteria)
     if not uids:
         return {
             "decision": "ALLOW",
@@ -1502,7 +1555,7 @@ async def _handle_bulk_mark_seen(
             "folder": folder_path,
             "marked_count": 0,
         }
-    count = await imap_store_flags_batch(account, password, folder_path, uids, r"\Seen", add=seen)
+    count = await imap_store_flags_batch(account, password, imap_folder, uids, r"\Seen", add=seen)
     return {
         "decision": "ALLOW",
         "reason": "rule_matched",
@@ -1549,7 +1602,8 @@ async def _handle_mark_tagged(context: ServerContext, arguments: dict[str, Any])
             "forbidden_tags": forbidden,
         }
     account, password = await _password_for(context, account_id)
-    ok = await imap_store_keywords(account, password, folder_path, uid, tags, mode=mode)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    ok = await imap_store_keywords(account, password, imap_folder, uid, tags, mode=mode)
     return {
         "decision": "ALLOW",
         "reason": "rule_matched",
@@ -1620,6 +1674,8 @@ async def _handle_move(context: ServerContext, arguments: dict[str, Any]) -> dic
         }
     if src_account == dst_account:
         account, password = await _password_for(context, src_account)
+        imap_src = await _resolve_imap_folder(context, src_account, src_folder)
+        imap_dst = await _resolve_imap_folder(context, src_account, dst_folder)
         # Gmail label-swap: for Google accounts, intra-account moves
         # are implemented as label remove + label add instead of IMAP
         # MOVE, because Gmail folders are label projections over a
@@ -1655,7 +1711,7 @@ async def _handle_move(context: ServerContext, arguments: dict[str, Any]) -> dic
                 "uid": src_uid,
             }
         try:
-            mechanism = await imap_move_message(account, password, src_folder, src_uid, dst_folder)
+            mechanism = await imap_move_message(account, password, imap_src, src_uid, imap_dst)
         except TargetFolderMissing:
             return {
                 "decision": "ALLOW",
@@ -1712,15 +1768,17 @@ async def _handle_move(context: ServerContext, arguments: dict[str, Any]) -> dic
         }
     src_acct, src_pwd = await _password_for(context, src_account)
     dst_acct, dst_pwd = await _password_for(context, dst_account)
+    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
+    imap_dst = await _resolve_imap_folder(context, dst_account, dst_folder)
     result = await context.saga.run_cross_account_move(
         caller_id=context.caller_id,
         src_account=src_acct,
         src_password=src_pwd,
-        src_folder=src_folder,
+        src_folder=imap_src,
         src_uid=src_uid,
         dst_account=dst_acct,
         dst_password=dst_pwd,
-        dst_folder=dst_folder,
+        dst_folder=imap_dst,
         delete_source=True,
     )
     return {
@@ -1780,15 +1838,17 @@ async def _handle_copy(context: ServerContext, arguments: dict[str, Any]) -> dic
             }
         src_acct, src_pwd = await _password_for(context, src_account)
         dst_acct, dst_pwd = await _password_for(context, dst_account)
+        imap_src = await _resolve_imap_folder(context, src_account, src_folder)
+        imap_dst = await _resolve_imap_folder(context, dst_account, dst_folder)
         result = await context.saga.run_cross_account_move(
             caller_id=context.caller_id,
             src_account=src_acct,
             src_password=src_pwd,
-            src_folder=src_folder,
+            src_folder=imap_src,
             src_uid=src_uid,
             dst_account=dst_acct,
             dst_password=dst_pwd,
-            dst_folder=dst_folder,
+            dst_folder=imap_dst,
             delete_source=False,
         )
         return {
@@ -1803,7 +1863,9 @@ async def _handle_copy(context: ServerContext, arguments: dict[str, Any]) -> dic
             "uid": src_uid,
         }
     account, password = await _password_for(context, src_account)
-    ok = await imap_copy_message(account, password, src_folder, src_uid, dst_folder)
+    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
+    imap_dst = await _resolve_imap_folder(context, src_account, dst_folder)
+    ok = await imap_copy_message(account, password, imap_src, src_uid, imap_dst)
     return {
         "decision": "ALLOW",
         "result": "OK" if ok else "ERROR",
@@ -1839,7 +1901,8 @@ async def _handle_create_draft(context: ServerContext, arguments: dict[str, Any]
             "folder": folder_path,
         }
     account, password = await _password_for(context, account_id)
-    ok = await imap_append_message(account, password, folder_path, rfc822_text.encode("utf-8"))
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    ok = await imap_append_message(account, password, imap_folder, rfc822_text.encode("utf-8"))
     return {
         "decision": "ALLOW",
         "result": "OK" if ok else "ERROR",
@@ -1943,7 +2006,8 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
         imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
 
     account, password = await _password_for(context, account_id)
-    all_uids = await imap_search_uids(account, password, folder_path, imap_criteria)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    all_uids = await imap_search_uids(account, password, imap_folder, imap_criteria)
     matched_total = len(all_uids)
 
     fp = folder_decision.folder_policy
@@ -1969,7 +2033,7 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
     if pdp_predetermined and not criteria_needs_envelope:
         visible_uids = list(all_uids)
     else:
-        all_envelopes = await imap_fetch_envelopes_batch(account, password, folder_path, all_uids)
+        all_envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, all_uids)
         envelope_by_uid = {e.uid: e for e in all_envelopes}
         visible_uids = []
         for candidate_uid in all_uids:
@@ -1998,11 +2062,14 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
         for vuid in page:
             entry: dict[str, Any] = {"uid": vuid}
             try:
-                gm_msgid = await imap_gmail_fetch_msgid(account, password, folder_path, vuid)
+                gm_msgid = await imap_gmail_fetch_msgid(account, password, imap_folder, vuid)
                 if gm_msgid is not None:
                     entry["gm_msgid"] = gm_msgid
+                    imap_all_mail = await _resolve_imap_folder(
+                        context, account_id, "[Gmail]/All Mail"
+                    )
                     all_mail_hits = await imap_gmail_search_by_msgid(
-                        account, password, "[Gmail]/All Mail", gm_msgid
+                        account, password, imap_all_mail, gm_msgid
                     )
                     if all_mail_hits:
                         entry["canonical_all_mail_uid"] = all_mail_hits[0]
@@ -2074,7 +2141,8 @@ async def _handle_list_messages(
         imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
 
     account, password = await _password_for(context, account_id)
-    all_uids = await imap_search_uids(account, password, folder_path, imap_criteria)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    all_uids = await imap_search_uids(account, password, imap_folder, imap_criteria)
     matched_total = len(all_uids)
 
     pdp_predetermined = (
@@ -2100,7 +2168,7 @@ async def _handle_list_messages(
         visible_uids = list(all_uids)
         all_envelopes_map: dict[int, Any] = {}
     else:
-        all_envelopes = await imap_fetch_envelopes_batch(account, password, folder_path, all_uids)
+        all_envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, all_uids)
         all_envelopes_map = {e.uid: e for e in all_envelopes}
         visible_uids = []
         for candidate_uid in all_uids:
@@ -2124,7 +2192,7 @@ async def _handle_list_messages(
     if all_envelopes_map:
         envelope_by_uid = {u: all_envelopes_map[u] for u in page_uids if u in all_envelopes_map}
     else:
-        envelopes = await imap_fetch_envelopes_batch(account, password, folder_path, page_uids)
+        envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, page_uids)
         envelope_by_uid = {e.uid: e for e in envelopes}
 
     messages = []

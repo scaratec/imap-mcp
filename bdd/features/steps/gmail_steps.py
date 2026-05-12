@@ -736,3 +736,80 @@ def step_assert_max_connections(context: Context, n: int) -> None:
     assert actual <= n, (
         f"Expected at most {n} IMAP connections, got {actual}"
     )
+
+
+# ---------------------------------------- localized Gmail folders
+
+
+@given("the mock-gmail server uses localized folder names:")
+def step_mock_gmail_localized_folders(context: Context) -> None:
+    """Configure the mock-gmail to return localized folder names in LIST.
+
+    Table columns: canonical, localized, flags.
+    """
+    state = _gmail_state(context)
+    mapping = []
+    for row in context.table:
+        mapping.append((row["canonical"], row["localized"], row["flags"]))
+    state.set_localized_folders(mapping)
+
+
+@then(
+    'the draft is stored in "{folder}" on IMAP account "{account_id}"'
+)
+def step_draft_stored_on_imap(
+    context: Context, folder: str, account_id: str
+) -> None:
+    """Verify via direct GmailState that a draft was appended to the
+    expected (localized) folder."""
+    state = _gmail_state(context)
+    msgs = state.messages_in_folder(folder)
+    if not msgs:
+        all_folders = state.all_folders()
+        folder_contents = {
+            f: len(state.messages_in_folder(f)) for f in all_folders
+        }
+        raise AssertionError(
+            f"No messages found in folder {folder!r}. "
+            f"Folder message counts: {folder_contents!r}"
+        )
+
+
+@then('the response contains folder "{folder_path}"')
+def step_response_contains_folder(context: Context, folder_path: str) -> None:
+    response = _last_response(context)
+    folders = response.get("folders") or []
+    folder_names = []
+    for f in folders:
+        if isinstance(f, dict):
+            folder_names.append(
+                f.get("path") or f.get("name") or f.get("folder", "")
+            )
+        else:
+            folder_names.append(str(f))
+    if folder_path not in folder_names:
+        raise AssertionError(
+            f"Folder {folder_path!r} not found in response. "
+            f"Available: {folder_names!r}"
+        )
+
+
+@then('the response does not contain folder "{folder_path}"')
+def step_response_does_not_contain_folder(
+    context: Context, folder_path: str
+) -> None:
+    response = _last_response(context)
+    folders = response.get("folders") or []
+    folder_names = []
+    for f in folders:
+        if isinstance(f, dict):
+            folder_names.append(
+                f.get("path") or f.get("name") or f.get("folder", "")
+            )
+        else:
+            folder_names.append(str(f))
+    if folder_path in folder_names:
+        raise AssertionError(
+            f"Folder {folder_path!r} unexpectedly found in response. "
+            f"All folders: {folder_names!r}"
+        )
