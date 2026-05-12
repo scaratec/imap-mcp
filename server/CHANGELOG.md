@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.8.1 (2026-05-12)
+
+### Bug Fixes
+
+- Improve create_draft and fetch_body tool descriptions to reduce DENY errors
+  ([`016d82d`](https://github.com/scaratec/imap-mcp/commit/016d82dcd9a0fa1fb5398ebd14b7c1629ee16354))
+
+
 ## v0.8.0 (2026-05-12)
 
 ### Documentation
