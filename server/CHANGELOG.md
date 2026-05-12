@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.8.2 (2026-05-12)
+
+### Bug Fixes
+
+- **tracing**: Read service.version from package metadata instead of hardcoded
+  ([`98eee0d`](https://github.com/scaratec/imap-mcp/commit/98eee0d207604f403dd8ae83c87421647cddb071))
+
+
 ## v0.8.1 (2026-05-12)
 
 ### Bug Fixes
