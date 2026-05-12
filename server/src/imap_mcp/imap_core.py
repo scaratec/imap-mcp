@@ -473,6 +473,32 @@ async def store_flag(
         await imap.logout()
 
 
+async def store_flags_batch(
+    account: Account,
+    password: str,
+    folder: str,
+    uids: list[int],
+    flag: str,
+    *,
+    add: bool,
+) -> int:
+    """STORE flag on multiple UIDs in one IMAP session."""
+    if not uids:
+        return 0
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return 0
+        op = "+FLAGS" if add else "-FLAGS"
+        uid_str = ",".join(str(u) for u in uids)
+        status, _ = await imap.uid("store", uid_str, op, f"({flag})")
+        return len(uids) if status == "OK" else 0
+    finally:
+        await imap.logout()
+
+
 async def store_keywords(
     account: Account,
     password: str,

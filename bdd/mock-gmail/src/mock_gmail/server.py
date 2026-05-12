@@ -333,42 +333,49 @@ class GmailIMAPHandler:
     async def _uid_store(self, tag: str, args: str) -> None:
         folder = self._selected_folder or "INBOX"
         m = re.match(
-            r"(\d+)\s+([+-]?)(FLAGS|X-GM-LABELS)(?:\.SILENT)?\s+\(([^)]*)\)", args, re.IGNORECASE
+            r"([\d,:]+)\s+([+-]?)(FLAGS|X-GM-LABELS)(?:\.SILENT)?\s+\(([^)]*)\)",
+            args,
+            re.IGNORECASE,
         )
         if not m:
             self._send(tag, "BAD", "STORE parse error")
             return
-        uid = int(m.group(1))
+        uid_spec = m.group(1)
         op = m.group(2)
         field = m.group(3).upper()
         values_raw = m.group(4)
-        msg = self._state.message_by_uid(folder, uid)
-        if msg is None:
-            self._send(tag, "OK", "STORE completed (no match)")
-            return
-
-        if field == "X-GM-LABELS":
-            labels = _parse_label_list(values_raw)
-            for label in labels:
-                normalized = label.replace("\\\\", "\\")
-                if op == "+":
-                    self._state.add_label(msg, normalized)
-                elif op == "-":
-                    self._state.remove_label(msg, normalized)
-            visible = self._state.labels_visible_from(folder, msg)
-            label_str = " ".join(_quote_label(l) for l in visible)
-            self._send_untagged(f"{uid} FETCH (X-GM-LABELS ({label_str}) UID {uid})")
-        elif field == "FLAGS":
-            flags = set(values_raw.split())
-            if op == "+":
-                msg.flags.update(flags)
-            elif op == "-":
-                msg.flags -= flags
+        uids_to_store: list[int] = []
+        for part in uid_spec.split(","):
+            if ":" in part:
+                lo, hi = part.split(":", 1)
+                uids_to_store.extend(range(int(lo), int(hi) + 1))
             else:
-                msg.flags = flags
-            flags_str = " ".join(sorted(msg.flags))
-            self._send_untagged(f"{uid} FETCH (FLAGS ({flags_str}) UID {uid})")
-
+                uids_to_store.append(int(part))
+        for uid in uids_to_store:
+            msg = self._state.message_by_uid(folder, uid)
+            if msg is None:
+                continue
+            if field == "X-GM-LABELS":
+                labels = _parse_label_list(values_raw)
+                for label in labels:
+                    normalized = label.replace("\\\\", "\\")
+                    if op == "+":
+                        self._state.add_label(msg, normalized)
+                    elif op == "-":
+                        self._state.remove_label(msg, normalized)
+                visible = self._state.labels_visible_from(folder, msg)
+                label_str = " ".join(_quote_label(l) for l in visible)
+                self._send_untagged(f"{uid} FETCH (X-GM-LABELS ({label_str}) UID {uid})")
+            elif field == "FLAGS":
+                flags = set(values_raw.split())
+                if op == "+":
+                    msg.flags.update(flags)
+                elif op == "-":
+                    msg.flags -= flags
+                else:
+                    msg.flags = flags
+                flags_str = " ".join(sorted(msg.flags))
+                self._send_untagged(f"{uid} FETCH (FLAGS ({flags_str}) UID {uid})")
         self._send(tag, "OK", "STORE completed")
 
     async def _uid_copy(self, tag: str, args: str) -> None:

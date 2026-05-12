@@ -205,6 +205,31 @@ def step_caller_calls_mark_seen(
 
 
 @when(
+    '{caller_id} calls bulk_mark_seen with account "{account}", '
+    'folder "{folder}", criteria {criteria}, seen {seen_raw}'
+)
+def step_caller_calls_bulk_mark_seen(
+    context: Context, caller_id: str, account: str, folder: str, criteria: str, seen_raw: str
+) -> None:
+    import json as _json
+
+    gmail_state = getattr(context, "gmail_state", None)
+    if gmail_state is not None:
+        gmail_state.total_connections = 0
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool(
+        "bulk_mark_seen",
+        {
+            "account": account,
+            "folder": folder,
+            "criteria": _json.loads(criteria),
+            "seen": seen_raw.strip().lower() == "true",
+        },
+    )
+    _store_result(context, payload)
+
+
+@when(
     '{caller_id} calls mark_tagged with account "{account}", '
     'folder "{folder}", uid {uid:d}, tags {tags_raw}, mode "{mode}"'
 )

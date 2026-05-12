@@ -317,6 +317,27 @@ def build_server(context: ServerContext) -> Server:
                 },
             ),
             Tool(
+                name="bulk_mark_seen",
+                description=(
+                    "Mark all messages matching criteria as read (or "
+                    "unread) in one call. Use for 'mark all alerts as "
+                    "read'. Searches by criteria, then sets \\Seen on "
+                    "all matches in a single IMAP session. Returns "
+                    "marked_count."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "account": {"type": "string"},
+                        "folder": {"type": "string"},
+                        "criteria": {"type": "object"},
+                        "seen": {"type": "boolean"},
+                    },
+                    "required": ["account", "folder", "criteria", "seen"],
+                    "additionalProperties": False,
+                },
+            ),
+            Tool(
                 name="mark_tagged",
                 description="Add/remove/replace keywords on a message (ADR 0005).",
                 inputSchema={
@@ -544,6 +565,8 @@ def build_server(context: ServerContext) -> Server:
             return await _handle_folder_stats(context, arguments)
         if name == "mark_seen":
             return await _handle_mark_seen(context, arguments)
+        if name == "bulk_mark_seen":
+            return await _handle_bulk_mark_seen(context, arguments)
         if name == "mark_tagged":
             return await _handle_mark_tagged(context, arguments)
         if name == "move":
@@ -1208,6 +1231,7 @@ READ_TOOL_MIN_VIS = {
 }
 WRITE_TOOL_CAP = {
     "mark_seen": "mark_seen",
+    "bulk_mark_seen": "mark_seen",
     "mark_tagged": "mark_tagged",
     "move": "move_out",
     "copy": "accept_incoming",
@@ -1429,6 +1453,57 @@ async def _handle_mark_seen(context: ServerContext, arguments: dict[str, Any]) -
         "account": account_id,
         "folder": folder_path,
         "uid": uid,
+    }
+
+
+async def _handle_bulk_mark_seen(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    from .imap_core import store_flags_batch as imap_store_flags_batch
+
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+    criteria_raw = arguments.get("criteria", {})
+    seen = bool(arguments["seen"])
+
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    assert folder_decision.folder_policy is not None
+    if not folder_decision.folder_policy.mark_seen:
+        return {
+            "decision": "DENY",
+            "reason": "capability_missing",
+            "missing_capability": "mark_seen",
+            "account": account_id,
+            "folder": folder_path,
+        }
+
+    imap_criteria = _criteria_to_imap_search(criteria_raw)
+    account, password = await _password_for(context, account_id)
+    uids = await imap_search_uids(account, password, folder_path, imap_criteria)
+    if not uids:
+        return {
+            "decision": "ALLOW",
+            "reason": "rule_matched",
+            "result": "OK",
+            "account": account_id,
+            "folder": folder_path,
+            "marked_count": 0,
+        }
+    count = await imap_store_flags_batch(account, password, folder_path, uids, r"\Seen", add=seen)
+    return {
+        "decision": "ALLOW",
+        "reason": "rule_matched",
+        "result": "OK",
+        "account": account_id,
+        "folder": folder_path,
+        "marked_count": count,
     }
 
 

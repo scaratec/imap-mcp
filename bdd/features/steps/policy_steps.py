@@ -2605,13 +2605,17 @@ def step_policy_folder_defaults(
             f"{len(builder.accounts)}."
         )
     account_id = builder.accounts[0].id
-    builder.folder(
-        policy_name=policy_name,
-        account_id=account_id,
-        path=folder,
-        mode=row["mode"],
-        default=row["default"],
-    )
+    kwargs: dict[str, object] = {
+        "policy_name": policy_name,
+        "account_id": account_id,
+        "path": folder,
+        "mode": row["mode"],
+        "default": row["default"],
+    }
+    for cap in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append"):
+        if cap in row.headings:
+            kwargs[cap] = row[cap].strip().lower() == "true"
+    builder.folder(**kwargs)
     builder.write()
 
 
