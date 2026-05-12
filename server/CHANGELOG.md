@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.8.0 (2026-05-12)
+
+### Documentation
+
+- Add pipx installation to README quick start
+  ([`55ea8a6`](https://github.com/scaratec/imap-mcp/commit/55ea8a65b4b77be32504b933e763e2ff8fe25968))
+
+- Overhaul README for accuracy after production deployment
+  ([`fae2496`](https://github.com/scaratec/imap-mcp/commit/fae2496d4c5194407a0e8b204452458686458f53))
+
+### Features
+
+- Add bulk_mark_seen tool for batch flag operations
+  ([`e568006`](https://github.com/scaratec/imap-mcp/commit/e568006bf69f56666fbc1401dd32d1db0c07e23d))
+
+
 ## v0.7.3 (2026-05-12)
 
 ### Bug Fixes
