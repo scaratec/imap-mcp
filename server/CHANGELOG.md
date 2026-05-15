@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.12.0 (2026-05-15)
+
+### Features
+
+- Add_attachment, replace_attachment, delete_attachment tools
+  ([`5261c46`](https://github.com/scaratec/imap-mcp/commit/5261c46199ad9527042b2dd6b7e4c0c0ea7382ff))
+
+
 ## v0.11.3 (2026-05-15)
 
 ### Bug Fixes
