@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.11.3 (2026-05-15)
+
+### Bug Fixes
+
+- **fetch_body**: Extract readable text from HTML-only messages
+  ([`dd92826`](https://github.com/scaratec/imap-mcp/commit/dd92826517c60e1f081b5e1a3e277ceece0b8d1f))
+
+
 ## v0.11.2 (2026-05-15)
 
 ### Bug Fixes
