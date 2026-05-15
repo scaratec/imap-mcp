@@ -1074,6 +1074,114 @@ def step_caller_calls_fetch_body(
 
 
 @when(
+    '{caller_id} calls add_attachment with account "{account}", '
+    'folder "{folder}", uid {uid:d}, filename "{filename}", '
+    'mime_type "{mime_type}", content "{content}"'
+)
+def step_caller_calls_add_attachment(
+    context: Context,
+    caller_id: str,
+    account: str,
+    folder: str,
+    uid: int,
+    filename: str,
+    mime_type: str,
+    content: str,
+) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    lookup = getattr(context, "message_uids", {})
+    actual_uid = lookup.get((account, folder, uid), uid)
+    payload = client.call_tool(
+        "add_attachment",
+        {
+            "account": account,
+            "folder": folder,
+            "uid": actual_uid,
+            "filename": filename,
+            "mime_type": mime_type,
+            "content": content,
+        },
+    )
+    _store_result(context, payload)
+    _update_uid_after_rewrite(context, account, folder, uid)
+
+
+@when(
+    '{caller_id} calls replace_attachment with account "{account}", '
+    'folder "{folder}", uid {uid:d}, filename "{filename}", '
+    'new_content "{new_content}"'
+)
+def step_caller_calls_replace_attachment(
+    context: Context,
+    caller_id: str,
+    account: str,
+    folder: str,
+    uid: int,
+    filename: str,
+    new_content: str,
+) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    lookup = getattr(context, "message_uids", {})
+    actual_uid = lookup.get((account, folder, uid), uid)
+    payload = client.call_tool(
+        "replace_attachment",
+        {
+            "account": account,
+            "folder": folder,
+            "uid": actual_uid,
+            "filename": filename,
+            "new_content": new_content,
+        },
+    )
+    _store_result(context, payload)
+    _update_uid_after_rewrite(context, account, folder, uid)
+
+
+@when(
+    '{caller_id} calls delete_attachment with account "{account}", '
+    'folder "{folder}", uid {uid:d}, filename "{filename}"'
+)
+def step_caller_calls_delete_attachment(
+    context: Context,
+    caller_id: str,
+    account: str,
+    folder: str,
+    uid: int,
+    filename: str,
+) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    lookup = getattr(context, "message_uids", {})
+    actual_uid = lookup.get((account, folder, uid), uid)
+    payload = client.call_tool(
+        "delete_attachment",
+        {
+            "account": account,
+            "folder": folder,
+            "uid": actual_uid,
+            "filename": filename,
+        },
+    )
+    _store_result(context, payload)
+    _update_uid_after_rewrite(context, account, folder, uid)
+
+
+def _update_uid_after_rewrite(
+    context: Context, account: str, folder: str, uid_hint: int
+) -> None:
+    """After a message rewrite the old UID is gone and a new one exists.
+
+    Update the UID lookup so subsequent steps (fetch_attachment,
+    fetch_envelope) that reference the original hint-UID resolve to
+    the new server-side UID.
+    """
+    result = getattr(context, "last_response", None) or {}
+    new_uid = result.get("new_uid")
+    if new_uid is not None:
+        context.message_uids = getattr(context, "message_uids", {})
+        context.message_uids[(account, folder, uid_hint)] = new_uid
+
+
+@when(
     '{caller_id} calls folder_stats with account "{account}", folder "{folder}"'
 )
 def step_caller_calls_folder_stats(

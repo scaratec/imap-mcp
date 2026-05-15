@@ -175,6 +175,7 @@ class FolderPolicy(BaseModel):
     move_out: bool = False
     accept_incoming: bool = False
     draft_append: bool = False
+    modify_message: bool = False
 
     @model_validator(mode="after")
     def _check_mode_invariants(self) -> "FolderPolicy":

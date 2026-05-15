@@ -29,6 +29,7 @@ from .config import Account
 from .imap_core import (
     append_message,
     fetch_full_message,
+    fetch_raw_with_flags,
     gmail_fetch_msgid,
     gmail_search_by_msgid,
     search_uids,
@@ -449,6 +450,7 @@ class SagaManager:
         src_folder: str,
         src_uid: int,
         delete_source: bool,
+        mechanism: str = "saga",
     ) -> SagaResult:
         if delete_source:
             # Idempotent delete: if the source UID is already absent,
@@ -470,7 +472,7 @@ class SagaManager:
                         self._audit_step(tx_id, "escalated", outcome="ERROR")
                     return SagaResult(
                         tx_id=tx_id,
-                        mechanism="saga",
+                        mechanism=mechanism,
                         result="ERROR",
                         error_type="source_delete_failed",
                     )
@@ -480,7 +482,7 @@ class SagaManager:
 
         self.wal.commit(tx_id)
         self._audit_step(tx_id, "commit")
-        return SagaResult(tx_id=tx_id, mechanism="saga", result="OK")
+        return SagaResult(tx_id=tx_id, mechanism=mechanism, result="OK")
 
     async def resume(self, tx: dict) -> SagaResult | None:
         """Resume a single non-terminal transaction. Returns None if
@@ -561,6 +563,105 @@ class SagaManager:
             known_message_id=tx.get("message_id"),
             known_target_uid=tx.get("target_uid"),
             resume_from_status=tx["status"],
+        )
+
+    async def run_message_rewrite(
+        self,
+        *,
+        caller_id: str,
+        account: Account,
+        password: str,
+        folder: str,
+        uid: int,
+        transform: Callable[[bytes], bytes],
+    ) -> SagaResult:
+        """WAL-backed message rewrite: FETCH → transform → APPEND → DELETE.
+
+        Same account and folder. Preserves IMAP flags from the original
+        message. On crash after APPEND (staged), recovery resumes the
+        DELETE step.
+        """
+        tx_id = self.wal.begin(
+            caller_id=caller_id,
+            src_account=account.id,
+            src_folder=folder,
+            src_uid=uid,
+            dst_account=account.id,
+            dst_folder=folder,
+        )
+        self._audit_step(tx_id, "begin")
+
+        result = await fetch_raw_with_flags(account, password, folder, uid)
+        if result is None:
+            self.wal.abort(tx_id, "uid_not_found")
+            return SagaResult(
+                tx_id=tx_id,
+                mechanism="message_rewrite",
+                result="ERROR",
+                error_type="uid_not_found",
+            )
+        raw, flags = result
+        content_hash = hashlib.sha256(raw).hexdigest()
+        message_id = _extract_message_id(raw)
+        self.wal.record_fetch(tx_id, message_id, content_hash)
+        self._audit_step(tx_id, "fetched")
+
+        try:
+            modified = transform(raw)
+        except ValueError as exc:
+            error_msg = str(exc)
+            self.wal.abort(tx_id, f"transform_failed: {error_msg}")
+            error_type = "attachment_not_found" if "not found" in error_msg else error_msg
+            return SagaResult(
+                tx_id=tx_id,
+                mechanism="message_rewrite",
+                result="ERROR",
+                error_type=error_type,
+            )
+
+        try:
+            ok = await append_message(account, password, folder, modified, flags=flags)
+        except Exception as exc:
+            self.wal.bump_retry(tx_id, f"append_failed: {exc}")
+            return SagaResult(
+                tx_id=tx_id,
+                mechanism="message_rewrite",
+                result="ERROR",
+                error_type="append_failed",
+            )
+        if not ok:
+            self.wal.bump_retry(tx_id, "append_failed: server rejected")
+            return SagaResult(
+                tx_id=tx_id,
+                mechanism="message_rewrite",
+                result="ERROR",
+                error_type="append_failed",
+            )
+
+        target_uid: int | None = None
+        if message_id is not None:
+            try:
+                hits = await search_uids(
+                    account, password, folder,
+                    f'HEADER "Message-Id" "{message_id}"',
+                )
+                for h in hits:
+                    if h != uid:
+                        target_uid = h
+                        break
+            except Exception:
+                pass
+        self.wal.mark_staged(tx_id, target_uid)
+        self._audit_step(tx_id, "staged")
+
+        return await self._finish_delete_and_commit(
+            tx_id=tx_id,
+            src_account=account,
+            src_password=password,
+            src_folder=folder,
+            src_uid=uid,
+            delete_source=True,
+            mechanism="message_rewrite",
         )
 
     async def run_pending_recovery(self) -> int:

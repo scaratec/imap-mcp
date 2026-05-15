@@ -319,7 +319,7 @@ def step_policy_grants_folder_inline_rules(
                 )
             account_id = builder.accounts[0].id
         caps: dict[str, bool] = {}
-        for cap_key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append"):
+        for cap_key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append", "modify_message"):
             if cap_key in row.headings:
                 caps[cap_key] = _parse_bool(row[cap_key])
         folder = builder.folder(

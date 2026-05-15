@@ -17,7 +17,7 @@ Feature: MCP tool discovery
     Given the server is started with a minimal caller configuration
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The V1 tool set consists of exactly these 19 tools
+  Scenario: The V1 tool set consists of exactly these 22 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
       | tool                      |
@@ -36,6 +36,9 @@ Feature: MCP tool discovery
       | move                      |
       | copy                      |
       | create_draft              |
+      | add_attachment            |
+      | replace_attachment        |
+      | delete_attachment         |
       | describe_policy           |
       | get_transaction_status    |
       | get_caller_identity       |
@@ -76,11 +79,14 @@ Feature: MCP tool discovery
     When invoice-agent calls the MCP list_tools method
     Then each write tool's metadata contains "required_capability" matching:
       | tool          | required_capability |
-      | mark_seen     | mark_seen           |
-      | mark_tagged   | mark_tagged         |
-      | move          | move_out            |
-      | copy          | accept_incoming     |
-      | create_draft  | draft_append        |
+      | mark_seen          | mark_seen           |
+      | mark_tagged        | mark_tagged         |
+      | move               | move_out            |
+      | copy               | accept_incoming     |
+      | create_draft       | draft_append        |
+      | add_attachment     | modify_message      |
+      | replace_attachment | modify_message      |
+      | delete_attachment  | modify_message      |
 
   Scenario: Meta tools advertise no visibility requirement
     When invoice-agent calls the MCP list_tools method

@@ -60,6 +60,9 @@ from .imap_core import (
     search_uids as imap_search_uids,
     store_flag as imap_store_flag,
     store_keywords as imap_store_keywords,
+    mime_add_attachment,
+    mime_replace_attachment,
+    mime_delete_attachment,
 )
 from .policy import (
     MessageFacts,
@@ -442,6 +445,68 @@ def build_server(context: ServerContext) -> Server:
                 },
             ),
             Tool(
+                name="add_attachment",
+                description=(
+                    "Add an attachment to an existing message. The message "
+                    "is rewritten via FETCH-APPEND-DELETE (WAL-backed). "
+                    "Requires modify_message capability and FULL visibility."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "account": {"type": "string"},
+                        "folder": {"type": "string"},
+                        "uid": {"type": "integer"},
+                        "filename": {"type": "string"},
+                        "mime_type": {"type": "string"},
+                        "content": {"type": "string", "description": "Base64-encoded attachment content"},
+                    },
+                    "required": ["account", "folder", "uid", "filename", "mime_type", "content"],
+                    "additionalProperties": False,
+                },
+            ),
+            Tool(
+                name="replace_attachment",
+                description=(
+                    "Replace an existing attachment identified by filename. "
+                    "The message is rewritten via FETCH-APPEND-DELETE (WAL-backed). "
+                    "Requires modify_message capability and FULL visibility."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "account": {"type": "string"},
+                        "folder": {"type": "string"},
+                        "uid": {"type": "integer"},
+                        "filename": {"type": "string", "description": "Name of the attachment to replace"},
+                        "new_content": {"type": "string", "description": "Base64-encoded new content"},
+                        "new_mime_type": {"type": "string"},
+                        "new_filename": {"type": "string"},
+                    },
+                    "required": ["account", "folder", "uid", "filename", "new_content"],
+                    "additionalProperties": False,
+                },
+            ),
+            Tool(
+                name="delete_attachment",
+                description=(
+                    "Remove an attachment identified by filename from a message. "
+                    "The message is rewritten via FETCH-APPEND-DELETE (WAL-backed). "
+                    "Requires modify_message capability and FULL visibility."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "account": {"type": "string"},
+                        "folder": {"type": "string"},
+                        "uid": {"type": "integer"},
+                        "filename": {"type": "string", "description": "Name of the attachment to delete"},
+                    },
+                    "required": ["account", "folder", "uid", "filename"],
+                    "additionalProperties": False,
+                },
+            ),
+            Tool(
                 name="folder_stats",
                 description=(
                     "Return aggregate counts for a folder: visible "
@@ -585,6 +650,12 @@ def build_server(context: ServerContext) -> Server:
             return await _handle_copy(context, arguments)
         if name == "create_draft":
             return await _handle_create_draft(context, arguments)
+        if name == "add_attachment":
+            return await _handle_add_attachment(context, arguments)
+        if name == "replace_attachment":
+            return await _handle_replace_attachment(context, arguments)
+        if name == "delete_attachment":
+            return await _handle_delete_attachment(context, arguments)
         if name == "describe_policy":
             return await _handle_describe_policy(context, arguments)
         if name == "get_caller_identity":
@@ -1361,6 +1432,9 @@ WRITE_TOOL_CAP = {
     "move": "move_out",
     "copy": "accept_incoming",
     "create_draft": "draft_append",
+    "add_attachment": "modify_message",
+    "replace_attachment": "modify_message",
+    "delete_attachment": "modify_message",
 }
 
 
@@ -1514,7 +1588,7 @@ def _max_visibility(fp: "Any") -> str:
 
 def _granted_caps(fp: "Any") -> list[str]:
     caps: list[str] = []
-    for key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append"):
+    for key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append", "modify_message"):
         if getattr(fp, key, False):
             caps.append(key)
     return caps
@@ -1978,6 +2052,129 @@ async def _handle_create_draft(context: ServerContext, arguments: dict[str, Any]
         "account": account_id,
         "folder": folder_path,
     }
+
+
+async def _handle_attachment_modify(
+    context: ServerContext,
+    arguments: dict[str, Any],
+    tool_name: str,
+    build_transform: Any,
+) -> dict[str, Any]:
+    import base64
+
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+    uid = int(arguments["uid"])
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+            "uid": uid,
+        }
+    assert folder_decision.folder_policy is not None
+    if not folder_decision.folder_policy.modify_message:
+        return {
+            "decision": "DENY",
+            "reason": "capability_missing",
+            "missing_capability": "modify_message",
+            "account": account_id,
+            "folder": folder_path,
+            "uid": uid,
+        }
+    try:
+        transform = build_transform(arguments)
+    except Exception as exc:
+        return {
+            "decision": "ALLOW",
+            "result": "ERROR",
+            "error_type": str(exc),
+            "account": account_id,
+            "folder": folder_path,
+            "uid": uid,
+        }
+    account, password = await _password_for(context, account_id)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    saga_result = await context.saga.run_message_rewrite(
+        caller_id=context.caller_id,
+        account=account,
+        password=password,
+        folder=imap_folder,
+        uid=uid,
+        transform=transform,
+    )
+    result: dict[str, Any] = {
+        "decision": "ALLOW",
+        "result": saga_result.result,
+        "mechanism": saga_result.mechanism,
+        "tx_id": saga_result.tx_id,
+        "account": account_id,
+        "folder": folder_path,
+        "old_uid": uid,
+    }
+    if saga_result.error_type:
+        result["error_type"] = saga_result.error_type
+    tx = context.saga.wal.get(saga_result.tx_id)
+    if tx and tx.get("target_uid"):
+        result["new_uid"] = tx["target_uid"]
+    return result
+
+
+async def _handle_add_attachment(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    import base64
+
+    def _build(args: dict[str, Any]) -> Any:
+        content = base64.b64decode(args["content"])
+        filename = args["filename"]
+        mime_type = args["mime_type"]
+
+        def transform(rfc822: bytes) -> bytes:
+            return mime_add_attachment(rfc822, filename, mime_type, content)
+
+        return transform
+
+    return await _handle_attachment_modify(context, arguments, "add_attachment", _build)
+
+
+async def _handle_replace_attachment(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    import base64
+
+    def _build(args: dict[str, Any]) -> Any:
+        new_content = base64.b64decode(args["new_content"])
+        filename = args["filename"]
+        new_mime_type = args.get("new_mime_type")
+        new_filename = args.get("new_filename")
+
+        def transform(rfc822: bytes) -> bytes:
+            return mime_replace_attachment(
+                rfc822, filename, new_content,
+                new_mime_type=new_mime_type,
+                new_filename=new_filename,
+            )
+
+        return transform
+
+    return await _handle_attachment_modify(context, arguments, "replace_attachment", _build)
+
+
+async def _handle_delete_attachment(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    def _build(args: dict[str, Any]) -> Any:
+        filename = args["filename"]
+
+        def transform(rfc822: bytes) -> bytes:
+            return mime_delete_attachment(rfc822, filename)
+
+        return transform
+
+    return await _handle_attachment_modify(context, arguments, "delete_attachment", _build)
 
 
 def _criteria_match(criteria: dict[str, Any], facts: MessageFacts) -> bool:

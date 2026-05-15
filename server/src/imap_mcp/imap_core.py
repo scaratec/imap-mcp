@@ -447,6 +447,116 @@ async def fetch_full_message(
         await imap.logout()
 
 
+def mime_add_attachment(
+    rfc822: bytes, filename: str, mime_type: str, content: bytes
+) -> bytes:
+    import email
+    from email.message import EmailMessage
+
+    import email.policy as _ep
+    msg = email.message_from_bytes(rfc822, policy=_ep.default)
+    maintype, _, subtype = mime_type.partition("/")
+    if not msg.is_multipart():
+        original_body = msg.get_body(preferencelist=("plain", "html"))
+        wrapper = EmailMessage()
+        for key, value in msg.items():
+            if key.lower() not in ("content-type", "content-transfer-encoding", "mime-version"):
+                wrapper[key] = value
+        wrapper["MIME-Version"] = "1.0"
+        if original_body is not None:
+            ct = original_body.get_content_type()
+            body_maintype, _, body_subtype = ct.partition("/")
+            body_bytes = original_body.get_content()
+            if isinstance(body_bytes, str):
+                wrapper.set_content(body_bytes, subtype=body_subtype)
+            else:
+                wrapper.set_content(body_bytes, maintype=body_maintype, subtype=body_subtype)
+        msg = wrapper
+    msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=filename)
+    return msg.as_bytes()
+
+
+def mime_replace_attachment(
+    rfc822: bytes, filename: str, new_content: bytes,
+    new_mime_type: str | None = None, new_filename: str | None = None,
+) -> bytes:
+    import email
+
+    import email.policy as _ep
+    msg = email.message_from_bytes(rfc822, policy=_ep.default)
+    if not msg.is_multipart():
+        raise ValueError(f"Message is not multipart; cannot replace attachment {filename!r}")
+    found = False
+    parts = list(msg.iter_parts())
+    for i, part in enumerate(parts):
+        part_fn = part.get_filename()
+        if part_fn == filename:
+            target_mime = new_mime_type or part.get_content_type()
+            maintype, _, subtype = target_mime.partition("/")
+            target_fn = new_filename or filename
+            part.set_content(
+                new_content, maintype=maintype, subtype=subtype, filename=target_fn,
+                disposition="attachment",
+            )
+            found = True
+            break
+    if not found:
+        raise ValueError(f"Attachment {filename!r} not found in message")
+    return msg.as_bytes()
+
+
+def mime_delete_attachment(rfc822: bytes, filename: str) -> bytes:
+    import email
+    from email.message import EmailMessage
+
+    import email.policy as _ep
+    msg = email.message_from_bytes(rfc822, policy=_ep.default)
+    if not msg.is_multipart():
+        raise ValueError(f"Message is not multipart; cannot delete attachment {filename!r}")
+    found = False
+    keep_parts = []
+    for part in msg.iter_parts():
+        part_fn = part.get_filename()
+        if part_fn == filename and not found:
+            found = True
+            continue
+        keep_parts.append(part)
+    if not found:
+        raise ValueError(f"Attachment {filename!r} not found in message")
+    new_msg = EmailMessage()
+    for key, value in msg.items():
+        if key.lower() not in ("content-type", "content-transfer-encoding", "mime-version"):
+            new_msg[key] = value
+    new_msg["MIME-Version"] = "1.0"
+    if len(keep_parts) == 1 and keep_parts[0].get_content_disposition() != "attachment":
+        body_part = keep_parts[0]
+        ct = body_part.get_content_type()
+        maintype, _, subtype = ct.partition("/")
+        body_content = body_part.get_content()
+        if isinstance(body_content, str):
+            new_msg.set_content(body_content, subtype=subtype)
+        else:
+            new_msg.set_content(body_content, maintype=maintype, subtype=subtype)
+    else:
+        new_msg.set_content("", subtype="plain")
+        for part in keep_parts:
+            if part.get_content_disposition() in ("attachment", "inline"):
+                ct = part.get_content_type()
+                maintype, _, subtype = ct.partition("/")
+                payload = part.get_payload(decode=True) or b""
+                fn = part.get_filename() or "attachment"
+                new_msg.add_attachment(
+                    payload, maintype=maintype, subtype=subtype, filename=fn,
+                )
+            elif part == keep_parts[0]:
+                ct = part.get_content_type()
+                _, _, subtype = ct.partition("/")
+                body_content = part.get_content()
+                if isinstance(body_content, str):
+                    new_msg.set_content(body_content, subtype=subtype)
+    return new_msg.as_bytes()
+
+
 def _strip_html(html: str) -> str:
     from html import unescape
     from html.parser import HTMLParser
@@ -747,6 +857,7 @@ async def append_message(
     password: str,
     folder: str,
     rfc822: bytes,
+    flags: tuple[str, ...] = (),
 ) -> bool:
     import asyncio
     from datetime import datetime, timezone
@@ -755,10 +866,12 @@ async def append_message(
     imap = await _open_imap(account, timeout=timeout)
     await _authenticate_imap(imap, account, password)
     try:
+        flags_str = " ".join(flags) if flags else None
         status, _ = await asyncio.wait_for(
             imap.append(
                 rfc822,
                 mailbox=folder,
+                flags=flags_str,
                 date=datetime.now(tz=timezone.utc),
             ),
             timeout=timeout,
@@ -769,6 +882,28 @@ async def append_message(
             await imap.logout()
         except Exception:
             pass
+
+
+async def fetch_raw_with_flags(
+    account: Account, password: str, folder: str, uid: int
+) -> tuple[bytes, tuple[str, ...]] | None:
+    """Fetch RFC822 bytes and FLAGS for a UID. Returns None if absent."""
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return None
+        status, response = await imap.uid("fetch", str(uid), "(FLAGS RFC822)")
+        if status != "OK":
+            return None
+        raw = _extract_literal(response)
+        if raw is None:
+            return None
+        flags = _extract_flags(response)
+        return raw, flags
+    finally:
+        await imap.logout()
 
 
 async def search_uids(
