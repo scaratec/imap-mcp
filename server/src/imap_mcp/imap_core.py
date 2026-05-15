@@ -447,6 +447,25 @@ async def fetch_full_message(
         await imap.logout()
 
 
+def _strip_html(html: str) -> str:
+    from html import unescape
+    from html.parser import HTMLParser
+
+    class _Stripper(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self._parts: list[str] = []
+
+        def handle_data(self, data: str) -> None:
+            self._parts.append(data)
+
+    stripper = _Stripper()
+    stripper.feed(unescape(html))
+    text = "".join(stripper._parts)
+    lines = [line.strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 async def fetch_body(
     account: Account, password: str, folder: str, uid: int
 ) -> tuple[Envelope, str] | None:
@@ -479,10 +498,22 @@ async def fetch_body(
                         part.get_content_charset("utf-8"), errors="replace"
                     )
                     break
+            if not body_text:
+                for part in message.walk():
+                    if part.get_content_type() == "text/html":
+                        raw_html = part.get_payload(decode=True).decode(
+                            part.get_content_charset("utf-8"), errors="replace"
+                        )
+                        body_text = _strip_html(raw_html)
+                        break
         else:
             payload = message.get_payload(decode=True)
             if isinstance(payload, bytes):
-                body_text = payload.decode(message.get_content_charset("utf-8"), errors="replace")
+                raw = payload.decode(message.get_content_charset("utf-8"), errors="replace")
+                if message.get_content_type() == "text/html":
+                    body_text = _strip_html(raw)
+                else:
+                    body_text = raw
         # Strip trailing CRLF / whitespace that IMAP servers add during
         # APPEND; the caller expects the body as authored.
         body_text = body_text.rstrip("\r\n")

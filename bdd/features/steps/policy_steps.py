@@ -580,6 +580,7 @@ def _seed_message(context: Context, account_id: str, folder: str) -> None:
             "extra_attachments": [],
             "extra_headers": [],
             "body_override": None,
+            "html_body": None,
         }
         context.staged_messages.append(staged)
 
@@ -610,7 +611,10 @@ def flush_staged_messages(context: Context) -> None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             date_header = format_datetime(parsed)
         body_override = staged["body_override"]
-        if body_override is not None:
+        html_body = staged.get("html_body")
+        if html_body and body_override is None:
+            body = ""
+        elif body_override is not None:
             body = body_override
         elif size_hint:
             body = _body_padded_to(size_hint, subject)
@@ -638,6 +642,7 @@ def flush_staged_messages(context: Context) -> None:
             to=to_addr,
             subject=subject,
             body=body,
+            html_body=html_body,
             message_id=message_id,
             date=date_header,
             flags=staged.get("flags", []),
@@ -2758,6 +2763,14 @@ def step_message_has_plain_body(context: Context, body: str) -> None:
     if not staged_list:
         raise AssertionError("No staged message; cannot override body.")
     staged_list[-1]["body_override"] = body
+
+
+@given('the message has html body "{html}"')
+def step_message_has_html_body(context: Context, html: str) -> None:
+    staged_list = getattr(context, "staged_messages", [])
+    if not staged_list:
+        raise AssertionError("No staged message; cannot override html body.")
+    staged_list[-1]["html_body"] = html
 
 
 @given("the server loads a policy file containing:")

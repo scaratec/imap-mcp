@@ -183,6 +183,7 @@ class IMAPFixture:
         date: str | None = None,
         flags: Iterable[str] = (),
         extra_headers: dict[str, str] | None = None,
+        html_body: str | None = None,
         attachments: Iterable[tuple[str, str, bytes]] = (),
         inline_attachments: Iterable[tuple[str, str, bytes]] = (),
         omit_message_id: bool = False,
@@ -206,7 +207,12 @@ class IMAPFixture:
         msg["Date"] = date or email.utils.formatdate(localtime=False)
         for header, value in (extra_headers or {}).items():
             msg[header] = value
-        msg.set_content(body)
+        if html_body and not body:
+            msg.set_content(html_body, subtype="html")
+        else:
+            msg.set_content(body)
+            if html_body:
+                msg.add_alternative(html_body, subtype="html")
         for filename, mime_type, payload in attachments:
             maintype, _, subtype = mime_type.partition("/")
             msg.add_attachment(
