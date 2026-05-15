@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.11.2 (2026-05-15)
+
+### Bug Fixes
+
+- **fetch_body**: Include FLAGS in envelope so flagged rules match
+  ([`47bdda0`](https://github.com/scaratec/imap-mcp/commit/47bdda0d88e85820fe1596749d603f14f0d188f5))
+
+
 ## v0.11.1 (2026-05-12)
 
 ### Bug Fixes
