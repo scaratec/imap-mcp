@@ -459,12 +459,13 @@ async def fetch_body(
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
-        status, response = await imap.uid("fetch", str(uid), "(RFC822)")
+        status, response = await imap.uid("fetch", str(uid), "(FLAGS RFC822)")
         if status != "OK":
             return None
         raw = _extract_literal(response)
         if raw is None:
             return None
+        flags = _extract_flags(response)
         message = email.message_from_bytes(raw)
         from email.utils import getaddresses
 
@@ -492,6 +493,7 @@ async def fetch_body(
             subject=re.sub(r"\r?\n\s+", " ", message.get("Subject", "") or ""),
             message_id=message.get("Message-ID"),
             date=message.get("Date"),
+            flags=flags,
         )
         return envelope, body_text
     finally:

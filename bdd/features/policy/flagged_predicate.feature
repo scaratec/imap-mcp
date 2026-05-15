@@ -6,12 +6,13 @@ Feature: Flagged predicate in sender rules
   whitelists.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - flagged=true match in whitelist mode   : 1
+    - flagged=true match in whitelist mode    : 1
     - flagged=false match in whitelist mode   : 1
     - flagged=true in blacklist mode (cap)    : 1
     - flagged composes with from_domain (AND) : 1
     - Grammar acceptance at load time         : 1
-    Total enumerated                          : 5   covered: 5
+    - flagged grant honoured by fetch_body    : 1
+    Total enumerated                          : 6   covered: 6
 
   Background:
     Given the IMAP account "gupta-scaratec" exists with folder "INBOX"
@@ -75,6 +76,21 @@ Feature: Flagged predicate in sender rules
       | 533 | bob@other.com       | [\Flagged] |
     When inbox-agent calls search with account "gupta-scaratec", folder "INBOX", criteria {}
     Then the response field uids contains exactly [531]
+
+  Scenario: fetch_body honours a flagged-only whitelist grant
+    Given policy "inbox-policy" folder defaults for "INBOX" are:
+      | mode      | default |
+      | whitelist | NONE    |
+    And policy "inbox-policy" sets folder "INBOX" rules to:
+      | match          | grant |
+      | flagged=true   | FULL  |
+    And the folder "INBOX" holds a message with:
+      | uid | from                  | subject                | flags      |
+      | 541 | someone@unrelated.com | Starred by the user    | [\Flagged] |
+    When inbox-agent calls fetch_body with account "gupta-scaratec", folder "INBOX", uid 541
+    Then the response decision is ALLOW
+    And the response field visibility_applied equals "FULL"
+    And the response field matched_rule_index is 0
 
   Scenario: flagged is accepted as a valid V1 core grammar predicate
     Given policy "inbox-policy" folder defaults for "INBOX" are:
