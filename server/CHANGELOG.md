@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.13.0 (2026-05-15)
+
+### Features
+
+- Create_reply_draft tool for server-side reply
+  ([`985d591`](https://github.com/scaratec/imap-mcp/commit/985d59120da96f5e7bb41029984b7a7ebe9df400))
+
+
 ## v0.12.0 (2026-05-15)
 
 ### Features
