@@ -50,6 +50,7 @@ from .imap_core import (
     fetch_envelope as imap_fetch_envelope,
     fetch_envelopes_batch as imap_fetch_envelopes_batch,
     fetch_full_message as imap_fetch_full_message,
+    fetch_message_for_reply as imap_fetch_message_for_reply,
     folder_stats as imap_folder_stats,
     gmail_fetch_msgid as imap_gmail_fetch_msgid,
     gmail_label_swap as imap_gmail_label_swap,
@@ -64,6 +65,7 @@ from .imap_core import (
     mime_replace_attachment,
     mime_delete_attachment,
 )
+from . import reply as reply_builder
 from .policy import (
     MessageFacts,
     PolicyDecisionPoint,
@@ -407,6 +409,35 @@ def build_server(context: ServerContext) -> Server:
                 },
             ),
             Tool(
+                name="create_reply_draft",
+                description=(
+                    "Build a top-posted reply to <account/source_folder/uid>"
+                    " and APPEND it as a draft to drafts_folder. The agent "
+                    "supplies only reply_text; the server derives Re:-subject"
+                    ", In-Reply-To and References headers, reply-all "
+                    "recipients (with the account identity removed from Cc),"
+                    " and the quoted original body."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "account": {"type": "string"},
+                        "source_folder": {"type": "string"},
+                        "uid": {"type": "integer"},
+                        "drafts_folder": {"type": "string"},
+                        "reply_text": {"type": "string"},
+                    },
+                    "required": [
+                        "account",
+                        "source_folder",
+                        "uid",
+                        "drafts_folder",
+                        "reply_text",
+                    ],
+                    "additionalProperties": False,
+                },
+            ),
+            Tool(
                 name="describe_policy",
                 description=(
                     "Return the caller's own policy profile. The caller "
@@ -650,6 +681,8 @@ def build_server(context: ServerContext) -> Server:
             return await _handle_copy(context, arguments)
         if name == "create_draft":
             return await _handle_create_draft(context, arguments)
+        if name == "create_reply_draft":
+            return await _handle_create_reply_draft(context, arguments)
         if name == "add_attachment":
             return await _handle_add_attachment(context, arguments)
         if name == "replace_attachment":
@@ -1432,6 +1465,7 @@ WRITE_TOOL_CAP = {
     "move": "move_out",
     "copy": "accept_incoming",
     "create_draft": "draft_append",
+    "create_reply_draft": "draft_append",
     "add_attachment": "modify_message",
     "replace_attachment": "modify_message",
     "delete_attachment": "modify_message",
@@ -2051,6 +2085,165 @@ async def _handle_create_draft(context: ServerContext, arguments: dict[str, Any]
         "error_type": None if ok else "append_failed",
         "account": account_id,
         "folder": folder_path,
+    }
+
+
+async def _handle_create_reply_draft(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    account_id = str(arguments["account"])
+    source_folder = str(arguments["source_folder"])
+    uid = int(arguments["uid"])
+    drafts_folder = str(arguments["drafts_folder"])
+    reply_text = str(arguments["reply_text"])
+
+    if not reply_text.strip():
+        return {
+            "decision": "DENY",
+            "reason": "validation_failed",
+            "error_type": "empty_reply_text",
+            "account": account_id,
+        }
+
+    src_decision = context.pdp.decide_folder_access(
+        context.caller_id, account_id, source_folder
+    )
+    if not src_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": src_decision.reason,
+            "account": account_id,
+            "folder": source_folder,
+        }
+
+    drafts_decision = context.pdp.decide_folder_access(
+        context.caller_id, account_id, drafts_folder
+    )
+    if not drafts_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": drafts_decision.reason,
+            "account": account_id,
+            "folder": drafts_folder,
+        }
+    assert drafts_decision.folder_policy is not None
+    if not drafts_decision.folder_policy.draft_append:
+        return {
+            "decision": "DENY",
+            "reason": "capability_missing",
+            "missing_capability": "draft_append",
+            "account": account_id,
+            "folder": drafts_folder,
+        }
+
+    account, password = await _password_for(context, account_id)
+
+    imap_src = await _resolve_imap_folder(context, account_id, source_folder)
+    result = await imap_fetch_message_for_reply(account, password, imap_src, uid)
+    if result is None:
+        return {
+            "decision": "ALLOW",
+            "result": "ERROR",
+            "error_type": "uid_not_found",
+            "account": account_id,
+            "folder": source_folder,
+            "uid": uid,
+        }
+    source_msg, source_body = result
+
+    from email.utils import getaddresses as _ga
+
+    _from_addrs = _ga(source_msg.get_all("From", []))
+    _to_addrs = _ga(
+        source_msg.get_all("To", []) + source_msg.get_all("Cc", [])
+    )
+    assert src_decision.folder_policy is not None
+    src_facts = MessageFacts(
+        from_address=_from_addrs[0][1] if _from_addrs else "",
+        to_addresses=tuple(a for _, a in _to_addrs if a),
+        subject=source_msg.get("Subject") or "",
+        has_attachment=False,
+        flagged=False,
+        size_bytes=0,
+        date_iso=None,
+    )
+    src_msg_decision = evaluate_message_against_folder(
+        src_decision.folder_policy, facts=src_facts
+    )
+    if not src_msg_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": src_msg_decision.reason,
+            "account": account_id,
+            "folder": source_folder,
+            "uid": uid,
+        }
+    if level_rank(src_msg_decision.visibility) < level_rank("BODY"):
+        return {
+            "decision": "DENY",
+            "reason": "visibility_below_BODY",
+            "account": account_id,
+            "folder": source_folder,
+            "uid": uid,
+        }
+
+    src_mid = source_msg.get("Message-ID")
+    if not src_mid:
+        return {
+            "decision": "DENY",
+            "reason": "missing_message_id",
+            "account": account_id,
+            "folder": source_folder,
+            "uid": uid,
+        }
+
+    if account.identity is None:
+        return {
+            "decision": "DENY",
+            "reason": "account_identity_missing",
+            "account": account_id,
+        }
+
+    from email.header import decode_header as _dh, make_header as _mh
+
+    src_from = str(_mh(_dh(source_msg.get("From") or "")))
+    src_reply_to = source_msg.get("Reply-To")
+    src_to = source_msg.get("To")
+    src_cc = source_msg.get("Cc")
+    src_subject = str(_mh(_dh(source_msg.get("Subject") or "")))
+    src_date = source_msg.get("Date")
+    src_references = source_msg.get("References")
+
+    subject = reply_builder.build_reply_subject(src_subject)
+    to = reply_builder.derive_reply_to(src_reply_to, src_from)
+    cc = reply_builder.derive_reply_cc(src_to, src_cc, account.identity)
+    attribution = reply_builder.build_attribution(src_date, src_from)
+    quoted = reply_builder.quote_body(source_body)
+    body = reply_builder.build_reply_body(reply_text, attribution, quoted)
+    in_reply_to, references = reply_builder.build_threading_headers(
+        src_mid, src_references
+    )
+
+    rfc822_bytes = reply_builder.build_reply_message(
+        self_identity=account.identity,
+        reply_to=to,
+        cc=cc,
+        subject=subject,
+        in_reply_to=in_reply_to,
+        references=references,
+        body=body,
+    )
+
+    imap_dst = await _resolve_imap_folder(context, account_id, drafts_folder)
+    ok = await imap_append_message(account, password, imap_dst, rfc822_bytes)
+    return {
+        "decision": "ALLOW",
+        "result": "OK" if ok else "ERROR",
+        "error_type": None if ok else "append_failed",
+        "account": account_id,
+        "source_folder": source_folder,
+        "drafts_folder": drafts_folder,
+        "uid": uid,
     }
 
 

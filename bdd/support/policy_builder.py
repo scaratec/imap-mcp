@@ -26,6 +26,10 @@ class Account:
     host: str = "127.0.0.1"
     port: int = 11143
     user: str | None = None
+    identity: str | None = None
+    """RFC 5322 mailbox the account itself owns; used by reply-builder
+    tools to populate `From:` and to dedup self from reply-all Cc lists.
+    Optional — only required by tools that build outgoing messages."""
     auth_type: str = "password"
     secret_ref: str | None = None
     oauth_scope: str | None = None
@@ -162,6 +166,7 @@ class PolicyBuilder:
                                 "host": a.host,
                                 "port": a.port,
                                 "user": a.user,
+                                "identity": a.identity,
                                 "auth": _clean(
                                     {
                                         "type": a.auth_type,

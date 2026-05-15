@@ -1,8 +1,8 @@
 Feature: MCP tool discovery
 
   A connected client enumerates the server's tools via the standard
-  MCP list_tools handshake. V1 exposes exactly nineteen tools
-  partitioned into ten read, five write, and three meta. The
+  MCP list_tools handshake. V1 exposes exactly twenty-three tools
+  partitioned into ten read, six write, and three meta. The
   advertised shape matches ADR 0016.
 
   Covered error layers (per BDD Guidelines §4.5):
@@ -17,7 +17,7 @@ Feature: MCP tool discovery
     Given the server is started with a minimal caller configuration
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The V1 tool set consists of exactly these 22 tools
+  Scenario: The V1 tool set consists of exactly these 23 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
       | tool                      |
@@ -36,6 +36,7 @@ Feature: MCP tool discovery
       | move                      |
       | copy                      |
       | create_draft              |
+      | create_reply_draft        |
       | add_attachment            |
       | replace_attachment        |
       | delete_attachment         |
@@ -84,6 +85,7 @@ Feature: MCP tool discovery
       | move               | move_out            |
       | copy               | accept_incoming     |
       | create_draft       | draft_append        |
+      | create_reply_draft | draft_append        |
       | add_attachment     | modify_message      |
       | replace_attachment | modify_message      |
       | delete_attachment  | modify_message      |

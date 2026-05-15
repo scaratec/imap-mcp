@@ -1308,3 +1308,97 @@ def step_caller_calls_fetch_envelope(
         {"account": account, "folder": folder, "uid": actual_uid},
     )
     _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls create_reply_draft with account "{account}", '
+    'source_folder "{src_folder}", uid {uid:d}, '
+    'drafts_folder "{drafts_folder}", reply_text:'
+)
+def step_caller_calls_create_reply_draft_docstring(
+    context: Context,
+    caller_id: str,
+    account: str,
+    src_folder: str,
+    uid: int,
+    drafts_folder: str,
+) -> None:
+    """DocString form: reply_text body lives in `context.text`."""
+    client = _ensure_mcp_client(context, caller_id)
+    lookup = getattr(context, "message_uids", {})
+    actual_uid = lookup.get((account, src_folder, uid), uid)
+    payload = client.call_tool(
+        "create_reply_draft",
+        {
+            "account": account,
+            "source_folder": src_folder,
+            "uid": actual_uid,
+            "drafts_folder": drafts_folder,
+            "reply_text": context.text or "",
+        },
+    )
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls create_reply_draft with account "{account}", '
+    'source_folder "{src_folder}", uid {uid:d}, '
+    'drafts_folder "{drafts_folder}", reply_text ""'
+)
+def step_caller_calls_create_reply_draft_empty(
+    context: Context,
+    caller_id: str,
+    account: str,
+    src_folder: str,
+    uid: int,
+    drafts_folder: str,
+) -> None:
+    """Inline empty-string form for the empty_reply_text validation path."""
+    client = _ensure_mcp_client(context, caller_id)
+    lookup = getattr(context, "message_uids", {})
+    actual_uid = lookup.get((account, src_folder, uid), uid)
+    payload = client.call_tool(
+        "create_reply_draft",
+        {
+            "account": account,
+            "source_folder": src_folder,
+            "uid": actual_uid,
+            "drafts_folder": drafts_folder,
+            "reply_text": "",
+        },
+    )
+    _store_result(context, payload)
+
+
+@when('{caller_id} calls fetch_body on the only message in folder "{folder}"')
+def step_caller_calls_fetch_body_on_only_message(
+    context: Context, caller_id: str, folder: str
+) -> None:
+    """Convenience: list_messages on the folder, assert exactly one
+    visible message, then fetch_body on that uid. Used by reply-builder
+    body assertions where the scenario already proved persistence via a
+    prior list_messages and just needs the body content."""
+    client = _ensure_mcp_client(context, caller_id)
+    from features.steps.policy_steps import _find_account_for_folder
+
+    account = _find_account_for_folder(context, folder)
+    list_payload = client.call_tool(
+        "list_messages",
+        {"account": account, "folder": folder},
+    )
+    _store_result(context, list_payload)
+    response = context.last_response
+    messages = response.get("messages") or []
+    if len(messages) != 1:
+        raise AssertionError(
+            f"Expected exactly one visible message in {folder!r}, "
+            f"got {len(messages)}: {messages!r}"
+        )
+    uid = messages[0].get("uid")
+    if uid is None:
+        raise AssertionError(f"Message entry has no uid: {messages[0]!r}")
+    body_payload = client.call_tool(
+        "fetch_body",
+        {"account": account, "folder": folder, "uid": uid},
+    )
+    _store_result(context, body_payload)

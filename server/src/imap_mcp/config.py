@@ -44,6 +44,12 @@ class Account(BaseModel):
     host: str = "127.0.0.1"
     port: int = 143
     user: str | None = None
+    identity: str | None = None
+    """RFC 5322 mailbox the account itself owns. Used by tools that
+    build outgoing messages (e.g. create_reply_draft) to populate the
+    `From:` header and to dedup the account's own address from
+    reply-all `Cc:` lists. Optional — only required by tools that build
+    outgoing messages; read tools ignore it."""
     auth: AccountAuth | None = None
     token_cache: Literal["memory_only", "persist_all"] = "memory_only"
 

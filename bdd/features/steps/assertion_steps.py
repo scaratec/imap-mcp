@@ -2895,3 +2895,134 @@ def step_attachment_field_int(
             f"attachment[{idx}].{field}: expected {expected!r}, "
             f"got {actual!r}"
         )
+
+
+# ----------------------------------------------------------------------
+# Reply-builder Then-steps (create_reply_draft.feature).
+# These read the resulting draft directly via IMAP — the second channel
+# required by §13.2 Prüfung 1, independent of the MCP server's response.
+# ----------------------------------------------------------------------
+
+
+def _decoded_header(msg, name: str) -> str:
+    """Return the RFC 2047-decoded value of header `name`, or "" if absent."""
+    from email.header import decode_header, make_header
+
+    raw = msg[name]
+    if raw is None:
+        return ""
+    return str(make_header(decode_header(raw)))
+
+
+def _resolve_message_in_folder_by_subject(
+    context: Context, folder: str, subject: str
+):
+    """Return the parsed EmailMessage in `folder` matching `subject`."""
+    from support.imap_fixture import resolve_account
+
+    account_id = _account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    uid = context.imap.find_uid_by_decoded_subject(
+        instance, user, folder, subject
+    )
+    if uid is None:
+        raise AssertionError(
+            f"No message in folder {folder!r} has decoded subject {subject!r}"
+        )
+    return context.imap.fetch_message(instance, user, folder, uid)
+
+
+@then(
+    'the message in folder "{folder}" with subject "{subject}" '
+    'has {header} header equal to "{value}"'
+)
+def step_message_in_folder_header_equal(
+    context: Context, folder: str, subject: str, header: str, value: str
+) -> None:
+    msg = _resolve_message_in_folder_by_subject(context, folder, subject)
+    actual = _decoded_header(msg, header)
+    if actual != value:
+        raise AssertionError(
+            f"{header} header on message {subject!r} in {folder!r}: "
+            f"expected {value!r}, got {actual!r}"
+        )
+
+
+@then(
+    'the message in folder "{folder}" with subject "{subject}" '
+    'has {header} header NOT containing "{value}"'
+)
+def step_message_in_folder_header_not_containing(
+    context: Context, folder: str, subject: str, header: str, value: str
+) -> None:
+    msg = _resolve_message_in_folder_by_subject(context, folder, subject)
+    actual = _decoded_header(msg, header)
+    if value in actual:
+        raise AssertionError(
+            f"{header} header on message {subject!r} in {folder!r} "
+            f"contains forbidden substring {value!r}: {actual!r}"
+        )
+
+
+@then(
+    'the message in folder "{folder}" with In-Reply-To "{message_id}" '
+    'has subject "{subject}"'
+)
+def step_message_in_folder_by_in_reply_to_has_subject(
+    context: Context, folder: str, message_id: str, subject: str
+) -> None:
+    from support.imap_fixture import resolve_account
+
+    account_id = _account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    uid = context.imap.find_uid_by_in_reply_to(
+        instance, user, folder, message_id
+    )
+    if uid is None:
+        raise AssertionError(
+            f"No message in folder {folder!r} has In-Reply-To {message_id!r}"
+        )
+    msg = context.imap.fetch_message(instance, user, folder, uid)
+    actual = _decoded_header(msg, "Subject")
+    if actual != subject:
+        raise AssertionError(
+            f"Message in {folder!r} with In-Reply-To {message_id!r}: "
+            f"expected subject {subject!r}, got {actual!r}"
+        )
+
+
+@then('the response text_body equals the following document:')
+def step_response_text_body_equals_document(context: Context) -> None:
+    """Match a multi-line text_body against a Gherkin DocString.
+
+    Phrased to avoid clashing with the generic
+    `the response field {field} equals {expected}` step (which expects
+    a JSON literal on a single line, not a DocString)."""
+    _assert_text_body_equals_exactly(context)
+
+
+def _assert_text_body_equals_exactly(context: Context) -> None:
+    expected = context.text or ""
+    response = _last_response(context)
+    if "text_body" not in response:
+        raise AssertionError(
+            f"Response has no field 'text_body'. Available fields: "
+            f"{sorted(response.keys())}"
+        )
+    actual = response["text_body"]
+    # Normalize CRLF → LF (RFC822 uses CRLF, Gherkin DocStrings use LF)
+    # and tolerate trailing newline differences.
+    actual_n = actual.replace("\r\n", "\n").rstrip("\n")
+    expected_n = expected.rstrip("\n")
+    if actual_n != expected_n:
+        raise AssertionError(
+            "text_body mismatch.\n"
+            f"--- expected ---\n{expected_n!r}\n"
+            f"--- actual   ---\n{actual_n!r}"
+        )
+
+
+# NOTE: the matching step
+#   `the response field {field} contains exactly one entry with:`
+# is already defined further up (~line 616) as a generic one-row tabular
+# match. The reply-builder feature reuses it via field=messages.

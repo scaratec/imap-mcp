@@ -187,6 +187,7 @@ class IMAPFixture:
         attachments: Iterable[tuple[str, str, bytes]] = (),
         inline_attachments: Iterable[tuple[str, str, bytes]] = (),
         omit_message_id: bool = False,
+        omit_date: bool = False,
     ) -> SeededMessage:
         """Append a message to `folder` and return metadata for assertions.
 
@@ -194,7 +195,13 @@ class IMAPFixture:
 
         Setting `omit_message_id=True` skips the Message-ID header
         entirely — used by 5-tuple-fallback scenarios that need a
-        message identified solely by from/date/subject/size/4kb-hash.
+        message identified solely by from/date/subject/size/4kb-hash,
+        and by reply-builder scenarios that exercise the
+        missing_message_id error path.
+
+        Setting `omit_date=True` skips the Date header entirely so
+        scenarios can verify how the server reacts to malformed
+        sources (e.g. attribution lines built without a date prefix).
         """
         msg = EmailMessage()
         msg["From"] = sender
@@ -204,7 +211,8 @@ class IMAPFixture:
             if message_id is None:
                 message_id = email.utils.make_msgid(domain="bdd.local")
             msg["Message-ID"] = message_id
-        msg["Date"] = date or email.utils.formatdate(localtime=False)
+        if not omit_date:
+            msg["Date"] = date or email.utils.formatdate(localtime=False)
         for header, value in (extra_headers or {}).items():
             msg[header] = value
         if html_body and not body:
@@ -309,6 +317,70 @@ class IMAPFixture:
         if status != "OK" or not data or not data[0]:
             return []
         return [int(token) for token in data[0].split()]
+
+    def fetch_message(
+        self, instance: str, user: str, folder: str, uid: int
+    ) -> email.message.EmailMessage:
+        """Fetch the parsed EmailMessage at <folder>/<uid>.
+
+        Used by Then-steps that inspect message headers as a second
+        channel (BDD Guidelines §13.2 Prüfung 1) — independent of the
+        MCP server's view of the message.
+
+        Raises if the UID is not present.
+        """
+        conn = self.connect(instance, user)
+        conn.select(folder)
+        status, data = conn.uid("FETCH", str(uid), "(RFC822)")
+        if status != "OK" or not data or data[0] is None:
+            raise RuntimeError(
+                f"FETCH RFC822 on {folder!r} uid {uid} failed: {data!r}"
+            )
+        # imaplib returns a list of tuples for FETCH; the bytes payload
+        # lives at index [0][1] for the matched UID.
+        for item in data:
+            if isinstance(item, tuple) and len(item) >= 2 and item[1]:
+                raw = item[1]
+                msg = email.message_from_bytes(raw, _class=EmailMessage)
+                return msg
+        raise RuntimeError(f"No RFC822 payload returned for uid {uid}")
+
+    def find_uid_by_decoded_subject(
+        self, instance: str, user: str, folder: str, subject: str
+    ) -> int | None:
+        """Locate a UID by RFC 2047-decoded Subject equality.
+
+        Subjects containing non-ASCII (e.g. Cyrillic) are stored on the
+        wire as `=?utf-8?...?=` words. Plain IMAP SEARCH SUBJECT does not
+        decode them. We enumerate the folder's UIDs and decode each
+        Subject header so the caller can match against the same string a
+        human would read in a mail client.
+        """
+        from email.header import decode_header, make_header
+
+        for uid in self.folder_uids(instance, user, folder):
+            try:
+                msg = self.fetch_message(instance, user, folder, uid)
+            except RuntimeError:
+                continue
+            raw = msg["Subject"] or ""
+            decoded = str(make_header(decode_header(raw)))
+            if decoded == subject:
+                return uid
+        return None
+
+    def find_uid_by_in_reply_to(
+        self, instance: str, user: str, folder: str, message_id: str
+    ) -> int | None:
+        """Locate a UID by exact In-Reply-To header match (ASCII-safe)."""
+        for uid in self.folder_uids(instance, user, folder):
+            try:
+                msg = self.fetch_message(instance, user, folder, uid)
+            except RuntimeError:
+                continue
+            if (msg["In-Reply-To"] or "").strip() == message_id.strip():
+                return uid
+        return None
 
     def fetch_flags(
         self, instance: str, user: str, folder: str, uid: int

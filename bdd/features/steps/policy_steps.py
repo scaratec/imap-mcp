@@ -555,16 +555,41 @@ def _seed_message(context: Context, account_id: str, folder: str) -> None:
     attachment X" can modify the staged record before it reaches IMAP.
     The actual seed happens on first `When` step via
     `flush_staged_messages(context)`.
+
+    Recognised optional columns (each is set verbatim as the corresponding
+    RFC 5322 header on the seeded message):
+
+      reply_to           -> Reply-To
+      cc_header          -> Cc
+      to_header          -> overrides `to` (allows multi-recipient seeds)
+      references_header  -> References
+
+    Empty cells in `message_id` and `date` mean "do not set this header" —
+    used by reply-builder scenarios that exercise the missing_message_id
+    error path and the dateless-attribution tolerant path.
     """
     context.staged_messages = getattr(context, "staged_messages", [])
     for row in context.table:
         headings = row.headings
+        extra_headers: list[tuple[str, str]] = []
+        if "reply_to" in headings and row["reply_to"]:
+            extra_headers.append(("Reply-To", row["reply_to"]))
+        if "cc_header" in headings and row["cc_header"]:
+            extra_headers.append(("Cc", row["cc_header"]))
+        if "references_header" in headings and row["references_header"]:
+            extra_headers.append(("References", row["references_header"]))
+        if "to_header" in headings and row["to_header"]:
+            to_value: str | None = row["to_header"]
+        elif "to" in headings:
+            to_value = row["to"]
+        else:
+            to_value = None
         staged: dict[str, object] = {
             "_account_id": account_id,
             "_folder": folder,
             "uid_hint": int(row["uid"]),
             "from": row["from"] if "from" in headings else None,
-            "to": row["to"] if "to" in headings else None,
+            "to": to_value,
             "subject": row["subject"] if "subject" in headings else "Test",
             "message_id_override": row["message_id"]
             if "message_id" in headings
@@ -578,15 +603,17 @@ def _seed_message(context: Context, account_id: str, folder: str) -> None:
             "date": row["date"] if "date" in headings else None,
             "flags": _parse_flags(row["flags"]) if "flags" in headings else [],
             "extra_attachments": [],
-            "extra_headers": [],
+            "extra_headers": extra_headers,
             "body_override": None,
             "html_body": None,
+            "html_only": False,
         }
         context.staged_messages.append(staged)
 
 
 def flush_staged_messages(context: Context) -> None:
     """Turn the staged message list into real IMAP APPENDs."""
+    import email.utils as _email_utils
     from datetime import datetime, timezone
     from email.utils import format_datetime
 
@@ -604,15 +631,22 @@ def flush_staged_messages(context: Context) -> None:
         subject = staged["subject"]
         size_hint = staged["size_hint"]
         date_header: str | None = None
-        if staged["date"]:
-            iso = staged["date"]
-            parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        omit_date = False
+        date_str = staged["date"]
+        if date_str == "":
+            omit_date = True
+        elif date_str:
+            try:
+                parsed = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = _email_utils.parsedate_to_datetime(date_str)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             date_header = format_datetime(parsed)
         body_override = staged["body_override"]
         html_body = staged.get("html_body")
-        if html_body and body_override is None:
+        html_only = bool(staged.get("html_only"))
+        if html_body and (html_only or body_override is None):
             body = ""
         elif body_override is not None:
             body = body_override
@@ -628,7 +662,7 @@ def flush_staged_messages(context: Context) -> None:
         extra_headers = {
             name: value for name, value in staged["extra_headers"]
         }
-        omit_msgid = staged["message_id_override"] == "(absent)"
+        omit_msgid = staged["message_id_override"] in ("(absent)", "")
         message_id = (
             None if omit_msgid
             else (staged["message_id_override"] or f"<scenario-{uid_hint}@bdd.local>")
@@ -638,6 +672,7 @@ def flush_staged_messages(context: Context) -> None:
             user,
             folder,
             omit_message_id=omit_msgid,
+            omit_date=omit_date,
             sender=sender,
             to=to_addr,
             subject=subject,
@@ -2773,6 +2808,40 @@ def step_message_has_html_body(context: Context, html: str) -> None:
     staged_list[-1]["html_body"] = html
 
 
+def _staged_by_uid(context: Context, uid_hint: int) -> dict[str, object]:
+    staged_list = getattr(context, "staged_messages", [])
+    for staged in staged_list:
+        if staged["uid_hint"] == uid_hint:
+            return staged
+    raise AssertionError(
+        f"No staged message at uid {uid_hint}. Staged uids: "
+        f"{[s['uid_hint'] for s in staged_list]!r}"
+    )
+
+
+@given('the message at uid {uid:d} has plain text body:')
+def step_message_at_uid_has_plain_body_docstring(
+    context: Context, uid: int
+) -> None:
+    """DocString form: the multi-line body content lives in `context.text`."""
+    body = context.text or ""
+    _staged_by_uid(context, uid)["body_override"] = body
+
+
+@given('the message at uid {uid:d} has html body "{html}"')
+def step_message_at_uid_has_html_body(
+    context: Context, uid: int, html: str
+) -> None:
+    _staged_by_uid(context, uid)["html_body"] = html
+
+
+@given('the message at uid {uid:d} has no plain text body')
+def step_message_at_uid_has_no_plain_body(context: Context, uid: int) -> None:
+    """Mark the staged message as HTML-only (used together with
+    `has html body` to seed a message without any text/plain part)."""
+    _staged_by_uid(context, uid)["html_only"] = True
+
+
 @given("the server loads a policy file containing:")
 def step_server_loads_policy_file_containing(context: Context) -> None:
     """Write the inline YAML to the config directory and run the server once.
@@ -3122,4 +3191,41 @@ def step_policy_has_sender_rules(context: Context, policy_name: str) -> None:
         from support.policy_builder import SenderRule  # local import avoids cycle
 
         target_folder.rules.append(SenderRule(match={key: value}, grant=grant))
+    builder.write()
+
+
+@given('the account "{account_id}" has identity "{identity}"')
+def step_account_has_identity(
+    context: Context, account_id: str, identity: str
+) -> None:
+    """Set the account's owning mailbox; required by reply-builder tools
+    so they can populate `From:` and dedup self from reply-all Cc lists."""
+    builder = _ensure_builder(context)
+    for account in builder.accounts:
+        if account.id == account_id:
+            account.identity = identity
+            builder.write()
+            return
+    raise AssertionError(
+        f"Account {account_id!r} is not registered yet; declare it via "
+        f"'the IMAP account \"{account_id}\" exists with folder ...' first."
+    )
+
+
+@given('the IMAP account "{account_id}" also exists with folder "{folder}"')
+def step_imap_account_also_exists_with_folder(
+    context: Context, account_id: str, folder: str
+) -> None:
+    """Add another folder to an already-registered account.
+
+    Distinct verb ('also exists') so a scenario can extend the Background
+    setup without re-declaring the account from scratch."""
+    builder = _ensure_builder(context)
+    if not any(a.id == account_id for a in builder.accounts):
+        raise AssertionError(
+            f"Account {account_id!r} is not registered; use the plain "
+            f"'exists with folder' form instead of 'also exists'."
+        )
+    instance, user = resolve_account(account_id)
+    context.imap.create_folder(instance, user, folder)
     builder.write()

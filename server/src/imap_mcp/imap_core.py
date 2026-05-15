@@ -255,7 +255,7 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
             uid=uid,
             from_address=from_addrs[0][1] if from_addrs else "",
             to_addresses=[addr for _, addr in to_addrs if addr],
-            subject=re.sub(r"\r?\n\s+", " ", message.get("Subject", "") or ""),
+            subject=_decode_header(message.get("Subject", "") or ""),
             message_id=message.get("Message-ID"),
             date=date_iso,
             size_bytes=size_bytes,
@@ -264,6 +264,17 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
         )
     finally:
         await imap.logout()
+
+
+def _decode_header(raw: str) -> str:
+    """RFC 2047-decode a header value and unfold any header continuations."""
+    from email.header import decode_header, make_header
+
+    try:
+        decoded = str(make_header(decode_header(raw)))
+    except Exception:
+        decoded = raw
+    return re.sub(r"\r?\n\s+", " ", decoded)
 
 
 async def fetch_envelopes_batch(
@@ -316,7 +327,7 @@ async def fetch_envelopes_batch(
                     uid=uid_val or 0,
                     from_address=from_addrs[0][1] if from_addrs else "",
                     to_addresses=[addr for _, addr in to_addrs if addr],
-                    subject=re.sub(r"\r?\n\s+", " ", message.get("Subject", "") or ""),
+                    subject=_decode_header(message.get("Subject", "") or ""),
                     message_id=message.get("Message-ID"),
                     date=date_iso,
                     size_bytes=size_bytes,
@@ -631,12 +642,72 @@ async def fetch_body(
             uid=uid,
             from_address=from_addrs[0][1] if from_addrs else "",
             to_addresses=[addr for _, addr in to_addrs if addr],
-            subject=re.sub(r"\r?\n\s+", " ", message.get("Subject", "") or ""),
+            subject=_decode_header(message.get("Subject", "") or ""),
             message_id=message.get("Message-ID"),
             date=message.get("Date"),
             flags=flags,
         )
         return envelope, body_text
+    finally:
+        await imap.logout()
+
+
+async def fetch_message_for_reply(
+    account: Account, password: str, folder: str, uid: int
+):
+    """Fetch the parsed email.Message and the extracted plain-text body.
+
+    Same I/O path as `fetch_body` but returns the full Message object so
+    callers can read raw headers (Reply-To, Cc separately, References,
+    From with display-name, original Date string) that the slim
+    `Envelope` does not expose. Used by `create_reply_draft`.
+
+    Returns ``None`` when the UID is absent.
+    """
+    import email
+    from email.message import Message
+
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return None
+        status, response = await imap.uid("fetch", str(uid), "(FLAGS RFC822)")
+        if status != "OK":
+            return None
+        raw = _extract_literal(response)
+        if raw is None:
+            return None
+        message: Message = email.message_from_bytes(raw)
+        body_text = ""
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_type() == "text/plain":
+                    body_text = part.get_payload(decode=True).decode(
+                        part.get_content_charset("utf-8"), errors="replace"
+                    )
+                    break
+            if not body_text:
+                for part in message.walk():
+                    if part.get_content_type() == "text/html":
+                        raw_html = part.get_payload(decode=True).decode(
+                            part.get_content_charset("utf-8"), errors="replace"
+                        )
+                        body_text = _strip_html(raw_html)
+                        break
+        else:
+            payload = message.get_payload(decode=True)
+            if isinstance(payload, bytes):
+                decoded = payload.decode(
+                    message.get_content_charset("utf-8"), errors="replace"
+                )
+                if message.get_content_type() == "text/html":
+                    body_text = _strip_html(decoded)
+                else:
+                    body_text = decoded
+        body_text = body_text.replace("\r\n", "\n").rstrip("\n")
+        return message, body_text
     finally:
         await imap.logout()
 
