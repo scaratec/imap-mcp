@@ -12,6 +12,7 @@ server module stays a thin dispatcher.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import os
 from dataclasses import dataclass
@@ -826,13 +827,30 @@ def _facts_from_envelope(envelope: Any) -> MessageFacts:
     )
 
 
+def _deny(*, reason: str, **fields: Any) -> dict[str, Any]:
+    return {"decision": "DENY", "reason": reason, **fields}
+
+
+def _ok(**fields: Any) -> dict[str, Any]:
+    return {"decision": "ALLOW", "result": "OK", "error_type": None, **fields}
+
+
+def _error(*, error_type: str, **fields: Any) -> dict[str, Any]:
+    return {
+        "decision": "ALLOW",
+        "result": "ERROR",
+        "error_type": error_type,
+        **fields,
+    }
+
+
 def _handle_list_accounts(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     _ = arguments
     visibility = context.pdp.visible_accounts_for(context.caller_id)
     accounts = []
     for aid in visibility.visible_account_ids:
         state = "active"
-        if getattr(context.oauth_manager, "_needs_rebootstrap", {}).get(aid):
+        if context.oauth_manager.is_rebootstrap_needed(aid):
             state = "needs_rebootstrap"
         accounts.append({"id": aid, "state": state})
 
@@ -903,19 +921,14 @@ async def _handle_list_folders(context: ServerContext, arguments: dict[str, Any]
     account_id = str(arguments["account"])
     visible = context.pdp.visible_accounts_for(context.caller_id)
     if account_id not in visible.visible_account_ids:
-        return {
-            "decision": "DENY",
-            "reason": "account_hidden",
-            "account": account_id,
-            "folders": [],
-            "hidden_folders_count": 0,
-        }
-    if getattr(context.oauth_manager, "_needs_rebootstrap", {}).get(account_id):
-        return {
-            "decision": "DENY",
-            "reason": "needs_rebootstrap",
-            "account": account_id,
-        }
+        return _deny(
+            reason="account_hidden",
+            account=account_id,
+            folders=[],
+            hidden_folders_count=0,
+        )
+    if context.oauth_manager.is_rebootstrap_needed(account_id):
+        return _deny(reason="needs_rebootstrap", account=account_id)
     account_model, password = await _password_for_account(context, account_id)
     folder_infos = await imap_list_folders(account_model, password)
 
@@ -985,18 +998,13 @@ async def _handle_list_labels(context: ServerContext, arguments: dict[str, Any])
     # Provider gate: list_labels is only meaningful for Google accounts.
     account = context.account_by_id(account_id)
     if account is None or not _is_google_provider(account):
-        return {
-            "decision": "DENY",
-            "reason": "tool_not_applicable_for_provider",
-            "account": account_id,
-        }
+        return _deny(
+            reason="tool_not_applicable_for_provider",
+            account=account_id,
+        )
     visible = context.pdp.visible_accounts_for(context.caller_id)
     if account_id not in visible.visible_account_ids:
-        return {
-            "decision": "DENY",
-            "reason": "account_hidden",
-            "account": account_id,
-        }
+        return _deny(reason="account_hidden", account=account_id)
     account_model, password = await _password_for(context, account_id)
     labels = await imap_gmail_list_labels(account_model, password)
     return {
@@ -1032,49 +1040,31 @@ async def _handle_fetch_envelope(
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
+    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
-        return {
-            "decision": "ALLOW",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-            "result": "ERROR",
-            "error_type": "uid_not_found",
-        }
+        return _error(
+            error_type="uid_not_found",
+            reason=folder_decision.reason,
+            **base,
+        )
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": message_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-            "_matched_sender": facts.from_address,
-        }
+        return _deny(
+            reason=message_decision.reason,
+            _matched_sender=facts.from_address,
+            **base,
+        )
     minimum_for_tool = level_rank("ENVELOPE")
     if level_rank(message_decision.visibility) < minimum_for_tool:
-        return {
-            "decision": "DENY",
-            "reason": "visibility_below_ENVELOPE",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason="visibility_below_ENVELOPE", **base)
     granted = level_rank(message_decision.visibility)
     body_visible = granted >= level_rank("BODY")
     attachments_visible = granted >= level_rank("FULL")
@@ -1110,49 +1100,28 @@ async def _handle_fetch_body(context: ServerContext, arguments: dict[str, Any]) 
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
+    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     result = await imap_fetch_body(account, password, imap_folder, uid)
     if result is None:
-        return {
-            "decision": "ALLOW",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-            "result": "ERROR",
-            "error_type": "uid_not_found",
-        }
+        return _error(
+            error_type="uid_not_found",
+            reason=folder_decision.reason,
+            **base,
+        )
     envelope, body_text = result
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": message_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=message_decision.reason, **base)
     minimum_for_tool = level_rank("BODY")
     if level_rank(message_decision.visibility) < minimum_for_tool:
-        return {
-            "decision": "DENY",
-            "reason": "visibility_below_BODY",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason="visibility_below_BODY", **base)
     return {
         "decision": "ALLOW",
         "reason": message_decision.reason,
@@ -1184,46 +1153,22 @@ async def _handle_fetch_headers(
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
+    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "uid_not_found",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _error(error_type="uid_not_found", **base)
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": message_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=message_decision.reason, **base)
     if level_rank(message_decision.visibility) < level_rank("HEADERS"):
-        return {
-            "decision": "DENY",
-            "reason": "visibility_below_HEADERS",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason="visibility_below_HEADERS", **base)
     raw = await imap_fetch_full_message(account, password, imap_folder, uid)
     headers: dict[str, str] = {}
     if raw is not None:
@@ -1251,56 +1196,25 @@ async def _handle_fetch_attachment(
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
     part_id = arguments.get("part_id")
+    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "uid_not_found",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _error(error_type="uid_not_found", **base)
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": message_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=message_decision.reason, **base)
     if level_rank(message_decision.visibility) < level_rank("FULL"):
-        return {
-            "decision": "DENY",
-            "reason": "visibility_below_FULL",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason="visibility_below_FULL", **base)
     raw = await imap_fetch_full_message(account, password, imap_folder, uid)
     if raw is None:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "uid_not_found",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _error(error_type="uid_not_found", **base)
     msg = email.message_from_bytes(raw)
     all_parts = []
     for part in msg.walk():
@@ -1320,14 +1234,7 @@ async def _handle_fetch_attachment(
             all_parts.append(part)
 
     if not all_parts:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "attachment_not_found",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _error(error_type="attachment_not_found", **base)
 
     if part_id is None:
         attachments_meta = []
@@ -1354,14 +1261,7 @@ async def _handle_fetch_attachment(
             selected_part = p
             break
     if selected_part is None:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "attachment_not_found",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _error(error_type="attachment_not_found", **base)
     import base64
 
     payload = selected_part.get_payload(decode=True) or b""
@@ -1388,14 +1288,10 @@ async def _handle_fetch_attachment(
 async def _handle_folder_stats(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
+    base = {"account": account_id, "folder": folder_path}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     # folder_stats does not need to match per-message sender rules;
     # it needs the *folder* to be reachable at at least COUNT. For a
@@ -1407,24 +1303,16 @@ async def _handle_folder_stats(context: ServerContext, arguments: dict[str, Any]
         default=level_rank(folder_decision.folder_policy.default),
     )
     if effective_ceiling < level_rank("COUNT"):
-        return {
-            "decision": "DENY",
-            "reason": "visibility_below_COUNT",
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(reason="visibility_below_COUNT", **base)
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     result = await imap_folder_stats(account, password, imap_folder)
     if result is None:
-        return {
-            "decision": "ALLOW",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "result": "ERROR",
-            "error_type": "folder_not_found",
-        }
+        return _error(
+            error_type="folder_not_found",
+            reason=folder_decision.reason,
+            **base,
+        )
     total, uids = result
     # Determine how many of those messages the caller can actually see
     # (applies sender rules). For now we treat all messages equally
@@ -1633,61 +1521,39 @@ async def _handle_mark_seen(context: ServerContext, arguments: dict[str, Any]) -
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
     seen = bool(arguments["seen"])
+    base = {"account": account_id, "folder": folder_path, "uid": uid}
 
     account = context.account_by_id(account_id)
     if account and account.auth and account.auth.type == "xoauth2":
         scope = account.auth.oauth_scope or ""
         if "readonly" in scope:
-            return {
-                "decision": "DENY",
-                "reason": "oauth_scope_insufficient",
-                "required_scope": "https://mail.google.com/",
-                "granted_scope": scope,
-                "account": account_id,
-                "folder": folder_path,
-                "uid": uid,
-            }
+            return _deny(
+                reason="oauth_scope_insufficient",
+                required_scope="https://mail.google.com/",
+                granted_scope=scope,
+                **base,
+            )
 
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     if not folder_decision.folder_policy.mark_seen:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "mark_seen",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="mark_seen",
+            **base,
+        )
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     ok = await imap_store_flag(account, password, imap_folder, uid, r"\Seen", add=seen)
     if not ok:
-        return {
-            "decision": "ALLOW",
-            "reason": "rule_matched",
-            "result": "ERROR",
-            "error_type": "uid_not_found",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
-    return {
-        "decision": "ALLOW",
-        "reason": "rule_matched",
-        "result": "OK",
-        "account": account_id,
-        "folder": folder_path,
-        "uid": uid,
-    }
+        return _error(
+            error_type="uid_not_found",
+            reason="rule_matched",
+            **base,
+        )
+    return _ok(reason="rule_matched", **base)
 
 
 async def _handle_bulk_mark_seen(
@@ -1699,47 +1565,27 @@ async def _handle_bulk_mark_seen(
     folder_path = str(arguments["folder"])
     criteria_raw = arguments.get("criteria", {})
     seen = bool(arguments["seen"])
+    base = {"account": account_id, "folder": folder_path}
 
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     if not folder_decision.folder_policy.mark_seen:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "mark_seen",
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="mark_seen",
+            **base,
+        )
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     uids = await imap_search_uids(account, password, imap_folder, imap_criteria)
     if not uids:
-        return {
-            "decision": "ALLOW",
-            "reason": "rule_matched",
-            "result": "OK",
-            "account": account_id,
-            "folder": folder_path,
-            "marked_count": 0,
-        }
+        return _ok(reason="rule_matched", marked_count=0, **base)
     count = await imap_store_flags_batch(account, password, imap_folder, uids, r"\Seen", add=seen)
-    return {
-        "decision": "ALLOW",
-        "reason": "rule_matched",
-        "result": "OK",
-        "account": account_id,
-        "folder": folder_path,
-        "marked_count": count,
-    }
+    return _ok(reason="rule_matched", marked_count=count, **base)
 
 
 async def _handle_mark_tagged(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1748,45 +1594,33 @@ async def _handle_mark_tagged(context: ServerContext, arguments: dict[str, Any])
     uid = int(arguments["uid"])
     tags = list(arguments["tags"])
     mode = str(arguments["mode"])
+    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     if not folder_decision.folder_policy.mark_tagged:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "mark_tagged",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="mark_tagged",
+            **base,
+        )
     forbidden = [t for t in tags if t in _FORBIDDEN_SYSTEM_FLAGS]
     if forbidden:
-        return {
-            "decision": "DENY",
-            "reason": "forbidden_system_flag",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-            "forbidden_tags": forbidden,
-        }
+        return _deny(
+            reason="forbidden_system_flag",
+            forbidden_tags=forbidden,
+            **base,
+        )
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     ok = await imap_store_keywords(account, password, imap_folder, uid, tags, mode=mode)
+    # mark_tagged returns no `error_type` on failure (legacy shape).
     return {
         "decision": "ALLOW",
         "reason": "rule_matched",
         "result": "OK" if ok else "ERROR",
-        "account": account_id,
-        "folder": folder_path,
-        "uid": uid,
+        **base,
     }
 
 
@@ -1802,52 +1636,41 @@ async def _handle_move(context: ServerContext, arguments: dict[str, Any]) -> dic
     # Check pre-conditions that do not depend on any policy evaluation
     # first — a degenerate request like "move INBOX to INBOX" never
     # needs authorization discussion.
+    src_base = {"account": src_account, "folder": src_folder, "uid": src_uid}
     if src_account == dst_account and src_folder == dst_folder:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "same_source_and_target",
-            "account": src_account,
-            "folder": src_folder,
-            "uid": src_uid,
-        }
+        return _error(error_type="same_source_and_target", **src_base)
 
     src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
     if not src_dec.allowed:
-        return {
-            "decision": "DENY",
-            "reason": src_dec.reason,
-            "account": src_account,
-            "folder": src_folder,
-            "uid": src_uid,
-        }
+        return _deny(reason=src_dec.reason, **src_base)
     assert src_dec.folder_policy is not None
     if not src_dec.folder_policy.move_out:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "move_out",
-            "account": src_account,
-            "folder": src_folder,
-            "uid": src_uid,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="move_out",
+            **src_base,
+        )
     dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
     if not dst_dec.allowed:
-        return {
-            "decision": "DENY",
-            "reason": dst_dec.reason,
-            "account": dst_account,
-            "folder": dst_folder,
-        }
+        return _deny(
+            reason=dst_dec.reason,
+            account=dst_account,
+            folder=dst_folder,
+        )
     assert dst_dec.folder_policy is not None
     if not dst_dec.folder_policy.accept_incoming:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "accept_incoming",
-            "account": dst_account,
-            "folder": dst_folder,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="accept_incoming",
+            account=dst_account,
+            folder=dst_folder,
+        )
+    saga_base = {
+        "account": src_account,
+        "source_folder": src_folder,
+        "target_folder": dst_folder,
+        "uid": src_uid,
+    }
     if src_account == dst_account:
         account, password = await _password_for(context, src_account)
         imap_src = await _resolve_imap_folder(context, src_account, src_folder)
@@ -1868,80 +1691,22 @@ async def _handle_move(context: ServerContext, arguments: dict[str, Any]) -> dic
             try:
                 await imap_gmail_label_swap(account, password, src_uid, src_label, dst_label)
             except RuntimeError:
-                return {
-                    "decision": "ALLOW",
-                    "result": "ERROR",
-                    "error_type": "uid_not_found",
-                    "account": src_account,
-                    "folder": src_folder,
-                    "uid": src_uid,
-                }
-            return {
-                "decision": "ALLOW",
-                "result": "OK",
-                "mechanism": "gmail_label_swap",
-                "tx_id": None,
-                "account": src_account,
-                "source_folder": src_folder,
-                "target_folder": dst_folder,
-                "uid": src_uid,
-            }
+                return _error(error_type="uid_not_found", **src_base)
+            return _ok(mechanism="gmail_label_swap", tx_id=None, **saga_base)
         try:
             mechanism = await imap_move_message(account, password, imap_src, src_uid, imap_dst)
         except TargetFolderMissing:
-            return {
-                "decision": "ALLOW",
-                "result": "ERROR",
-                "error_type": "target_folder_missing",
-                "account": src_account,
-                "source_folder": src_folder,
-                "target_folder": dst_folder,
-                "uid": src_uid,
-            }
+            return _error(error_type="target_folder_missing", **saga_base)
         except UidStale:
-            return {
-                "decision": "ALLOW",
-                "result": "ERROR",
-                "error_type": "uid_stale",
-                "account": src_account,
-                "folder": src_folder,
-                "uid": src_uid,
-            }
+            return _error(error_type="uid_stale", **src_base)
         except UidNotFound:
-            return {
-                "decision": "ALLOW",
-                "result": "ERROR",
-                "error_type": "uid_not_found",
-                "account": src_account,
-                "folder": src_folder,
-                "uid": src_uid,
-            }
+            return _error(error_type="uid_not_found", **src_base)
         except RuntimeError:
-            return {
-                "decision": "ALLOW",
-                "result": "ERROR",
-                "error_type": "uid_not_found",
-                "account": src_account,
-                "folder": src_folder,
-                "uid": src_uid,
-            }
-        return {
-            "decision": "ALLOW",
-            "result": "OK",
-            "mechanism": mechanism,
-            "tx_id": None,
-            "account": src_account,
-            "source_folder": src_folder,
-            "target_folder": dst_folder,
-            "uid": src_uid,
-        }
+            return _error(error_type="uid_not_found", **src_base)
+        return _ok(mechanism=mechanism, tx_id=None, **saga_base)
     # Cross-account saga (ADR 0006).
     if context.saga is None:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "saga_not_configured",
-        }
+        return _error(error_type="saga_not_configured")
     src_acct, src_pwd = await _password_for(context, src_account)
     dst_acct, dst_pwd = await _password_for(context, dst_account)
     imap_src = await _resolve_imap_folder(context, src_account, src_folder)
@@ -1963,10 +1728,7 @@ async def _handle_move(context: ServerContext, arguments: dict[str, Any]) -> dic
         "error_type": result.error_type,
         "mechanism": result.mechanism,
         "tx_id": result.tx_id,
-        "account": src_account,
-        "source_folder": src_folder,
-        "target_folder": dst_folder,
-        "uid": src_uid,
+        **saga_base,
     }
 
 
@@ -1979,39 +1741,34 @@ async def _handle_copy(context: ServerContext, arguments: dict[str, Any]) -> dic
     dst_account = str(dst["account"])
     dst_folder = str(dst["folder"])
 
+    src_base = {"account": src_account, "folder": src_folder, "uid": src_uid}
+    saga_base = {
+        "account": src_account,
+        "source_folder": src_folder,
+        "target_folder": dst_folder,
+        "uid": src_uid,
+    }
     src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
     if not src_dec.allowed:
-        return {
-            "decision": "DENY",
-            "reason": src_dec.reason,
-            "account": src_account,
-            "folder": src_folder,
-            "uid": src_uid,
-        }
+        return _deny(reason=src_dec.reason, **src_base)
     dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
     if not dst_dec.allowed:
-        return {
-            "decision": "DENY",
-            "reason": dst_dec.reason,
-            "account": dst_account,
-            "folder": dst_folder,
-        }
+        return _deny(
+            reason=dst_dec.reason,
+            account=dst_account,
+            folder=dst_folder,
+        )
     assert dst_dec.folder_policy is not None
     if not dst_dec.folder_policy.accept_incoming:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "accept_incoming",
-            "account": dst_account,
-            "folder": dst_folder,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="accept_incoming",
+            account=dst_account,
+            folder=dst_folder,
+        )
     if src_account != dst_account:
         if context.saga is None:
-            return {
-                "decision": "ALLOW",
-                "result": "ERROR",
-                "error_type": "saga_not_configured",
-            }
+            return _error(error_type="saga_not_configured")
         src_acct, src_pwd = await _password_for(context, src_account)
         dst_acct, dst_pwd = await _password_for(context, dst_account)
         imap_src = await _resolve_imap_folder(context, src_account, src_folder)
@@ -2033,92 +1790,54 @@ async def _handle_copy(context: ServerContext, arguments: dict[str, Any]) -> dic
             "error_type": result.error_type,
             "mechanism": result.mechanism,
             "tx_id": result.tx_id,
-            "account": src_account,
-            "source_folder": src_folder,
-            "target_folder": dst_folder,
-            "uid": src_uid,
+            **saga_base,
         }
     account, password = await _password_for(context, src_account)
     imap_src = await _resolve_imap_folder(context, src_account, src_folder)
     imap_dst = await _resolve_imap_folder(context, src_account, dst_folder)
     ok = await imap_copy_message(account, password, imap_src, src_uid, imap_dst)
-    return {
-        "decision": "ALLOW",
-        "result": "OK" if ok else "ERROR",
-        "error_type": None if ok else "uid_not_found",
-        "mechanism": "native_copy",
-        "tx_id": None,
-        "account": src_account,
-        "source_folder": src_folder,
-        "target_folder": dst_folder,
-        "uid": src_uid,
-    }
+    if ok:
+        return _ok(mechanism="native_copy", tx_id=None, **saga_base)
+    return _error(
+        error_type="uid_not_found",
+        mechanism="native_copy",
+        tx_id=None,
+        **saga_base,
+    )
 
 
 async def _handle_create_draft(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     rfc822_text = str(arguments["rfc822"])
+    base = {"account": account_id, "folder": folder_path}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     if not folder_decision.folder_policy.draft_append:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "draft_append",
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="draft_append",
+            **base,
+        )
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    import asyncio as _asyncio
-
     try:
         append_result = await imap_append_message(
             account, password, imap_folder, rfc822_text.encode("utf-8")
         )
-    except _asyncio.TimeoutError:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "append_timeout",
-            "imap_response": None,
-            "account": account_id,
-            "folder": folder_path,
-        }
+    except asyncio.TimeoutError:
+        return _error(error_type="append_timeout", imap_response=None, **base)
     except Exception:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "append_failed",
-            "imap_response": None,
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _error(error_type="append_failed", imap_response=None, **base)
     if append_result.outcome == "ok":
-        return {
-            "decision": "ALLOW",
-            "result": "OK",
-            "error_type": None,
-            "imap_response": None,
-            "account": account_id,
-            "folder": folder_path,
-        }
-    return {
-        "decision": "ALLOW",
-        "result": "ERROR",
-        "error_type": "append_rejected",
-        "imap_response": append_result.imap_response,
-        "account": account_id,
-        "folder": folder_path,
-    }
+        return _ok(imap_response=None, **base)
+    return _error(
+        error_type="append_rejected",
+        imap_response=append_result.imap_response,
+        **base,
+    )
 
 
 async def _handle_create_reply_draft(
@@ -2131,57 +1850,47 @@ async def _handle_create_reply_draft(
     reply_text = str(arguments["reply_text"])
 
     if not reply_text.strip():
-        return {
-            "decision": "DENY",
-            "reason": "validation_failed",
-            "error_type": "empty_reply_text",
-            "account": account_id,
-        }
+        return _deny(
+            reason="validation_failed",
+            error_type="empty_reply_text",
+            account=account_id,
+        )
 
     src_decision = context.pdp.decide_folder_access(
         context.caller_id, account_id, source_folder
     )
     if not src_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": src_decision.reason,
-            "account": account_id,
-            "folder": source_folder,
-        }
+        return _deny(
+            reason=src_decision.reason,
+            account=account_id,
+            folder=source_folder,
+        )
 
     drafts_decision = context.pdp.decide_folder_access(
         context.caller_id, account_id, drafts_folder
     )
     if not drafts_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": drafts_decision.reason,
-            "account": account_id,
-            "folder": drafts_folder,
-        }
+        return _deny(
+            reason=drafts_decision.reason,
+            account=account_id,
+            folder=drafts_folder,
+        )
     assert drafts_decision.folder_policy is not None
     if not drafts_decision.folder_policy.draft_append:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "draft_append",
-            "account": account_id,
-            "folder": drafts_folder,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="draft_append",
+            account=account_id,
+            folder=drafts_folder,
+        )
 
     account, password = await _password_for(context, account_id)
 
+    src_base = {"account": account_id, "folder": source_folder, "uid": uid}
     imap_src = await _resolve_imap_folder(context, account_id, source_folder)
     result = await imap_fetch_message_for_reply(account, password, imap_src, uid)
     if result is None:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": "uid_not_found",
-            "account": account_id,
-            "folder": source_folder,
-            "uid": uid,
-        }
+        return _error(error_type="uid_not_found", **src_base)
     source_msg, source_body = result
 
     from email.utils import getaddresses as _ga
@@ -2204,38 +1913,16 @@ async def _handle_create_reply_draft(
         src_decision.folder_policy, facts=src_facts
     )
     if not src_msg_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": src_msg_decision.reason,
-            "account": account_id,
-            "folder": source_folder,
-            "uid": uid,
-        }
+        return _deny(reason=src_msg_decision.reason, **src_base)
     if level_rank(src_msg_decision.visibility) < level_rank("BODY"):
-        return {
-            "decision": "DENY",
-            "reason": "visibility_below_BODY",
-            "account": account_id,
-            "folder": source_folder,
-            "uid": uid,
-        }
+        return _deny(reason="visibility_below_BODY", **src_base)
 
     src_mid = source_msg.get("Message-ID")
     if not src_mid:
-        return {
-            "decision": "DENY",
-            "reason": "missing_message_id",
-            "account": account_id,
-            "folder": source_folder,
-            "uid": uid,
-        }
+        return _deny(reason="missing_message_id", **src_base)
 
     if account.identity is None:
-        return {
-            "decision": "DENY",
-            "reason": "account_identity_missing",
-            "account": account_id,
-        }
+        return _deny(reason="account_identity_missing", account=account_id)
 
     from email.header import decode_header as _dh, make_header as _mh
 
@@ -2269,16 +1956,15 @@ async def _handle_create_reply_draft(
 
     imap_dst = await _resolve_imap_folder(context, account_id, drafts_folder)
     append_result = await imap_append_message(account, password, imap_dst, rfc822_bytes)
-    ok = append_result.outcome == "ok"
-    return {
-        "decision": "ALLOW",
-        "result": "OK" if ok else "ERROR",
-        "error_type": None if ok else "append_failed",
+    reply_base = {
         "account": account_id,
         "source_folder": source_folder,
         "drafts_folder": drafts_folder,
         "uid": uid,
     }
+    if append_result.outcome == "ok":
+        return _ok(**reply_base)
+    return _error(error_type="append_failed", **reply_base)
 
 
 async def _handle_attachment_modify(
@@ -2292,36 +1978,21 @@ async def _handle_attachment_modify(
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
+    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     if not folder_decision.folder_policy.modify_message:
-        return {
-            "decision": "DENY",
-            "reason": "capability_missing",
-            "missing_capability": "modify_message",
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _deny(
+            reason="capability_missing",
+            missing_capability="modify_message",
+            **base,
+        )
     try:
         transform = build_transform(arguments)
     except Exception as exc:
-        return {
-            "decision": "ALLOW",
-            "result": "ERROR",
-            "error_type": str(exc),
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-        }
+        return _error(error_type=str(exc), **base)
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     saga_result = await context.saga.run_message_rewrite(
@@ -2332,6 +2003,8 @@ async def _handle_attachment_modify(
         uid=uid,
         transform=transform,
     )
+    # attachment_modify response keeps its tool-specific shape (mechanism,
+    # tx_id, old_uid, optional error_type/new_uid).
     result: dict[str, Any] = {
         "decision": "ALLOW",
         "result": saga_result.result,
@@ -2465,14 +2138,10 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
     criteria_raw = arguments.get("criteria") or {}
     limit = int(arguments.get("limit") or 50)
     offset = int(arguments.get("offset") or 0)
+    base = {"account": account_id, "folder": folder_path}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     minimum_for_tool = level_rank("METADATA")
     if level_rank(folder_decision.visibility) < minimum_for_tool and not any(
@@ -2481,12 +2150,7 @@ async def _handle_search(context: ServerContext, arguments: dict[str, Any]) -> d
         if rule.grant is not None
     ):
         if folder_decision.folder_policy.mode == "whitelist":
-            return {
-                "decision": "DENY",
-                "reason": "visibility_below_METADATA",
-                "account": account_id,
-                "folder": folder_path,
-            }
+            return _deny(reason="visibility_below_METADATA", **base)
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
     applied_default_scope = False
@@ -2600,14 +2264,10 @@ async def _handle_list_messages(
     limit = int(arguments.get("limit") or 20)
     offset = int(arguments.get("offset") or 0)
 
+    base = {"account": account_id, "folder": folder_path}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return {
-            "decision": "DENY",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(reason=folder_decision.reason, **base)
     assert folder_decision.folder_policy is not None
     minimum_for_tool = level_rank("METADATA")
     fp = folder_decision.folder_policy
@@ -2620,12 +2280,7 @@ async def _handle_list_messages(
         )
         and fp.mode == "whitelist"
     ):
-        return {
-            "decision": "DENY",
-            "reason": "visibility_below_METADATA",
-            "account": account_id,
-            "folder": folder_path,
-        }
+        return _deny(reason="visibility_below_METADATA", **base)
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
     applied_default_scope = False
@@ -2843,11 +2498,7 @@ def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
         new_scope = new_acct.auth.oauth_scope if new_acct.auth else None
         old_scope = old_scopes.get(new_acct.id)
         if old_scope is not None and new_scope != old_scope:
-            rebootstrap = getattr(context.oauth_manager, "_needs_rebootstrap", None)
-            if rebootstrap is None:
-                context.oauth_manager._needs_rebootstrap = {}
-                rebootstrap = context.oauth_manager._needs_rebootstrap
-            rebootstrap[new_acct.id] = True
+            context.oauth_manager._mark_rebootstrap_needed(new_acct.id)
             if audit is not None:
                 audit.write(
                     {
@@ -2899,7 +2550,6 @@ def _install_sighup_handler(context: ServerContext, config_dir: Path) -> None:
     reload. Windows lacks SIGHUP; on those platforms the registration
     is a no-op (the BDD suite runs on Linux only).
     """
-    import asyncio
     import signal
 
     if not hasattr(signal, "SIGHUP"):
@@ -2929,17 +2579,23 @@ async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
         auth_failure_reason = "unknown_caller_id"
 
     if auth_failure_reason is not None:
-        await _stdio_deny_initialize(context, caller_id, auth_failure_reason)
+        try:
+            await _stdio_deny_initialize(context, caller_id, auth_failure_reason)
+        finally:
+            await context.oauth_manager.aclose()
         return
 
     _install_sighup_handler(context, config_dir)
     app = build_server(context)
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options(),
-        )
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(
+                read_stream,
+                write_stream,
+                app.create_initialization_options(),
+            )
+    finally:
+        await context.oauth_manager.aclose()
 
 
 async def _stdio_deny_initialize(
@@ -2952,7 +2608,6 @@ async def _stdio_deny_initialize(
     The MCP client's `initialize()` reads the response, raises an
     `MCPRPCError` with the message matching `reason`, then sees EOF
     when the server exits."""
-    import asyncio as _asyncio
     import json as _json
     import sys as _sys
 
@@ -2969,7 +2624,7 @@ async def _stdio_deny_initialize(
         }
         context.audit.write(record)
 
-    loop = _asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     line = await loop.run_in_executor(None, _sys.stdin.readline)
     request_id: Any = None
     if line.strip():
@@ -3155,9 +2810,12 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
     )
     starlette_app.add_middleware(BearerAuthMiddleware)
 
-    async with session_manager.run():
-        config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
-        await uvicorn.Server(config).serve()
+    try:
+        async with session_manager.run():
+            config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
+            await uvicorn.Server(config).serve()
+    finally:
+        await context.oauth_manager.aclose()
 
 
 def _caller_id_from_env_or_exit() -> str:

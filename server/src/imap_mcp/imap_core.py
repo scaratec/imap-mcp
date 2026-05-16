@@ -15,9 +15,10 @@ logins are supported at this stage.
 
 from __future__ import annotations
 
+import asyncio
 import re
-
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from aioimaplib import IMAP4, IMAP4_SSL
 
@@ -70,14 +71,12 @@ async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
         "imap.connect",
         attributes={"imap.host": account.host, "imap.port": account.port},
     ):
-        import asyncio as _asyncio
-
         if account.port == 993:
             imap = IMAP4_SSL(host=account.host, port=account.port, timeout=timeout)
         else:
             try:
-                _r, _w = await _asyncio.wait_for(
-                    _asyncio.open_connection(account.host, account.port),
+                _r, _w = await asyncio.wait_for(
+                    asyncio.open_connection(account.host, account.port),
                     timeout=timeout,
                 )
                 _w.close()
@@ -219,7 +218,6 @@ def _imap_user_for(account: Account) -> str:
 async def fetch_envelope(account: Account, password: str, folder: str, uid: int) -> Envelope | None:
     """Fetch ENVELOPE fields of a single UID. Returns None if absent."""
     import email
-    from datetime import timezone
     from email.utils import getaddresses, parsedate_to_datetime
 
     imap = await _open_imap(account)
@@ -282,7 +280,6 @@ async def fetch_envelopes_batch(
 ) -> list[Envelope]:
     """Fetch ENVELOPE fields for multiple UIDs in a single IMAP session."""
     import email
-    from datetime import timezone
     from email.utils import getaddresses, parsedate_to_datetime
 
     if not uids:
@@ -945,9 +942,6 @@ async def append_message(
     rfc822: bytes,
     flags: tuple[str, ...] = (),
 ) -> AppendResult:
-    import asyncio
-    from datetime import datetime, timezone
-
     timeout = _append_timeout()
     imap = await _open_imap(account, timeout=timeout)
     await _authenticate_imap(imap, account, password)
