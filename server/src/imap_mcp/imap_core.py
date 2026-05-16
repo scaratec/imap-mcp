@@ -923,13 +923,28 @@ async def copy_message(
         await imap.logout()
 
 
+@dataclass(frozen=True)
+class AppendResult:
+    """Outcome of an APPEND that completed with a tagged server response.
+
+    `outcome` is "ok" when the server accepted the APPEND, "rejected"
+    when the server returned a tagged NO or BAD. `imap_response` carries
+    the verbatim reason text the server sent after the NO/BAD token, or
+    None for "ok". Failures that yield no tagged response (timeout,
+    connection lost, library errors) propagate as exceptions and are
+    NOT represented here — the caller decides how to classify them."""
+
+    outcome: str
+    imap_response: str | None
+
+
 async def append_message(
     account: Account,
     password: str,
     folder: str,
     rfc822: bytes,
     flags: tuple[str, ...] = (),
-) -> bool:
+) -> AppendResult:
     import asyncio
     from datetime import datetime, timezone
 
@@ -938,16 +953,40 @@ async def append_message(
     await _authenticate_imap(imap, account, password)
     try:
         flags_str = " ".join(flags) if flags else None
-        status, _ = await asyncio.wait_for(
-            imap.append(
-                rfc822,
-                mailbox=folder,
-                flags=flags_str,
-                date=datetime.now(tz=timezone.utc),
-            ),
-            timeout=timeout,
-        )
-        return status == "OK"
+        try:
+            response = await asyncio.wait_for(
+                imap.append(
+                    rfc822,
+                    mailbox=folder,
+                    flags=flags_str,
+                    date=datetime.now(tz=timezone.utc),
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            # aioimaplib's `connection_lost` does not fail pending
+            # futures, so a server-side connection drop while we wait
+            # for the APPEND tagged response surfaces here as a
+            # TimeoutError even though no time-based limit was the
+            # real cause. The transport's `is_closing()` flag is the
+            # only signal we have to tell the two apart.
+            transport = getattr(imap.protocol, "transport", None)
+            if transport is None or transport.is_closing():
+                raise ConnectionResetError(
+                    "IMAP connection lost while waiting for APPEND response"
+                )
+            raise
+        if response.result == "OK":
+            return AppendResult(outcome="ok", imap_response=None)
+        reason: str | None = None
+        if response.lines:
+            last = response.lines[-1]
+            if isinstance(last, (bytes, bytearray)):
+                reason = bytes(last).decode("utf-8", errors="replace")
+            else:
+                reason = str(last)
+            reason = reason.rstrip("\r\n")
+        return AppendResult(outcome="rejected", imap_response=reason)
     finally:
         try:
             await imap.logout()

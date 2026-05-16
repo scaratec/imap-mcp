@@ -914,6 +914,67 @@ def step_fault_next_append_error(context: Context, account_id: str, code: int) -
     )
 
 
+@given('the IMAP server for "{account_id}" responds to the next APPEND with NO response text "{text}"')
+def step_fault_next_append_no_text(
+    context: Context, account_id: str, text: str
+) -> None:
+    """Tagged NO with caller-chosen reason text. The proxy emits
+    `<tag> NO <text>\\r\\n` verbatim instead of forwarding the APPEND
+    upstream — the text the scenario writes is the text the wire sees."""
+    _start_imap_proxy(
+        context, account_id,
+        inject_failure_on=[
+            {
+                "command": "APPEND",
+                "remaining": 1,
+                "mode": "no_response",
+                "response_text": text,
+            }
+        ],
+    )
+
+
+@given('the IMAP server for "{account_id}" responds to the next APPEND with BAD response text "{text}"')
+def step_fault_next_append_bad_text(
+    context: Context, account_id: str, text: str
+) -> None:
+    """Tagged BAD with caller-chosen reason text. Same shape as the NO
+    variant; the proxy emits `<tag> BAD <text>\\r\\n` verbatim."""
+    _start_imap_proxy(
+        context, account_id,
+        inject_failure_on=[
+            {
+                "command": "APPEND",
+                "remaining": 1,
+                "mode": "bad_response",
+                "response_text": text,
+            }
+        ],
+    )
+
+
+@given(
+    'the IMAP server for "{account_id}" closes the connection after the next APPEND command without responding'
+)
+def step_fault_next_append_close(context: Context, account_id: str) -> None:
+    """Connection-drop injection: the proxy reads the APPEND command
+    line and immediately closes the client-facing writer without
+    sending any tagged response. The IMAP client sees a connection
+    drop with no tagged result and no timeout — the wire-level shape
+    the `append_failed` catch-all in the response contract is meant
+    to classify."""
+    _start_imap_proxy(
+        context, account_id,
+        inject_failure_on=[
+            {
+                "command": "APPEND",
+                "remaining": 1,
+                "mode": "close",
+            }
+        ],
+    )
+
+
 @given('the IMAP server for "{account_id}" responds to every APPEND with error {code:d}')
 def step_fault_every_append_error(context: Context, account_id: str, code: int) -> None:
     _ = code

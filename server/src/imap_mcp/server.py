@@ -2078,11 +2078,44 @@ async def _handle_create_draft(context: ServerContext, arguments: dict[str, Any]
         }
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    ok = await imap_append_message(account, password, imap_folder, rfc822_text.encode("utf-8"))
+    import asyncio as _asyncio
+
+    try:
+        append_result = await imap_append_message(
+            account, password, imap_folder, rfc822_text.encode("utf-8")
+        )
+    except _asyncio.TimeoutError:
+        return {
+            "decision": "ALLOW",
+            "result": "ERROR",
+            "error_type": "append_timeout",
+            "imap_response": None,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    except Exception:
+        return {
+            "decision": "ALLOW",
+            "result": "ERROR",
+            "error_type": "append_failed",
+            "imap_response": None,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    if append_result.outcome == "ok":
+        return {
+            "decision": "ALLOW",
+            "result": "OK",
+            "error_type": None,
+            "imap_response": None,
+            "account": account_id,
+            "folder": folder_path,
+        }
     return {
         "decision": "ALLOW",
-        "result": "OK" if ok else "ERROR",
-        "error_type": None if ok else "append_failed",
+        "result": "ERROR",
+        "error_type": "append_rejected",
+        "imap_response": append_result.imap_response,
         "account": account_id,
         "folder": folder_path,
     }
@@ -2235,7 +2268,8 @@ async def _handle_create_reply_draft(
     )
 
     imap_dst = await _resolve_imap_folder(context, account_id, drafts_folder)
-    ok = await imap_append_message(account, password, imap_dst, rfc822_bytes)
+    append_result = await imap_append_message(account, password, imap_dst, rfc822_bytes)
+    ok = append_result.outcome == "ok"
     return {
         "decision": "ALLOW",
         "result": "OK" if ok else "ERROR",

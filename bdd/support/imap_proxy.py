@@ -89,9 +89,11 @@ def _parse_tag_and_verb(command_line: bytes) -> tuple[bytes, str]:
     return parts[0], parts[1].decode("ascii", errors="replace").upper()
 
 
-def _consume_command_match(specs: list, verb_upper: str) -> bool:
+def _consume_command_match(specs: list, verb_upper: str) -> dict | None:
     """If any spec in `specs` matches `verb_upper` and has a non-zero
-    `remaining` slot (or `null` = unlimited), decrement and return True.
+    `remaining` slot (or `null` = unlimited), decrement and return the
+    matched spec dict. Returns None when no spec matches.
+
     Specs are mutated in place — list contents are shared with the
     `ProxySession.config` dict, which is how the count survives
     across sequential commands within a single connection."""
@@ -101,12 +103,12 @@ def _consume_command_match(specs: list, verb_upper: str) -> bool:
             continue
         remaining = spec.get("remaining")
         if remaining is None:
-            return True
+            return spec
         if remaining <= 0:
             continue
         spec["remaining"] = remaining - 1
-        return True
-    return False
+        return spec
+    return None
 
 
 def _consume_delay_match(spec: dict, verb_upper: str) -> bool:
@@ -124,15 +126,31 @@ def _consume_delay_match(spec: dict, verb_upper: str) -> bool:
     return True
 
 
-def _build_no_response(tag: bytes, verb_upper: str) -> bytes:
-    """Tagged NO line synthesised in lieu of forwarding `tag verb` to
-    upstream. The text intentionally mentions `simulated error 500` so
-    grepping the IMAP client's exception text from logs is unambiguous."""
+def _build_tagged_response(
+    tag: bytes,
+    verb_upper: str,
+    *,
+    status: str = "NO",
+    text: str | None = None,
+) -> bytes:
+    """Tagged response line synthesised in lieu of forwarding `tag verb`
+    to upstream. `status` is "NO" or "BAD". `text` is the reason text
+    after the status token; when None, the default text mentions
+    `simulated error 500` so grepping the IMAP client's exception text
+    from logs is unambiguous."""
     if not tag:
         tag = b"*"
-    return tag + b" NO [SERVERBUG] simulated error 500 (" + verb_upper.encode(
-        "ascii", "replace"
-    ) + b")\r\n"
+    status_upper = status.upper()
+    if text is None:
+        text = f"[SERVERBUG] simulated error 500 ({verb_upper})"
+    return (
+        tag
+        + b" "
+        + status_upper.encode("ascii", "replace")
+        + b" "
+        + text.encode("utf-8", "replace")
+        + b"\r\n"
+    )
 
 
 def _strip_tokens(payload: bytes, tokens: list[str]) -> bytes:
@@ -287,11 +305,36 @@ class ProxySession:
             await self._log_command(command_line)
             tag, verb = _parse_tag_and_verb(command_line)
 
-            if verb and _consume_command_match(inject_specs, verb):
-                # Synthesise a tagged NO; do NOT forward upstream. The
-                # client's APPEND-literal body never gets a `+ continue`
-                # so it stays unsent — upstream sees nothing.
-                resp = _build_no_response(tag, verb)
+            matched_spec = (
+                _consume_command_match(inject_specs, verb) if verb else None
+            )
+            if matched_spec is not None:
+                mode = (matched_spec.get("mode") or "no_response").lower()
+                # Do NOT forward upstream. The client's APPEND-literal
+                # body never gets a `+ continue` so it stays unsent —
+                # upstream sees nothing.
+                if mode == "close":
+                    # Close the client-facing writer without sending any
+                    # tagged response. The IMAP client sees a connection
+                    # drop after its command line was acknowledged on
+                    # the wire — exactly the "no tagged response, no
+                    # timeout either" surface the append_failed
+                    # catch-all maps to.
+                    try:
+                        self.client_writer.close()
+                    except Exception:
+                        pass
+                    return
+                if mode == "bad_response":
+                    status = "BAD"
+                else:
+                    status = "NO"
+                resp = _build_tagged_response(
+                    tag,
+                    verb,
+                    status=status,
+                    text=matched_spec.get("response_text"),
+                )
                 self.client_writer.write(resp)
                 try:
                     await self.client_writer.drain()
