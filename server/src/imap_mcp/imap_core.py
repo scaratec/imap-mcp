@@ -19,6 +19,7 @@ import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Literal
 
 from aioimaplib import IMAP4, IMAP4_SSL
 
@@ -931,8 +932,23 @@ class AppendResult:
     connection lost, library errors) propagate as exceptions and are
     NOT represented here — the caller decides how to classify them."""
 
-    outcome: str
+    outcome: Literal["ok", "rejected"]
     imap_response: str | None
+
+
+def _connection_lost(imap: IMAP4) -> bool:
+    """True when the IMAP connection's transport has been closed.
+
+    aioimaplib's `connection_lost` callback does not fail pending
+    futures, so a server-side connection drop while we wait for a
+    tagged response surfaces to us as an `asyncio.TimeoutError`
+    rather than a connection error. The transport's `is_closing()`
+    flag is the only signal we have to tell the two apart; this
+    helper hides the two-level attribute walk into aioimaplib's
+    internals so callers do not reach across object boundaries.
+    """
+    transport = getattr(imap.protocol, "transport", None)
+    return transport is None or transport.is_closing()
 
 
 async def append_message(
@@ -958,14 +974,7 @@ async def append_message(
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
-            # aioimaplib's `connection_lost` does not fail pending
-            # futures, so a server-side connection drop while we wait
-            # for the APPEND tagged response surfaces here as a
-            # TimeoutError even though no time-based limit was the
-            # real cause. The transport's `is_closing()` flag is the
-            # only signal we have to tell the two apart.
-            transport = getattr(imap.protocol, "transport", None)
-            if transport is None or transport.is_closing():
+            if _connection_lost(imap):
                 raise ConnectionResetError(
                     "IMAP connection lost while waiting for APPEND response"
                 )
