@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.14.0 (2026-05-16)
+
+### Features
+
+- **create_draft**: Surface IMAP APPEND rejection reason in response
+  ([`223c6e5`](https://github.com/scaratec/imap-mcp/commit/223c6e55dcdbcd5d78f9d2fba23f32b68d03cc91))
+
+
 ## v0.13.0 (2026-05-15)
 
 ### Features
