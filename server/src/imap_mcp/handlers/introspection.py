@@ -3,13 +3,55 @@ get_transaction_status, plus policy-projection helpers."""
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import Any, NotRequired, TypedDict, TYPE_CHECKING
 
 from ..policy import level_rank
 from ._common import READ_TOOL_MIN_VIS, TOOL_SET_VERSION, WRITE_TOOL_CAP
 
 if TYPE_CHECKING:
     from ..context import ServerContext
+
+
+class CallerIdentityResponse(TypedDict):
+    caller_id: str
+
+
+class TransactionStatusResponse(TypedDict, total=False):
+    tx_id: str
+    state: str
+    reason: NotRequired[str]
+    src_account: NotRequired[str]
+    src_folder: NotRequired[str]
+    src_uid: NotRequired[int]
+    dst_account: NotRequired[str]
+    dst_folder: NotRequired[str]
+    message_id: NotRequired[str]
+    retry_count: NotRequired[int]
+
+
+class FolderVisibilityEntry(TypedDict):
+    path: str
+    mode: str
+    default_visibility: str
+    max_visibility: str
+    capabilities: list[str]
+    sender_rules_count: int
+
+
+class AccountVisibilityEntry(TypedDict):
+    id: str
+    semantics: str
+    token_cache: Any
+    folders_visible: list[FolderVisibilityEntry]
+    hidden_folders_count: int
+
+
+class DescribePolicyResponse(TypedDict):
+    caller_id: str
+    tool_set_version: str
+    accounts: list[AccountVisibilityEntry]
+    hidden_accounts_count: int
+    tool_set_available: list[str]
 
 
 def _max_visibility(fp: "Any") -> str:
@@ -32,13 +74,13 @@ def _granted_caps(fp: "Any") -> list[str]:
     return caps
 
 
-def handle_get_caller_identity(context: "ServerContext") -> dict[str, Any]:
+def handle_get_caller_identity(context: "ServerContext") -> CallerIdentityResponse:
     return {"caller_id": context.caller_id}
 
 
 async def handle_get_transaction_status(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> TransactionStatusResponse:
     tx_id = str(arguments["tx_id"])
     if context.saga is None:
         return {"tx_id": tx_id, "state": "unknown", "reason": "saga_not_configured"}
@@ -68,7 +110,7 @@ async def handle_get_transaction_status(
 
 async def handle_describe_policy(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> DescribePolicyResponse:
     _ = arguments  # extra arguments are ignored deliberately (ADR 0018)
     from ..config import Configuration
 
@@ -77,12 +119,12 @@ async def handle_describe_policy(
     policy = config.policy_by_name(caller.policy) if caller is not None else None
     granted_accounts = set(policy.accounts.keys()) if policy is not None else set()
     all_accounts = [a.id for a in config.accounts_file.accounts]
-    visible_accounts: list[dict[str, Any]] = []
+    visible_accounts: list[AccountVisibilityEntry] = []
     for account in config.accounts_file.accounts:
         if account.id not in granted_accounts:
             continue
         folder_policies = policy.accounts.get(account.id, []) if policy else []
-        folders_visible = []
+        folders_visible: list[FolderVisibilityEntry] = []
         for fp in folder_policies:
             folders_visible.append(
                 {

@@ -1,13 +1,15 @@
 """Shared helpers for tool handlers.
 
 This module exposes pure helpers (`_facts_from_envelope`, alias
-resolution, password lookup, response builders) plus the per-tool
-visibility / capability tables that the dispatcher consults. Tool
-modules in `handlers/` import from here; nothing here imports back
-from a handler module.
+resolution, password lookup) plus the per-tool visibility /
+capability tables that the dispatcher consults. Tool modules in
+`handlers/` import from here; nothing here imports back from a
+handler module.
 
 The leading underscore on the file name signals: helpers, not tools.
-Phase C replaces `_deny`/`_ok`/`_error` with per-tool builders.
+Per-tool response builders + TypedDicts live in each handler module
+since Phase C; this module no longer exports generic _deny / _ok /
+_error.
 """
 
 from __future__ import annotations
@@ -48,23 +50,6 @@ WRITE_TOOL_CAP = {
     "replace_attachment": "modify_message",
     "delete_attachment": "modify_message",
 }
-
-
-def _deny(*, reason: str, **fields: Any) -> dict[str, Any]:
-    return {"decision": "DENY", "reason": reason, **fields}
-
-
-def _ok(**fields: Any) -> dict[str, Any]:
-    return {"decision": "ALLOW", "result": "OK", "error_type": None, **fields}
-
-
-def _error(*, error_type: str, **fields: Any) -> dict[str, Any]:
-    return {
-        "decision": "ALLOW",
-        "result": "ERROR",
-        "error_type": error_type,
-        **fields,
-    }
 
 
 def _facts_from_envelope(envelope: Any) -> MessageFacts:
@@ -208,9 +193,6 @@ __all__ = [
     "TOOL_SET_VERSION",
     "READ_TOOL_MIN_VIS",
     "WRITE_TOOL_CAP",
-    "_deny",
-    "_ok",
-    "_error",
     "_facts_from_envelope",
     "_get_folder_aliases",
     "_is_google_provider",

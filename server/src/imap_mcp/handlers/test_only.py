@@ -9,7 +9,7 @@ direct env-var reads with injected `TestHooks`.
 from __future__ import annotations
 
 import os
-from typing import Any, TYPE_CHECKING
+from typing import Any, NotRequired, TypedDict, TYPE_CHECKING
 
 from mcp.shared.exceptions import McpError
 from mcp.types import ErrorData
@@ -18,9 +18,22 @@ if TYPE_CHECKING:
     from ..context import ServerContext
 
 
+class TestRecoveryResponse(TypedDict, total=False):
+    processed: int
+    passes: NotRequired[int]
+    reason: NotRequired[str]
+
+
+class TestAuditRotationResponse(TypedDict, total=False):
+    reason: NotRequired[str]
+    # AuditWriter.rotate() may return arbitrary summary fields; we widen
+    # via total=False rather than enumerate them since this surface is
+    # test-only and changes with the audit module.
+
+
 async def handle_test_run_recovery(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> TestRecoveryResponse:
     """Test-only: run N recovery passes. Not listed in tool discovery.
 
     Guarded by `IMAP_MCP_TEST_MODE`. The BDD harness uses this to

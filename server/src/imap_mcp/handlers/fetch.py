@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
 
 from ..imap_core import (
     fetch_body as imap_fetch_body,
@@ -11,8 +11,6 @@ from ..imap_core import (
 )
 from ..policy import evaluate_message_against_folder, level_rank
 from ._common import (
-    _deny,
-    _error,
     _facts_from_envelope,
     _password_for,
     _resolve_imap_folder,
@@ -22,37 +20,136 @@ if TYPE_CHECKING:
     from ..context import ServerContext
 
 
+class AttachmentMetaEntry(TypedDict):
+    part_id: str
+    mime_type: str
+    size_bytes: int
+
+
+class FetchResponse(TypedDict, total=False):
+    """Union shape over the four fetch handlers.
+
+    Each handler returns a strict subset of these keys; ``total=False``
+    keeps every field optional so that a single TypedDict can capture
+    the union without splitting it per-tool. The non-public ``_blob*``
+    keys are stripped by the dispatcher's ``_emit`` before the wire
+    response is built (ADR 0021 §8).
+    """
+
+    decision: Literal["ALLOW", "DENY"]
+    result: NotRequired[Literal["OK", "ERROR"]]
+    error_type: NotRequired[str | None]
+    reason: NotRequired[str]
+    visibility_applied: NotRequired[str]
+    matched_rule_index: NotRequired[int | None]
+    account: str
+    folder: str
+    uid: int
+    # Envelope payload
+    from_: NotRequired[str]  # not actually used; "from" is reserved keyword
+    to: NotRequired[tuple[str, ...] | list[str]]
+    subject: NotRequired[str]
+    message_id: NotRequired[str | None]
+    date: NotRequired[str | None]
+    body: NotRequired[str | None]
+    text_body: NotRequired[str]
+    attachments: NotRequired[list[AttachmentMetaEntry] | list[Any] | None]
+    redacted_fields: NotRequired[list[str]]
+    redaction_reason: NotRequired[str | None]
+    # fetch_headers payload
+    headers: NotRequired[dict[str, str]]
+    # fetch_attachment selected-part payload
+    part_id: NotRequired[str]
+    mime_type: NotRequired[str]
+    size_bytes: NotRequired[int]
+    content_hash: NotRequired[str]
+    # Dispatcher-stripped blob keys (private)
+    _blob: NotRequired[str]
+    _blob_mime_type: NotRequired[str]
+    _blob_uri: NotRequired[str]
+    # Private hint for audit sender-hashing in dispatch
+    _matched_sender: NotRequired[str]
+
+
+def _deny_fetch(
+    *,
+    reason: str,
+    account: str,
+    folder: str,
+    uid: int,
+    matched_sender: str | None = None,
+) -> FetchResponse:
+    response: FetchResponse = {
+        "decision": "DENY",
+        "reason": reason,
+        "account": account,
+        "folder": folder,
+        "uid": uid,
+    }
+    if matched_sender is not None:
+        response["_matched_sender"] = matched_sender
+    return response
+
+
+def _error_fetch(
+    *,
+    error_type: str,
+    account: str,
+    folder: str,
+    uid: int,
+    reason: str | None = None,
+) -> FetchResponse:
+    response: FetchResponse = {
+        "decision": "ALLOW",
+        "result": "ERROR",
+        "error_type": error_type,
+        "account": account,
+        "folder": folder,
+        "uid": uid,
+    }
+    if reason is not None:
+        response["reason"] = reason
+    return response
+
+
 async def handle_fetch_envelope(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> FetchResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return _deny(reason=folder_decision.reason, **base)
+        return _deny_fetch(
+            reason=folder_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
-        return _error(
+        return _error_fetch(
             error_type="uid_not_found",
+            account=account_id,
+            folder=folder_path,
+            uid=uid,
             reason=folder_decision.reason,
-            **base,
         )
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
-        return _deny(
+        return _deny_fetch(
             reason=message_decision.reason,
-            _matched_sender=facts.from_address,
-            **base,
+            account=account_id,
+            folder=folder_path,
+            uid=uid,
+            matched_sender=facts.from_address,
         )
     minimum_for_tool = level_rank("ENVELOPE")
     if level_rank(message_decision.visibility) < minimum_for_tool:
-        return _deny(reason="visibility_below_ENVELOPE", **base)
+        return _deny_fetch(
+            reason="visibility_below_ENVELOPE", account=account_id, folder=folder_path, uid=uid
+        )
     granted = level_rank(message_decision.visibility)
     body_visible = granted >= level_rank("BODY")
     attachments_visible = granted >= level_rank("FULL")
@@ -72,7 +169,7 @@ async def handle_fetch_envelope(
         "account": account_id,
         "folder": folder_path,
         "uid": uid,
-        "from": envelope.from_address,
+        "from": envelope.from_address,  # type: ignore[typeddict-unknown-key]
         "to": envelope.to_addresses,
         "subject": envelope.subject,
         "message_id": envelope.message_id,
@@ -84,32 +181,41 @@ async def handle_fetch_envelope(
     }
 
 
-async def handle_fetch_body(context: "ServerContext", arguments: dict[str, Any]) -> dict[str, Any]:
+async def handle_fetch_body(
+    context: "ServerContext", arguments: dict[str, Any]
+) -> FetchResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return _deny(reason=folder_decision.reason, **base)
+        return _deny_fetch(
+            reason=folder_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     result = await imap_fetch_body(account, password, imap_folder, uid)
     if result is None:
-        return _error(
+        return _error_fetch(
             error_type="uid_not_found",
+            account=account_id,
+            folder=folder_path,
+            uid=uid,
             reason=folder_decision.reason,
-            **base,
         )
     envelope, body_text = result
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
-        return _deny(reason=message_decision.reason, **base)
+        return _deny_fetch(
+            reason=message_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
     minimum_for_tool = level_rank("BODY")
     if level_rank(message_decision.visibility) < minimum_for_tool:
-        return _deny(reason="visibility_below_BODY", **base)
+        return _deny_fetch(
+            reason="visibility_below_BODY", account=account_id, folder=folder_path, uid=uid
+        )
     return {
         "decision": "ALLOW",
         "reason": message_decision.reason,
@@ -117,7 +223,7 @@ async def handle_fetch_body(context: "ServerContext", arguments: dict[str, Any])
         "account": account_id,
         "folder": folder_path,
         "uid": uid,
-        "from": envelope.from_address,
+        "from": envelope.from_address,  # type: ignore[typeddict-unknown-key]
         "subject": envelope.subject,
         "text_body": body_text,
         "matched_rule_index": message_decision.matched_rule_index,
@@ -135,28 +241,35 @@ async def handle_fetch_body(context: "ServerContext", arguments: dict[str, Any])
 
 async def handle_fetch_headers(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> FetchResponse:
     import email
 
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return _deny(reason=folder_decision.reason, **base)
+        return _deny_fetch(
+            reason=folder_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
-        return _error(error_type="uid_not_found", **base)
+        return _error_fetch(
+            error_type="uid_not_found", account=account_id, folder=folder_path, uid=uid
+        )
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
-        return _deny(reason=message_decision.reason, **base)
+        return _deny_fetch(
+            reason=message_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
     if level_rank(message_decision.visibility) < level_rank("HEADERS"):
-        return _deny(reason="visibility_below_HEADERS", **base)
+        return _deny_fetch(
+            reason="visibility_below_HEADERS", account=account_id, folder=folder_path, uid=uid
+        )
     raw = await imap_fetch_full_message(account, password, imap_folder, uid)
     headers: dict[str, str] = {}
     if raw is not None:
@@ -176,7 +289,7 @@ async def handle_fetch_headers(
 
 async def handle_fetch_attachment(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> FetchResponse:
     import email
     import hashlib
 
@@ -184,25 +297,34 @@ async def handle_fetch_attachment(
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
     part_id = arguments.get("part_id")
-    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return _deny(reason=folder_decision.reason, **base)
+        return _deny_fetch(
+            reason=folder_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
     assert folder_decision.folder_policy is not None
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
     if envelope is None:
-        return _error(error_type="uid_not_found", **base)
+        return _error_fetch(
+            error_type="uid_not_found", account=account_id, folder=folder_path, uid=uid
+        )
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
-        return _deny(reason=message_decision.reason, **base)
+        return _deny_fetch(
+            reason=message_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
     if level_rank(message_decision.visibility) < level_rank("FULL"):
-        return _deny(reason="visibility_below_FULL", **base)
+        return _deny_fetch(
+            reason="visibility_below_FULL", account=account_id, folder=folder_path, uid=uid
+        )
     raw = await imap_fetch_full_message(account, password, imap_folder, uid)
     if raw is None:
-        return _error(error_type="uid_not_found", **base)
+        return _error_fetch(
+            error_type="uid_not_found", account=account_id, folder=folder_path, uid=uid
+        )
     msg = email.message_from_bytes(raw)
     all_parts = []
     for part in msg.walk():
@@ -222,10 +344,12 @@ async def handle_fetch_attachment(
             all_parts.append(part)
 
     if not all_parts:
-        return _error(error_type="attachment_not_found", **base)
+        return _error_fetch(
+            error_type="attachment_not_found", account=account_id, folder=folder_path, uid=uid
+        )
 
     if part_id is None:
-        attachments_meta = []
+        attachments_meta: list[AttachmentMetaEntry] = []
         for p in all_parts:
             p_payload = p.get_payload(decode=True) or b""
             attachments_meta.append({
@@ -249,7 +373,9 @@ async def handle_fetch_attachment(
             selected_part = p
             break
     if selected_part is None:
-        return _error(error_type="attachment_not_found", **base)
+        return _error_fetch(
+            error_type="attachment_not_found", account=account_id, folder=folder_path, uid=uid
+        )
     import base64
 
     payload = selected_part.get_payload(decode=True) or b""

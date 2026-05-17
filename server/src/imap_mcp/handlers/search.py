@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
 
 from ..imap_core import (
     fetch_envelopes_batch as imap_fetch_envelopes_batch,
@@ -17,7 +17,6 @@ from ..policy import (
     level_rank,
 )
 from ._common import (
-    _deny,
     _facts_from_envelope,
     _is_google_provider,
     _password_for,
@@ -26,6 +25,63 @@ from ._common import (
 
 if TYPE_CHECKING:
     from ..context import ServerContext
+
+
+class GmailSearchEntry(TypedDict, total=False):
+    uid: int
+    gm_msgid: NotRequired[str]
+    canonical_all_mail_uid: NotRequired[int]
+
+
+class SearchResponse(TypedDict, total=False):
+    decision: Literal["ALLOW", "DENY"]
+    reason: NotRequired[str]
+    account: str
+    folder: str
+    uids: NotRequired[list[int]]
+    matched_total: NotRequired[int]
+    matched_visible: NotRequired[int]
+    filtered_out: NotRequired[int]
+    page_offset: NotRequired[int]
+    page_limit: NotRequired[int]
+    has_more: NotRequired[bool]
+    default_scope: NotRequired[str]
+    gmail_results: NotRequired[list[GmailSearchEntry]]
+
+
+class MessageEntry(TypedDict):
+    uid: int
+    from_: str  # placeholder; real key is "from"
+    to: tuple[str, ...] | list[str]
+    subject: str
+    date: str | None
+    has_attachment: bool
+    size_bytes: int
+
+
+class ListMessagesResponse(TypedDict, total=False):
+    decision: Literal["ALLOW", "DENY"]
+    reason: NotRequired[str]
+    account: str
+    folder: str
+    messages: NotRequired[list[dict[str, Any]]]
+    matched_total: NotRequired[int]
+    matched_visible: NotRequired[int]
+    filtered_out: NotRequired[int]
+    page_offset: NotRequired[int]
+    page_limit: NotRequired[int]
+    has_more: NotRequired[bool]
+    default_scope: NotRequired[str]
+
+
+def _deny_search(*, reason: str, account: str, folder: str) -> SearchResponse:
+    return {"decision": "DENY", "reason": reason, "account": account, "folder": folder}
+
+
+def _deny_list_messages(
+    *, reason: str, account: str, folder: str
+) -> ListMessagesResponse:
+    return {"decision": "DENY", "reason": reason, "account": account, "folder": folder}
 
 
 def _criteria_match(criteria: dict[str, Any], facts: MessageFacts) -> bool:
@@ -83,16 +139,15 @@ def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> dict[str, Any]:
+async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> SearchResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     criteria_raw = arguments.get("criteria") or {}
     limit = int(arguments.get("limit") or 50)
     offset = int(arguments.get("offset") or 0)
-    base = {"account": account_id, "folder": folder_path}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return _deny(reason=folder_decision.reason, **base)
+        return _deny_search(reason=folder_decision.reason, account=account_id, folder=folder_path)
     assert folder_decision.folder_policy is not None
     minimum_for_tool = level_rank("METADATA")
     if level_rank(folder_decision.visibility) < minimum_for_tool and not any(
@@ -101,7 +156,9 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
         if rule.grant is not None
     ):
         if folder_decision.folder_policy.mode == "whitelist":
-            return _deny(reason="visibility_below_METADATA", **base)
+            return _deny_search(
+                reason="visibility_below_METADATA", account=account_id, folder=folder_path
+            )
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
     applied_default_scope = False
@@ -164,12 +221,12 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
     page = all_visible[offset : offset + limit]
     has_more = (offset + limit) < len(all_visible)
 
-    results_with_gmail: list[dict[str, Any]] | None = None
+    results_with_gmail: list[GmailSearchEntry] | None = None
     account_obj = context.account_by_id(account_id)
     if account_obj is not None and _is_google_provider(account_obj) and page and len(page) <= 10:
         results_with_gmail = []
         for vuid in page:
-            entry: dict[str, Any] = {"uid": vuid}
+            entry: GmailSearchEntry = {"uid": vuid}
             try:
                 gm_msgid = await imap_gmail_fetch_msgid(account, password, imap_folder, vuid)
                 if gm_msgid is not None:
@@ -186,7 +243,7 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
                 pass
             results_with_gmail.append(entry)
 
-    result: dict[str, Any] = {
+    result: SearchResponse = {
         "decision": "ALLOW",
         "reason": "rule_matched" if all_visible else "folder_default_applied",
         "account": account_id,
@@ -208,17 +265,18 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
 
 async def handle_list_messages(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> ListMessagesResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     criteria_raw = arguments.get("criteria") or {}
     limit = int(arguments.get("limit") or 20)
     offset = int(arguments.get("offset") or 0)
 
-    base = {"account": account_id, "folder": folder_path}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return _deny(reason=folder_decision.reason, **base)
+        return _deny_list_messages(
+            reason=folder_decision.reason, account=account_id, folder=folder_path
+        )
     assert folder_decision.folder_policy is not None
     minimum_for_tool = level_rank("METADATA")
     fp = folder_decision.folder_policy
@@ -231,7 +289,9 @@ async def handle_list_messages(
         )
         and fp.mode == "whitelist"
     ):
-        return _deny(reason="visibility_below_METADATA", **base)
+        return _deny_list_messages(
+            reason="visibility_below_METADATA", account=account_id, folder=folder_path
+        )
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
     applied_default_scope = False
@@ -299,7 +359,7 @@ async def handle_list_messages(
         envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, page_uids)
         envelope_by_uid = {e.uid: e for e in envelopes}
 
-    messages = []
+    messages: list[dict[str, Any]] = []
     for uid in page_uids:
         env = envelope_by_uid.get(uid)
         if env is None:
@@ -316,7 +376,7 @@ async def handle_list_messages(
             }
         )
 
-    result: dict[str, Any] = {
+    result: ListMessagesResponse = {
         "decision": "ALLOW",
         "reason": "rule_matched" if visible_uids else "folder_default_applied",
         "account": account_id,

@@ -9,17 +9,65 @@ defines the bytes-transform callback and passes it down.
 from __future__ import annotations
 
 import base64
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
 
 from ..imap_core import (
     mime_add_attachment,
     mime_delete_attachment,
     mime_replace_attachment,
 )
-from ._common import _deny, _error, _password_for, _resolve_imap_folder
+from ._common import _password_for, _resolve_imap_folder
 
 if TYPE_CHECKING:
     from ..context import ServerContext
+
+
+class AttachmentModifyResponse(TypedDict, total=False):
+    decision: Literal["ALLOW", "DENY"]
+    result: NotRequired[Literal["OK", "ERROR"]]
+    error_type: NotRequired[str | None]
+    reason: NotRequired[str]
+    account: str
+    folder: str
+    uid: NotRequired[int]
+    old_uid: NotRequired[int]
+    new_uid: NotRequired[int]
+    missing_capability: NotRequired[str]
+    mechanism: NotRequired[str]
+    tx_id: NotRequired[str | None]
+
+
+def _deny_attachment(
+    *,
+    reason: str,
+    account: str,
+    folder: str,
+    uid: int,
+    missing_capability: str | None = None,
+) -> AttachmentModifyResponse:
+    response: AttachmentModifyResponse = {
+        "decision": "DENY",
+        "reason": reason,
+        "account": account,
+        "folder": folder,
+        "uid": uid,
+    }
+    if missing_capability is not None:
+        response["missing_capability"] = missing_capability
+    return response
+
+
+def _error_attachment(
+    *, error_type: str, account: str, folder: str, uid: int
+) -> AttachmentModifyResponse:
+    return {
+        "decision": "ALLOW",
+        "result": "ERROR",
+        "error_type": error_type,
+        "account": account,
+        "folder": folder,
+        "uid": uid,
+    }
 
 
 async def _attachment_modify(
@@ -27,25 +75,30 @@ async def _attachment_modify(
     arguments: dict[str, Any],
     tool_name: str,
     build_transform: Any,
-) -> dict[str, Any]:
+) -> AttachmentModifyResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    base = {"account": account_id, "folder": folder_path, "uid": uid}
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return _deny(reason=folder_decision.reason, **base)
+        return _deny_attachment(
+            reason=folder_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
     assert folder_decision.folder_policy is not None
     if not folder_decision.folder_policy.modify_message:
-        return _deny(
+        return _deny_attachment(
             reason="capability_missing",
+            account=account_id,
+            folder=folder_path,
+            uid=uid,
             missing_capability="modify_message",
-            **base,
         )
     try:
         transform = build_transform(arguments)
     except Exception as exc:
-        return _error(error_type=str(exc), **base)
+        return _error_attachment(
+            error_type=str(exc), account=account_id, folder=folder_path, uid=uid
+        )
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     saga_result = await context.saga.run_message_rewrite(
@@ -58,7 +111,7 @@ async def _attachment_modify(
     )
     # attachment_modify response keeps its tool-specific shape (mechanism,
     # tx_id, old_uid, optional error_type/new_uid).
-    result: dict[str, Any] = {
+    result: AttachmentModifyResponse = {
         "decision": "ALLOW",
         "result": saga_result.result,
         "mechanism": saga_result.mechanism,
@@ -77,7 +130,7 @@ async def _attachment_modify(
 
 async def handle_add_attachment(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> AttachmentModifyResponse:
     def _build(args: dict[str, Any]) -> Any:
         content = base64.b64decode(args["content"])
         filename = args["filename"]
@@ -93,7 +146,7 @@ async def handle_add_attachment(
 
 async def handle_replace_attachment(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> AttachmentModifyResponse:
     def _build(args: dict[str, Any]) -> Any:
         new_content = base64.b64decode(args["new_content"])
         filename = args["filename"]
@@ -114,7 +167,7 @@ async def handle_replace_attachment(
 
 async def handle_delete_attachment(
     context: "ServerContext", arguments: dict[str, Any]
-) -> dict[str, Any]:
+) -> AttachmentModifyResponse:
     def _build(args: dict[str, Any]) -> Any:
         filename = args["filename"]
 

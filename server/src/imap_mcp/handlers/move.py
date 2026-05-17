@@ -7,7 +7,7 @@ IMAP MOVE because Gmail folders are label projections.
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
 
 from ..imap_core import (
     TargetFolderMissing,
@@ -18,10 +18,7 @@ from ..imap_core import (
     move_message as imap_move_message,
 )
 from ._common import (
-    _deny,
-    _error,
     _is_google_provider,
-    _ok,
     _password_for,
     _resolve_imap_folder,
 )
@@ -30,7 +27,97 @@ if TYPE_CHECKING:
     from ..context import ServerContext
 
 
-async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> dict[str, Any]:
+class MoveCopyResponse(TypedDict, total=False):
+    decision: Literal["ALLOW", "DENY"]
+    result: NotRequired[Literal["OK", "ERROR"]]
+    error_type: NotRequired[str | None]
+    reason: NotRequired[str]
+    account: NotRequired[str]
+    folder: NotRequired[str]
+    source_folder: NotRequired[str]
+    target_folder: NotRequired[str]
+    uid: NotRequired[int]
+    missing_capability: NotRequired[str]
+    mechanism: NotRequired[str]
+    tx_id: NotRequired[str | None]
+
+
+def _deny_move(
+    *,
+    reason: str,
+    account: str,
+    folder: str,
+    uid: int | None = None,
+    missing_capability: str | None = None,
+) -> MoveCopyResponse:
+    response: MoveCopyResponse = {
+        "decision": "DENY",
+        "reason": reason,
+        "account": account,
+        "folder": folder,
+    }
+    if uid is not None:
+        response["uid"] = uid
+    if missing_capability is not None:
+        response["missing_capability"] = missing_capability
+    return response
+
+
+def _ok_saga(
+    *,
+    mechanism: str,
+    account: str,
+    source_folder: str,
+    target_folder: str,
+    uid: int,
+    tx_id: str | None,
+) -> MoveCopyResponse:
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "error_type": None,
+        "mechanism": mechanism,
+        "tx_id": tx_id,
+        "account": account,
+        "source_folder": source_folder,
+        "target_folder": target_folder,
+        "uid": uid,
+    }
+
+
+def _error_saga(
+    *,
+    error_type: str,
+    account: str | None = None,
+    folder: str | None = None,
+    source_folder: str | None = None,
+    target_folder: str | None = None,
+    uid: int | None = None,
+    mechanism: str | None = None,
+    tx_id: str | None = None,
+) -> MoveCopyResponse:
+    response: MoveCopyResponse = {
+        "decision": "ALLOW",
+        "result": "ERROR",
+        "error_type": error_type,
+    }
+    if mechanism is not None:
+        response["mechanism"] = mechanism
+        response["tx_id"] = tx_id
+    if account is not None:
+        response["account"] = account
+    if folder is not None:
+        response["folder"] = folder
+    if source_folder is not None:
+        response["source_folder"] = source_folder
+    if target_folder is not None:
+        response["target_folder"] = target_folder
+    if uid is not None:
+        response["uid"] = uid
+    return response
+
+
+async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> MoveCopyResponse:
     src = arguments["source"]
     dst = arguments["target"]
     src_account = str(src["account"])
@@ -42,41 +129,39 @@ async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> di
     # Check pre-conditions that do not depend on any policy evaluation
     # first — a degenerate request like "move INBOX to INBOX" never
     # needs authorization discussion.
-    src_base = {"account": src_account, "folder": src_folder, "uid": src_uid}
     if src_account == dst_account and src_folder == dst_folder:
-        return _error(error_type="same_source_and_target", **src_base)
+        return _error_saga(
+            error_type="same_source_and_target",
+            account=src_account,
+            folder=src_folder,
+            uid=src_uid,
+        )
 
     src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
     if not src_dec.allowed:
-        return _deny(reason=src_dec.reason, **src_base)
+        return _deny_move(
+            reason=src_dec.reason, account=src_account, folder=src_folder, uid=src_uid
+        )
     assert src_dec.folder_policy is not None
     if not src_dec.folder_policy.move_out:
-        return _deny(
+        return _deny_move(
             reason="capability_missing",
+            account=src_account,
+            folder=src_folder,
+            uid=src_uid,
             missing_capability="move_out",
-            **src_base,
         )
     dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
     if not dst_dec.allowed:
-        return _deny(
-            reason=dst_dec.reason,
-            account=dst_account,
-            folder=dst_folder,
-        )
+        return _deny_move(reason=dst_dec.reason, account=dst_account, folder=dst_folder)
     assert dst_dec.folder_policy is not None
     if not dst_dec.folder_policy.accept_incoming:
-        return _deny(
+        return _deny_move(
             reason="capability_missing",
-            missing_capability="accept_incoming",
             account=dst_account,
             folder=dst_folder,
+            missing_capability="accept_incoming",
         )
-    saga_base = {
-        "account": src_account,
-        "source_folder": src_folder,
-        "target_folder": dst_folder,
-        "uid": src_uid,
-    }
     if src_account == dst_account:
         account, password = await _password_for(context, src_account)
         imap_src = await _resolve_imap_folder(context, src_account, src_folder)
@@ -97,22 +182,62 @@ async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> di
             try:
                 await imap_gmail_label_swap(account, password, src_uid, src_label, dst_label)
             except RuntimeError:
-                return _error(error_type="uid_not_found", **src_base)
-            return _ok(mechanism="gmail_label_swap", tx_id=None, **saga_base)
+                return _error_saga(
+                    error_type="uid_not_found",
+                    account=src_account,
+                    folder=src_folder,
+                    uid=src_uid,
+                )
+            return _ok_saga(
+                mechanism="gmail_label_swap",
+                tx_id=None,
+                account=src_account,
+                source_folder=src_folder,
+                target_folder=dst_folder,
+                uid=src_uid,
+            )
         try:
             mechanism = await imap_move_message(account, password, imap_src, src_uid, imap_dst)
         except TargetFolderMissing:
-            return _error(error_type="target_folder_missing", **saga_base)
+            return _error_saga(
+                error_type="target_folder_missing",
+                account=src_account,
+                source_folder=src_folder,
+                target_folder=dst_folder,
+                uid=src_uid,
+            )
         except UidStale:
-            return _error(error_type="uid_stale", **src_base)
+            return _error_saga(
+                error_type="uid_stale",
+                account=src_account,
+                folder=src_folder,
+                uid=src_uid,
+            )
         except UidNotFound:
-            return _error(error_type="uid_not_found", **src_base)
+            return _error_saga(
+                error_type="uid_not_found",
+                account=src_account,
+                folder=src_folder,
+                uid=src_uid,
+            )
         except RuntimeError:
-            return _error(error_type="uid_not_found", **src_base)
-        return _ok(mechanism=mechanism, tx_id=None, **saga_base)
+            return _error_saga(
+                error_type="uid_not_found",
+                account=src_account,
+                folder=src_folder,
+                uid=src_uid,
+            )
+        return _ok_saga(
+            mechanism=mechanism,
+            tx_id=None,
+            account=src_account,
+            source_folder=src_folder,
+            target_folder=dst_folder,
+            uid=src_uid,
+        )
     # Cross-account saga (ADR 0006).
     if context.saga is None:
-        return _error(error_type="saga_not_configured")
+        return _error_saga(error_type="saga_not_configured")
     src_acct, src_pwd = await _password_for(context, src_account)
     dst_acct, dst_pwd = await _password_for(context, dst_account)
     imap_src = await _resolve_imap_folder(context, src_account, src_folder)
@@ -134,11 +259,14 @@ async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> di
         "error_type": result.error_type,
         "mechanism": result.mechanism,
         "tx_id": result.tx_id,
-        **saga_base,
+        "account": src_account,
+        "source_folder": src_folder,
+        "target_folder": dst_folder,
+        "uid": src_uid,
     }
 
 
-async def handle_copy(context: "ServerContext", arguments: dict[str, Any]) -> dict[str, Any]:
+async def handle_copy(context: "ServerContext", arguments: dict[str, Any]) -> MoveCopyResponse:
     src = arguments["source"]
     dst = arguments["target"]
     src_account = str(src["account"])
@@ -147,34 +275,25 @@ async def handle_copy(context: "ServerContext", arguments: dict[str, Any]) -> di
     dst_account = str(dst["account"])
     dst_folder = str(dst["folder"])
 
-    src_base = {"account": src_account, "folder": src_folder, "uid": src_uid}
-    saga_base = {
-        "account": src_account,
-        "source_folder": src_folder,
-        "target_folder": dst_folder,
-        "uid": src_uid,
-    }
     src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
     if not src_dec.allowed:
-        return _deny(reason=src_dec.reason, **src_base)
+        return _deny_move(
+            reason=src_dec.reason, account=src_account, folder=src_folder, uid=src_uid
+        )
     dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
     if not dst_dec.allowed:
-        return _deny(
-            reason=dst_dec.reason,
-            account=dst_account,
-            folder=dst_folder,
-        )
+        return _deny_move(reason=dst_dec.reason, account=dst_account, folder=dst_folder)
     assert dst_dec.folder_policy is not None
     if not dst_dec.folder_policy.accept_incoming:
-        return _deny(
+        return _deny_move(
             reason="capability_missing",
-            missing_capability="accept_incoming",
             account=dst_account,
             folder=dst_folder,
+            missing_capability="accept_incoming",
         )
     if src_account != dst_account:
         if context.saga is None:
-            return _error(error_type="saga_not_configured")
+            return _error_saga(error_type="saga_not_configured")
         src_acct, src_pwd = await _password_for(context, src_account)
         dst_acct, dst_pwd = await _password_for(context, dst_account)
         imap_src = await _resolve_imap_folder(context, src_account, src_folder)
@@ -196,17 +315,30 @@ async def handle_copy(context: "ServerContext", arguments: dict[str, Any]) -> di
             "error_type": result.error_type,
             "mechanism": result.mechanism,
             "tx_id": result.tx_id,
-            **saga_base,
+            "account": src_account,
+            "source_folder": src_folder,
+            "target_folder": dst_folder,
+            "uid": src_uid,
         }
     account, password = await _password_for(context, src_account)
     imap_src = await _resolve_imap_folder(context, src_account, src_folder)
     imap_dst = await _resolve_imap_folder(context, src_account, dst_folder)
     ok = await imap_copy_message(account, password, imap_src, src_uid, imap_dst)
     if ok:
-        return _ok(mechanism="native_copy", tx_id=None, **saga_base)
-    return _error(
+        return _ok_saga(
+            mechanism="native_copy",
+            tx_id=None,
+            account=src_account,
+            source_folder=src_folder,
+            target_folder=dst_folder,
+            uid=src_uid,
+        )
+    return _error_saga(
         error_type="uid_not_found",
         mechanism="native_copy",
         tx_id=None,
-        **saga_base,
+        account=src_account,
+        source_folder=src_folder,
+        target_folder=dst_folder,
+        uid=src_uid,
     )
