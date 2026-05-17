@@ -31,7 +31,9 @@ def generate_pkce() -> tuple[str, str]:
     verifier_bytes = secrets.token_bytes(32)
     verifier = base64.urlsafe_b64encode(verifier_bytes).decode("ascii").rstrip("=")
 
-    if os.environ.get("IMAP_MCP_TEST_TAMPER_PKCE"):
+    from ..test_hooks import TestHooks
+
+    if TestHooks.from_environment().tamper_pkce:
         challenge_bytes = hashlib.sha256(b"tampered").digest()
     else:
         challenge_bytes = hashlib.sha256(verifier.encode("ascii")).digest()
@@ -131,7 +133,9 @@ def main(argv: list[str] | None = None) -> int:
     code = query["code"][0]
 
     # Exchange code for tokens
-    if os.environ.get("IMAP_MCP_TEST_TAMPER_PKCE"):
+    from ..test_hooks import TestHooks
+
+    if TestHooks.from_environment().tamper_pkce:
         print(
             "Token exchange failed: {'error': 'invalid_grant', 'error_description': 'PKCE verification failed'}",
             file=sys.stderr,

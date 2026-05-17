@@ -50,19 +50,14 @@ _LIST_LINE = re.compile(rb'\s*\((?P<flags>[^)]*)\)\s+"(?P<sep>[^"]*)"\s+(?P<name
 def _append_timeout() -> int:
     """Timeout (seconds) for IMAP4 connections that perform APPEND.
 
-    Override via `IMAP_MCP_APPEND_TIMEOUT` for scenarios that inject an
-    APPEND delay and then assert the server exits the call with a
-    timeout rather than blocking forever.
+    The BDD harness can override via ``TestHooks.append_timeout_override``
+    (env: ``IMAP_MCP_APPEND_TIMEOUT``) when injecting an APPEND delay
+    so the server returns a timeout instead of blocking forever.
     """
-    import os
+    from .test_hooks import get_global_hooks
 
-    raw = os.environ.get("IMAP_MCP_APPEND_TIMEOUT")
-    if raw:
-        try:
-            return int(raw)
-        except ValueError:
-            pass
-    return 60
+    override = get_global_hooks().append_timeout_override
+    return override if override is not None else 60
 
 
 async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:

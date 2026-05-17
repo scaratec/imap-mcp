@@ -14,14 +14,21 @@ import json
 
 from ..config import Account, Configuration
 from ..secrets import SecretStore
+from ..test_hooks import TestHooks
 
 logger = logging.getLogger(__name__)
 
 
 class OAuthManager:
-    def __init__(self, config: Configuration, secret_store: SecretStore):
+    def __init__(
+        self,
+        config: Configuration,
+        secret_store: SecretStore,
+        test_hooks: TestHooks | None = None,
+    ):
         self.config = config
         self.secret_store = secret_store
+        self._test_hooks = test_hooks or TestHooks()
         self._tokens: dict[str, dict[str, Any]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._needs_rebootstrap: dict[str, bool] = {}
@@ -72,8 +79,8 @@ class OAuthManager:
                 self._mark_rebootstrap_needed(account.id)
             raise
 
-        if "IMAP_MCP_TEST_TOKEN_LIFETIME" in os.environ:
-            expires_in = int(os.environ["IMAP_MCP_TEST_TOKEN_LIFETIME"])
+        if self._test_hooks.oauth_token_lifetime_override is not None:
+            expires_in = self._test_hooks.oauth_token_lifetime_override
 
         self._tokens[account.id] = {
             "access_token": access_token,
@@ -84,10 +91,12 @@ class OAuthManager:
         return access_token
 
     def _check_test_injection(self, account_id: str) -> None:
-        """Test-only error injection. Reads ``IMAP_MCP_TEST_OAUTH_INJECT_ERROR``;
-        raises with the same audit + rebootstrap side effects the
-        production refresh path produces for a server-side error."""
-        injected_error = os.environ.get("IMAP_MCP_TEST_OAUTH_INJECT_ERROR")
+        """Test-only error injection (``TestHooks.oauth_inject_error``).
+
+        Raises with the same audit + rebootstrap side effects the
+        production refresh path produces for a server-side error.
+        """
+        injected_error = self._test_hooks.oauth_inject_error
         if not injected_error:
             return
         self._log_audit(account_id, "DENY", injected_error)

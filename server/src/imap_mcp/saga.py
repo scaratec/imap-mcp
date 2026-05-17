@@ -45,11 +45,14 @@ def _is_google_provider(account: Account) -> bool:
 def _maybe_crash(at: str) -> None:
     """Test-only crash injection (LIM-0004 style, but for saga state).
 
-    If `IMAP_MCP_CRASH_AT` matches `at`, flush stdio and terminate
-    with `os._exit(1)`. Used by saga_crash_recovery.feature to exit
-    the server at a known WAL state.
+    If ``TestHooks.saga_crash_at`` matches ``at``, flush stdio and
+    terminate with ``os._exit(1)``. Used by
+    saga_crash_recovery.feature to exit the server at a known WAL
+    state.
     """
-    if os.environ.get("IMAP_MCP_CRASH_AT") != at:
+    from .test_hooks import get_global_hooks
+
+    if get_global_hooks().saga_crash_at != at:
         return
     try:
         sys.stdout.flush()
@@ -62,14 +65,17 @@ def _maybe_crash(at: str) -> None:
 async def _maybe_pause(at: str) -> None:
     """Test-only saga pause (ADR-0023).
 
-    If `IMAP_MCP_SAGA_PAUSE_AT` matches `at`, write the step name to
-    the marker file and poll for a `.resume` sibling. Used by
-    policy_reload.feature to hold a saga mid-flight while SIGHUP swaps
-    the policy.
+    If ``TestHooks.saga_pause_at`` matches ``at``, write the step
+    name to the marker file and poll for a ``.resume`` sibling. Used
+    by policy_reload.feature to hold a saga mid-flight while SIGHUP
+    swaps the policy.
     """
-    if os.environ.get("IMAP_MCP_SAGA_PAUSE_AT") != at:
+    from .test_hooks import get_global_hooks
+
+    hooks = get_global_hooks()
+    if hooks.saga_pause_at != at:
         return
-    marker = os.environ.get("IMAP_MCP_SAGA_PAUSE_MARKER")
+    marker = hooks.saga_pause_marker
     if not marker:
         return
     Path(marker).write_text(at)
@@ -99,11 +105,17 @@ class SagaManager:
         audit_emitter: Any | None,
         retry_limit: int = 3,
         account_resolver: AccountResolver | None = None,
+        test_hooks: Any = None,
     ) -> None:
         self.wal = wal
         self.audit = audit_emitter
         self.retry_limit = retry_limit
         self.account_resolver = account_resolver
+        # test_hooks is accepted for DI symmetry with OAuthManager and
+        # context._build_context, but the crash/pause helpers read the
+        # process-global TestHooks singleton since they fire from deep
+        # inside saga step closures without ready access to `self`.
+        self.test_hooks = test_hooks
 
     def _audit_step(
         self,

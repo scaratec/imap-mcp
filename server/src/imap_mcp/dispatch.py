@@ -488,7 +488,7 @@ def build_server(context: ServerContext) -> Server:
             "get_transaction_status",
         }
     )
-    if os.environ.get("IMAP_MCP_TEST_MODE") == "1":
+    if context.test_hooks.test_mode:
         known_tools = known_tools | {
             "_test_run_recovery",
             "_test_run_audit_rotation",

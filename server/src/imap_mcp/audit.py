@@ -49,9 +49,12 @@ FORBIDDEN_FIELDS = frozenset(
 
 
 def _now_utc() -> datetime:
-    """Wall-clock helper that honours `IMAP_MCP_FAKE_NOW_UTC` so BDD
-    scenarios can advance the clock without restarting the server."""
-    raw = os.environ.get("IMAP_MCP_FAKE_NOW_UTC")
+    """Wall-clock helper that honours ``TestHooks.fake_now_utc`` so
+    BDD scenarios can advance the clock without restarting the
+    server. Falls back to ``datetime.now`` in production."""
+    from .test_hooks import get_global_hooks
+
+    raw = get_global_hooks().fake_now_utc
     if raw:
         if raw.endswith("Z"):
             raw = raw[:-1] + "+00:00"

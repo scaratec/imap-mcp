@@ -1,14 +1,12 @@
-"""Test-only tool handlers, gated by IMAP_MCP_TEST_MODE (ADR 0023).
+"""Test-only tool handlers, gated by TestHooks.test_mode (ADR 0023).
 
 These are not listed in tool discovery and never reach a production
 caller. They exist so the BDD harness can drive deterministic
-recovery and audit-rotation scenarios. Phase D will replace the
-direct env-var reads with injected `TestHooks`.
+recovery and audit-rotation scenarios.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any, NotRequired, TypedDict, TYPE_CHECKING
 
 from mcp.shared.exceptions import McpError
@@ -36,10 +34,10 @@ async def handle_test_run_recovery(
 ) -> TestRecoveryResponse:
     """Test-only: run N recovery passes. Not listed in tool discovery.
 
-    Guarded by `IMAP_MCP_TEST_MODE`. The BDD harness uses this to
+    Guarded by ``TestHooks.test_mode``. The BDD harness uses this to
     exercise retry-limit scenarios deterministically.
     """
-    if os.environ.get("IMAP_MCP_TEST_MODE") != "1":
+    if not context.test_hooks.test_mode:
         raise McpError(ErrorData(code=-32601, message="Unknown tool: '_test_run_recovery'"))
     if context.saga is None:
         return {"processed": 0, "reason": "saga_not_configured"}
@@ -53,13 +51,13 @@ async def handle_test_run_recovery(
 async def handle_test_run_audit_rotation(
     context: "ServerContext", arguments: dict[str, Any]
 ) -> dict[str, Any]:
-    """Test-only: trigger AuditWriter.rotate() once. Reads
-    `IMAP_MCP_FAKE_NOW_UTC` from the env to advance the clock.
+    """Test-only: trigger AuditWriter.rotate() once. ``audit._now_utc``
+    reads ``TestHooks.fake_now_utc`` to advance the clock.
 
-    Guarded by `IMAP_MCP_TEST_MODE`. ADR 0023 documents the
+    Guarded by ``TestHooks.test_mode``. ADR 0023 documents the
     test-only control surface.
     """
-    if os.environ.get("IMAP_MCP_TEST_MODE") != "1":
+    if not context.test_hooks.test_mode:
         raise McpError(ErrorData(code=-32601, message="Unknown tool: '_test_run_audit_rotation'"))
     _ = arguments
     if context.audit is None:

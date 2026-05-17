@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -20,6 +20,7 @@ from .config import load_configuration
 from .policy import PolicyDecisionPoint
 from .saga import SagaManager
 from .secrets import build_secret_store
+from .test_hooks import TestHooks, set_global_hooks
 from .wal import WAL
 
 if TYPE_CHECKING:
@@ -53,6 +54,7 @@ class ServerContext:
     secret_store: "object"  # SecretStore protocol
     audit: "AuditWriter | None" = None
     saga: "SagaManager | None" = None
+    test_hooks: TestHooks = field(default_factory=TestHooks)
 
     @property
     def caller_id(self) -> str:
@@ -117,6 +119,9 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
     """
     from .config import Configuration
 
+    test_hooks = TestHooks.from_environment()
+    set_global_hooks(test_hooks)
+
     configuration: Configuration = load_configuration(config_dir)
     pdp = PolicyDecisionPoint(configuration)
     store_cfg = configuration.accounts_file.secret_store
@@ -147,11 +152,13 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
         wal = WAL(path=Path(wal_cfg.path))
         retry_limit_env = os.environ.get("IMAP_MCP_RETRY_LIMIT")
         retry_limit = int(retry_limit_env) if retry_limit_env else 3
-        saga_mgr = SagaManager(wal=wal, audit_emitter=audit_writer, retry_limit=retry_limit)
+        saga_mgr = SagaManager(
+            wal=wal, audit_emitter=audit_writer, retry_limit=retry_limit, test_hooks=test_hooks
+        )
 
     from .auth.oauth_manager import OAuthManager
 
-    oauth_manager = OAuthManager(configuration, secret_store)
+    oauth_manager = OAuthManager(configuration, secret_store, test_hooks=test_hooks)
 
     live = _LiveState(pdp=pdp, configuration=configuration, oauth_manager=oauth_manager)
     context = ServerContext(
@@ -160,6 +167,7 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
         secret_store=secret_store,
         audit=audit_writer,
         saga=saga_mgr,
+        test_hooks=test_hooks,
     )
     if saga_mgr is not None:
 
