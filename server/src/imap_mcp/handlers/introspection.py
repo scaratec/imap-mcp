@@ -1,0 +1,131 @@
+"""Introspection handlers: describe_policy, get_caller_identity,
+get_transaction_status, plus policy-projection helpers."""
+
+from __future__ import annotations
+
+from typing import Any, TYPE_CHECKING
+
+from ..policy import level_rank
+from ._common import READ_TOOL_MIN_VIS, TOOL_SET_VERSION, WRITE_TOOL_CAP
+
+if TYPE_CHECKING:
+    from ..context import ServerContext
+
+
+def _max_visibility(fp: "Any") -> str:
+    default_rank = level_rank(fp.default)
+    best = default_rank
+    for rule in fp.rules:
+        if rule.grant is not None:
+            best = max(best, level_rank(rule.grant))
+    for level in ("NONE", "COUNT", "METADATA", "ENVELOPE", "HEADERS", "BODY", "FULL"):
+        if level_rank(level) == best:  # type: ignore[arg-type]
+            return level
+    return "NONE"
+
+
+def _granted_caps(fp: "Any") -> list[str]:
+    caps: list[str] = []
+    for key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append", "modify_message"):
+        if getattr(fp, key, False):
+            caps.append(key)
+    return caps
+
+
+def handle_get_caller_identity(context: "ServerContext") -> dict[str, Any]:
+    return {"caller_id": context.caller_id}
+
+
+async def handle_get_transaction_status(
+    context: "ServerContext", arguments: dict[str, Any]
+) -> dict[str, Any]:
+    tx_id = str(arguments["tx_id"])
+    if context.saga is None:
+        return {"tx_id": tx_id, "state": "unknown", "reason": "saga_not_configured"}
+    row = context.saga.wal.get(tx_id)
+    if row is None:
+        return {"tx_id": tx_id, "state": "unknown"}
+    # Opportunistic recovery: if the tx is non-terminal, attempt one
+    # resume pass before reporting state. ADR 0007 §recovery.
+    if row["status"] in ("pending", "staged"):
+        try:
+            await context.saga.resume(row)
+        except Exception:
+            pass
+        row = context.saga.wal.get(tx_id) or row
+    return {
+        "tx_id": tx_id,
+        "state": row["status"],
+        "src_account": row["src_account"],
+        "src_folder": row["src_folder"],
+        "src_uid": row["src_uid"],
+        "dst_account": row["dst_account"],
+        "dst_folder": row["dst_folder"],
+        "message_id": row["message_id"],
+        "retry_count": row["retry_count"],
+    }
+
+
+async def handle_describe_policy(
+    context: "ServerContext", arguments: dict[str, Any]
+) -> dict[str, Any]:
+    _ = arguments  # extra arguments are ignored deliberately (ADR 0018)
+    from ..config import Configuration
+
+    config: Configuration = context.configuration  # type: ignore[assignment]
+    caller = config.caller_by_id(context.caller_id)
+    policy = config.policy_by_name(caller.policy) if caller is not None else None
+    granted_accounts = set(policy.accounts.keys()) if policy is not None else set()
+    all_accounts = [a.id for a in config.accounts_file.accounts]
+    visible_accounts: list[dict[str, Any]] = []
+    for account in config.accounts_file.accounts:
+        if account.id not in granted_accounts:
+            continue
+        folder_policies = policy.accounts.get(account.id, []) if policy else []
+        folders_visible = []
+        for fp in folder_policies:
+            folders_visible.append(
+                {
+                    "path": fp.path,
+                    "mode": fp.mode,
+                    "default_visibility": fp.default,
+                    "max_visibility": _max_visibility(fp),
+                    "capabilities": _granted_caps(fp),
+                    "sender_rules_count": len(fp.rules),
+                }
+            )
+        # Count hidden folders as total IMAP folders minus those in policy.
+        hidden_folders = 0
+        try:
+            from ..imap_core import list_folders as _list_folders
+
+            all_folder_infos = await _list_folders(
+                account,
+                context.secret_store.get(account.auth.password_secret_ref() if account.auth else "")
+                or "",
+            )
+            visible_paths = {fp.path for fp in folder_policies}
+            hidden_folders = len([fi for fi in all_folder_infos if fi.path not in visible_paths])
+        except Exception:
+            hidden_folders = 0
+        visible_accounts.append(
+            {
+                "id": account.id,
+                "semantics": "gmail-labels"
+                if account.provider in ("google", "google-mock")
+                else "imap-standard",
+                "token_cache": account.token_cache,
+                "folders_visible": folders_visible,
+                "hidden_folders_count": hidden_folders,
+            }
+        )
+    hidden_accounts = len(all_accounts) - len(visible_accounts)
+    return {
+        "caller_id": context.caller_id,
+        "tool_set_version": TOOL_SET_VERSION,
+        "accounts": visible_accounts,
+        "hidden_accounts_count": hidden_accounts,
+        "tool_set_available": list(READ_TOOL_MIN_VIS.keys())
+        + list(WRITE_TOOL_CAP.keys())
+        + ["describe_policy", "get_caller_identity", "get_transaction_status"],
+    }

@@ -1,0 +1,126 @@
+"""Attachment-rewrite handlers: add, replace, delete.
+
+All three tools delegate to the shared `_attachment_modify` saga
+wrapper which performs the FETCH-APPEND-DELETE rewrite through the
+WAL-backed SagaManager.run_message_rewrite. Each public handler
+defines the bytes-transform callback and passes it down.
+"""
+
+from __future__ import annotations
+
+import base64
+from typing import Any, TYPE_CHECKING
+
+from ..imap_core import (
+    mime_add_attachment,
+    mime_delete_attachment,
+    mime_replace_attachment,
+)
+from ._common import _deny, _error, _password_for, _resolve_imap_folder
+
+if TYPE_CHECKING:
+    from ..context import ServerContext
+
+
+async def _attachment_modify(
+    context: "ServerContext",
+    arguments: dict[str, Any],
+    tool_name: str,
+    build_transform: Any,
+) -> dict[str, Any]:
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+    uid = int(arguments["uid"])
+    base = {"account": account_id, "folder": folder_path, "uid": uid}
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return _deny(reason=folder_decision.reason, **base)
+    assert folder_decision.folder_policy is not None
+    if not folder_decision.folder_policy.modify_message:
+        return _deny(
+            reason="capability_missing",
+            missing_capability="modify_message",
+            **base,
+        )
+    try:
+        transform = build_transform(arguments)
+    except Exception as exc:
+        return _error(error_type=str(exc), **base)
+    account, password = await _password_for(context, account_id)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    saga_result = await context.saga.run_message_rewrite(
+        caller_id=context.caller_id,
+        account=account,
+        password=password,
+        folder=imap_folder,
+        uid=uid,
+        transform=transform,
+    )
+    # attachment_modify response keeps its tool-specific shape (mechanism,
+    # tx_id, old_uid, optional error_type/new_uid).
+    result: dict[str, Any] = {
+        "decision": "ALLOW",
+        "result": saga_result.result,
+        "mechanism": saga_result.mechanism,
+        "tx_id": saga_result.tx_id,
+        "account": account_id,
+        "folder": folder_path,
+        "old_uid": uid,
+    }
+    if saga_result.error_type:
+        result["error_type"] = saga_result.error_type
+    tx = context.saga.wal.get(saga_result.tx_id)
+    if tx and tx.get("target_uid"):
+        result["new_uid"] = tx["target_uid"]
+    return result
+
+
+async def handle_add_attachment(
+    context: "ServerContext", arguments: dict[str, Any]
+) -> dict[str, Any]:
+    def _build(args: dict[str, Any]) -> Any:
+        content = base64.b64decode(args["content"])
+        filename = args["filename"]
+        mime_type = args["mime_type"]
+
+        def transform(rfc822: bytes) -> bytes:
+            return mime_add_attachment(rfc822, filename, mime_type, content)
+
+        return transform
+
+    return await _attachment_modify(context, arguments, "add_attachment", _build)
+
+
+async def handle_replace_attachment(
+    context: "ServerContext", arguments: dict[str, Any]
+) -> dict[str, Any]:
+    def _build(args: dict[str, Any]) -> Any:
+        new_content = base64.b64decode(args["new_content"])
+        filename = args["filename"]
+        new_mime_type = args.get("new_mime_type")
+        new_filename = args.get("new_filename")
+
+        def transform(rfc822: bytes) -> bytes:
+            return mime_replace_attachment(
+                rfc822, filename, new_content,
+                new_mime_type=new_mime_type,
+                new_filename=new_filename,
+            )
+
+        return transform
+
+    return await _attachment_modify(context, arguments, "replace_attachment", _build)
+
+
+async def handle_delete_attachment(
+    context: "ServerContext", arguments: dict[str, Any]
+) -> dict[str, Any]:
+    def _build(args: dict[str, Any]) -> Any:
+        filename = args["filename"]
+
+        def transform(rfc822: bytes) -> bytes:
+            return mime_delete_attachment(rfc822, filename)
+
+        return transform
+
+    return await _attachment_modify(context, arguments, "delete_attachment", _build)
