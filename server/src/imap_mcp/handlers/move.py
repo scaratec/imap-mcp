@@ -117,7 +117,132 @@ def _error_saga(
     return response
 
 
+async def _handle_move_gmail_label_swap(
+    context: "ServerContext",
+    *,
+    src_account: str,
+    src_folder: str,
+    dst_folder: str,
+    src_uid: int,
+) -> MoveCopyResponse:
+    """Gmail intra-account branch: remove the source label and add the
+    target label. Gmail folders are label projections over a single
+    [Gmail]/All Mail store, so this is the correct primitive instead
+    of IMAP MOVE."""
+    from ..imap_core import _LABEL_TO_FOLDER
+
+    account, password = await _password_for(context, src_account)
+    folder_to_label: dict[str, str] = {v: k for k, v in _LABEL_TO_FOLDER.items()}
+    src_label = folder_to_label.get(src_folder, src_folder)
+    dst_label = folder_to_label.get(dst_folder, dst_folder)
+    try:
+        await imap_gmail_label_swap(account, password, src_uid, src_label, dst_label)
+    except RuntimeError:
+        return _error_saga(
+            error_type="uid_not_found",
+            account=src_account,
+            folder=src_folder,
+            uid=src_uid,
+        )
+    return _ok_saga(
+        mechanism="gmail_label_swap",
+        tx_id=None,
+        account=src_account,
+        source_folder=src_folder,
+        target_folder=dst_folder,
+        uid=src_uid,
+    )
+
+
+async def _handle_move_intra_account_standard(
+    context: "ServerContext",
+    *,
+    src_account: str,
+    src_folder: str,
+    dst_folder: str,
+    src_uid: int,
+) -> MoveCopyResponse:
+    """Non-Gmail intra-account branch: native IMAP MOVE, falling back
+    to COPY+DELETE inside ``imap_move_message``. The four except arms
+    surface each known failure mode as its own ``error_type``."""
+    account, password = await _password_for(context, src_account)
+    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
+    imap_dst = await _resolve_imap_folder(context, src_account, dst_folder)
+    try:
+        mechanism = await imap_move_message(account, password, imap_src, src_uid, imap_dst)
+    except TargetFolderMissing:
+        return _error_saga(
+            error_type="target_folder_missing",
+            account=src_account,
+            source_folder=src_folder,
+            target_folder=dst_folder,
+            uid=src_uid,
+        )
+    except UidStale:
+        return _error_saga(
+            error_type="uid_stale", account=src_account, folder=src_folder, uid=src_uid
+        )
+    except (UidNotFound, RuntimeError):
+        return _error_saga(
+            error_type="uid_not_found", account=src_account, folder=src_folder, uid=src_uid
+        )
+    return _ok_saga(
+        mechanism=mechanism,
+        tx_id=None,
+        account=src_account,
+        source_folder=src_folder,
+        target_folder=dst_folder,
+        uid=src_uid,
+    )
+
+
+async def _handle_move_cross_account(
+    context: "ServerContext",
+    *,
+    src_account: str,
+    src_folder: str,
+    src_uid: int,
+    dst_account: str,
+    dst_folder: str,
+) -> MoveCopyResponse:
+    """Cross-account branch: the saga (ADR 0006) drives BEGIN → FETCH
+    src → APPEND dst → VERIFY → DELETE src → COMMIT with WAL-backed
+    recovery."""
+    if context.saga is None:
+        return _error_saga(error_type="saga_not_configured")
+    src_acct, src_pwd = await _password_for(context, src_account)
+    dst_acct, dst_pwd = await _password_for(context, dst_account)
+    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
+    imap_dst = await _resolve_imap_folder(context, dst_account, dst_folder)
+    result = await context.saga.run_cross_account_move(
+        caller_id=context.caller_id,
+        src_account=src_acct,
+        src_password=src_pwd,
+        src_folder=imap_src,
+        src_uid=src_uid,
+        dst_account=dst_acct,
+        dst_password=dst_pwd,
+        dst_folder=imap_dst,
+        delete_source=True,
+    )
+    return {
+        "decision": "ALLOW",
+        "result": result.result,
+        "error_type": result.error_type,
+        "mechanism": result.mechanism,
+        "tx_id": result.tx_id,
+        "account": src_account,
+        "source_folder": src_folder,
+        "target_folder": dst_folder,
+        "uid": src_uid,
+    }
+
+
 async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> MoveCopyResponse:
+    """Top-level orchestrator: validation gates first, then dispatch
+    to one of the three branches (Gmail label-swap, native IMAP MOVE,
+    cross-account saga). The validation gates are pre-policy, then
+    src + dst folder-access decisions, then write capabilities."""
     src = arguments["source"]
     dst = arguments["target"]
     src_account = str(src["account"])
@@ -126,9 +251,8 @@ async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> Mo
     dst_account = str(dst["account"])
     dst_folder = str(dst["folder"])
 
-    # Check pre-conditions that do not depend on any policy evaluation
-    # first — a degenerate request like "move INBOX to INBOX" never
-    # needs authorization discussion.
+    # Pre-policy gate: a degenerate "move INBOX to INBOX" never needs
+    # authorization discussion.
     if src_account == dst_account and src_folder == dst_folder:
         return _error_saga(
             error_type="same_source_and_target",
@@ -162,108 +286,33 @@ async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> Mo
             folder=dst_folder,
             missing_capability="accept_incoming",
         )
-    if src_account == dst_account:
-        account, password = await _password_for(context, src_account)
-        imap_src = await _resolve_imap_folder(context, src_account, src_folder)
-        imap_dst = await _resolve_imap_folder(context, src_account, dst_folder)
-        # Gmail label-swap: for Google accounts, intra-account moves
-        # are implemented as label remove + label add instead of IMAP
-        # MOVE, because Gmail folders are label projections over a
-        # single [Gmail]/All Mail store.
-        account_obj = context.account_by_id(src_account)
-        if account_obj is not None and _is_google_provider(account_obj):
-            from ..imap_core import _LABEL_TO_FOLDER  # noqa: F811
 
-            # Build the reverse map: folder -> label
-            _folder_to_label: dict[str, str] = {v: k for k, v in _LABEL_TO_FOLDER.items()}
-            # Custom labels map to themselves
-            src_label = _folder_to_label.get(src_folder, src_folder)
-            dst_label = _folder_to_label.get(dst_folder, dst_folder)
-            try:
-                await imap_gmail_label_swap(account, password, src_uid, src_label, dst_label)
-            except RuntimeError:
-                return _error_saga(
-                    error_type="uid_not_found",
-                    account=src_account,
-                    folder=src_folder,
-                    uid=src_uid,
-                )
-            return _ok_saga(
-                mechanism="gmail_label_swap",
-                tx_id=None,
-                account=src_account,
-                source_folder=src_folder,
-                target_folder=dst_folder,
-                uid=src_uid,
-            )
-        try:
-            mechanism = await imap_move_message(account, password, imap_src, src_uid, imap_dst)
-        except TargetFolderMissing:
-            return _error_saga(
-                error_type="target_folder_missing",
-                account=src_account,
-                source_folder=src_folder,
-                target_folder=dst_folder,
-                uid=src_uid,
-            )
-        except UidStale:
-            return _error_saga(
-                error_type="uid_stale",
-                account=src_account,
-                folder=src_folder,
-                uid=src_uid,
-            )
-        except UidNotFound:
-            return _error_saga(
-                error_type="uid_not_found",
-                account=src_account,
-                folder=src_folder,
-                uid=src_uid,
-            )
-        except RuntimeError:
-            return _error_saga(
-                error_type="uid_not_found",
-                account=src_account,
-                folder=src_folder,
-                uid=src_uid,
-            )
-        return _ok_saga(
-            mechanism=mechanism,
-            tx_id=None,
-            account=src_account,
-            source_folder=src_folder,
-            target_folder=dst_folder,
-            uid=src_uid,
+    if src_account != dst_account:
+        return await _handle_move_cross_account(
+            context,
+            src_account=src_account,
+            src_folder=src_folder,
+            src_uid=src_uid,
+            dst_account=dst_account,
+            dst_folder=dst_folder,
         )
-    # Cross-account saga (ADR 0006).
-    if context.saga is None:
-        return _error_saga(error_type="saga_not_configured")
-    src_acct, src_pwd = await _password_for(context, src_account)
-    dst_acct, dst_pwd = await _password_for(context, dst_account)
-    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
-    imap_dst = await _resolve_imap_folder(context, dst_account, dst_folder)
-    result = await context.saga.run_cross_account_move(
-        caller_id=context.caller_id,
-        src_account=src_acct,
-        src_password=src_pwd,
-        src_folder=imap_src,
+
+    account_obj = context.account_by_id(src_account)
+    if account_obj is not None and _is_google_provider(account_obj):
+        return await _handle_move_gmail_label_swap(
+            context,
+            src_account=src_account,
+            src_folder=src_folder,
+            dst_folder=dst_folder,
+            src_uid=src_uid,
+        )
+    return await _handle_move_intra_account_standard(
+        context,
+        src_account=src_account,
+        src_folder=src_folder,
+        dst_folder=dst_folder,
         src_uid=src_uid,
-        dst_account=dst_acct,
-        dst_password=dst_pwd,
-        dst_folder=imap_dst,
-        delete_source=True,
     )
-    return {
-        "decision": "ALLOW",
-        "result": result.result,
-        "error_type": result.error_type,
-        "mechanism": result.mechanism,
-        "tx_id": result.tx_id,
-        "account": src_account,
-        "source_folder": src_folder,
-        "target_folder": dst_folder,
-        "uid": src_uid,
-    }
 
 
 async def handle_copy(context: "ServerContext", arguments: dict[str, Any]) -> MoveCopyResponse:

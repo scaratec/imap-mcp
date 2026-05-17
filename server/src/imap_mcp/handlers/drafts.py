@@ -189,6 +189,110 @@ async def handle_create_draft(
     )
 
 
+def _validate_reply_preconditions(
+    context: "ServerContext",
+    *,
+    account_id: str,
+    source_folder: str,
+    drafts_folder: str,
+    reply_text: str,
+) -> "tuple[CreateReplyDraftResponse | None, Any, Any]":
+    """Run pre-fetch validation chain. Returns
+    ``(deny_response, src_decision, drafts_decision)``: when
+    ``deny_response`` is non-None the caller short-circuits; otherwise
+    the two PDP decisions are returned for later message-level checks.
+    """
+    if not reply_text.strip():
+        return (
+            _deny_reply(
+                reason="validation_failed",
+                account=account_id,
+                error_type="empty_reply_text",
+            ),
+            None,
+            None,
+        )
+
+    src_decision = context.pdp.decide_folder_access(
+        context.caller_id, account_id, source_folder
+    )
+    if not src_decision.allowed:
+        return (
+            _deny_reply(
+                reason=src_decision.reason, account=account_id, folder=source_folder
+            ),
+            None,
+            None,
+        )
+
+    drafts_decision = context.pdp.decide_folder_access(
+        context.caller_id, account_id, drafts_folder
+    )
+    if not drafts_decision.allowed:
+        return (
+            _deny_reply(
+                reason=drafts_decision.reason, account=account_id, folder=drafts_folder
+            ),
+            None,
+            None,
+        )
+    assert drafts_decision.folder_policy is not None
+    if not drafts_decision.folder_policy.draft_append:
+        return (
+            _deny_reply(
+                reason="capability_missing",
+                account=account_id,
+                folder=drafts_folder,
+                missing_capability="draft_append",
+            ),
+            None,
+            None,
+        )
+    return None, src_decision, drafts_decision
+
+
+def _assemble_reply_rfc822(
+    *,
+    source_msg: Any,
+    source_body: str,
+    reply_text: str,
+    identity: Any,
+) -> bytes:
+    """Take the validated source message + agent-supplied reply_text
+    and produce the RFC822 bytes for the draft APPEND. Handles
+    subject/recipient derivation, attribution, body quoting, and
+    threading headers via ``reply_builder``.
+    """
+    from email.header import decode_header as _dh, make_header as _mh
+
+    src_from = str(_mh(_dh(source_msg.get("From") or "")))
+    src_reply_to = source_msg.get("Reply-To")
+    src_to = source_msg.get("To")
+    src_cc = source_msg.get("Cc")
+    src_subject = str(_mh(_dh(source_msg.get("Subject") or "")))
+    src_date = source_msg.get("Date")
+    src_references = source_msg.get("References")
+    src_mid = source_msg.get("Message-ID")
+
+    subject = reply_builder.build_reply_subject(src_subject)
+    to = reply_builder.derive_reply_to(src_reply_to, src_from)
+    cc = reply_builder.derive_reply_cc(src_to, src_cc, identity)
+    attribution = reply_builder.build_attribution(src_date, src_from)
+    quoted = reply_builder.quote_body(source_body)
+    body = reply_builder.build_reply_body(reply_text, attribution, quoted)
+    in_reply_to, references = reply_builder.build_threading_headers(src_mid, src_references)
+
+    return reply_builder.build_reply_message(
+        self_identity=identity,
+        reply_to=to,
+        cc=cc,
+        subject=subject,
+        in_reply_to=in_reply_to,
+        references=references,
+        body=body,
+    )
+
+
 async def handle_create_reply_draft(
     context: "ServerContext", arguments: dict[str, Any]
 ) -> CreateReplyDraftResponse:
@@ -198,40 +302,15 @@ async def handle_create_reply_draft(
     drafts_folder = str(arguments["drafts_folder"])
     reply_text = str(arguments["reply_text"])
 
-    if not reply_text.strip():
-        return _deny_reply(
-            reason="validation_failed",
-            account=account_id,
-            error_type="empty_reply_text",
-        )
-
-    src_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, source_folder
+    deny, src_decision, _drafts_decision = _validate_reply_preconditions(
+        context,
+        account_id=account_id,
+        source_folder=source_folder,
+        drafts_folder=drafts_folder,
+        reply_text=reply_text,
     )
-    if not src_decision.allowed:
-        return _deny_reply(
-            reason=src_decision.reason,
-            account=account_id,
-            folder=source_folder,
-        )
-
-    drafts_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, drafts_folder
-    )
-    if not drafts_decision.allowed:
-        return _deny_reply(
-            reason=drafts_decision.reason,
-            account=account_id,
-            folder=drafts_folder,
-        )
-    assert drafts_decision.folder_policy is not None
-    if not drafts_decision.folder_policy.draft_append:
-        return _deny_reply(
-            reason="capability_missing",
-            account=account_id,
-            folder=drafts_folder,
-            missing_capability="draft_append",
-        )
+    if deny is not None:
+        return deny
 
     account, password = await _password_for(context, account_id)
 
@@ -252,7 +331,7 @@ async def handle_create_reply_draft(
     _to_addrs = _ga(
         source_msg.get_all("To", []) + source_msg.get_all("Cc", [])
     )
-    assert src_decision.folder_policy is not None
+    assert src_decision is not None and src_decision.folder_policy is not None
     src_facts = MessageFacts(
         from_address=_from_addrs[0][1] if _from_addrs else "",
         to_addresses=tuple(a for _, a in _to_addrs if a),
@@ -280,8 +359,7 @@ async def handle_create_reply_draft(
             uid=uid,
         )
 
-    src_mid = source_msg.get("Message-ID")
-    if not src_mid:
+    if not source_msg.get("Message-ID"):
         return _deny_reply(
             reason="missing_message_id",
             account=account_id,
@@ -292,34 +370,11 @@ async def handle_create_reply_draft(
     if account.identity is None:
         return _deny_reply(reason="account_identity_missing", account=account_id)
 
-    from email.header import decode_header as _dh, make_header as _mh
-
-    src_from = str(_mh(_dh(source_msg.get("From") or "")))
-    src_reply_to = source_msg.get("Reply-To")
-    src_to = source_msg.get("To")
-    src_cc = source_msg.get("Cc")
-    src_subject = str(_mh(_dh(source_msg.get("Subject") or "")))
-    src_date = source_msg.get("Date")
-    src_references = source_msg.get("References")
-
-    subject = reply_builder.build_reply_subject(src_subject)
-    to = reply_builder.derive_reply_to(src_reply_to, src_from)
-    cc = reply_builder.derive_reply_cc(src_to, src_cc, account.identity)
-    attribution = reply_builder.build_attribution(src_date, src_from)
-    quoted = reply_builder.quote_body(source_body)
-    body = reply_builder.build_reply_body(reply_text, attribution, quoted)
-    in_reply_to, references = reply_builder.build_threading_headers(
-        src_mid, src_references
-    )
-
-    rfc822_bytes = reply_builder.build_reply_message(
-        self_identity=account.identity,
-        reply_to=to,
-        cc=cc,
-        subject=subject,
-        in_reply_to=in_reply_to,
-        references=references,
-        body=body,
+    rfc822_bytes = _assemble_reply_rfc822(
+        source_msg=source_msg,
+        source_body=source_body,
+        reply_text=reply_text,
+        identity=account.identity,
     )
 
     imap_dst = await _resolve_imap_folder(context, account_id, drafts_folder)

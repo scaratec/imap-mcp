@@ -287,11 +287,83 @@ async def handle_fetch_headers(
     }
 
 
+def _walk_attachment_parts(msg: Any) -> list[Any]:
+    """Walk the MIME tree and return parts that count as an
+    attachment from the agent's perspective: any non-multipart part
+    whose Content-Disposition is ``attachment``, or which is
+    ``inline`` but carries a filename, or which is a non-text part
+    with a filename. The same rule is used both for the meta-list
+    ``part_id is None`` branch and the selection branch."""
+    all_parts: list[Any] = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        disposition = (part.get("Content-Disposition") or "").lower()
+        is_attachment = disposition.startswith("attachment")
+        is_inline_file = (
+            disposition.startswith("inline") and part.get_filename() is not None
+        )
+        is_named_binary = (
+            part.get_content_maintype() not in ("text", "multipart")
+            and part.get_filename() is not None
+        )
+        if is_attachment or is_inline_file or is_named_binary:
+            all_parts.append(part)
+    return all_parts
+
+
+def _select_attachment_part(all_parts: list[Any], part_id: str) -> Any | None:
+    """Pick the MIME part whose filename matches ``part_id``. Returns
+    None when no part matches; callers translate that into
+    ``attachment_not_found``."""
+    for p in all_parts:
+        if p.get_filename() == part_id:
+            return p
+    return None
+
+
+def _build_attachment_blob_response(
+    part: Any,
+    *,
+    message_decision: Any,
+    account_id: str,
+    folder_path: str,
+    uid: int,
+) -> FetchResponse:
+    """Encode a selected MIME part into the ALLOW + blob response
+    that the dispatcher's ``_emit`` will split into a TextContent
+    metadata header plus an EmbeddedResource blob."""
+    import base64
+    import hashlib
+
+    payload = part.get_payload(decode=True) or b""
+    mime_type = part.get_content_type()
+    content_hash = hashlib.sha256(payload).hexdigest()
+    filename = part.get_filename() or "attachment"
+    return {
+        "decision": "ALLOW",
+        "reason": message_decision.reason,
+        "visibility_applied": message_decision.visibility,
+        "account": account_id,
+        "folder": folder_path,
+        "uid": uid,
+        "part_id": filename,
+        "mime_type": mime_type,
+        "size_bytes": len(payload),
+        "content_hash": content_hash,
+        "_blob": base64.b64encode(payload).decode("ascii"),
+        "_blob_mime_type": mime_type,
+        "_blob_uri": f"attachment://{account_id}/{folder_path}/{uid}/{filename}",
+    }
+
+
 async def handle_fetch_attachment(
     context: "ServerContext", arguments: dict[str, Any]
 ) -> FetchResponse:
+    """Orchestrator: validate, fetch the raw message, walk for
+    attachment parts, then either list metadata (``part_id is None``)
+    or return the selected part's bytes as a blob."""
     import email
-    import hashlib
 
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
@@ -326,23 +398,7 @@ async def handle_fetch_attachment(
             error_type="uid_not_found", account=account_id, folder=folder_path, uid=uid
         )
     msg = email.message_from_bytes(raw)
-    all_parts = []
-    for part in msg.walk():
-        if part.get_content_maintype() == "multipart":
-            continue
-        disposition = (part.get("Content-Disposition") or "").lower()
-        is_attachment = disposition.startswith("attachment")
-        is_inline_file = (
-            disposition.startswith("inline")
-            and part.get_filename() is not None
-        )
-        is_named_binary = (
-            part.get_content_maintype() not in ("text", "multipart")
-            and part.get_filename() is not None
-        )
-        if is_attachment or is_inline_file or is_named_binary:
-            all_parts.append(part)
-
+    all_parts = _walk_attachment_parts(msg)
     if not all_parts:
         return _error_fetch(
             error_type="attachment_not_found", account=account_id, folder=folder_path, uid=uid
@@ -367,33 +423,15 @@ async def handle_fetch_attachment(
             "attachments": attachments_meta,
         }
 
-    selected_part = None
-    for p in all_parts:
-        if p.get_filename() == part_id:
-            selected_part = p
-            break
+    selected_part = _select_attachment_part(all_parts, part_id)
     if selected_part is None:
         return _error_fetch(
             error_type="attachment_not_found", account=account_id, folder=folder_path, uid=uid
         )
-    import base64
-
-    payload = selected_part.get_payload(decode=True) or b""
-    mime_type = selected_part.get_content_type()
-    content_hash = hashlib.sha256(payload).hexdigest()
-    filename = selected_part.get_filename() or "attachment"
-    return {
-        "decision": "ALLOW",
-        "reason": message_decision.reason,
-        "visibility_applied": message_decision.visibility,
-        "account": account_id,
-        "folder": folder_path,
-        "uid": uid,
-        "part_id": filename,
-        "mime_type": mime_type,
-        "size_bytes": len(payload),
-        "content_hash": content_hash,
-        "_blob": base64.b64encode(payload).decode("ascii"),
-        "_blob_mime_type": mime_type,
-        "_blob_uri": f"attachment://{account_id}/{folder_path}/{uid}/{filename}",
-    }
+    return _build_attachment_blob_response(
+        selected_part,
+        message_decision=message_decision,
+        account_id=account_id,
+        folder_path=folder_path,
+        uid=uid,
+    )
