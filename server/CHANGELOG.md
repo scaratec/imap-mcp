@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v0.15.0 (2026-05-18)
+
+### Chores
+
+- Add pre-commit hooks for ruff and apply formatting
+  ([`1dd2762`](https://github.com/scaratec/imap-mcp/commit/1dd2762d17b62cf992560602aadd9b09864b8000))
+
+### Code Style
+
+- Remove unused imports flagged by ruff
+  ([`daafdda`](https://github.com/scaratec/imap-mcp/commit/daafdda1f1c7292c0e31a4c02deaaf94e267d89f))
+
+### Features
+
+- **imap**: Decode/encode Modified UTF-7 mailbox names at wire boundary
+  ([`7a2479a`](https://github.com/scaratec/imap-mcp/commit/7a2479ae25b164303ef87ec58126de537fc90102))
+
+
 ## v0.14.2 (2026-05-18)
 
 ### Bug Fixes
