@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.14.2 (2026-05-18)
+
+### Bug Fixes
+
+- **policy**: Use fake-clock for newer_than/older_than
+  ([`96e8287`](https://github.com/scaratec/imap-mcp/commit/96e828768d01709754024835d011dea743496022))
+
+
 ## v0.14.1 (2026-05-18)
 
 ### Bug Fixes
