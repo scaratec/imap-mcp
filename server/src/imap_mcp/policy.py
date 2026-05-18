@@ -165,7 +165,9 @@ def _match_single_predicate(key: str, expected: object, *, facts: MessageFacts) 
             return False
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        now = datetime.now(tz=timezone.utc)
+        from .audit import _now_utc
+
+        now = _now_utc()
         delta = (now - parsed).total_seconds()
         if key == "newer_than":
             return delta <= seconds

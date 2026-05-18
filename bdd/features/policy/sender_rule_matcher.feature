@@ -14,7 +14,8 @@ Feature: Sender rule matcher grammar
     Total enumerated            : 20  covered by this feature: 20
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folder "INBOX"
+    Given the server date is pinned to "2026-05-01"
+    And the IMAP account "gupta-scaratec" exists with folder "INBOX"
     And the server is configured with caller "inbox-agent" using policy "inbox-policy"
     And policy "inbox-policy" grants account "gupta-scaratec"
     And policy "inbox-policy" folder defaults for "INBOX" are:
