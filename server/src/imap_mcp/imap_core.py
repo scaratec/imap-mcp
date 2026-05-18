@@ -25,6 +25,83 @@ from aioimaplib import IMAP4, IMAP4_SSL
 
 from .config import Account
 
+# --------------------------------------------------------------- mUTF-7
+# RFC 3501 §5.1.3 — Modified UTF-7 codec for IMAP mailbox names.
+# The MCP surface uses UTF-8 throughout; encoding/decoding happens
+# only at the IMAP wire boundary inside this module.
+
+
+def decode_mutf7(wire: str) -> str:
+    """Decode an IMAP Modified UTF-7 mailbox name to UTF-8.
+
+    Printable ASCII passes through unchanged.  ``&`` starts a
+    base64-encoded UTF-16BE run terminated by ``-``.  The literal
+    ampersand is encoded as ``&-``.
+
+    Returns the input unchanged on malformed sequences so that callers
+    always get a usable folder path (degraded, not crashed).
+    """
+    import base64
+
+    out: list[str] = []
+    i = 0
+    n = len(wire)
+    while i < n:
+        if wire[i] != "&":
+            out.append(wire[i])
+            i += 1
+            continue
+        end = wire.find("-", i + 1)
+        if end < 0:
+            return wire
+        if end == i + 1:
+            out.append("&")
+            i = end + 1
+            continue
+        b64 = wire[i + 1 : end].replace(",", "/")
+        pad = (4 - len(b64) % 4) % 4
+        try:
+            raw = base64.b64decode(b64 + "=" * pad)
+            out.append(raw.decode("utf-16-be"))
+        except Exception:
+            return wire
+        i = end + 1
+    return "".join(out)
+
+
+def encode_mutf7(utf8: str) -> str:
+    """Encode a UTF-8 mailbox name to IMAP Modified UTF-7.
+
+    Printable ASCII (0x20–0x7E) passes through.  Everything else is
+    grouped into runs and encoded as base64'd UTF-16BE between ``&``
+    and ``-``.  A literal ``&`` becomes ``&-``.
+    """
+    import base64
+
+    out: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if not buf:
+            return
+        raw = "".join(buf).encode("utf-16-be")
+        b64 = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+        out.append("&" + b64 + "-")
+        buf.clear()
+
+    for ch in utf8:
+        cp = ord(ch)
+        if 0x20 <= cp <= 0x7E:
+            flush()
+            if ch == "&":
+                out.append("&-")
+            else:
+                out.append(ch)
+        else:
+            buf.append(ch)
+    flush()
+    return "".join(out)
+
 
 @dataclass(frozen=True)
 class Envelope:
@@ -140,7 +217,7 @@ async def list_folders(account: Account, password: str) -> list[FolderInfo]:
             name_raw = match.group("name").strip()
             if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
                 name_raw = name_raw[1:-1]
-            entries.append((name_raw.decode("utf-8"), flags_raw))
+            entries.append((decode_mutf7(name_raw.decode("utf-8")), flags_raw))
 
         result: list[FolderInfo] = []
         for folder_path, flags in entries:
@@ -186,6 +263,7 @@ _STATUS_MESSAGES = re.compile(rb"MESSAGES\s+(\d+)")
 
 async def _folder_message_count(imap: IMAP4, folder: str) -> int:
     """Issue IMAP STATUS for a folder and return its MESSAGES count."""
+    folder = encode_mutf7(folder)
     quoted = f'"{folder}"'
     status, response = await imap.status(quoted, "(MESSAGES)")
     if status != "OK":
@@ -216,6 +294,7 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
     import email
     from email.utils import getaddresses, parsedate_to_datetime
 
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -278,6 +357,7 @@ async def fetch_envelopes_batch(
     import email
     from email.utils import getaddresses, parsedate_to_datetime
 
+    folder = encode_mutf7(folder)
     if not uids:
         return []
     imap = await _open_imap(account)
@@ -437,6 +517,7 @@ async def fetch_full_message(
     account: Account, password: str, folder: str, uid: int
 ) -> "bytes | None":
     """Return the raw RFC822 bytes for a UID."""
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -601,6 +682,7 @@ async def fetch_body(
     """
     import email
 
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -671,6 +753,7 @@ async def fetch_message_for_reply(account: Account, password: str, folder: str, 
     import email
     from email.message import Message
 
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -718,6 +801,7 @@ async def folder_stats(
     account: Account, password: str, folder: str
 ) -> tuple[int, list[int]] | None:
     """Return (exists, uid_list) for a folder."""
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -745,6 +829,7 @@ async def store_flag(
     *,
     add: bool,
 ) -> bool:
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -768,6 +853,7 @@ async def store_flags_batch(
     add: bool,
 ) -> int:
     """STORE flag on multiple UIDs in one IMAP session."""
+    folder = encode_mutf7(folder)
     if not uids:
         return 0
     imap = await _open_imap(account)
@@ -793,6 +879,7 @@ async def store_keywords(
     *,
     mode: str,
 ) -> bool:
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -848,6 +935,8 @@ async def move_message(
     target_folder: str,
 ) -> str:
     """Intra-account move via RFC 6851 MOVE. Returns 'native_move' or 'copy_store_expunge'."""
+    folder = encode_mutf7(folder)
+    target_folder = encode_mutf7(target_folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -913,6 +1002,8 @@ async def copy_message(
     uid: int,
     target_folder: str,
 ) -> bool:
+    folder = encode_mutf7(folder)
+    target_folder = encode_mutf7(target_folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -962,6 +1053,7 @@ async def append_message(
     rfc822: bytes,
     flags: tuple[str, ...] = (),
 ) -> AppendResult:
+    folder = encode_mutf7(folder)
     timeout = _append_timeout()
     imap = await _open_imap(account, timeout=timeout)
     await _authenticate_imap(imap, account, password)
@@ -1003,6 +1095,7 @@ async def fetch_raw_with_flags(
     account: Account, password: str, folder: str, uid: int
 ) -> tuple[bytes, tuple[str, ...]] | None:
     """Fetch RFC822 bytes and FLAGS for a UID. Returns None if absent."""
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1025,6 +1118,7 @@ async def search_uids(
     account: Account, password: str, folder: str, criteria: str = "ALL"
 ) -> list[int]:
     """Execute a SEARCH in `folder` and return the matching UIDs."""
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1074,6 +1168,7 @@ async def gmail_search_by_msgid(
     account: Account, password: str, folder: str, gm_msgid: int
 ) -> list[int]:
     """SEARCH X-GM-MSGID <id> in the given folder."""
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1095,6 +1190,7 @@ async def gmail_search_by_msgid(
 
 async def gmail_fetch_labels(account: Account, password: str, folder: str, uid: int) -> list[str]:
     """FETCH (X-GM-LABELS) for a single UID."""
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1119,6 +1215,7 @@ async def gmail_fetch_labels(account: Account, password: str, folder: str, uid: 
 
 async def gmail_fetch_msgid(account: Account, password: str, folder: str, uid: int) -> int | None:
     """FETCH (X-GM-MSGID) for a single UID."""
+    folder = encode_mutf7(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:

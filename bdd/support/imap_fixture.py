@@ -88,6 +88,29 @@ class IMAPFixture:
     _connections: dict[tuple[str, str], imaplib.IMAP4] = field(
         default_factory=dict, init=False
     )
+    _folder_wire_map: dict[tuple[str, str], dict[str, str]] = field(
+        default_factory=dict, init=False
+    )
+
+    def register_wire_folders(
+        self, instance: str, user: str, mapping: dict[str, str]
+    ) -> None:
+        """Store a UTF-8 → mUTF-7 wire-name mapping for folder names.
+
+        Steps that reference folders by UTF-8 name are transparently
+        resolved to the wire form before talking to Dovecot.
+        """
+        key = (instance, user)
+        self._folder_wire_map.setdefault(key, {}).update(mapping)
+
+    def to_wire(self, instance: str, user: str, folder: str) -> str:
+        """Resolve a UTF-8 folder name to its mUTF-7 wire form.
+
+        Returns the folder unchanged if no mapping exists.
+        """
+        return self._folder_wire_map.get((instance, user), {}).get(
+            folder, folder
+        )
 
     # ---------------------------------------------------------- connection
 
@@ -165,9 +188,17 @@ class IMAPFixture:
     # ----------------------------------------------------------- creation
 
     def create_folder(self, instance: str, user: str, folder: str) -> None:
-        """Create a folder (and any implicit parents) if missing."""
+        """Create a folder (and any implicit parents) if missing.
+
+        Resolves UTF-8 folder names to their mUTF-7 wire form if a
+        mapping is registered.  Folder names containing spaces must be
+        quoted for the IMAP protocol; Python's imaplib does not
+        auto-quote CREATE arguments.
+        """
+        folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        conn.create(folder)
+        quoted = f'"{folder}"' if " " in folder else folder
+        conn.create(quoted)
 
     def seed_message(
         self,
@@ -189,6 +220,7 @@ class IMAPFixture:
         omit_message_id: bool = False,
         omit_date: bool = False,
     ) -> SeededMessage:
+        folder = self.to_wire(instance, user, folder)
         """Append a message to `folder` and return metadata for assertions.
 
         `attachments` is a sequence of (filename, mime_type, bytes) tuples.
@@ -299,6 +331,7 @@ class IMAPFixture:
         self, instance: str, user: str, folder: str, message_id: str
     ) -> list[int]:
         """Independent IMAP SEARCH for a specific Message-ID; for Then-step use."""
+        folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
         status, _ = conn.select(folder)
         if status != "OK":
@@ -309,6 +342,7 @@ class IMAPFixture:
         return [int(token) for token in data[0].split()]
 
     def folder_uids(self, instance: str, user: str, folder: str) -> list[int]:
+        folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
         status, _ = conn.select(folder)
         if status != "OK":
@@ -329,6 +363,7 @@ class IMAPFixture:
 
         Raises if the UID is not present.
         """
+        folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
         conn.select(folder)
         status, data = conn.uid("FETCH", str(uid), "(RFC822)")
@@ -385,6 +420,7 @@ class IMAPFixture:
     def fetch_flags(
         self, instance: str, user: str, folder: str, uid: int
     ) -> tuple[str, ...]:
+        folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
         conn.select(folder)
         status, data = conn.uid("FETCH", str(uid), "(FLAGS)")
@@ -401,7 +437,14 @@ class IMAPFixture:
     def list_folders(self, instance: str, user: str) -> list[str]:
         conn = self.connect(instance, user)
         _, folder_lines = conn.list()
-        return [self._parse_folder_name(line) for line in folder_lines or []]
+        raw_names = [self._parse_folder_name(line) for line in folder_lines or []]
+        reverse = {
+            v: k
+            for k, v in self._folder_wire_map.get(
+                (instance, user), {}
+            ).items()
+        }
+        return [reverse.get(n, n) for n in raw_names]
 
     @staticmethod
     def _parse_folder_name(line: bytes) -> str:
