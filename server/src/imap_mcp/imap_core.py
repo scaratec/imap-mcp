@@ -582,9 +582,15 @@ def _strip_html(html: str) -> str:
 
 async def fetch_body(
     account: Account, password: str, folder: str, uid: int
-) -> tuple[Envelope, str] | None:
-    """Fetch headers + plain-text body for one UID. Returns None if absent."""
+) -> "tuple[Envelope, str, Any] | None":
+    """Fetch headers + plain-text body for one UID. Returns None if absent.
+
+    The third element is the parsed ``email.message.Message`` so that
+    callers can walk the MIME tree for attachment metadata without a
+    second IMAP round-trip.
+    """
     import email
+    from typing import Any
 
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
@@ -628,8 +634,6 @@ async def fetch_body(
                     body_text = _strip_html(raw)
                 else:
                     body_text = raw
-        # Strip trailing CRLF / whitespace that IMAP servers add during
-        # APPEND; the caller expects the body as authored.
         body_text = body_text.rstrip("\r\n")
         envelope = Envelope(
             uid=uid,
@@ -640,7 +644,7 @@ async def fetch_body(
             date=message.get("Date"),
             flags=flags,
         )
-        return envelope, body_text
+        return envelope, body_text, message
     finally:
         await imap.logout()
 

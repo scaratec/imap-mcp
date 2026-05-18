@@ -70,7 +70,7 @@ Feature: Linear visibility levels
     Given policy "invoice-policy" grants folder:
       | folder            | mode      | default | rule                                    |
       | INBOX/Rechnungen  | whitelist | NONE    | from_domain=hornbach.de -> FULL         |
-    When invoice-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 100, part_id "invoice.pdf"
+    When invoice-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 100, part_id 0
     Then the response decision is ALLOW
     And the response field visibility_applied equals "FULL"
     And the response field mime_type equals "application/pdf"

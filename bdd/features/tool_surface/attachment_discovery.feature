@@ -21,10 +21,12 @@ Feature: Attachment discovery without part_id
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 901
     Then the response decision is ALLOW
     And the response field attachments has 2 entries
-    And attachment 0 has field "part_id" equal to "invoice.pdf"
+    And attachment 0 has field "index" equal to 0
+    And attachment 0 has field "filename" equal to "invoice.pdf"
     And attachment 0 has field "mime_type" equal to "application/pdf"
     And attachment 0 has field "size_bytes" equal to 4096
-    And attachment 1 has field "part_id" equal to "receipt.xlsx"
+    And attachment 1 has field "index" equal to 1
+    And attachment 1 has field "filename" equal to "receipt.xlsx"
     And attachment 1 has field "size_bytes" equal to 2048
 
   Scenario: fetch_attachment with part_id returns blob for that part
@@ -33,7 +35,7 @@ Feature: Attachment discovery without part_id
       | 911 | sender@test.example | Two invoices |
     And the message has attachment "invoice.pdf" of type "application/pdf" with size 4096 bytes
     And the message has attachment "receipt.xlsx" of type "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" with size 2048 bytes
-    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 911, part_id "invoice.pdf"
+    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 911, part_id 0
     Then the response decision is ALLOW
-    And the response field part_id equals "invoice.pdf"
+    And the response field part_id equals 0
     And the response contains a blob resource with mime type "application/pdf"

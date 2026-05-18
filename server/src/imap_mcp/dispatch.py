@@ -183,7 +183,9 @@ def build_server(context: ServerContext) -> Server:
             Tool(
                 name="fetch_attachment",
                 description=(
-                    "Fetch a single MIME attachment. Requires FULL visibility (ADR 0002)."
+                    "Fetch a single MIME attachment by index. "
+                    "Omit part_id to list all attachments with their metadata. "
+                    "Requires FULL visibility (ADR 0002)."
                 ),
                 inputSchema={
                     "type": "object",
@@ -191,7 +193,13 @@ def build_server(context: ServerContext) -> Server:
                         "account": {"type": "string"},
                         "folder": {"type": "string"},
                         "uid": {"type": "integer"},
-                        "part_id": {"type": "string"},
+                        "part_id": {
+                            "type": "integer",
+                            "description": (
+                                "0-based attachment index from fetch_body "
+                                "or from calling this tool without part_id"
+                            ),
+                        },
                     },
                     "required": ["account", "folder", "uid"],
                     "additionalProperties": False,

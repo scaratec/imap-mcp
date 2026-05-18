@@ -19,7 +19,7 @@ Feature: fetch_attachment returns binary content via MCP EmbeddedResource
     And the message has attachment "report.pdf" of type "application/pdf" with size 4096 bytes
 
   Scenario: fetch_attachment returns blob content alongside metadata
-    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 601, part_id "report.pdf"
+    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 601, part_id 0
     Then the response decision is ALLOW
     And the response field mime_type equals "application/pdf"
     And the response field size_bytes equals 4096
@@ -30,4 +30,5 @@ Feature: fetch_attachment returns binary content via MCP EmbeddedResource
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 601
     Then the response decision is ALLOW
     And the response field attachments has 1 entries
-    And attachment 0 has field "part_id" equal to "report.pdf"
+    And attachment 0 has field "index" equal to 0
+    And attachment 0 has field "filename" equal to "report.pdf"

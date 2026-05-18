@@ -21,7 +21,8 @@ if TYPE_CHECKING:
 
 
 class AttachmentMetaEntry(TypedDict):
-    part_id: str
+    index: int
+    filename: str | None
     mime_type: str
     size_bytes: int
 
@@ -59,7 +60,7 @@ class FetchResponse(TypedDict, total=False):
     # fetch_headers payload
     headers: NotRequired[dict[str, str]]
     # fetch_attachment selected-part payload
-    part_id: NotRequired[str]
+    part_id: NotRequired[int]
     mime_type: NotRequired[str]
     size_bytes: NotRequired[int]
     content_hash: NotRequired[str]
@@ -204,7 +205,7 @@ async def handle_fetch_body(
             uid=uid,
             reason=folder_decision.reason,
         )
-    envelope, body_text = result
+    envelope, body_text, msg = result
     facts = _facts_from_envelope(envelope)
     message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
     if not message_decision.allowed:
@@ -216,6 +217,19 @@ async def handle_fetch_body(
         return _deny_fetch(
             reason="visibility_below_BODY", account=account_id, folder=folder_path, uid=uid
         )
+    full_visible = level_rank(message_decision.visibility) >= level_rank("FULL")
+    attachments_meta: list[AttachmentMetaEntry] | None = None
+    if full_visible:
+        all_parts = _walk_attachment_parts(msg)
+        attachments_meta = []
+        for i, p in enumerate(all_parts):
+            p_payload = p.get_payload(decode=True) or b""
+            attachments_meta.append({
+                "index": i,
+                "filename": p.get_filename(),
+                "mime_type": p.get_content_type(),
+                "size_bytes": len(p_payload),
+            })
     return {
         "decision": "ALLOW",
         "reason": message_decision.reason,
@@ -227,15 +241,9 @@ async def handle_fetch_body(
         "subject": envelope.subject,
         "text_body": body_text,
         "matched_rule_index": message_decision.matched_rule_index,
-        "attachments": None if level_rank(message_decision.visibility) < level_rank("FULL") else [],
-        "redacted_fields": (
-            ["attachments"] if level_rank(message_decision.visibility) < level_rank("FULL") else []
-        ),
-        "redaction_reason": (
-            "visibility_below_FULL"
-            if level_rank(message_decision.visibility) < level_rank("FULL")
-            else None
-        ),
+        "attachments": attachments_meta,
+        "redacted_fields": ["attachments"] if not full_visible else [],
+        "redaction_reason": "visibility_below_FULL" if not full_visible else None,
     }
 
 
@@ -312,19 +320,19 @@ def _walk_attachment_parts(msg: Any) -> list[Any]:
     return all_parts
 
 
-def _select_attachment_part(all_parts: list[Any], part_id: str) -> Any | None:
-    """Pick the MIME part whose filename matches ``part_id``. Returns
-    None when no part matches; callers translate that into
+def _select_attachment_part(all_parts: list[Any], part_id: int) -> Any | None:
+    """Pick the MIME part at the given 0-based index. Returns None
+    when out of range; callers translate that into
     ``attachment_not_found``."""
-    for p in all_parts:
-        if p.get_filename() == part_id:
-            return p
+    if 0 <= part_id < len(all_parts):
+        return all_parts[part_id]
     return None
 
 
 def _build_attachment_blob_response(
     part: Any,
     *,
+    index: int,
     message_decision: Any,
     account_id: str,
     folder_path: str,
@@ -347,7 +355,7 @@ def _build_attachment_blob_response(
         "account": account_id,
         "folder": folder_path,
         "uid": uid,
-        "part_id": filename,
+        "part_id": index,
         "mime_type": mime_type,
         "size_bytes": len(payload),
         "content_hash": content_hash,
@@ -368,7 +376,8 @@ async def handle_fetch_attachment(
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    part_id = arguments.get("part_id")
+    raw_part_id = arguments.get("part_id")
+    part_id: int | None = int(raw_part_id) if raw_part_id is not None else None
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return _deny_fetch(
@@ -406,10 +415,11 @@ async def handle_fetch_attachment(
 
     if part_id is None:
         attachments_meta: list[AttachmentMetaEntry] = []
-        for p in all_parts:
+        for i, p in enumerate(all_parts):
             p_payload = p.get_payload(decode=True) or b""
             attachments_meta.append({
-                "part_id": p.get_filename() or "attachment",
+                "index": i,
+                "filename": p.get_filename(),
                 "mime_type": p.get_content_type(),
                 "size_bytes": len(p_payload),
             })
@@ -430,6 +440,7 @@ async def handle_fetch_attachment(
         )
     return _build_attachment_blob_response(
         selected_part,
+        index=part_id,
         message_decision=message_decision,
         account_id=account_id,
         folder_path=folder_path,

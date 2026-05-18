@@ -31,7 +31,8 @@ Feature: add_attachment appends a new part to an existing message
     When att-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX", uid 801
     Then the response field attachments contains exactly one entry with:
       | field   | value      |
-      | part_id | report.pdf |
+      | index | 0          |
+      | filename | report.pdf |
 
   Scenario: add attachment preserves existing attachments
     Given the folder "INBOX" holds a message with:

@@ -18,7 +18,7 @@ Feature: Inline attachment detection for Apple Mail MIME structures
       | uid | from                | subject        |
       | 801 | sender@test.example | Monthly report |
     And the message has inline attachment "report.pdf" of type "application/pdf" with size 4096 bytes
-    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Reports", uid 801, part_id "report.pdf"
+    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Reports", uid 801, part_id 0
     Then the response decision is ALLOW
     And the response field mime_type equals "application/pdf"
     And the response contains a blob resource with mime type "application/pdf"
@@ -31,4 +31,5 @@ Feature: Inline attachment detection for Apple Mail MIME structures
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Reports", uid 811
     Then the response decision is ALLOW
     And the response field attachments has 1 entries
-    And attachment 0 has field "part_id" equal to "report.pdf"
+    And attachment 0 has field "index" equal to 0
+    And attachment 0 has field "filename" equal to "report.pdf"

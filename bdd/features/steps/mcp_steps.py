@@ -1014,7 +1014,7 @@ def step_caller_calls_fetch_headers(
 
 @when(
     '{caller_id} calls fetch_attachment with account "{account}", '
-    'folder "{folder}", uid {uid:d}, part_id "{part_id}"'
+    'folder "{folder}", uid {uid:d}, part_id {part_id:d}'
 )
 def step_caller_calls_fetch_attachment_with_part(
     context: Context,
@@ -1022,7 +1022,7 @@ def step_caller_calls_fetch_attachment_with_part(
     account: str,
     folder: str,
     uid: int,
-    part_id: str,
+    part_id: int,
 ) -> None:
     client = _ensure_mcp_client(context, caller_id)
     lookup = getattr(context, "message_uids", {})
