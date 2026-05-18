@@ -2,6 +2,34 @@
 
 <!-- version list -->
 
+## v0.14.1 (2026-05-18)
+
+### Bug Fixes
+
+- **attachments**: Populate metadata in fetch_body, use
+  ([`6bfabc9`](https://github.com/scaratec/imap-mcp/commit/6bfabc91fed67837c37e1cbe7bc6157d48efe810))
+
+### Refactoring
+
+- Response helpers, OAuth lifecycle, import hoisting
+  ([`a176861`](https://github.com/scaratec/imap-mcp/commit/a1768613066ccf921b2112a5b548bf65fcebdb78))
+
+- **handlers**: Per-tool response TypedDicts replace generic _deny/_ok/_error
+  ([`d749edf`](https://github.com/scaratec/imap-mcp/commit/d749edf7d4bc2ea875a16de8de1978087ab1bb84))
+
+- **handlers**: Sub-extract the three long handlers (move/drafts/fetch)
+  ([`6a98800`](https://github.com/scaratec/imap-mcp/commit/6a988006f09520758750941d8d77ebf1c342ec98))
+
+- **imap_core**: Narrow AppendResult.outcome and wrap Demeter chain
+  ([`9f4d07d`](https://github.com/scaratec/imap-mcp/commit/9f4d07d6f30366785e357bf06e78025fb6220961))
+
+- **server**: Split monolith into context/dispatch/reload + runtime/ + handlers/
+  ([`5698331`](https://github.com/scaratec/imap-mcp/commit/5698331197d76d5ea1cb291bea8589d31637e961))
+
+- **test_hooks**: Centralise IMAP_MCP_TEST_* env-var reads into TestHooks
+  ([`cbea3de`](https://github.com/scaratec/imap-mcp/commit/cbea3deeb17c30a28467aa5ad5e9e57f482de402))
+
+
 ## v0.14.0 (2026-05-16)
 
 ### Features
