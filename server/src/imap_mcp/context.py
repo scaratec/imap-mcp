@@ -8,7 +8,6 @@ shared by `runtime.stdio.run_stdio` and `runtime.http.run_http`.
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import os
 from dataclasses import dataclass, field

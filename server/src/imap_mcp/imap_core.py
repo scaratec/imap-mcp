@@ -582,7 +582,7 @@ def _strip_html(html: str) -> str:
 
 async def fetch_body(
     account: Account, password: str, folder: str, uid: int
-) -> "tuple[Envelope, str, Any] | None":
+) -> "tuple[Envelope, str, object] | None":
     """Fetch headers + plain-text body for one UID. Returns None if absent.
 
     The third element is the parsed ``email.message.Message`` so that
@@ -590,7 +590,6 @@ async def fetch_body(
     second IMAP round-trip.
     """
     import email
-    from typing import Any
 
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
