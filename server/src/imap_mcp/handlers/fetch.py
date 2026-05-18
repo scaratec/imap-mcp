@@ -182,9 +182,7 @@ async def handle_fetch_envelope(
     }
 
 
-async def handle_fetch_body(
-    context: "ServerContext", arguments: dict[str, Any]
-) -> FetchResponse:
+async def handle_fetch_body(context: "ServerContext", arguments: dict[str, Any]) -> FetchResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
@@ -224,12 +222,14 @@ async def handle_fetch_body(
         attachments_meta = []
         for i, p in enumerate(all_parts):
             p_payload = p.get_payload(decode=True) or b""
-            attachments_meta.append({
-                "index": i,
-                "filename": p.get_filename(),
-                "mime_type": p.get_content_type(),
-                "size_bytes": len(p_payload),
-            })
+            attachments_meta.append(
+                {
+                    "index": i,
+                    "filename": p.get_filename(),
+                    "mime_type": p.get_content_type(),
+                    "size_bytes": len(p_payload),
+                }
+            )
     return {
         "decision": "ALLOW",
         "reason": message_decision.reason,
@@ -308,9 +308,7 @@ def _walk_attachment_parts(msg: Any) -> list[Any]:
             continue
         disposition = (part.get("Content-Disposition") or "").lower()
         is_attachment = disposition.startswith("attachment")
-        is_inline_file = (
-            disposition.startswith("inline") and part.get_filename() is not None
-        )
+        is_inline_file = disposition.startswith("inline") and part.get_filename() is not None
         is_named_binary = (
             part.get_content_maintype() not in ("text", "multipart")
             and part.get_filename() is not None
@@ -417,12 +415,14 @@ async def handle_fetch_attachment(
         attachments_meta: list[AttachmentMetaEntry] = []
         for i, p in enumerate(all_parts):
             p_payload = p.get_payload(decode=True) or b""
-            attachments_meta.append({
-                "index": i,
-                "filename": p.get_filename(),
-                "mime_type": p.get_content_type(),
-                "size_bytes": len(p_payload),
-            })
+            attachments_meta.append(
+                {
+                    "index": i,
+                    "filename": p.get_filename(),
+                    "mime_type": p.get_content_type(),
+                    "size_bytes": len(p_payload),
+                }
+            )
         return {
             "decision": "ALLOW",
             "reason": message_decision.reason,

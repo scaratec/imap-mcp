@@ -68,7 +68,14 @@ def _max_visibility(fp: "Any") -> str:
 
 def _granted_caps(fp: "Any") -> list[str]:
     caps: list[str] = []
-    for key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append", "modify_message"):
+    for key in (
+        "mark_seen",
+        "mark_tagged",
+        "move_out",
+        "accept_incoming",
+        "draft_append",
+        "modify_message",
+    ):
         if getattr(fp, key, False):
             caps.append(key)
     return caps

@@ -79,9 +79,7 @@ def _is_google_provider(account: Any) -> bool:
     return getattr(account, "provider", "imap-standard") in ("google", "google-mock")
 
 
-def _get_folder_aliases(
-    context: "ServerContext", account_id: str
-) -> dict[str, str]:
+def _get_folder_aliases(context: "ServerContext", account_id: str) -> dict[str, str]:
     """Return the cached folder alias map for a Google account.
 
     The map is populated by ``handle_list_folders`` as a side effect

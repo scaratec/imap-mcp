@@ -100,10 +100,7 @@ async def handle_list_folders(
 
     reverse_map = {v: k for k, v in alias_map.items()}
     all_paths = [reverse_map.get(fi.path, fi.path) for fi in folder_infos]
-    count_by_path = {
-        reverse_map.get(fi.path, fi.path): fi.message_count
-        for fi in folder_infos
-    }
+    count_by_path = {reverse_map.get(fi.path, fi.path): fi.message_count for fi in folder_infos}
     visibility = context.pdp.visible_folders_for(context.caller_id, account_id, all_paths)
     folders_result: list[FolderEntry] = [
         {"path": p, "message_count": count_by_path.get(p, 0)}

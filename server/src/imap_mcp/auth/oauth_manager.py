@@ -139,9 +139,7 @@ class OAuthManager:
         expires_in = data.get("expires_in", 3600)
         return access_token, expires_in
 
-    def _persist_access_token_if_configured(
-        self, account: Account, access_token: str
-    ) -> None:
+    def _persist_access_token_if_configured(self, account: Account, access_token: str) -> None:
         """Write the access token to the configured secret-store backend
         when the account opts into ``token_cache: persist_all``. No-op
         for ``memory_only`` or for backends other than ``file_dir``."""
@@ -153,16 +151,14 @@ class OAuthManager:
         if store_cfg is None or store_cfg.backend != "file_dir" or not store_cfg.path:
             return
         access_ref = account.auth.secret_ref.replace("refresh_token", "access_token")
-        rel_path = access_ref[len("secret://"):].lstrip("/")
+        rel_path = access_ref[len("secret://") :].lstrip("/")
         target = pathlib.Path(store_cfg.path) / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(access_token, encoding="utf-8")
 
     def _log_audit(self, account_id: str, decision: str, reason_or_result: str):
         audit_dir = (
-            self.config.accounts_file.audit.directory
-            if self.config.accounts_file.audit
-            else None
+            self.config.accounts_file.audit.directory if self.config.accounts_file.audit else None
         )
         if not audit_dir:
             return

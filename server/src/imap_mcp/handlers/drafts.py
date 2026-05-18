@@ -41,7 +41,9 @@ class CreateReplyDraftResponse(TypedDict, total=False):
     missing_capability: NotRequired[str]
 
 
-def _ok_draft(*, account: str, folder: str, imap_response: str | None = None) -> CreateDraftResponse:
+def _ok_draft(
+    *, account: str, folder: str, imap_response: str | None = None
+) -> CreateDraftResponse:
     return {
         "decision": "ALLOW",
         "result": "OK",
@@ -213,26 +215,18 @@ def _validate_reply_preconditions(
             None,
         )
 
-    src_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, source_folder
-    )
+    src_decision = context.pdp.decide_folder_access(context.caller_id, account_id, source_folder)
     if not src_decision.allowed:
         return (
-            _deny_reply(
-                reason=src_decision.reason, account=account_id, folder=source_folder
-            ),
+            _deny_reply(reason=src_decision.reason, account=account_id, folder=source_folder),
             None,
             None,
         )
 
-    drafts_decision = context.pdp.decide_folder_access(
-        context.caller_id, account_id, drafts_folder
-    )
+    drafts_decision = context.pdp.decide_folder_access(context.caller_id, account_id, drafts_folder)
     if not drafts_decision.allowed:
         return (
-            _deny_reply(
-                reason=drafts_decision.reason, account=account_id, folder=drafts_folder
-            ),
+            _deny_reply(reason=drafts_decision.reason, account=account_id, folder=drafts_folder),
             None,
             None,
         )
@@ -328,9 +322,7 @@ async def handle_create_reply_draft(
     from email.utils import getaddresses as _ga
 
     _from_addrs = _ga(source_msg.get_all("From", []))
-    _to_addrs = _ga(
-        source_msg.get_all("To", []) + source_msg.get_all("Cc", [])
-    )
+    _to_addrs = _ga(source_msg.get_all("To", []) + source_msg.get_all("Cc", []))
     assert src_decision is not None and src_decision.folder_policy is not None
     src_facts = MessageFacts(
         from_address=_from_addrs[0][1] if _from_addrs else "",
@@ -341,9 +333,7 @@ async def handle_create_reply_draft(
         size_bytes=0,
         date_iso=None,
     )
-    src_msg_decision = evaluate_message_against_folder(
-        src_decision.folder_policy, facts=src_facts
-    )
+    src_msg_decision = evaluate_message_against_folder(src_decision.folder_policy, facts=src_facts)
     if not src_msg_decision.allowed:
         return _deny_reply(
             reason=src_msg_decision.reason,

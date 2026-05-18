@@ -155,7 +155,9 @@ async def handle_replace_attachment(
 
         def transform(rfc822: bytes) -> bytes:
             return mime_replace_attachment(
-                rfc822, filename, new_content,
+                rfc822,
+                filename,
+                new_content,
                 new_mime_type=new_mime_type,
                 new_filename=new_filename,
             )

@@ -78,9 +78,7 @@ def _deny_search(*, reason: str, account: str, folder: str) -> SearchResponse:
     return {"decision": "DENY", "reason": reason, "account": account, "folder": folder}
 
 
-def _deny_list_messages(
-    *, reason: str, account: str, folder: str
-) -> ListMessagesResponse:
+def _deny_list_messages(*, reason: str, account: str, folder: str) -> ListMessagesResponse:
     return {"decision": "DENY", "reason": reason, "account": account, "folder": folder}
 
 

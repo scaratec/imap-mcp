@@ -451,13 +451,12 @@ async def fetch_full_message(
         await imap.logout()
 
 
-def mime_add_attachment(
-    rfc822: bytes, filename: str, mime_type: str, content: bytes
-) -> bytes:
+def mime_add_attachment(rfc822: bytes, filename: str, mime_type: str, content: bytes) -> bytes:
     import email
     from email.message import EmailMessage
 
     import email.policy as _ep
+
     msg = email.message_from_bytes(rfc822, policy=_ep.default)
     maintype, _, subtype = mime_type.partition("/")
     if not msg.is_multipart():
@@ -481,12 +480,16 @@ def mime_add_attachment(
 
 
 def mime_replace_attachment(
-    rfc822: bytes, filename: str, new_content: bytes,
-    new_mime_type: str | None = None, new_filename: str | None = None,
+    rfc822: bytes,
+    filename: str,
+    new_content: bytes,
+    new_mime_type: str | None = None,
+    new_filename: str | None = None,
 ) -> bytes:
     import email
 
     import email.policy as _ep
+
     msg = email.message_from_bytes(rfc822, policy=_ep.default)
     if not msg.is_multipart():
         raise ValueError(f"Message is not multipart; cannot replace attachment {filename!r}")
@@ -499,7 +502,10 @@ def mime_replace_attachment(
             maintype, _, subtype = target_mime.partition("/")
             target_fn = new_filename or filename
             part.set_content(
-                new_content, maintype=maintype, subtype=subtype, filename=target_fn,
+                new_content,
+                maintype=maintype,
+                subtype=subtype,
+                filename=target_fn,
                 disposition="attachment",
             )
             found = True
@@ -514,6 +520,7 @@ def mime_delete_attachment(rfc822: bytes, filename: str) -> bytes:
     from email.message import EmailMessage
 
     import email.policy as _ep
+
     msg = email.message_from_bytes(rfc822, policy=_ep.default)
     if not msg.is_multipart():
         raise ValueError(f"Message is not multipart; cannot delete attachment {filename!r}")
@@ -550,7 +557,10 @@ def mime_delete_attachment(rfc822: bytes, filename: str) -> bytes:
                 payload = part.get_payload(decode=True) or b""
                 fn = part.get_filename() or "attachment"
                 new_msg.add_attachment(
-                    payload, maintype=maintype, subtype=subtype, filename=fn,
+                    payload,
+                    maintype=maintype,
+                    subtype=subtype,
+                    filename=fn,
                 )
             elif part == keep_parts[0]:
                 ct = part.get_content_type()
@@ -648,9 +658,7 @@ async def fetch_body(
         await imap.logout()
 
 
-async def fetch_message_for_reply(
-    account: Account, password: str, folder: str, uid: int
-):
+async def fetch_message_for_reply(account: Account, password: str, folder: str, uid: int):
     """Fetch the parsed email.Message and the extracted plain-text body.
 
     Same I/O path as `fetch_body` but returns the full Message object so
@@ -695,9 +703,7 @@ async def fetch_message_for_reply(
         else:
             payload = message.get_payload(decode=True)
             if isinstance(payload, bytes):
-                decoded = payload.decode(
-                    message.get_content_charset("utf-8"), errors="replace"
-                )
+                decoded = payload.decode(message.get_content_charset("utf-8"), errors="replace")
                 if message.get_content_type() == "text/html":
                     body_text = _strip_html(decoded)
                 else:
@@ -973,9 +979,7 @@ async def append_message(
             )
         except asyncio.TimeoutError:
             if _connection_lost(imap):
-                raise ConnectionResetError(
-                    "IMAP connection lost while waiting for APPEND response"
-                )
+                raise ConnectionResetError("IMAP connection lost while waiting for APPEND response")
             raise
         if response.result == "OK":
             return AppendResult(outcome="ok", imap_response=None)

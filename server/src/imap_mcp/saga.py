@@ -382,9 +382,7 @@ class SagaManager:
 
             # APPEND target
             try:
-                append_result = await append_message(
-                    dst_account, dst_password, dst_folder, raw
-                )
+                append_result = await append_message(dst_account, dst_password, dst_folder, raw)
                 ok = append_result.outcome == "ok"
             except asyncio.TimeoutError:
                 count = self.wal.bump_retry(tx_id, "append_failed: timeout")
@@ -635,9 +633,7 @@ class SagaManager:
             )
 
         try:
-            append_result = await append_message(
-                account, password, folder, modified, flags=flags
-            )
+            append_result = await append_message(account, password, folder, modified, flags=flags)
             ok = append_result.outcome == "ok"
         except Exception as exc:
             self.wal.bump_retry(tx_id, f"append_failed: {exc}")
@@ -660,7 +656,9 @@ class SagaManager:
         if message_id is not None:
             try:
                 hits = await search_uids(
-                    account, password, folder,
+                    account,
+                    password,
+                    folder,
                     f'HEADER "Message-Id" "{message_id}"',
                 )
                 for h in hits:

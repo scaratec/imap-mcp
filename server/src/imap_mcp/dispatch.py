@@ -404,7 +404,10 @@ def build_server(context: ServerContext) -> Server:
                         "uid": {"type": "integer"},
                         "filename": {"type": "string"},
                         "mime_type": {"type": "string"},
-                        "content": {"type": "string", "description": "Base64-encoded attachment content"},
+                        "content": {
+                            "type": "string",
+                            "description": "Base64-encoded attachment content",
+                        },
                     },
                     "required": ["account", "folder", "uid", "filename", "mime_type", "content"],
                     "additionalProperties": False,
@@ -423,8 +426,14 @@ def build_server(context: ServerContext) -> Server:
                         "account": {"type": "string"},
                         "folder": {"type": "string"},
                         "uid": {"type": "integer"},
-                        "filename": {"type": "string", "description": "Name of the attachment to replace"},
-                        "new_content": {"type": "string", "description": "Base64-encoded new content"},
+                        "filename": {
+                            "type": "string",
+                            "description": "Name of the attachment to replace",
+                        },
+                        "new_content": {
+                            "type": "string",
+                            "description": "Base64-encoded new content",
+                        },
                         "new_mime_type": {"type": "string"},
                         "new_filename": {"type": "string"},
                     },
@@ -445,7 +454,10 @@ def build_server(context: ServerContext) -> Server:
                         "account": {"type": "string"},
                         "folder": {"type": "string"},
                         "uid": {"type": "integer"},
-                        "filename": {"type": "string", "description": "Name of the attachment to delete"},
+                        "filename": {
+                            "type": "string",
+                            "description": "Name of the attachment to delete",
+                        },
                     },
                     "required": ["account", "folder", "uid", "filename"],
                     "additionalProperties": False,
@@ -551,7 +563,17 @@ def build_server(context: ServerContext) -> Server:
             _safe = {
                 k: v
                 for k, v in result.items()
-                if k not in ("messages", "body", "headers", "attachment", "rfc822", "_blob", "_blob_mime_type", "_blob_uri")
+                if k
+                not in (
+                    "messages",
+                    "body",
+                    "headers",
+                    "attachment",
+                    "rfc822",
+                    "_blob",
+                    "_blob_mime_type",
+                    "_blob_uri",
+                )
             }
             span.set_attribute("mcp.response", _json.dumps(_safe, default=str))
             span.set_attribute("mcp.request", _json.dumps(arguments, default=str))
