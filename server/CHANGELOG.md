@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.15.2 (2026-05-19)
+
+### Bug Fixes
+
+- **gmail**: Encode Modified UTF-7 in X-GM-LABELS and SELECT
+  ([`46f0e01`](https://github.com/scaratec/imap-mcp/commit/46f0e01efb0247a120afad02f7174d77708ef233))
+
+
 ## v0.15.1 (2026-05-19)
 
 ### Bug Fixes
