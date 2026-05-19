@@ -17,13 +17,30 @@ Feature: IMAP mailbox names are UTF-8 across the MCP surface
   independent IMAP query against the destination mailbox.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Inbound decoding (umlaut, escape '&', mixed, malformed, ASCII) : 5
+    - Inbound decoding (umlaut, escape '&', mixed, ASCII)             : 4
+    - Inbound decoding (malformed)                          : 1 @pending
     - Policy matching (UTF-8 policy ↔ mUTF-7 wire mailbox)            : 1
     - Outbound encoding (SELECT, COPY/MOVE target, APPEND target)     : 3
     - Audit/Observability (audit log carries UTF-8)                   : 1
     - Round-trip (wire form never leaks into list_folders)            : 1
     Total enumerated                                                  : 11
-    Covered by this feature                                           : 11
+    Covered by this feature                                           : 10
+    Pending (see @pending scenario below)                             : 1
+
+  Known gap — malformed mUTF-7 decode path:
+  The "malformed wire bytes" scenario is currently @pending. The
+  server already returns the raw path on malformed input
+  (server/src/imap_mcp/imap_core.py:55-67, "degraded not crashed"),
+  so the *behaviour* is implemented; what is missing is
+  (a) a fixture that can feed malformed wire bytes to the server
+      (Dovecot 2.3 rejects the CREATE so the harness cannot stage
+      such a mailbox today), and
+  (b) the mailbox_name_decode DEGRADED audit record that the
+      scenario asserts on, which has no producer yet.
+  Unblocking requires a LIST-injection proxy fixture and a small
+  audit emitter in decode_mutf7. Tracked here in-file because it
+  is small enough not to need an external ticket; promote to an
+  issue if it grows.
 
   Background:
     Given the IMAP account "gupta-scaratec" exists
@@ -83,11 +100,15 @@ Feature: IMAP mailbox names are UTF-8 across the MCP surface
       | Gel&APY-schte Elemente | Gelöschte Elemente |
       | Belege/&ANw-bersicht   | Belege/Übersicht   |
 
-  @wip
+  @pending
   Scenario: A mailbox name with malformed Modified UTF-7 keeps its raw path and is logged
     # Dovecot 2.3 rejects CREATE for invalid mUTF-7 names, so this
     # scenario cannot be exercised against a real Dovecot instance.
-    # It requires a mock IMAP server or proxy LIST-injection.
+    # Skipped via @pending until a LIST-injection proxy fixture
+    # exists; the server-side decode_mutf7 already returns the raw
+    # path on malformed input (imap_core.py:55-67), so the missing
+    # piece is observability (mailbox_name_decode audit record) and
+    # a fixture capable of feeding the malformed wire bytes.
     Given the IMAP server for "gupta-scaratec" exposes the following mailboxes on the wire:
       | wire (mUTF-7 bytes) | utf-8 (intended name) |
       | INBOX               | INBOX                 |

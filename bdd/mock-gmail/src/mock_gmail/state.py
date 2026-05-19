@@ -11,12 +11,47 @@ within a session (mapping: (label, gm_msgid) -> uid).
 
 from __future__ import annotations
 
+import base64
 import itertools
 from dataclasses import dataclass, field
 from typing import Any
 
 
 _msgid_counter = itertools.count(1_800_000_000_000_000_000)
+
+
+def decode_mutf7(wire: str) -> str:
+    """RFC 3501 §5.1.3 Modified UTF-7 → UTF-8 (mock-side, vendored).
+
+    The mock is a standalone package and intentionally does not import
+    from sc-imap-mcp; this mirrors imap_core.decode_mutf7 so the mock
+    can accept the same wire form real Gmail does and resolve labels
+    back to their UTF-8 form internally.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(wire)
+    while i < n:
+        if wire[i] != "&":
+            out.append(wire[i])
+            i += 1
+            continue
+        end = wire.find("-", i + 1)
+        if end < 0:
+            return wire
+        if end == i + 1:
+            out.append("&")
+            i = end + 1
+            continue
+        b64 = wire[i + 1 : end].replace(",", "/")
+        pad = (4 - len(b64) % 4) % 4
+        try:
+            raw = base64.b64decode(b64 + "=" * pad)
+            out.append(raw.decode("utf-16-be"))
+        except Exception:
+            return wire
+        i = end + 1
+    return "".join(out)
 
 
 @dataclass

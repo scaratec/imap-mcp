@@ -162,13 +162,17 @@ class IMAPFixture:
                 self._empty_folder(conn, folder)
 
         # Delete non-system folders, deepest first so parents go last.
+        # Folder names containing spaces must be quoted on the wire;
+        # imaplib does not auto-quote DELETE arguments, so without
+        # this an undeletable "Tom &- Jerry" survives into the next
+        # scenario and inflates hidden_folders_count.
         for folder in sorted(
             (f for f in folders if f not in _SYSTEM_FOLDERS),
             key=lambda f: f.count("/"),
             reverse=True,
         ):
             try:
-                conn.delete(folder)
+                conn.delete(f'"{folder}"' if " " in folder else folder)
             except imaplib.IMAP4.error:
                 pass
 
@@ -448,6 +452,16 @@ class IMAPFixture:
 
     @staticmethod
     def _parse_folder_name(line: bytes) -> str:
-        # RFC 3501 LIST response: (flags) "/" "Folder Name"
+        # RFC 3501 LIST response: (flags) "sep" name
+        # name is either an atom (unquoted, no spaces) or a quoted
+        # string. rsplit(" ", 1) is wrong for quoted names with
+        # spaces — "Tom &- Jerry" parses as just "Jerry" and the
+        # folder cannot be deleted at reset, leaking into the next
+        # scenario's hidden_folders_count.
         text = line.decode() if isinstance(line, bytes) else line
-        return text.rsplit(" ", 1)[-1].strip('"')
+        text = text.rstrip()
+        if text.endswith('"'):
+            start = text.rfind('"', 0, -1)
+            if start >= 0:
+                return text[start + 1 : -1]
+        return text.rsplit(" ", 1)[-1]

@@ -13,7 +13,7 @@ import email.utils
 import re
 from typing import Any
 
-from .state import FOLDER_TO_LABEL, GmailState, Message
+from .state import FOLDER_TO_LABEL, GmailState, Message, decode_mutf7
 
 
 class GmailIMAPHandler:
@@ -384,13 +384,19 @@ class GmailIMAPHandler:
             if field == "X-GM-LABELS":
                 labels = _parse_label_list(values_raw)
                 for label in labels:
-                    normalized = label.replace("\\\\", "\\")
+                    wire = label.replace("\\\\", "\\")
                     if self._state.record_store_operations and op in ("+", "-"):
-                        self._state.store_operations.append((uid, op, normalized))
+                        self._state.store_operations.append((uid, op, wire))
+                    # Real Gmail: user labels arrive Modified-UTF-7
+                    # encoded; system labels (\Inbox etc.) are flags
+                    # and travel literally. Decoding here lets the
+                    # message end up under its UTF-8 label name so
+                    # later SEARCH/SELECT on the UTF-8 form works.
+                    applied = wire if wire.startswith("\\") else decode_mutf7(wire)
                     if op == "+":
-                        self._state.add_label(msg, normalized)
+                        self._state.add_label(msg, applied)
                     elif op == "-":
-                        self._state.remove_label(msg, normalized)
+                        self._state.remove_label(msg, applied)
                 visible = self._state.labels_visible_from(folder, msg)
                 label_str = " ".join(_quote_label(l) for l in visible)
                 self._send_untagged(f"{uid} FETCH (X-GM-LABELS ({label_str}) UID {uid})")

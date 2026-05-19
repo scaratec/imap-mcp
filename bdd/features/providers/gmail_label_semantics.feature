@@ -17,7 +17,8 @@ Feature: Gmail label semantics
     - Non-google account does NOT receive google-only tools: 1
     - Move applies target label BEFORE removing source label: 1
     - Move when Gmail STORE rejects returns provider_rejected: 1
-    Total enumerated                                 : 9   covered by this feature: 9
+    - Move encodes Modified UTF-7 for non-ASCII labels: 1
+    Total enumerated                                 : 10  covered by this feature: 10
 
   Background:
     Given the IMAP account "scaratec-gmail" exists with provider "google" and folders:
@@ -25,6 +26,7 @@ Feature: Gmail label semantics
       | INBOX                |
       | Rechnungen           |
       | Hornbach             |
+      | Rechnungseingänge    |
       | [Gmail]/All Mail     |
       | [Gmail]/Drafts       |
       | [Gmail]/Trash        |
@@ -35,11 +37,12 @@ Feature: Gmail label semantics
       | scaratec-gmail |
       | archive-srv    |
     And policy "invoice-policy" grants folder:
-      | account        | folder        | mode      | default | move_out | accept_incoming | rules                                        |
-      | scaratec-gmail | INBOX         | whitelist | NONE    | true     | false           | [{from_domain=hornbach.de -> FULL}]          |
-      | scaratec-gmail | Rechnungen    | whitelist | NONE    | true     | true            | [{from_domain=hornbach.de -> FULL}]          |
-      | scaratec-gmail | Hornbach      | whitelist | NONE    | false    | true            | [{from_domain=hornbach.de -> FULL}]          |
-      | archive-srv    | Archiv        | whitelist | NONE    | false    | true            | []                                           |
+      | account        | folder              | mode      | default | move_out | accept_incoming | rules                                        |
+      | scaratec-gmail | INBOX               | whitelist | NONE    | true     | false           | [{from_domain=hornbach.de -> FULL}]          |
+      | scaratec-gmail | Rechnungen          | whitelist | NONE    | true     | true            | [{from_domain=hornbach.de -> FULL}]          |
+      | scaratec-gmail | Hornbach            | whitelist | NONE    | false    | true            | [{from_domain=hornbach.de -> FULL}]          |
+      | scaratec-gmail | Rechnungseingänge   | whitelist | NONE    | true     | true            | [{from_domain=hornbach.de -> FULL}]          |
+      | archive-srv    | Archiv              | whitelist | NONE    | false    | true            | []                                           |
 
   Scenario: describe_policy flags a Google account with semantics gmail-labels
     When invoice-agent calls describe_policy
@@ -101,6 +104,24 @@ Feature: Gmail label semantics
     And a direct IMAP SEARCH on "scaratec-gmail:INBOX" for X-GM-MSGID 10006 returns exactly one result
     # The message stays in INBOX because the failing STORE was the +Hornbach
     # add, and the -Inbox remove never executed (ADD before REMOVE order).
+
+  Scenario: Move on Google encodes Modified UTF-7 for non-ASCII labels
+    # Regression: Gmail's X-GM-LABELS expects user labels in IMAP
+    # Modified UTF-7 on the wire (RFC 3501 §5.1.3), not raw UTF-8.
+    # The previous implementation sent raw UTF-8 bytes for
+    # "Rechnungseingänge" and Gmail replied "Could not parse command".
+    # System labels (\Inbox etc.) are IMAP flags and travel literally.
+    Given a Gmail message with canonical_all_mail_uid 10007 carries labels ["INBOX"]
+    And the mock Gmail server records all X-GM-LABELS STORE operations
+    When invoice-agent calls move with account "scaratec-gmail", source folder "INBOX" uid 505, target folder "Rechnungseingänge"
+    Then the response decision is ALLOW
+    And the response field mechanism equals "gmail_label_swap"
+    And the recorded X-GM-LABELS STORE operations on UID 505 are in order:
+      | op | label                 |
+      | +  | Rechnungseing&AOQ-nge |
+      | -  | \Inbox                |
+    And a direct IMAP SEARCH on "scaratec-gmail:Rechnungseingänge" for X-GM-MSGID 10007 returns exactly one result
+    And a direct IMAP SEARCH on "scaratec-gmail:INBOX" for X-GM-MSGID 10007 returns zero results
 
   Scenario: list_labels is available only for Google accounts
     When invoice-agent calls list_labels with account "scaratec-gmail"

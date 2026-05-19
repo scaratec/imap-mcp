@@ -1281,7 +1281,9 @@ async def gmail_label_swap(
     therefore run before REMOVE while the source label is still
     keeping the UID visible in the selected folder.
     """
-    folder = _label_to_folder(remove_label)
+    folder = encode_mutf7(_label_to_folder(remove_label))
+    wire_add = _encode_gmail_label(add_label)
+    wire_remove = _encode_gmail_label(remove_label)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1289,12 +1291,12 @@ async def gmail_label_swap(
         if status != "OK":
             raise RuntimeError(f"cannot SELECT {folder!r}")
         status, lines = await imap.uid(
-            "store", str(uid), "+X-GM-LABELS", f"({_quote_gmail_label(add_label)})"
+            "store", str(uid), "+X-GM-LABELS", f"({_quote_gmail_label(wire_add)})"
         )
         if status != "OK":
             raise LabelMutationFailed("add", add_label, status, _response_text(lines))
         status, lines = await imap.uid(
-            "store", str(uid), "-X-GM-LABELS", f"({_quote_gmail_label(remove_label)})"
+            "store", str(uid), "-X-GM-LABELS", f"({_quote_gmail_label(wire_remove)})"
         )
         if status != "OK":
             raise LabelMutationFailed("remove", remove_label, status, _response_text(lines))
@@ -1369,6 +1371,19 @@ def _quote_gmail_label(label: str) -> str:
     if " " in label or '"' in label:
         return f'"{label}"'
     return label
+
+
+def _encode_gmail_label(label: str) -> str:
+    """Modified-UTF-7 encode a Gmail user label for the wire.
+
+    Gmail's X-GM-EXT-1 places user labels on the IMAP wire in the
+    same encoding as mailbox names (RFC 3501 §5.1.3). System labels
+    starting with backslash are IMAP flags, not mailbox names, and
+    travel literally — encoding them would corrupt the flag syntax.
+    """
+    if label.startswith("\\"):
+        return label
+    return encode_mutf7(label)
 
 
 # Maps Gmail system labels back to IMAP folder paths.
