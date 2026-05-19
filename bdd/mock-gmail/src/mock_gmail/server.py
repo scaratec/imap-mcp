@@ -368,14 +368,25 @@ class GmailIMAPHandler:
                 uids_to_store.extend(range(int(lo), int(hi) + 1))
             else:
                 uids_to_store.append(int(part))
+        # Check injected rejection BEFORE mutating state, so the test
+        # observes "STORE never ran" rather than "half-applied".
+        if field == "X-GM-LABELS" and self._state.next_store_rejection is not None:
+            status, text = self._state.next_store_rejection
+            self._state.next_store_rejection = None
+            self._send(tag, status, text)
+            return
+        any_resolved = False
         for uid in uids_to_store:
             msg = self._state.message_by_uid(folder, uid)
             if msg is None:
                 continue
+            any_resolved = True
             if field == "X-GM-LABELS":
                 labels = _parse_label_list(values_raw)
                 for label in labels:
                     normalized = label.replace("\\\\", "\\")
+                    if self._state.record_store_operations and op in ("+", "-"):
+                        self._state.store_operations.append((uid, op, normalized))
                     if op == "+":
                         self._state.add_label(msg, normalized)
                     elif op == "-":
@@ -393,6 +404,9 @@ class GmailIMAPHandler:
                     msg.flags = flags
                 flags_str = " ".join(sorted(msg.flags))
                 self._send_untagged(f"{uid} FETCH (FLAGS ({flags_str}) UID {uid})")
+        if not any_resolved and uids_to_store:
+            self._send(tag, "NO", "STORE failed: no matching UIDs")
+            return
         self._send(tag, "OK", "STORE completed")
 
     async def _uid_copy(self, tag: str, args: str) -> None:

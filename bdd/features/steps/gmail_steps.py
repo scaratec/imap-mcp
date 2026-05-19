@@ -813,3 +813,41 @@ def step_response_does_not_contain_folder(
             f"Folder {folder_path!r} unexpectedly found in response. "
             f"All folders: {folder_names!r}"
         )
+
+
+# ---------------------------------------- STORE-operation log / rejection hooks
+
+
+@given("the mock Gmail server records all X-GM-LABELS STORE operations")
+def step_mock_gmail_records_store_ops(context: Context) -> None:
+    state = _gmail_state(context)
+    state.record_store_operations = True
+    state.store_operations.clear()
+
+
+@given(
+    'the mock Gmail server is configured to reject the next '
+    'X-GM-LABELS STORE with status "{status}" and text "{text}"'
+)
+def step_mock_gmail_reject_next_store(
+    context: Context, status: str, text: str
+) -> None:
+    state = _gmail_state(context)
+    state.next_store_rejection = (status, text)
+
+
+@then(
+    "the recorded X-GM-LABELS STORE operations on UID {uid:d} are in order:"
+)
+def step_recorded_store_ops_in_order(context: Context, uid: int) -> None:
+    state = _gmail_state(context)
+    recorded = [
+        (op, label) for (recorded_uid, op, label) in state.store_operations
+        if recorded_uid == uid
+    ]
+    expected = [(row["op"], row["label"]) for row in context.table]
+    if recorded != expected:
+        raise AssertionError(
+            f"X-GM-LABELS STORE ops on UID {uid}: "
+            f"expected {expected!r}, got {recorded!r}"
+        )

@@ -909,6 +909,23 @@ class UidStale(RuntimeError):
     different message; the saga must re-resolve before retrying."""
 
 
+class LabelMutationFailed(RuntimeError):
+    """A Gmail X-GM-LABELS STORE was rejected by the server (NO/BAD).
+
+    Carries the stage ("add" or "remove"), the label that was being
+    mutated, the IMAP status, and the raw response text so the handler
+    can surface a precise ``provider_rejected`` error instead of
+    masking it as ``uid_not_found``.
+    """
+
+    def __init__(self, stage: str, label: str, status: str, response_text: str) -> None:
+        super().__init__(f"X-GM-LABELS {stage} {label!r} failed: {status} {response_text}")
+        self.stage = stage
+        self.label = label
+        self.status = status
+        self.response_text = response_text
+
+
 def _extract_uidvalidity(lines: "list[bytes | bytearray] | None") -> int | None:
     """Pull `UIDVALIDITY <n>` from the untagged response lines of a
     SELECT or NOOP. Returns None if absent."""
@@ -1237,6 +1254,18 @@ async def gmail_fetch_msgid(account: Account, password: str, folder: str, uid: i
         await imap.logout()
 
 
+def _response_text(lines: "list[bytes | bytearray] | None") -> str:
+    if not lines:
+        return ""
+    parts: list[str] = []
+    for raw in lines:
+        if isinstance(raw, (bytes, bytearray)):
+            parts.append(bytes(raw).decode("utf-8", errors="replace"))
+        else:
+            parts.append(str(raw))
+    return " ".join(parts).strip()
+
+
 async def gmail_label_swap(
     account: Account,
     password: str,
@@ -1244,15 +1273,14 @@ async def gmail_label_swap(
     remove_label: str,
     add_label: str,
 ) -> None:
-    """STORE -X-GM-LABELS (remove) then +X-GM-LABELS (add).
+    """ADD the target label, then REMOVE the source label.
 
-    Both operations are performed on the same connection with the
-    source folder selected. The message stays in [Gmail]/All Mail;
-    only its label set changes — which is the Gmail-native way to
-    "move" between virtual folders.
+    Gmail folders are label projections: removing the source label
+    first detaches the UID from the selected mailbox, so the next
+    STORE on the same UID is rejected as "no matching UIDs". ADD must
+    therefore run before REMOVE while the source label is still
+    keeping the UID visible in the selected folder.
     """
-    # Select the folder that corresponds to the label being removed so
-    # that the UID is valid in the selected mailbox.
     folder = _label_to_folder(remove_label)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
@@ -1260,18 +1288,16 @@ async def gmail_label_swap(
         status, _ = await imap.select(folder)
         if status != "OK":
             raise RuntimeError(f"cannot SELECT {folder!r}")
-        # Remove the source label
-        status, _ = await imap.uid(
-            "store", str(uid), "-X-GM-LABELS", f"({_quote_gmail_label(remove_label)})"
-        )
-        if status != "OK":
-            raise RuntimeError(f"STORE -X-GM-LABELS failed: {status}")
-        # Add the target label
-        status, _ = await imap.uid(
+        status, lines = await imap.uid(
             "store", str(uid), "+X-GM-LABELS", f"({_quote_gmail_label(add_label)})"
         )
         if status != "OK":
-            raise RuntimeError(f"STORE +X-GM-LABELS failed: {status}")
+            raise LabelMutationFailed("add", add_label, status, _response_text(lines))
+        status, lines = await imap.uid(
+            "store", str(uid), "-X-GM-LABELS", f"({_quote_gmail_label(remove_label)})"
+        )
+        if status != "OK":
+            raise LabelMutationFailed("remove", remove_label, status, _response_text(lines))
     finally:
         await imap.logout()
 

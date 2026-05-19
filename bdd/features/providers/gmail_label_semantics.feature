@@ -15,7 +15,9 @@ Feature: Gmail label semantics
     - Cross-account fetch sources from All Mail     : 1
     - System folders ([Gmail]/*) policy-addressable : 1
     - Non-google account does NOT receive google-only tools: 1
-    Total enumerated                                 : 7   covered by this feature: 7
+    - Move applies target label BEFORE removing source label: 1
+    - Move when Gmail STORE rejects returns provider_rejected: 1
+    Total enumerated                                 : 9   covered by this feature: 9
 
   Background:
     Given the IMAP account "scaratec-gmail" exists with provider "google" and folders:
@@ -67,6 +69,38 @@ Feature: Gmail label semantics
     And a direct IMAP SEARCH on "scaratec-gmail:Hornbach" for X-GM-MSGID 10002 returns exactly one result
     And a direct IMAP SEARCH on "scaratec-gmail:[Gmail]/All Mail" for X-GM-MSGID 10002 returns exactly one result
     And the same message still appears under "scaratec-gmail:Rechnungen" (the second original label was not touched)
+
+  Scenario: Move on Google applies the target label BEFORE removing the source label
+    # Regression: removing the source label first detaches the UID from the
+    # selected folder, so the subsequent STORE +X-GM-LABELS fails. The fix
+    # is to ADD the target label first, then REMOVE the source label.
+    # The canonical-uid step assigns INBOX UID 505 by convention.
+    Given a Gmail message with canonical_all_mail_uid 10005 carries labels ["INBOX"]
+    And the mock Gmail server records all X-GM-LABELS STORE operations
+    When invoice-agent calls move with account "scaratec-gmail", source folder "INBOX" uid 505, target folder "Hornbach"
+    Then the response decision is ALLOW
+    And the response field mechanism equals "gmail_label_swap"
+    And the recorded X-GM-LABELS STORE operations on UID 505 are in order:
+      | op | label    |
+      | +  | Hornbach |
+      | -  | \Inbox   |
+    And a direct IMAP SEARCH on "scaratec-gmail:INBOX" for X-GM-MSGID 10005 returns zero results
+    And a direct IMAP SEARCH on "scaratec-gmail:Hornbach" for X-GM-MSGID 10005 returns exactly one result
+
+  Scenario: Move on Google surfaces a STORE rejection as provider_rejected with imap_response
+    # When Gmail rejects a STORE (quota, ACL, transient backend issue),
+    # the handler must surface error_type "provider_rejected" with the
+    # IMAP status, not mask it as "uid_not_found".
+    Given a Gmail message with canonical_all_mail_uid 10006 carries labels ["INBOX"]
+    And the mock Gmail server is configured to reject the next X-GM-LABELS STORE with status "NO" and text "[OVERQUOTA] Mailbox over quota"
+    When invoice-agent calls move with account "scaratec-gmail", source folder "INBOX" uid 505, target folder "Hornbach"
+    Then the response decision is ALLOW
+    And the response field result equals "ERROR"
+    And the response field error_type equals "provider_rejected"
+    And the response field imap_response contains "OVERQUOTA"
+    And a direct IMAP SEARCH on "scaratec-gmail:INBOX" for X-GM-MSGID 10006 returns exactly one result
+    # The message stays in INBOX because the failing STORE was the +Hornbach
+    # add, and the -Inbox remove never executed (ADD before REMOVE order).
 
   Scenario: list_labels is available only for Google accounts
     When invoice-agent calls list_labels with account "scaratec-gmail"

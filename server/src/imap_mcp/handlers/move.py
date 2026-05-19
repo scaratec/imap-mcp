@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
 
 from ..imap_core import (
+    LabelMutationFailed,
     TargetFolderMissing,
     UidNotFound,
     UidStale,
@@ -40,6 +41,7 @@ class MoveCopyResponse(TypedDict, total=False):
     missing_capability: NotRequired[str]
     mechanism: NotRequired[str]
     tx_id: NotRequired[str | None]
+    imap_response: NotRequired[str]
 
 
 def _deny_move(
@@ -95,6 +97,7 @@ def _error_saga(
     uid: int | None = None,
     mechanism: str | None = None,
     tx_id: str | None = None,
+    imap_response: str | None = None,
 ) -> MoveCopyResponse:
     response: MoveCopyResponse = {
         "decision": "ALLOW",
@@ -114,6 +117,8 @@ def _error_saga(
         response["target_folder"] = target_folder
     if uid is not None:
         response["uid"] = uid
+    if imap_response is not None:
+        response["imap_response"] = imap_response
     return response
 
 
@@ -137,6 +142,17 @@ async def _handle_move_gmail_label_swap(
     dst_label = folder_to_label.get(dst_folder, dst_folder)
     try:
         await imap_gmail_label_swap(account, password, src_uid, src_label, dst_label)
+    except LabelMutationFailed as e:
+        return _error_saga(
+            error_type="provider_rejected",
+            mechanism="gmail_label_swap",
+            tx_id=None,
+            account=src_account,
+            source_folder=src_folder,
+            target_folder=dst_folder,
+            uid=src_uid,
+            imap_response=e.response_text or e.status,
+        )
     except RuntimeError:
         return _error_saga(
             error_type="uid_not_found",

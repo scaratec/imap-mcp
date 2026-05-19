@@ -64,6 +64,14 @@ class GmailState:
         self.password: str = "test"
         self.total_connections: int = 0
         self._localized_folders: dict[str, tuple[str, str]] = {}
+        # Test hooks: when record_store_operations is True the server
+        # appends every X-GM-LABELS STORE op as (uid, '+'|'-', label)
+        # so scenarios can verify the ADD-before-REMOVE order.
+        self.record_store_operations: bool = False
+        self.store_operations: list[tuple[int, str, str]] = []
+        # Test hook: (status, text) injected into the next STORE response
+        # to simulate a backend rejection (e.g. OVERQUOTA).
+        self.next_store_rejection: tuple[str, str] | None = None
 
     def reset(self) -> None:
         self.messages.clear()
@@ -72,6 +80,9 @@ class GmailState:
         self._created_folders.clear()
         self._localized_folders.clear()
         self.total_connections = 0
+        self.record_store_operations = False
+        self.store_operations.clear()
+        self.next_store_rejection = None
 
     def set_localized_folders(
         self, mapping: list[tuple[str, str, str]]
@@ -143,7 +154,14 @@ class GmailState:
         self._assign_uid(folder, msg.gm_msgid)
 
     def remove_label(self, msg: Message, label: str) -> None:
+        # Drop the per-folder UID mapping too, mirroring real Gmail:
+        # once the label is gone, the message is no longer visible in
+        # that folder's UID namespace.
         msg.labels.discard(label)
+        folder = self._label_to_folder(label)
+        uid_map = self._uid_maps.get(folder)
+        if uid_map is not None:
+            uid_map.pop(msg.gm_msgid, None)
 
     def labels_visible_from(self, folder: str, msg: Message) -> list[str]:
         """Labels as Gmail shows them from a given folder's perspective."""
