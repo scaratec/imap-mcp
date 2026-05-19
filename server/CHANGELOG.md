@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.15.1 (2026-05-19)
+
+### Bug Fixes
+
+- **gmail**: Swap label-mutation order and classify STORE rejections
+  ([`66972a1`](https://github.com/scaratec/imap-mcp/commit/66972a1e2f57a46e1db657b08f0b2d97ad5f55e6))
+
+
 ## v0.15.0 (2026-05-18)
 
 ### Chores
