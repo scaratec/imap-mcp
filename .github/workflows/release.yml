@@ -1,8 +1,16 @@
 name: Release
 
+# Only run after the BDD workflow finished successfully. The full BDD
+# suite is the strongest signal we have, and it implicitly depends on
+# the server building cleanly; gating on BDD alone (rather than CI+BDD)
+# avoids the double-trigger that listing both workflows produces.
+# CI lint/unit-test failures on the same push will be visible on the
+# commit but do not block release — make them a gate by adding "CI" to
+# the workflows list once mypy is green and we want stricter promotion.
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: ["BDD"]
+    types: [completed]
 
 permissions:
   contents: write
@@ -10,12 +18,26 @@ permissions:
 
 jobs:
   release:
+    # Only proceed when the upstream workflow was green and the push was
+    # to main. Forks and feature branches that piggy-back on the same
+    # workflow names cannot trigger a release.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
-    concurrency: release
+    concurrency:
+      group: release
+      cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
         with:
+          # Check out the exact commit the upstream workflow ran on, not
+          # whatever happens to be at the tip of main right now. Without
+          # this, a fast follow-up push could let us release a different
+          # SHA than the one CI/BDD validated.
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           token: ${{ secrets.RELEASE_TOKEN }}
 
@@ -40,60 +62,90 @@ jobs:
             echo "Created baseline tag v${VERSION} on ${FIRST}"
           fi
 
+      # semantic-release version performs the full release in one shot:
+      # bump pyproject + CHANGELOG, commit, tag, push, build via the
+      # configured build_command, AND upload the artefacts to the GitHub
+      # release. We pass --no-vcs-release to suppress the GitHub-side
+      # release+asset upload here so PyPI publish can race ahead and we
+      # control the GitHub release as a separate, retryable step.
+      #
+      # If HEAD already carries a release tag (typical on the bump-commit
+      # that semantic-release itself just pushed), version exits early
+      # with "No release will be made". We capture that and skip the
+      # downstream steps so the workflow stays idempotent across
+      # re-triggers and across the bump-commit feedback loop.
       - name: Semantic release — version
         id: semver
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         working-directory: server
         run: |
-          OUTPUT=$(semantic-release version 2>&1) || true
+          set -euo pipefail
+          OUTPUT=$(semantic-release version --no-vcs-release 2>&1) || {
+            echo "$OUTPUT"
+            exit 1
+          }
           echo "$OUTPUT"
           if git tag --points-at HEAD | grep -qE "^v[0-9]"; then
-            echo "tagged=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "tagged=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check if version is already on PyPI
-        id: pypi_check
-        if: steps.semver.outputs.tagged == 'true'
-        working-directory: server
-        run: |
-          VERSION=$(python -c "
+            VERSION=$(python -c "
           import tomllib, pathlib
           d = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
           print(d['project']['version'])
           ")
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://pypi.org/pypi/sc-imap-mcp/${VERSION}/json")
-          if [ "$HTTP" = "200" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "v${VERSION} already on PyPI — skipping publish"
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Released v${VERSION}"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "v${VERSION} not on PyPI — will publish"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+            echo "No new release on this commit; downstream steps will skip."
           fi
 
-      - name: Build package
-        if: >-
-          steps.semver.outputs.tagged == 'true' &&
-          steps.pypi_check.outputs.exists == 'false'
-        working-directory: server
-        run: python -m build
-
+      # PyPI publish is idempotent (skip-existing=true), so re-running
+      # this step on a re-triggered release is harmless.
       - name: Publish to PyPI
-        if: >-
-          steps.semver.outputs.tagged == 'true' &&
-          steps.pypi_check.outputs.exists == 'false'
+        if: steps.semver.outputs.tagged == 'true'
         uses: pypa/gh-action-pypi-publish@v1.12.4
         with:
           packages-dir: server/dist/
           skip-existing: true
 
-      - name: Create GitHub release
+      # GitHub release + asset upload is the previously-flaky step. We
+      # use the gh CLI directly so we control the idempotency: if the
+      # release already exists, fetch its assets list and only upload
+      # what is missing. This makes the step safe to re-run on any
+      # bump-commit feedback loop or manual re-trigger.
+      - name: Publish GitHub release
         if: steps.semver.outputs.tagged == 'true'
-        working-directory: server
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: semantic-release publish
+          VERSION: ${{ steps.semver.outputs.version }}
+        working-directory: server
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          # Create the release if it does not exist yet.
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --notes "$(semantic-release changelog --released-only 2>/dev/null \
+                          || echo 'Release notes generated by semantic-release.')"
+          fi
+          # Compute the set of assets that are missing on the release
+          # and upload only those. gh release upload --clobber would
+          # overwrite, but we prefer leaving an existing asset alone so
+          # nothing on a previously-published release silently changes
+          # under consumers.
+          EXISTING=$(gh release view "$TAG" \
+            --repo "${{ github.repository }}" \
+            --json assets --jq '.assets[].name')
+          for f in dist/*; do
+            name=$(basename "$f")
+            if echo "$EXISTING" | grep -Fxq "$name"; then
+              echo "asset $name already on release — skipping"
+            else
+              echo "uploading $name"
+              gh release upload "$TAG" "$f" \
+                --repo "${{ github.repository }}"
+            fi
+          done

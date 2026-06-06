@@ -21,6 +21,12 @@ jobs:
       - run: ruff check src/
       - run: ruff format --check src/
 
+  # mypy is currently tracking a known backlog of typing debt (see the
+  # mypy_debt.md note in docs/ — TODO once the file is added). The job
+  # is informational so the release gate is not held hostage by it, but
+  # the output is visible on every push so the debt cannot grow silently.
+  # When the backlog is resolved, drop `continue-on-error` and tighten
+  # the invocation back to `--check-untyped-defs`.
   typecheck:
     runs-on: ubuntu-latest
     continue-on-error: true
