@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v0.16.0 (2026-06-06)
+
+### Features
+
+- **tool-surface**: Bump tool-set to 2.0.0 (ADR 0024-0027)
+  ([`fd6a053`](https://github.com/scaratec/imap-mcp/commit/fd6a053f735fae1d64435b034306cdc9b80bb902))
+
+### Breaking Changes
+
+- **tool-surface**: Tool surface, response envelope, and reason-code vocabulary all change.
+  tool_set_version bumps to 2.0.0 and is advertised in serverInfo.metadata so clients can pin at
+  handshake time without issuing a tools/call. The bundle is a single hard cut across four ADRs and
+  one Limitation Record; pre-2.0 callers must re-read the contract.
+
+
 ## v0.15.2 (2026-05-19)
 
 ### Bug Fixes
