@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.16.1 (2026-06-06)
+
+### Bug Fixes
+
+- **release**: Re-attach SHA to main and tolerate no-op semver exits
+  ([`e5625f8`](https://github.com/scaratec/imap-mcp/commit/e5625f8ac0502964d7cc6686b8a2eaa03746ced5))
+
+### Continuous Integration
+
+- **release**: Gate on green BDD, drop double-build, idempotent assets
+  ([`6377d82`](https://github.com/scaratec/imap-mcp/commit/6377d82d24df3c20c7ee0591c9dd8236384613ac))
+
+
 ## v0.16.0 (2026-06-06)
 
 ### Features
