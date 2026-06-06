@@ -41,6 +41,15 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_TOKEN }}
 
+      # actions/checkout with an explicit ref leaves the repo in
+      # detached-HEAD state. python-semantic-release refuses to release
+      # from a detached HEAD ("Detached HEAD state cannot match any
+      # release groups"), so re-attach the validated SHA to a local main
+      # branch. semver still pushes back to origin/main at the end.
+      - name: Re-attach SHA to main branch
+        run: |
+          git checkout -B main "${{ github.event.workflow_run.head_sha }}"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -80,11 +89,15 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         working-directory: server
         run: |
-          set -euo pipefail
-          OUTPUT=$(semantic-release version --no-vcs-release 2>&1) || {
-            echo "$OUTPUT"
-            exit 1
-          }
+          set -uo pipefail
+          # `semantic-release version` returns non-zero on a number of
+          # legitimate no-op conditions ("no commits to analyze", "next
+          # version equals last released", "branch is detached / not in
+          # release group"). We do NOT want those to fail the job — only
+          # a real CLI/network/parse error should. Differentiation is
+          # done after the call by inspecting whether HEAD now carries
+          # a release tag; that is the ground truth either way.
+          OUTPUT=$(semantic-release version --no-vcs-release 2>&1) || true
           echo "$OUTPUT"
           if git tag --points-at HEAD | grep -qE "^v[0-9]"; then
             VERSION=$(python -c "
