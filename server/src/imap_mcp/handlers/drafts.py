@@ -11,7 +11,7 @@ from ..imap_core import (
     fetch_message_for_reply as imap_fetch_message_for_reply,
 )
 from ..policy import MessageFacts, evaluate_message_against_folder, level_rank
-from ._common import _password_for, _resolve_imap_folder
+from ._common import _password_for, _resolve_imap_folder, error_envelope
 
 if TYPE_CHECKING:
     from ..context import ServerContext
@@ -19,20 +19,19 @@ if TYPE_CHECKING:
 
 class CreateDraftResponse(TypedDict, total=False):
     decision: Literal["ALLOW", "DENY"]
-    result: Literal["OK", "ERROR"]
-    error_type: NotRequired[str | None]
+    result: NotRequired[Literal["OK", "ERROR"]]
     account: str
     folder: str
     reason: NotRequired[str]
+    error: NotRequired[dict[str, str]]
     missing_capability: NotRequired[str]
-    imap_response: NotRequired[str | None]
 
 
 class CreateReplyDraftResponse(TypedDict, total=False):
     decision: Literal["ALLOW", "DENY"]
     result: NotRequired[Literal["OK", "ERROR"]]
-    error_type: NotRequired[str | None]
     reason: NotRequired[str]
+    error: NotRequired[dict[str, str]]
     account: str
     folder: NotRequired[str]
     source_folder: NotRequired[str]
@@ -41,16 +40,12 @@ class CreateReplyDraftResponse(TypedDict, total=False):
     missing_capability: NotRequired[str]
 
 
-def _ok_draft(
-    *, account: str, folder: str, imap_response: str | None = None
-) -> CreateDraftResponse:
+def _ok_draft(*, account: str, folder: str) -> CreateDraftResponse:
     return {
         "decision": "ALLOW",
         "result": "OK",
-        "error_type": None,
         "account": account,
         "folder": folder,
-        "imap_response": imap_response,
     }
 
 
@@ -77,16 +72,13 @@ def _error_draft(
     error_type: str,
     account: str,
     folder: str,
-    imap_response: str | None = None,
+    detail: str = "",
 ) -> CreateDraftResponse:
-    return {
-        "decision": "ALLOW",
-        "result": "ERROR",
-        "error_type": error_type,
-        "account": account,
-        "folder": folder,
-        "imap_response": imap_response,
-    }
+    return error_envelope(  # type: ignore[return-value]
+        error_type=error_type,
+        detail=detail,
+        extra={"account": account, "folder": folder},
+    )
 
 
 def _deny_reply(
@@ -96,7 +88,6 @@ def _deny_reply(
     folder: str | None = None,
     source_folder: str | None = None,
     uid: int | None = None,
-    error_type: str | None = None,
     missing_capability: str | None = None,
 ) -> CreateReplyDraftResponse:
     response: CreateReplyDraftResponse = {"decision": "DENY", "reason": reason, "account": account}
@@ -106,8 +97,6 @@ def _deny_reply(
         response["source_folder"] = source_folder
     if uid is not None:
         response["uid"] = uid
-    if error_type is not None:
-        response["error_type"] = error_type
     if missing_capability is not None:
         response["missing_capability"] = missing_capability
     return response
@@ -119,7 +108,6 @@ def _ok_reply(
     return {
         "decision": "ALLOW",
         "result": "OK",
-        "error_type": None,
         "account": account,
         "source_folder": source_folder,
         "drafts_folder": drafts_folder,
@@ -135,22 +123,20 @@ def _error_reply(
     drafts_folder: str | None = None,
     uid: int | None = None,
     folder: str | None = None,
+    detail: str = "",
 ) -> CreateReplyDraftResponse:
-    response: CreateReplyDraftResponse = {
-        "decision": "ALLOW",
-        "result": "ERROR",
-        "error_type": error_type,
-        "account": account,
-    }
+    extra: dict[str, Any] = {"account": account}
     if folder is not None:
-        response["folder"] = folder
+        extra["folder"] = folder
     if source_folder is not None:
-        response["source_folder"] = source_folder
+        extra["source_folder"] = source_folder
     if drafts_folder is not None:
-        response["drafts_folder"] = drafts_folder
+        extra["drafts_folder"] = drafts_folder
     if uid is not None:
-        response["uid"] = uid
-    return response
+        extra["uid"] = uid
+    return error_envelope(  # type: ignore[return-value]
+        error_type=error_type, detail=detail, extra=extra
+    )
 
 
 async def handle_create_draft(
@@ -187,7 +173,7 @@ async def handle_create_draft(
         error_type="append_rejected",
         account=account_id,
         folder=folder_path,
-        imap_response=append_result.imap_response,
+        detail=append_result.imap_response or "",
     )
 
 
@@ -206,10 +192,11 @@ def _validate_reply_preconditions(
     """
     if not reply_text.strip():
         return (
-            _deny_reply(
-                reason="validation_failed",
-                account=account_id,
+            _error_reply(
                 error_type="empty_reply_text",
+                account=account_id,
+                source_folder=source_folder,
+                drafts_folder=drafts_folder,
             ),
             None,
             None,

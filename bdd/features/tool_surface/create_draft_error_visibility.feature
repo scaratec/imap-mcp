@@ -1,12 +1,10 @@
 Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
 
-  When the IMAP server rejects an APPEND, the caller currently sees only
-  `{"result": "ERROR", "error_type": "append_failed"}`. The actual NO/BAD
-  reason text the server returned is discarded inside the server, which
-  makes the difference between "token rejected", "mailbox not selectable",
-  "over quota", and "syntax error" indistinguishable from the agent's
-  point of view and forces the operator to read server logs to debug
-  even trivial cases.
+  When the IMAP server rejects an APPEND, the caller must learn the
+  reason class AND get the verbatim server text so the difference
+  between "token rejected", "mailbox not selectable", "over quota",
+  and "syntax error" is visible from the response itself — no
+  server-log diving for trivial cases.
 
   Reported bug (2026-05-16, claude-agent on gupta@scaratec.com / [Gmail]/Drafts):
     Four `create_draft` calls with four different RFC822 variants all
@@ -18,32 +16,27 @@ Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
     APPEND. The server-side NO reason that Gmail sent was lost between
     aioimaplib and the tool response.
 
-  This feature pins down what `create_draft` MUST expose in its response
-  when an APPEND does not succeed, so that the response itself is enough
-  to diagnose the rejection class.
-
-  Tool response contract (additive — existing fields keep their meaning):
+  Tool response contract (uses the ADR 0027 unified envelope):
     - On success:
-        result        = "OK"
-        error_type    = null
-        imap_response = null
+        decision = "ALLOW", result = "OK"
+        error    = (absent)
     - When the IMAP server returns a tagged NO or BAD response:
-        result        = "ERROR"
-        error_type    = "append_rejected"
-        imap_response = the verbatim reason text the server sent after
-                        the NO or BAD response token, response codes
-                        like "[ALERT]" or "[OVERQUOTA]" preserved as-is.
+        decision     = "ALLOW", result = "ERROR"
+        error.type   = "append_rejected"
+        error.detail = the verbatim reason text the server sent after
+                       the NO or BAD response token, response codes
+                       like "[ALERT]" or "[OVERQUOTA]" preserved as-is,
+                       bounded to 256 characters.
     - When the APPEND does not produce a tagged response within the
       configured `append_timeout`:
-        result        = "ERROR"
-        error_type    = "append_timeout"
-        imap_response = null
+        decision     = "ALLOW", result = "ERROR"
+        error.type   = "append_timeout"
+        error.detail = "" (empty: no server text to surface)
     - When the connection is lost after the APPEND command was sent but
-      before a tagged response was received (any other failure mode that
-      yields no tagged server text):
-        result        = "ERROR"
-        error_type    = "append_failed"
-        imap_response = null
+      before a tagged response was received:
+        decision     = "ALLOW", result = "ERROR"
+        error.type   = "append_failed"
+        error.detail = "" (empty: no server text to surface)
 
   Persistence-Validierung (BDD Guidelines §13.2 Pruefung 1):
     Every error scenario asserts via a second channel (list_messages on
@@ -74,7 +67,7 @@ Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
   # so a future regression that always fills the field (e.g. with stdout
   # noise) is caught.
   # -------------------------------------------------------------------
-  Scenario: successful APPEND keeps imap_response null
+  Scenario: successful APPEND omits the error block entirely
     When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
       """
       From: draft-agent@gupta-scaratec.test
@@ -87,11 +80,10 @@ Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
       """
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    And the response field error_type equals null
-    And the response field imap_response equals null
+    And the response does not contain any field named "error"
 
     # Persistenz-Validierung: the draft really is on the server.
-    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts"
+    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts", scope "all"
     Then the response field matched_total equals 1
 
   # -------------------------------------------------------------------
@@ -115,11 +107,11 @@ Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "append_rejected"
-    And the response field imap_response equals "[OVERQUOTA] Mailbox is full (0.005 + 0.000 / 0.001 GB)"
+    And the response field error.type equals "append_rejected"
+    And the response field error.detail equals "[OVERQUOTA] Mailbox is full (0.005 + 0.000 / 0.001 GB)"
 
     # Persistenz-Validierung: nothing landed on the server.
-    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts"
+    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts", scope "all"
     Then the response field matched_total equals 0
 
   # -------------------------------------------------------------------
@@ -142,11 +134,11 @@ Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "append_rejected"
-    And the response field imap_response equals "Command APPEND argument 1 invalid"
+    And the response field error.type equals "append_rejected"
+    And the response field error.detail equals "Command APPEND argument 1 invalid"
 
     # Persistenz-Validierung: nothing landed on the server.
-    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts"
+    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts", scope "all"
     Then the response field matched_total equals 0
 
   # -------------------------------------------------------------------
@@ -170,11 +162,11 @@ Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "append_failed"
-    And the response field imap_response equals null
+    And the response field error.type equals "append_failed"
+    And the response field error.detail equals ""
 
     # Persistenz-Validierung: nothing landed on the server.
-    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts"
+    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts", scope "all"
     Then the response field matched_total equals 0
 
   # -------------------------------------------------------------------
@@ -182,7 +174,7 @@ Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
   # "the server took too long" from "the server actively said no". The
   # imap_response stays null because there is no server text to surface.
   # -------------------------------------------------------------------
-  Scenario: APPEND timeout is classified as append_timeout with null imap_response
+  Scenario: APPEND timeout is classified as append_timeout with empty detail
     Given the IMAP server for "gupta-scaratec" delays the next APPEND response by 45 seconds
     And the server append_timeout is configured to 2 seconds
     When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
@@ -197,9 +189,9 @@ Feature: create_draft surfaces the IMAP server's APPEND-rejection reason
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "append_timeout"
-    And the response field imap_response equals null
+    And the response field error.type equals "append_timeout"
+    And the response field error.detail equals ""
 
     # Persistenz-Validierung: nothing landed on the server.
-    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts"
+    When draft-agent calls list_messages with account "gupta-scaratec", folder "Drafts", scope "all"
     Then the response field matched_total equals 0

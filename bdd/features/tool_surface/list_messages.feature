@@ -14,7 +14,8 @@ Feature: list_messages returns envelope data in a single call
     - PDP filters hidden messages            : 1
     - Blacklist fast-path (no envelope loop) : 1
     - Empty result set                       : 1
-    Total enumerated                          : 7   covered by this feature: 7
+    - applied_scope present on every call    : 1
+    Total enumerated                          : 8   covered by this feature: 8
 
   Background:
     Given the server date is pinned to "2026-05-07"
@@ -37,6 +38,7 @@ Feature: list_messages returns envelope data in a single call
     And message 0 has field "date" matching the pattern "2026-05-06"
     And message 1 has field "from" equal to "bob@example.com"
     And message 1 has field "subject" equal to "Invoice 42"
+    And the response field applied_scope equals "recent_7d"
 
   Scenario: Empty criteria default to a 7-day scope
     Given policy "inbox-policy" folder defaults for "INBOX" are:
@@ -92,6 +94,7 @@ Feature: list_messages returns envelope data in a single call
     Then the response contains 1 messages
     And message 0 has field "from" equal to "rechnung@hornbach.de"
     And the response field filtered_out equals 1
+    And the response field applied_scope equals "explicit_window"
 
   Scenario: Blacklist fast-path skips per-message fetch
     Given the audit log directory is a fresh $TMPDIR/audit

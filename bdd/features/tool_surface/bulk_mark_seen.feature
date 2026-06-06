@@ -23,7 +23,7 @@ Feature: bulk_mark_seen marks multiple messages as read in one call
       | mode      | default  | mark_seen |
       | blacklist | ENVELOPE | true      |
     And the folder "INBOX" on "scaratec-gmail" holds 10 messages
-    When inbox-agent calls bulk_mark_seen with account "scaratec-gmail", folder "INBOX", criteria {"from_domain": "example.com"}, seen true
+    When inbox-agent calls bulk_mark_seen with account "scaratec-gmail", folder "INBOX", criteria {"from_domain": "example.com"}, seen true, scope "all"
     Then the response decision is ALLOW
     And the response field marked_count equals 10
 
@@ -32,7 +32,7 @@ Feature: bulk_mark_seen marks multiple messages as read in one call
       | mode      | default  | mark_seen |
       | blacklist | ENVELOPE | true      |
     And the folder "INBOX" on "scaratec-gmail" holds 5 messages
-    When inbox-agent calls bulk_mark_seen with account "scaratec-gmail", folder "INBOX", criteria {"from": "nobody@nowhere.com"}, seen true
+    When inbox-agent calls bulk_mark_seen with account "scaratec-gmail", folder "INBOX", criteria {"from": "nobody@nowhere.com"}, seen true, scope "all"
     Then the response decision is ALLOW
     And the response field marked_count equals 0
 
@@ -40,7 +40,7 @@ Feature: bulk_mark_seen marks multiple messages as read in one call
     Given policy "inbox-policy" folder defaults for "INBOX" are:
       | mode      | default  | mark_seen |
       | blacklist | ENVELOPE | false     |
-    When inbox-agent calls bulk_mark_seen with account "scaratec-gmail", folder "INBOX", criteria {"from_domain": "example.com"}, seen true
+    When inbox-agent calls bulk_mark_seen with account "scaratec-gmail", folder "INBOX", criteria {"from_domain": "example.com"}, seen true, scope "all"
     Then the response decision is DENY
     And the response field reason equals "capability_missing"
 
@@ -49,6 +49,6 @@ Feature: bulk_mark_seen marks multiple messages as read in one call
       | mode      | default  | mark_seen |
       | blacklist | ENVELOPE | true      |
     And the folder "INBOX" on "scaratec-gmail" holds 20 messages
-    When inbox-agent calls bulk_mark_seen with account "scaratec-gmail", folder "INBOX", criteria {"from_domain": "example.com"}, seen true
+    When inbox-agent calls bulk_mark_seen with account "scaratec-gmail", folder "INBOX", criteria {"from_domain": "example.com"}, seen true, scope "all"
     Then the response field marked_count equals 20
     And the mock-gmail server received at most 4 IMAP connections

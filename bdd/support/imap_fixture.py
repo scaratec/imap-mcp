@@ -23,6 +23,42 @@ from typing import Iterable
 # Password is the same for all test users (see docker/dovecot/users/README.md).
 TEST_PASSWORD = "test123"
 
+def _encode_mutf7(utf8: str) -> str:
+    """RFC 3501 §5.1.3 Modified UTF-7 mailbox name encoding.
+
+    Mirrors `imap_core._quote_mailbox`'s inner encode step so the
+    fixture can talk to Dovecot using the same wire form that the
+    server uses. ASCII characters in 0x20-0x7E pass through; `&`
+    becomes `&-`; everything else is base64'd UTF-16BE between `&`
+    and `-`.
+    """
+    import base64
+
+    out: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if not buf:
+            return
+        raw = "".join(buf).encode("utf-16-be")
+        b64 = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+        out.append("&" + b64 + "-")
+        buf.clear()
+
+    for ch in utf8:
+        cp = ord(ch)
+        if 0x20 <= cp <= 0x7E:
+            flush()
+            if ch == "&":
+                out.append("&-")
+            else:
+                out.append(ch)
+        else:
+            buf.append(ch)
+    flush()
+    return "".join(out)
+
+
 # Per-instance user list. Keep in sync with docker/dovecot/users/*.passwd.
 # mock-gmail is an in-process mock that resets via GmailState.reset(),
 # not via IMAP commands — its user entry is listed for completeness but
@@ -106,11 +142,19 @@ class IMAPFixture:
     def to_wire(self, instance: str, user: str, folder: str) -> str:
         """Resolve a UTF-8 folder name to its mUTF-7 wire form.
 
-        Returns the folder unchanged if no mapping exists.
+        Explicit mappings from `register_wire_folders` win first.
+        ASCII-only inputs pass through unchanged. Non-ASCII inputs get
+        the auto mUTF-7 encoder applied so the fixture can talk to
+        Dovecot with the same wire form the server uses. Strings that
+        already contain a `&` shift sequence are assumed to be wire
+        already and are passed through verbatim.
         """
-        return self._folder_wire_map.get((instance, user), {}).get(
-            folder, folder
-        )
+        explicit = self._folder_wire_map.get((instance, user), {}).get(folder)
+        if explicit is not None:
+            return explicit
+        if all(0x20 <= ord(c) <= 0x7E for c in folder):
+            return folder
+        return _encode_mutf7(folder)
 
     # ---------------------------------------------------------- connection
 
@@ -177,7 +221,7 @@ class IMAPFixture:
                 pass
 
     def _empty_folder(self, conn: imaplib.IMAP4, folder: str) -> None:
-        status, _ = conn.select(folder)
+        status, _ = conn.select(self._q(folder))
         if status != "OK":
             return
         status, uids = conn.search(None, "ALL")
@@ -201,8 +245,7 @@ class IMAPFixture:
         """
         folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        quoted = f'"{folder}"' if " " in folder else folder
-        conn.create(quoted)
+        conn.create(self._q(folder))
 
     def seed_message(
         self,
@@ -281,8 +324,9 @@ class IMAPFixture:
         flag_literal = "(" + " ".join(flags) + ")" if flags else None
 
         conn = self.connect(instance, user)
-        conn.create(folder)
-        status, response = conn.append(folder, flag_literal, internaldate, raw)
+        quoted = self._q(folder)
+        conn.create(quoted)
+        status, response = conn.append(quoted, flag_literal, internaldate, raw)
         if status != "OK":
             raise RuntimeError(f"APPEND to {folder} failed: {response!r}")
 
@@ -318,10 +362,20 @@ class IMAPFixture:
         uids = [int(x) for x in data[0].split()]
         return max(uids) if uids else 0
 
+    @staticmethod
+    def _q(folder: str) -> str:
+        """Wrap a wire mailbox name in IMAP quoted-string form so
+        spaces, brackets, and other reserved characters survive
+        imaplib's raw argv pass-through."""
+        if folder.startswith('"') and folder.endswith('"'):
+            return folder
+        escaped = folder.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
     def _lookup_uid_by_message_id(
         self, conn: imaplib.IMAP4, folder: str, message_id: str
     ) -> int:
-        conn.select(folder)
+        conn.select(self._q(folder))
         status, data = conn.uid("SEARCH", None, "HEADER", "Message-ID", message_id)
         if status != "OK" or not data or not data[0]:
             raise RuntimeError(
@@ -337,7 +391,7 @@ class IMAPFixture:
         """Independent IMAP SEARCH for a specific Message-ID; for Then-step use."""
         folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        status, _ = conn.select(folder)
+        status, _ = conn.select(self._q(folder))
         if status != "OK":
             return []
         status, data = conn.uid("SEARCH", None, "HEADER", "Message-ID", message_id)
@@ -348,7 +402,7 @@ class IMAPFixture:
     def folder_uids(self, instance: str, user: str, folder: str) -> list[int]:
         folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        status, _ = conn.select(folder)
+        status, _ = conn.select(self._q(folder))
         if status != "OK":
             return []
         status, data = conn.uid("SEARCH", None, "ALL")
@@ -369,7 +423,7 @@ class IMAPFixture:
         """
         folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        conn.select(folder)
+        conn.select(self._q(folder))
         status, data = conn.uid("FETCH", str(uid), "(RFC822)")
         if status != "OK" or not data or data[0] is None:
             raise RuntimeError(
@@ -426,7 +480,7 @@ class IMAPFixture:
     ) -> tuple[str, ...]:
         folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        conn.select(folder)
+        conn.select(self._q(folder))
         status, data = conn.uid("FETCH", str(uid), "(FLAGS)")
         if status != "OK" or not data or data[0] is None:
             return ()

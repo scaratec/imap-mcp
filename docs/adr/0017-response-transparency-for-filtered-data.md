@@ -1,6 +1,6 @@
 # ADR 0017: Response Transparency for Policy-Filtered Data
 
-- **Status:** Accepted
+- **Status:** Superseded in part by [ADR-0025](0025-folder-path-contract-and-error-taxonomy.md) (folder error taxonomy) and [ADR-0027](0027-error-envelope-and-tool-surface-versioning.md) (normalized envelope); reason-code closure rule remains Accepted
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

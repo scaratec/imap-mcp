@@ -24,6 +24,54 @@ from support.mcp_client import MCPClient, MCPClientError, MCPHttpClient, MCPRPCE
 SERVER_BINARY_ENV = "IMAP_MCP_SERVER_BINARY"
 
 
+def _parse_query_tail(tail: str) -> tuple[str, dict[str, object]]:
+    """Split a search/list/bulk tail into (criteria-JSON, extra-args).
+
+    The feature-file form is
+      criteria {...}, limit N, offset N, scope "X", seen true, ...
+    where every `, key value` pair is optional. Returns the JSON part
+    that holds the criteria object, plus a dict of the trailing key/
+    value pairs. Unknown keys are returned as-is so callers can decide
+    whether to honour or reject them.
+    """
+    import json as _json
+    import re as _re
+
+    matchers = {
+        "limit": _re.compile(r",\s*limit\s+(\d+)"),
+        "offset": _re.compile(r",\s*offset\s+(\d+)"),
+        "scope": _re.compile(r',\s*scope\s+"([^"]+)"'),
+        "seen": _re.compile(r",\s*seen\s+(true|false)"),
+        "mode": _re.compile(r',\s*mode\s+"([^"]+)"'),
+        "tags": _re.compile(r",\s*tags\s+(\[[^\]]*\])"),
+    }
+    earliest: int | None = None
+    extras: dict[str, object] = {}
+    for key, pattern in matchers.items():
+        m = pattern.search(tail)
+        if m is None:
+            continue
+        if earliest is None or m.start() < earliest:
+            earliest = m.start()
+        raw = m.group(1)
+        if key in ("limit", "offset"):
+            extras[key] = int(raw)
+        elif key == "seen":
+            extras[key] = raw.lower() == "true"
+        elif key == "tags":
+            import ast as _ast
+
+            try:
+                extras[key] = _json.loads(raw)
+            except _json.JSONDecodeError:
+                # Tolerate `["\Deleted"]` etc.
+                extras[key] = _ast.literal_eval(raw)
+        else:
+            extras[key] = raw
+    criteria_str = tail[:earliest] if earliest is not None else tail
+    return criteria_str, extras
+
+
 def _server_binary(context: Context) -> Path:
     import os
 
@@ -96,12 +144,18 @@ def _store_result(context: Context, payload: dict[str, object]) -> None:
             f"Server stderr:\n{stderr}"
         )
     try:
-        context.last_response = json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError as exc:
         raise AssertionError(
             f"MCP tool text payload is not valid JSON: {exc}. "
             f"Raw text: {text!r}"
         )
+    context.last_response = parsed
+    history = getattr(context, "response_history", None)
+    if history is None:
+        history = []
+        context.response_history = history
+    history.append(parsed)
     for block in content[1:]:
         if isinstance(block, dict) and block.get("type") == "resource":
             resource = block.get("resource", {})
@@ -211,26 +265,31 @@ def step_caller_calls_mark_seen(
 
 @when(
     '{caller_id} calls bulk_mark_seen with account "{account}", '
-    'folder "{folder}", criteria {criteria}, seen {seen_raw}'
+    'folder "{folder}", criteria {tail}'
 )
 def step_caller_calls_bulk_mark_seen(
-    context: Context, caller_id: str, account: str, folder: str, criteria: str, seen_raw: str
+    context: Context, caller_id: str, account: str, folder: str, tail: str
 ) -> None:
     import json as _json
 
     gmail_state = getattr(context, "gmail_state", None)
     if gmail_state is not None:
         gmail_state.total_connections = 0
+    criteria_str, extras = _parse_query_tail(tail)
+    if "seen" not in extras:
+        raise AssertionError(
+            "bulk_mark_seen step requires `, seen true|false` in the tail"
+        )
+    args: dict[str, object] = {
+        "account": account,
+        "folder": folder,
+        "criteria": _json.loads(criteria_str),
+        "seen": extras["seen"],
+    }
+    if "scope" in extras:
+        args["scope"] = extras["scope"]
     client = _ensure_mcp_client(context, caller_id)
-    payload = client.call_tool(
-        "bulk_mark_seen",
-        {
-            "account": account,
-            "folder": folder,
-            "criteria": _json.loads(criteria),
-            "seen": seen_raw.strip().lower() == "true",
-        },
-    )
+    payload = client.call_tool("bulk_mark_seen", args)
     _store_result(context, payload)
 
 
@@ -1043,16 +1102,88 @@ def step_caller_calls_fetch_attachment_with_part(
     '{caller_id} calls fetch_attachment with account "{account}", '
     'folder "{folder}", uid {uid:d}'
 )
-def step_caller_calls_fetch_attachment(
+def step_caller_calls_fetch_attachment_no_part(
+    context: Context, caller_id: str, account: str, folder: str, uid: int
+) -> None:
+    """fetch_attachment without part_id: after ADR 0026 the call is a
+    schema reject. We expect the MCP layer to surface JSON-RPC -32602;
+    the assertion side picks it up via `the server responds with JSON-RPC
+    error code -32602`. Listing-style discovery moved to list_attachments.
+    """
+    client = _ensure_mcp_client(context, caller_id)
+    lookup = getattr(context, "message_uids", {})
+    actual_uid = lookup.get((account, folder, uid), uid)
+    context.last_response = None
+    context.last_rpc_error = None
+    try:
+        payload = client.call_tool(
+            "fetch_attachment",
+            {"account": account, "folder": folder, "uid": actual_uid},
+        )
+        _store_result(context, payload)
+    except MCPRPCError as exc:
+        context.last_rpc_error = {
+            "code": exc.code,
+            "message": exc.message,
+            "data": exc.data,
+        }
+
+
+@when(
+    '{caller_id} calls list_attachments with account "{account}", '
+    'folder "{folder}", uid {uid:d}'
+)
+def step_caller_calls_list_attachments(
     context: Context, caller_id: str, account: str, folder: str, uid: int
 ) -> None:
     client = _ensure_mcp_client(context, caller_id)
     lookup = getattr(context, "message_uids", {})
     actual_uid = lookup.get((account, folder, uid), uid)
     payload = client.call_tool(
-        "fetch_attachment",
+        "list_attachments",
         {"account": account, "folder": folder, "uid": actual_uid},
     )
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls bulk_mark_tagged with account "{account}", '
+    'folder "{folder}", criteria {tail}'
+)
+def step_caller_calls_bulk_mark_tagged(
+    context: Context, caller_id: str, account: str, folder: str, tail: str
+) -> None:
+    """bulk_mark_tagged uses the same tail grammar as bulk_mark_seen plus
+    `, tags [...]` and `, mode "..."`. Both are required by the schema.
+    """
+    import json as _json
+
+    gmail_state = getattr(context, "gmail_state", None)
+    if gmail_state is not None:
+        gmail_state.total_connections = 0
+    criteria_str, extras = _parse_query_tail(tail)
+    if "tags" not in extras or "mode" not in extras:
+        raise AssertionError(
+            "bulk_mark_tagged step requires `, tags [...]` and `, mode \"...\"` in the tail"
+        )
+    args: dict[str, object] = {
+        "account": account,
+        "folder": folder,
+        "criteria": _json.loads(criteria_str),
+        "tags": extras["tags"],
+        "mode": extras["mode"],
+    }
+    if "scope" in extras:
+        args["scope"] = extras["scope"]
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("bulk_mark_tagged", args)
+    _store_result(context, payload)
+
+
+@when("{caller_id} calls tool_surface_info")
+def step_caller_calls_tool_surface_info(context: Context, caller_id: str) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("tool_surface_info", {})
     _store_result(context, payload)
 
 
@@ -1230,35 +1361,20 @@ def step_caller_calls_search(
     tail: str,
 ) -> None:
     import json as _json
-    import re as _re
 
-    limit_m = _re.search(r",\s*limit\s+(\d+)", tail)
-    offset_m = _re.search(r",\s*offset\s+(\d+)", tail)
-    if limit_m:
-        criteria_str = tail[: limit_m.start()]
-    else:
-        criteria_str = tail
-    criteria = _json.loads(criteria_str)
+    criteria_str, extras = _parse_query_tail(tail)
     context.last_call_account = account
     context.last_call_folder = folder
-    args: dict[str, object] = {"account": account, "folder": folder, "criteria": criteria}
-    if limit_m:
-        args["limit"] = int(limit_m.group(1))
-    if offset_m:
-        args["offset"] = int(offset_m.group(1))
+    args: dict[str, object] = {
+        "account": account,
+        "folder": folder,
+        "criteria": _json.loads(criteria_str),
+    }
+    for key in ("limit", "offset", "scope"):
+        if key in extras:
+            args[key] = extras[key]
     client = _ensure_mcp_client(context, caller_id)
     payload = client.call_tool("search", args)
-    _store_result(context, payload)
-
-
-@when(
-    '{caller_id} calls list_messages with account "{account}", folder "{folder}"'
-)
-def step_caller_calls_list_messages_no_criteria(
-    context: Context, caller_id: str, account: str, folder: str
-) -> None:
-    client = _ensure_mcp_client(context, caller_id)
-    payload = client.call_tool("list_messages", {"account": account, "folder": folder})
     _store_result(context, payload)
 
 
@@ -1269,19 +1385,56 @@ def step_caller_calls_list_messages(
     context: Context, caller_id: str, account: str, folder: str, tail: str
 ) -> None:
     import json as _json
-    import re as _re
 
-    limit_m = _re.search(r",\s*limit\s+(\d+)", tail)
-    offset_m = _re.search(r",\s*offset\s+(\d+)", tail)
-    criteria_str = tail[: limit_m.start()] if limit_m else tail
-    criteria = _json.loads(criteria_str)
-    args: dict[str, object] = {"account": account, "folder": folder, "criteria": criteria}
-    if limit_m:
-        args["limit"] = int(limit_m.group(1))
-    if offset_m:
-        args["offset"] = int(offset_m.group(1))
+    criteria_str, extras = _parse_query_tail(tail)
+    args: dict[str, object] = {
+        "account": account,
+        "folder": folder,
+        "criteria": _json.loads(criteria_str),
+    }
+    for key in ("limit", "offset", "scope"):
+        if key in extras:
+            args[key] = extras[key]
     client = _ensure_mcp_client(context, caller_id)
-    payload = client.call_tool("list_messages", args)
+    context.last_response = None
+    context.last_rpc_error = None
+    try:
+        payload = client.call_tool("list_messages", args)
+        _store_result(context, payload)
+    except MCPRPCError as exc:
+        context.last_rpc_error = {
+            "code": exc.code,
+            "message": exc.message,
+            "data": exc.data,
+        }
+
+
+@when(
+    '{caller_id} calls list_messages with account "{account:S}", folder "{folder:S}"'
+)
+def step_caller_calls_list_messages_no_criteria(
+    context: Context, caller_id: str, account: str, folder: str
+) -> None:
+    """no-criteria + no-scope short form. The :S type-spec on account/
+    folder makes the matcher non-greedy on whitespace so a trailing
+    `criteria {...}` / `scope "..."` is NOT absorbed into folder."""
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("list_messages", {"account": account, "folder": folder})
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls list_messages with account "{account:S}", folder "{folder:S}", scope "{scope:S}"'
+)
+def step_caller_calls_list_messages_scope_only(
+    context: Context, caller_id: str, account: str, folder: str, scope: str
+) -> None:
+    """list_messages without criteria but with explicit scope."""
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool(
+        "list_messages",
+        {"account": account, "folder": folder, "scope": scope},
+    )
     _store_result(context, payload)
 
 

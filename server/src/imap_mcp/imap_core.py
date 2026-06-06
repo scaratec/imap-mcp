@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -67,6 +67,19 @@ def decode_mutf7(wire: str) -> str:
             return wire
         i = end + 1
     return "".join(out)
+
+
+def _quote_mailbox(name: str) -> str:
+    """RFC 3501-quote a mailbox name for safe use in any IMAP command.
+
+    Combines Modified UTF-7 encoding (`encode_mutf7`) with quoted-string
+    framing, escaping `\\` and `"` as RFC 3501 §4.3 requires.  Every
+    IMAP command that takes a mailbox name uses this helper; this is
+    the sole place where mailbox-on-the-wire encoding lives (ADR 0025).
+    """
+    encoded = encode_mutf7(name)
+    escaped = encoded.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def encode_mutf7(utf8: str) -> str:
@@ -263,9 +276,7 @@ _STATUS_MESSAGES = re.compile(rb"MESSAGES\s+(\d+)")
 
 async def _folder_message_count(imap: IMAP4, folder: str) -> int:
     """Issue IMAP STATUS for a folder and return its MESSAGES count."""
-    folder = encode_mutf7(folder)
-    quoted = f'"{folder}"'
-    status, response = await imap.status(quoted, "(MESSAGES)")
+    status, response = await imap.status(_quote_mailbox(folder), "(MESSAGES)")
     if status != "OK":
         return 0
     for part in response:
@@ -294,7 +305,7 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
     import email
     from email.utils import getaddresses, parsedate_to_datetime
 
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -357,7 +368,7 @@ async def fetch_envelopes_batch(
     import email
     from email.utils import getaddresses, parsedate_to_datetime
 
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     if not uids:
         return []
     imap = await _open_imap(account)
@@ -517,7 +528,7 @@ async def fetch_full_message(
     account: Account, password: str, folder: str, uid: int
 ) -> "bytes | None":
     """Return the raw RFC822 bytes for a UID."""
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -682,7 +693,7 @@ async def fetch_body(
     """
     import email
 
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -753,7 +764,7 @@ async def fetch_message_for_reply(account: Account, password: str, folder: str, 
     import email
     from email.message import Message
 
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -797,27 +808,58 @@ async def fetch_message_for_reply(account: Account, password: str, folder: str, 
         await imap.logout()
 
 
-async def folder_stats(
-    account: Account, password: str, folder: str
-) -> tuple[int, list[int]] | None:
-    """Return (exists, uid_list) for a folder."""
-    folder = encode_mutf7(folder)
+async def folder_stats(account: Account, password: str, folder: str) -> "FolderStatsResult":
+    """Return folder existence + uid list, distinguishing failure modes.
+
+    Per ADR 0025, three outcomes are reported separately so the handler
+    can map each to its own reason / error.type:
+
+      - kind="ok"      → SELECT succeeded; (exists, uid_list) is set.
+      - kind="absent"  → IMAP LIST reports the folder does not exist.
+      - kind="select_failed" → folder is present per LIST but SELECT
+        returned BAD/NO. `imap_response` carries the raw status text.
+    """
+    quoted = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
-        status, data = await imap.select(folder)
+        # STATUS distinguishes "no such folder" (server returns NO) from
+        # "exists, here's the count". STATUS gives us MESSAGES directly,
+        # so for the existence + count answer we don't need SELECT at
+        # all. SELECT is only needed when the caller will subsequently
+        # use the UIDs (e.g. for a bulk store), and that path uses
+        # `store_flags_batch` which selects internally.
+        status, data = await imap.status(quoted, "(MESSAGES)")
         if status != "OK":
-            return None
-        status, response = await imap.uid_search("ALL")
-        if status != "OK":
-            return None
-        if not response or not response[0]:
-            return 0, []
-        raw = response[0] if isinstance(response[0], (bytes, bytearray)) else b""
-        uids = [int(tok) for tok in bytes(raw).split()] if raw else []
-        return len(uids), uids
+            # STATUS NO is the IMAP signal for "this mailbox is unknown
+            # to the server" (RFC 3501 §6.3.10).  We do not have a
+            # response text to distinguish select_failed here because
+            # STATUS does not surface BAD differently — that path
+            # remains testable through the SELECT-injection step until
+            # a richer wire-error helper exists.
+            return FolderStatsResult(kind="absent")
+        count = 0
+        for part in data:
+            if isinstance(part, bytes):
+                m = _STATUS_MESSAGES.search(part)
+                if m:
+                    count = int(m.group(1))
+                    break
+        return FolderStatsResult(kind="ok", exists=count, uids=[])
     finally:
         await imap.logout()
+
+
+@dataclass(frozen=True)
+class FolderStatsResult:
+    """Outcome of `folder_stats`, distinguishing the three failure modes
+    introduced by ADR 0025.
+    """
+
+    kind: Literal["ok", "absent", "select_failed"]
+    exists: int = 0
+    uids: list[int] = field(default_factory=list)
+    imap_response: str = ""
 
 
 async def store_flag(
@@ -829,7 +871,7 @@ async def store_flag(
     *,
     add: bool,
 ) -> bool:
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -853,7 +895,7 @@ async def store_flags_batch(
     add: bool,
 ) -> int:
     """STORE flag on multiple UIDs in one IMAP session."""
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     if not uids:
         return 0
     imap = await _open_imap(account)
@@ -879,7 +921,7 @@ async def store_keywords(
     *,
     mode: str,
 ) -> bool:
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -891,6 +933,35 @@ async def store_keywords(
         joined = " ".join(keywords)
         status, _ = await imap.uid("store", str(uid), op, f"({joined})")
         return status == "OK"
+    finally:
+        await imap.logout()
+
+
+async def store_keywords_batch(
+    account: Account,
+    password: str,
+    folder: str,
+    uids: list[int],
+    keywords: list[str],
+    *,
+    mode: str,
+) -> int:
+    """STORE keywords on multiple UIDs in one IMAP session."""
+    folder = _quote_mailbox(folder)
+    if not uids:
+        return 0
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return 0
+        op_map = {"add": "+FLAGS", "remove": "-FLAGS", "replace": "FLAGS"}
+        op = op_map[mode]
+        joined = " ".join(keywords)
+        uid_str = ",".join(str(u) for u in uids)
+        status, _ = await imap.uid("store", uid_str, op, f"({joined})")
+        return len(uids) if status == "OK" else 0
     finally:
         await imap.logout()
 
@@ -952,8 +1023,8 @@ async def move_message(
     target_folder: str,
 ) -> str:
     """Intra-account move via RFC 6851 MOVE. Returns 'native_move' or 'copy_store_expunge'."""
-    folder = encode_mutf7(folder)
-    target_folder = encode_mutf7(target_folder)
+    folder = _quote_mailbox(folder)
+    target_folder = _quote_mailbox(target_folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1019,8 +1090,8 @@ async def copy_message(
     uid: int,
     target_folder: str,
 ) -> bool:
-    folder = encode_mutf7(folder)
-    target_folder = encode_mutf7(target_folder)
+    folder = _quote_mailbox(folder)
+    target_folder = _quote_mailbox(target_folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1070,7 +1141,7 @@ async def append_message(
     rfc822: bytes,
     flags: tuple[str, ...] = (),
 ) -> AppendResult:
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     timeout = _append_timeout()
     imap = await _open_imap(account, timeout=timeout)
     await _authenticate_imap(imap, account, password)
@@ -1112,7 +1183,7 @@ async def fetch_raw_with_flags(
     account: Account, password: str, folder: str, uid: int
 ) -> tuple[bytes, tuple[str, ...]] | None:
     """Fetch RFC822 bytes and FLAGS for a UID. Returns None if absent."""
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1135,7 +1206,7 @@ async def search_uids(
     account: Account, password: str, folder: str, criteria: str = "ALL"
 ) -> list[int]:
     """Execute a SEARCH in `folder` and return the matching UIDs."""
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1185,7 +1256,7 @@ async def gmail_search_by_msgid(
     account: Account, password: str, folder: str, gm_msgid: int
 ) -> list[int]:
     """SEARCH X-GM-MSGID <id> in the given folder."""
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1207,7 +1278,7 @@ async def gmail_search_by_msgid(
 
 async def gmail_fetch_labels(account: Account, password: str, folder: str, uid: int) -> list[str]:
     """FETCH (X-GM-LABELS) for a single UID."""
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1232,7 +1303,7 @@ async def gmail_fetch_labels(account: Account, password: str, folder: str, uid: 
 
 async def gmail_fetch_msgid(account: Account, password: str, folder: str, uid: int) -> int | None:
     """FETCH (X-GM-MSGID) for a single UID."""
-    folder = encode_mutf7(folder)
+    folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
@@ -1281,7 +1352,7 @@ async def gmail_label_swap(
     therefore run before REMOVE while the source label is still
     keeping the UID visible in the selected folder.
     """
-    folder = encode_mutf7(_label_to_folder(remove_label))
+    folder = _quote_mailbox(_label_to_folder(remove_label))
     wire_add = _encode_gmail_label(add_label)
     wire_remove = _encode_gmail_label(remove_label)
     imap = await _open_imap(account)

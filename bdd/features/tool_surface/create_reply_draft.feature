@@ -109,11 +109,11 @@ Feature: create_reply_draft builds a deterministic top-posted reply
       """
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    And the response field error_type equals null
+    And the response does not contain any field named "error"
 
     # Persistence-Validierung (Spec-Audit Pruefung 1, §13.2):
     # the draft must be visible in the Drafts folder via a separate read.
-    When reply-agent calls list_messages with account "gupta-scaratec", folder "Drafts"
+    When reply-agent calls list_messages with account "gupta-scaratec", folder "Drafts", scope "all"
     Then the response field matched_total equals 1
     And the response field messages contains exactly one entry with:
       | field          | value                                                       |
@@ -305,7 +305,7 @@ Feature: create_reply_draft builds a deterministic top-posted reply
   # -------------------------------------------------------------------
   # Eingabevalidierung: empty reply_text rejected; original untouched.
   # -------------------------------------------------------------------
-  Scenario: empty reply_text is rejected with validation_failed and produces no draft
+  Scenario: empty reply_text is reported as empty_reply_text and produces no draft
     Given the folder "INBOX" holds a message with:
       | uid  | from               | subject  | date                            | message_id            |
       | 8001 | a@example.com      | Hello    | Tue, 12 May 2026 12:00:00 +0000 | <hello-8001@example>  |
@@ -314,10 +314,10 @@ Feature: create_reply_draft builds a deterministic top-posted reply
       Hi.
       """
     When reply-agent calls create_reply_draft with account "gupta-scaratec", source_folder "INBOX", uid 8001, drafts_folder "Drafts", reply_text ""
-    Then the response decision is DENY
-    And the response field reason equals "validation_failed"
-    And the response field error_type equals "empty_reply_text"
-    When reply-agent calls list_messages with account "gupta-scaratec", folder "Drafts"
+    Then the response decision is ALLOW
+    And the response field result equals "ERROR"
+    And the response field error.type equals "empty_reply_text"
+    When reply-agent calls list_messages with account "gupta-scaratec", folder "Drafts", scope "all"
     Then the response field matched_total equals 0
 
   # -------------------------------------------------------------------
@@ -330,8 +330,8 @@ Feature: create_reply_draft builds a deterministic top-posted reply
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "uid_not_found"
-    When reply-agent calls list_messages with account "gupta-scaratec", folder "Drafts"
+    And the response field error.type equals "uid_not_found"
+    When reply-agent calls list_messages with account "gupta-scaratec", folder "Drafts", scope "all"
     Then the response field matched_total equals 0
 
   # -------------------------------------------------------------------

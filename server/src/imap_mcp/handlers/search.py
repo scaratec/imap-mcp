@@ -1,7 +1,12 @@
-"""Listing/search handlers: search, list_messages, plus criteria helpers."""
+"""Listing/search handlers: search, list_messages, plus criteria helpers.
+
+ADR 0024 anchors the duration grammar; ADR 0026 introduces the explicit
+`scope` argument and renames `default_scope` to `applied_scope`.
+"""
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
 
 from ..imap_core import (
@@ -15,6 +20,7 @@ from ..policy import (
     _match_single_predicate,
     evaluate_message_against_folder,
     level_rank,
+    parse_duration,
 )
 from ._common import (
     _facts_from_envelope,
@@ -25,6 +31,9 @@ from ._common import (
 
 if TYPE_CHECKING:
     from ..context import ServerContext
+
+
+AppliedScope = Literal["recent_7d", "explicit_window", "all_time"]
 
 
 class GmailSearchEntry(TypedDict, total=False):
@@ -45,18 +54,25 @@ class SearchResponse(TypedDict, total=False):
     page_offset: NotRequired[int]
     page_limit: NotRequired[int]
     has_more: NotRequired[bool]
-    default_scope: NotRequired[str]
+    applied_scope: NotRequired[AppliedScope]
     gmail_results: NotRequired[list[GmailSearchEntry]]
 
 
-class MessageEntry(TypedDict):
-    uid: int
-    from_: str  # placeholder; real key is "from"
-    to: tuple[str, ...] | list[str]
-    subject: str
-    date: str | None
-    has_attachment: bool
-    size_bytes: int
+# Functional TypedDict form so the JSON-wire key `from` can be expressed
+# as the Python-keyword key, eliminating the old `from_` placeholder
+# (ADR 0026 §4).
+MessageEntry = TypedDict(
+    "MessageEntry",
+    {
+        "uid": int,
+        "from": str,
+        "to": list[str],
+        "subject": str,
+        "date": str | None,
+        "has_attachment": bool,
+        "size_bytes": int,
+    },
+)
 
 
 class ListMessagesResponse(TypedDict, total=False):
@@ -71,7 +87,7 @@ class ListMessagesResponse(TypedDict, total=False):
     page_offset: NotRequired[int]
     page_limit: NotRequired[int]
     has_more: NotRequired[bool]
-    default_scope: NotRequired[str]
+    applied_scope: NotRequired[AppliedScope]
 
 
 def _deny_search(*, reason: str, account: str, folder: str) -> SearchResponse:
@@ -94,10 +110,17 @@ def _criteria_match(criteria: dict[str, Any], facts: MessageFacts) -> bool:
 def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
     """Translate MCP search criteria dict to an IMAP SEARCH string.
 
-    Empty criteria (after this function returns "ALL") receive a 7-day
-    default scope in the caller — this function only handles explicit
-    predicates.
+    Duration values are parsed via the single grammar source
+    (`policy.parse_duration`).  Sub-day values are rounded to whole days
+    in the over-inclusive direction so the IMAP-layer result is always
+    a superset of the true match set; the per-message post-filter in
+    `_criteria_match` then narrows the window back to second resolution.
+    See ADR 0024.
     """
+    from datetime import timedelta
+
+    from ..audit import _now_utc
+
     parts: list[str] = []
     for key, value in criteria.items():
         if key == "from":
@@ -111,30 +134,53 @@ def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
         elif key == "subject_contains":
             parts.append(f'SUBJECT "{value}"')
         elif key == "newer_than":
-            from datetime import timedelta
-
-            from ..audit import _now_utc
-
-            days = int(str(value).rstrip("d"))
+            seconds = parse_duration(str(value))
+            days = max(1, math.ceil(seconds / 86400))
             since = _now_utc() - timedelta(days=days)
             parts.append(f"SINCE {since.strftime('%d-%b-%Y')}")
         elif key == "older_than":
-            from datetime import timedelta
-
-            from ..audit import _now_utc
-
-            days = int(str(value).rstrip("d"))
+            seconds = parse_duration(str(value))
+            days = max(0, math.floor(seconds / 86400))
             before = _now_utc() - timedelta(days=days)
             parts.append(f"BEFORE {before.strftime('%d-%b-%Y')}")
         elif key == "size_gt":
             parts.append(f"LARGER {int(value)}")
         elif key == "size_lt":
             parts.append(f"SMALLER {int(value)}")
+        elif key == "flagged":
+            if bool(value):
+                parts.append("FLAGGED")
+            else:
+                parts.append("UNFLAGGED")
         elif key == "has_attachment":
             pass
     if not parts:
         return "ALL"
     return " ".join(parts)
+
+
+def _resolve_scope(
+    criteria: dict[str, Any], scope_arg: str | None
+) -> tuple[AppliedScope, str | None]:
+    """Decide which time scope to apply.
+
+    Returns ``(applied_scope, since_term_or_none)``.  The since term is
+    appended to the IMAP SEARCH string by the caller; if it's ``None``
+    no SINCE/BEFORE is added beyond what an explicit time predicate in
+    `criteria` already contributed.
+    """
+    from datetime import timedelta
+
+    from ..audit import _now_utc
+
+    has_explicit_time = "newer_than" in criteria or "older_than" in criteria
+    if has_explicit_time:
+        return "explicit_window", None
+    scope = (scope_arg or "recent").lower()
+    if scope == "all":
+        return "all_time", None
+    since = _now_utc() - timedelta(days=7)
+    return "recent_7d", f"SINCE {since.strftime('%d-%b-%Y')}"
 
 
 async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> SearchResponse:
@@ -143,6 +189,7 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
     criteria_raw = arguments.get("criteria") or {}
     limit = int(arguments.get("limit") or 50)
     offset = int(arguments.get("offset") or 0)
+    scope_arg = arguments.get("scope")
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return _deny_search(reason=folder_decision.reason, account=account_id, folder=folder_path)
@@ -159,15 +206,12 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
             )
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
-    applied_default_scope = False
-    if imap_criteria == "ALL" and not criteria_raw:
-        from datetime import timedelta
-
-        from ..audit import _now_utc
-
-        since = _now_utc() - timedelta(days=7)
-        imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
-        applied_default_scope = True
+    applied_scope, since_term = _resolve_scope(criteria_raw, scope_arg)
+    if since_term is not None:
+        if imap_criteria == "ALL":
+            imap_criteria = since_term
+        else:
+            imap_criteria = f"{imap_criteria} {since_term}"
 
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
@@ -178,11 +222,12 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
     pdp_predetermined = (
         fp.mode == "blacklist" and not fp.rules and level_rank(fp.default) >= minimum_for_tool
     )
+    # newer_than/older_than removed from the envelope-free predicate list
+    # because sub-day rounding (ADR 0024) means the IMAP layer over-fetches
+    # and the post-filter must run to narrow back to second resolution.
     criteria_needs_envelope = criteria_raw and any(
         k
         not in (
-            "newer_than",
-            "older_than",
             "from",
             "from_domain",
             "to",
@@ -190,6 +235,7 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
             "subject_contains",
             "size_gt",
             "size_lt",
+            "flagged",
         )
         for k in criteria_raw
     )
@@ -253,9 +299,8 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
         "page_offset": offset,
         "page_limit": limit,
         "has_more": has_more,
+        "applied_scope": applied_scope,
     }
-    if applied_default_scope:
-        result["default_scope"] = "newer_than_7d"
     if results_with_gmail is not None:
         result["gmail_results"] = results_with_gmail
     return result
@@ -269,6 +314,7 @@ async def handle_list_messages(
     criteria_raw = arguments.get("criteria") or {}
     limit = int(arguments.get("limit") or 20)
     offset = int(arguments.get("offset") or 0)
+    scope_arg = arguments.get("scope")
 
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
@@ -292,15 +338,12 @@ async def handle_list_messages(
         )
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
-    applied_default_scope = False
-    if imap_criteria == "ALL" and not criteria_raw:
-        from datetime import timedelta
-
-        from ..audit import _now_utc
-
-        since = _now_utc() - timedelta(days=7)
-        imap_criteria = f"SINCE {since.strftime('%d-%b-%Y')}"
-        applied_default_scope = True
+    applied_scope, since_term = _resolve_scope(criteria_raw, scope_arg)
+    if since_term is not None:
+        if imap_criteria == "ALL":
+            imap_criteria = since_term
+        else:
+            imap_criteria = f"{imap_criteria} {since_term}"
 
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
@@ -313,8 +356,6 @@ async def handle_list_messages(
     criteria_needs_envelope = criteria_raw and any(
         k
         not in (
-            "newer_than",
-            "older_than",
             "from",
             "from_domain",
             "to",
@@ -322,6 +363,7 @@ async def handle_list_messages(
             "subject_contains",
             "size_gt",
             "size_lt",
+            "flagged",
         )
         for k in criteria_raw
     )
@@ -362,6 +404,14 @@ async def handle_list_messages(
         env = envelope_by_uid.get(uid)
         if env is None:
             continue
+        # Surface user-set keywords as `tags` so the bulk_mark_tagged
+        # verification path can read them back. System flags (Seen,
+        # Flagged, Draft, Deleted, Recent) are excluded — the caller
+        # cares about its own tag operations, not the IMAP machinery.
+        _SYSTEM_FLAGS = frozenset(
+            {"\\Seen", "\\Flagged", "\\Draft", "\\Deleted", "\\Recent", "\\Answered"}
+        )
+        tags = [f for f in (env.flags or ()) if f not in _SYSTEM_FLAGS]
         messages.append(
             {
                 "uid": env.uid,
@@ -371,6 +421,7 @@ async def handle_list_messages(
                 "date": env.date,
                 "has_attachment": env.has_attachment,
                 "size_bytes": env.size_bytes,
+                "tags": tags,
             }
         )
 
@@ -386,7 +437,6 @@ async def handle_list_messages(
         "page_offset": offset,
         "page_limit": limit,
         "has_more": has_more,
+        "applied_scope": applied_scope,
     }
-    if applied_default_scope:
-        result["default_scope"] = "newer_than_7d"
     return result

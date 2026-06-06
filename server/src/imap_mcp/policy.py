@@ -110,8 +110,10 @@ _CORE_PREDICATES: frozenset[str] = frozenset(
 )
 
 
-def _parse_duration(value: str) -> int:
-    """Parse `"30d"`, `"7d"`, `"1h"`, `"90m"`, `"60s"` into seconds."""
+def parse_duration(value: str) -> int:
+    """Parse `"30d"`, `"7d"`, `"1h"`, `"90m"`, `"60s"`, `"2w"`, `"1y"`
+    into seconds. Single source for the duration grammar per ADR 0024.
+    """
     if not value or len(value) < 2:
         raise ValueError(f"Cannot parse duration {value!r}")
     unit = value[-1]
@@ -120,6 +122,11 @@ def _parse_duration(value: str) -> int:
     if unit not in units:
         raise ValueError(f"Unknown duration unit {unit!r} in {value!r}")
     return amount * units[unit]
+
+
+# Back-compat alias for any in-repo caller that still uses the private
+# spelling. Removable once Phase 5 cleanup confirms nothing else imports it.
+_parse_duration = parse_duration
 
 
 def _match_single_predicate(key: str, expected: object, *, facts: MessageFacts) -> bool:
@@ -158,7 +165,7 @@ def _match_single_predicate(key: str, expected: object, *, facts: MessageFacts) 
     if key == "newer_than" or key == "older_than":
         if not isinstance(expected, str) or facts.date_iso is None:
             return False
-        seconds = _parse_duration(expected)
+        seconds = parse_duration(expected)
         try:
             parsed = datetime.fromisoformat(facts.date_iso.replace("Z", "+00:00"))
         except ValueError:

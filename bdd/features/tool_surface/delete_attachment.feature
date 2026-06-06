@@ -28,7 +28,7 @@ Feature: delete_attachment removes a part from an existing message
     Then the response decision is ALLOW
     And the response field result equals "OK"
     And the response field mechanism equals "message_rewrite"
-    When att-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX", uid 881
+    When att-agent calls list_attachments with account "gupta-scaratec", folder "INBOX", uid 881
     Then the response field attachments has length 1
 
   Scenario: delete attachment with non-existent filename returns error
@@ -38,7 +38,7 @@ Feature: delete_attachment removes a part from an existing message
     When att-agent calls delete_attachment with account "gupta-scaratec", folder "INBOX", uid 891, filename "ghost.pdf"
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "attachment_not_found"
+    And the response field error.type equals "attachment_not_found"
 
   Scenario: fetch_attachment after delete confirms removal
     Given the folder "INBOX" holds a message with:
@@ -48,6 +48,7 @@ Feature: delete_attachment removes a part from an existing message
     When att-agent calls delete_attachment with account "gupta-scaratec", folder "INBOX", uid 911, filename "only.pdf"
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    When att-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX", uid 911
+    When att-agent calls list_attachments with account "gupta-scaratec", folder "INBOX", uid 911
     Then the response decision is ALLOW
-    And the response field error_type equals "attachment_not_found"
+    And the response field result equals "OK"
+    And the response field attachments has 0 entries

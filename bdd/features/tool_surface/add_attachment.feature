@@ -28,10 +28,10 @@ Feature: add_attachment appends a new part to an existing message
     Then the response decision is ALLOW
     And the response field result equals "OK"
     And the response field mechanism equals "message_rewrite"
-    When att-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX", uid 801
+    When att-agent calls list_attachments with account "gupta-scaratec", folder "INBOX", uid 801
     Then the response field attachments contains exactly one entry with:
-      | field   | value      |
-      | index | 0          |
+      | field    | value      |
+      | index    | 0          |
       | filename | report.pdf |
 
   Scenario: add attachment preserves existing attachments
@@ -41,14 +41,14 @@ Feature: add_attachment appends a new part to an existing message
     When att-agent calls add_attachment with account "gupta-scaratec", folder "INBOX", uid 811, filename "second.pdf", mime_type "application/pdf", content "dGVzdA=="
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    When att-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX", uid 811
+    When att-agent calls list_attachments with account "gupta-scaratec", folder "INBOX", uid 811
     Then the response field attachments has length 2
 
   Scenario: add attachment to non-existent UID returns error
     When att-agent calls add_attachment with account "gupta-scaratec", folder "INBOX", uid 999, filename "x.pdf", mime_type "application/pdf", content "dGVzdA=="
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "uid_not_found"
+    And the response field error.type equals "uid_not_found"
 
   Scenario: rewrite replaces the original message, not duplicates it
     Given the folder "INBOX" holds a message with:
@@ -57,7 +57,7 @@ Feature: add_attachment appends a new part to an existing message
     When att-agent calls add_attachment with account "gupta-scaratec", folder "INBOX", uid 821, filename "a.bin", mime_type "application/octet-stream", content "AAAA"
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    When att-agent calls list_messages with account "gupta-scaratec", folder "INBOX"
+    When att-agent calls list_messages with account "gupta-scaratec", folder "INBOX", scope "all"
     Then the response field matched_total equals 1
 
   Scenario: WAL records committed state after add_attachment

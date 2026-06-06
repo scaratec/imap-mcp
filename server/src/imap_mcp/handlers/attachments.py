@@ -16,7 +16,7 @@ from ..imap_core import (
     mime_delete_attachment,
     mime_replace_attachment,
 )
-from ._common import _password_for, _resolve_imap_folder
+from ._common import _password_for, _resolve_imap_folder, error_envelope
 
 if TYPE_CHECKING:
     from ..context import ServerContext
@@ -25,8 +25,8 @@ if TYPE_CHECKING:
 class AttachmentModifyResponse(TypedDict, total=False):
     decision: Literal["ALLOW", "DENY"]
     result: NotRequired[Literal["OK", "ERROR"]]
-    error_type: NotRequired[str | None]
     reason: NotRequired[str]
+    error: NotRequired[dict[str, str]]
     account: str
     folder: str
     uid: NotRequired[int]
@@ -58,16 +58,13 @@ def _deny_attachment(
 
 
 def _error_attachment(
-    *, error_type: str, account: str, folder: str, uid: int
+    *, error_type: str, account: str, folder: str, uid: int, detail: str = ""
 ) -> AttachmentModifyResponse:
-    return {
-        "decision": "ALLOW",
-        "result": "ERROR",
-        "error_type": error_type,
-        "account": account,
-        "folder": folder,
-        "uid": uid,
-    }
+    return error_envelope(  # type: ignore[return-value]
+        error_type=error_type,
+        detail=detail,
+        extra={"account": account, "folder": folder, "uid": uid},
+    )
 
 
 async def _attachment_modify(
@@ -95,9 +92,17 @@ async def _attachment_modify(
         )
     try:
         transform = build_transform(arguments)
-    except Exception as exc:
+    except (FileNotFoundError, LookupError, KeyError) as exc:
+        # Build-time failures here are exclusively "the named attachment
+        # isn't on the message" — the only data the build_transform
+        # currently inspects.  Anything else propagates as an unhandled
+        # exception so it's visible during development.
         return _error_attachment(
-            error_type=str(exc), account=account_id, folder=folder_path, uid=uid
+            error_type="attachment_not_found",
+            detail=str(exc),
+            account=account_id,
+            folder=folder_path,
+            uid=uid,
         )
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
@@ -110,18 +115,29 @@ async def _attachment_modify(
         transform=transform,
     )
     # attachment_modify response keeps its tool-specific shape (mechanism,
-    # tx_id, old_uid, optional error_type/new_uid).
+    # tx_id, old_uid) and routes errors through the unified envelope.
+    if saga_result.result == "ERROR":
+        # Map the saga's free-form error string to the closed enumeration
+        # of ADR 0027.  Anything unrecognized becomes `rewrite_failed`.
+        et = saga_result.error_type or "rewrite_failed"
+        if et not in ("uid_not_found", "attachment_not_found", "rewrite_failed"):
+            et = "rewrite_failed"
+        return _error_attachment(
+            error_type=et,
+            account=account_id,
+            folder=folder_path,
+            uid=uid,
+            detail=saga_result.error_type or "",
+        )
     result: AttachmentModifyResponse = {
         "decision": "ALLOW",
-        "result": saga_result.result,
+        "result": "OK",
         "mechanism": saga_result.mechanism,
         "tx_id": saga_result.tx_id,
         "account": account_id,
         "folder": folder_path,
         "old_uid": uid,
     }
-    if saga_result.error_type:
-        result["error_type"] = saga_result.error_type
     tx = context.saga.wal.get(saga_result.tx_id)
     if tx and tx.get("target_uid"):
         result["new_uid"] = tx["target_uid"]

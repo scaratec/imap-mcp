@@ -1,18 +1,22 @@
-Feature: Response transparency for policy-filtered data
+Feature: Response transparency and unified envelope
 
   Every tool response carries transparency fields so that an LLM
   caller does not construct false conclusions from a silently
   filtered view. The vocabulary is categorical and never exposes
   rule identifiers or the names of hidden objects.
-  See ADR 0017.
+  See ADR 0017 (transparency contract) and ADR 0027 (unified envelope:
+  decision / result / reason / error.{type,detail}).
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Hidden counts (list/search/folder)    : 3
-    - Redaction reason codes                 : 6 (categorical vocabulary)
-    - describe_policy own-profile disclosure : 1
-    - describe_policy no-leak rules          : 1 (no rule patterns, no hidden names)
-    - Per-field redacted_fields flags        : 1
-    Total enumerated                          : 12   covered by this feature: 12
+    - Hidden counts (list/search/folder)        : 3
+    - Redaction reason codes                     : 6 (categorical vocabulary)
+    - describe_policy own-profile disclosure     : 1
+    - describe_policy no-leak rules              : 1 (no rule patterns, no hidden names)
+    - Per-field redacted_fields flags            : 1
+    - DENY envelope shape                        : 1 (decision/reason/account/folder, no error block)
+    - ALLOW + ERROR envelope shape               : 1 (decision/result/reason/error.{type,detail})
+    - error.detail is bounded and not echo'd    : 1
+    Total enumerated                              : 15   covered by this feature: 15
 
   Background:
     Given the IMAP account "gupta-scaratec" exists with folders:
@@ -87,7 +91,7 @@ Feature: Response transparency for policy-filtered data
   Scenario: describe_policy exposes the caller's own profile
     When invoice-agent calls describe_policy
     Then the response field caller_id equals "invoice-agent"
-    And the response field tool_set_version matches the regex "^1\.\d+\.\d+$"
+    And the response field tool_set_version matches the regex "^2\.\d+\.\d+$"
     And the response field accounts contains exactly one entry with:
       | field                   | value                     |
       | id                      | gupta-scaratec            |
@@ -111,3 +115,41 @@ Feature: Response transparency for policy-filtered data
       | Archiv           |
       | osthues-mail     |
       | overview-agent   |
+
+  # --- Unified envelope (ADR 0027) ---
+
+  Scenario: DENY responses carry decision/reason and never an error block
+    Given the folder "INBOX/Rechnungen" holds a message with:
+      | uid | from              |
+      | 630 | spam@unrelated.io |
+    When invoice-agent calls fetch_envelope with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 630
+    Then the response decision is DENY
+    And the response field reason equals "sender_not_whitelisted"
+    And the response does not contain any field named "result"
+    And the response does not contain any field named "error"
+    And the response does not contain any field named "error_type"
+    And the response does not contain any field named "imap_response"
+
+  Scenario: ALLOW + ERROR responses carry the unified error block
+    Given policy "invoice-policy" grants account "gupta-scaratec" and folder:
+      | folder              | mode      | default | rules |
+      | INBOX/Typo-no-exist | blacklist | COUNT   | []    |
+    When invoice-agent calls folder_stats with account "gupta-scaratec", folder "INBOX/Typo-no-exist"
+    Then the response decision is ALLOW
+    And the response field result equals "ERROR"
+    And the response field reason equals "folder_default_applied"
+    And the response field error.type equals "folder_absent"
+    And the response field error.detail is a string of at most 256 characters
+    And the response does not contain any field named "error_type"
+    And the response does not contain any field named "imap_response"
+
+  Scenario: error.detail never echoes caller-controlled input strings
+    # A malicious caller might try to ferry content out by stuffing a
+    # poisoned string into the folder name. The detail field is bounded
+    # to server-classified strings; the caller's literal must not appear.
+    Given policy "invoice-policy" grants account "gupta-scaratec" and folder:
+      | folder                              | mode      | default | rules |
+      | INBOX/POISON-MARKER-MUST-NOT-LEAK   | blacklist | COUNT   | []    |
+    When invoice-agent calls folder_stats with account "gupta-scaratec", folder "INBOX/POISON-MARKER-MUST-NOT-LEAK"
+    Then the response field error.type equals "folder_absent"
+    And the response field error.detail does NOT contain the literal string "POISON-MARKER-MUST-NOT-LEAK"

@@ -35,6 +35,7 @@ Feature: Non-goal tool surface is genuinely absent
       | reload_policy         |
       | get_audit_log         |
       | get_server_config     |
+      | bulk_move             |
 
   Scenario: A move call whose target is a non-existent "Trash" (because no Trash folder policy exists) yields capability_missing, not silent deletion
     Given caller "invoice-agent" has no policy that references any folder named "Trash"

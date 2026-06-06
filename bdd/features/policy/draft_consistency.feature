@@ -57,5 +57,5 @@ Feature: create_draft consistency with subsequent reads
       """
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    And the response field error_type equals null
+    And the response does not contain any field named "error"
     And the IMAP folder "Drafts" contains exactly one message with subject "Persisted draft"

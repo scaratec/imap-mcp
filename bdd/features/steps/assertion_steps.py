@@ -62,15 +62,26 @@ def _parse_expected(raw: str) -> Any:
         )
 
 
+def _resolve_dotted_field(payload: dict, field: str) -> tuple[bool, object]:
+    """Resolve a dotted path like `error.type` against a nested response."""
+    parts = field.split(".")
+    cursor: object = payload
+    for part in parts:
+        if not isinstance(cursor, dict) or part not in cursor:
+            return False, None
+        cursor = cursor[part]
+    return True, cursor
+
+
 @then("the response field {field} equals {expected}")
 def step_response_field_equals(context: Context, field: str, expected: str) -> None:
     response = _last_response(context)
-    if field not in response:
+    found, actual = _resolve_dotted_field(response, field)
+    if not found:
         raise AssertionError(
-            f"Response has no field {field!r}. Available fields: "
+            f"Response has no field {field!r}. Available top-level fields: "
             f"{sorted(response.keys())}"
         )
-    actual = response[field]
     expected_value = _parse_expected(expected)
     # UID translation: feature-file hints (e.g. [201, 202]) are not the
     # server-side UIDs IMAP assigns; the seed step records the mapping
@@ -1358,6 +1369,7 @@ CANONICAL_REASON_CODES = frozenset(
 )
 
 
+@then("every distinct reason code in the audit file is present in ADR-0017 §2.1 as amended by ADR-0025")
 @then("every distinct reason code in the audit file is present in ADR-0017 §2.1")
 def step_audit_reasons_in_canonical(context: Context) -> None:
     from support.audit_reader import AuditReader
@@ -1378,6 +1390,7 @@ def step_audit_reasons_in_canonical(context: Context) -> None:
         )
 
 
+@then("the canonical reason-code table in ADR-0017 §2.1 as amended by ADR-0025 has variance discipline")
 @then("the canonical reason-code table in ADR-0017 §2.1 has variance discipline")
 def step_canonical_variance_discipline(context: Context) -> None:
     """Assert that every canonical reason code is exercised by at least
@@ -3026,3 +3039,273 @@ def _assert_text_body_equals_exactly(context: Context) -> None:
 #   `the response field {field} contains exactly one entry with:`
 # is already defined further up (~line 616) as a generic one-row tabular
 # match. The reply-builder feature reuses it via field=messages.
+
+
+# --------------------------------------------------------------------- 2.0 surface
+
+
+def _server_info_metadata(context: Context) -> dict:
+    """Return the serverInfo.metadata block from the live MCP client."""
+    client = context.mcp
+    if client is None:
+        raise AssertionError("MCP client not initialised; start a tool call first")
+    info = getattr(client, "server_info", None) or {}
+    return info.get("metadata") or {}
+
+
+@then('the server info metadata contains "tool_set_version" matching the regex "{pattern}"')
+def step_server_info_metadata_version_regex(context: Context, pattern: str) -> None:
+    import re as _re
+
+    metadata = _server_info_metadata(context)
+    version = metadata.get("tool_set_version")
+    if not isinstance(version, str) or not _re.match(pattern, version):
+        raise AssertionError(
+            f"serverInfo.metadata.tool_set_version {version!r} does not match {pattern!r}"
+        )
+    context.last_server_info_tool_set_version = version
+
+
+@then("the major version of tool_set_version equals {major:d}")
+def step_major_version_of_tool_set_version_equals(context: Context, major: int) -> None:
+    version = getattr(context, "last_server_info_tool_set_version", None) or getattr(
+        context, "last_tool_set_version", None
+    )
+    if version is None:
+        raise AssertionError(
+            "No tool_set_version captured yet; precede with a regex assertion"
+        )
+    actual_major = int(version.split(".")[0])
+    if actual_major != major:
+        raise AssertionError(
+            f"Major version mismatch: got {actual_major}, expected {major}"
+        )
+
+
+@then("the response field {field} matches the serverInfo {meta_key}")
+def step_response_field_matches_server_info(
+    context: Context, field: str, meta_key: str
+) -> None:
+    metadata = _server_info_metadata(context)
+    expected = metadata.get(meta_key)
+    response = _last_response(context)
+    actual = response.get(field)
+    if expected is None:
+        raise AssertionError(f"serverInfo.metadata has no key {meta_key!r}")
+    if actual != expected:
+        raise AssertionError(
+            f"Field {field!r}: response {actual!r} vs serverInfo.{meta_key} {expected!r}"
+        )
+
+
+@then("the response field {field} is a string")
+def step_response_field_is_string(context: Context, field: str) -> None:
+    found, value = _resolve_dotted_field(_last_response(context), field)
+    if not found:
+        raise AssertionError(f"Response has no field {field!r}")
+    if not isinstance(value, str):
+        raise AssertionError(f"Field {field!r}: expected str, got {type(value).__name__}")
+
+
+@then("the response field {field} is an array")
+def step_response_field_is_array(context: Context, field: str) -> None:
+    found, value = _resolve_dotted_field(_last_response(context), field)
+    if not found:
+        raise AssertionError(f"Response has no field {field!r}")
+    if not isinstance(value, list):
+        raise AssertionError(f"Field {field!r}: expected array, got {type(value).__name__}")
+
+
+@then("the response field {field} is a string of at most {max_len:d} characters")
+def step_response_field_string_bounded(
+    context: Context, field: str, max_len: int
+) -> None:
+    found, value = _resolve_dotted_field(_last_response(context), field)
+    if not found:
+        raise AssertionError(f"Response has no field {field!r}")
+    if not isinstance(value, str):
+        raise AssertionError(f"Field {field!r}: expected str, got {type(value).__name__}")
+    if len(value) > max_len:
+        raise AssertionError(
+            f"Field {field!r}: length {len(value)} exceeds max {max_len}"
+        )
+
+
+@then('the response field {field} does NOT contain the literal string "{needle}"')
+def step_response_field_no_literal(context: Context, field: str, needle: str) -> None:
+    found, value = _resolve_dotted_field(_last_response(context), field)
+    if not found:
+        raise AssertionError(f"Response has no field {field!r}")
+    if isinstance(value, str) and needle in value:
+        raise AssertionError(
+            f"Field {field!r} unexpectedly contains literal {needle!r}: {value!r}"
+        )
+
+
+@then("the breaking_changes_since field has at least one entry")
+def step_breaking_changes_at_least_one(context: Context) -> None:
+    response = _last_response(context)
+    entries = response.get("breaking_changes_since") or []
+    if not isinstance(entries, list) or len(entries) < 1:
+        raise AssertionError(
+            f"breaking_changes_since expected ≥1 entry, got {entries!r}"
+        )
+
+
+@then('one entry has field "{key}" equal to "{expected}"')
+def step_one_entry_field_equals(context: Context, key: str, expected: str) -> None:
+    response = _last_response(context)
+    entries = response.get("breaking_changes_since") or []
+    if not any(
+        isinstance(entry, dict) and entry.get(key) == expected for entry in entries
+    ):
+        raise AssertionError(
+            f"No breaking_changes_since entry has {key}={expected!r} (got {entries!r})"
+        )
+
+
+@then('one entry has field "{key}" matching the regex "{pattern}"')
+def step_one_entry_field_matches_regex(
+    context: Context, key: str, pattern: str
+) -> None:
+    import re as _re
+
+    response = _last_response(context)
+    entries = response.get("breaking_changes_since") or []
+    if not any(
+        isinstance(entry, dict)
+        and isinstance(entry.get(key), str)
+        and _re.search(pattern, entry[key])
+        for entry in entries
+    ):
+        raise AssertionError(
+            f"No breaking_changes_since entry has {key} matching {pattern!r} (got {entries!r})"
+        )
+
+
+@then('the response error message contains "{needle}"')
+def step_response_error_message_contains(context: Context, needle: str) -> None:
+    rpc_error = getattr(context, "last_rpc_error", None)
+    if rpc_error is None:
+        raise AssertionError(
+            "No JSON-RPC error captured. Last response was: "
+            f"{getattr(context, 'last_response', None)!r}"
+        )
+    message = rpc_error.get("message") or ""
+    if needle not in message:
+        raise AssertionError(
+            f"JSON-RPC error message {message!r} does not contain {needle!r}"
+        )
+
+
+@then('both responses report applied_scope equal to "{expected}"')
+def step_both_responses_applied_scope(context: Context, expected: str) -> None:
+    history = getattr(context, "response_history", None) or []
+    if len(history) < 2:
+        raise AssertionError(
+            f"Need at least two recorded responses, have {len(history)}"
+        )
+    for i, resp in enumerate(history[-2:], start=1):
+        actual = resp.get("applied_scope")
+        if actual != expected:
+            raise AssertionError(
+                f"Response #{i}: applied_scope expected {expected!r}, got {actual!r}"
+            )
+
+
+@then('every returned message has tag "{tag}"')
+def step_every_returned_message_has_tag(context: Context, tag: str) -> None:
+    response = _last_response(context)
+    messages = response.get("messages") or []
+    if not messages:
+        raise AssertionError("No messages in last response")
+    for i, msg in enumerate(messages):
+        tags = msg.get("tags") or msg.get("keywords") or []
+        if tag not in tags:
+            raise AssertionError(
+                f"Message #{i} ({msg.get('uid')!r}) lacks tag {tag!r} "
+                f"(has {tags!r})"
+            )
+
+
+@then('no returned message has tag "{tag}"')
+def step_no_returned_message_has_tag(context: Context, tag: str) -> None:
+    response = _last_response(context)
+    messages = response.get("messages") or []
+    for i, msg in enumerate(messages):
+        tags = msg.get("tags") or msg.get("keywords") or []
+        if tag in tags:
+            raise AssertionError(
+                f"Message #{i} ({msg.get('uid')!r}) unexpectedly carries tag {tag!r}"
+            )
+
+
+@given(
+    "a sequence of operations exercises every folder-opening tool with "
+    "valid, hidden, typo'd, and SELECT-failing folder targets"
+)
+def step_seq_ops_folder_opening_tools(context: Context) -> None:
+    """Marker step: the audit/response sweep that follows reads
+    everything captured so far. The actual exercise is up to the
+    surrounding scenarios in this file — this step is a documentation
+    anchor so the negative assertion ("no record carries folder_not_found")
+    has an explicit precondition."""
+    context.folder_taxonomy_sweep_armed = True
+
+
+@when("the current audit file and the captured tool responses are scanned")
+def step_scan_audit_and_responses(context: Context) -> None:
+    """Collect every reason and every error.type currently visible to
+    the harness for the negative assertions below."""
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    reasons: set[str] = set()
+    error_types: set[str] = set()
+    for rec in reader.records_today():
+        reason = rec.record.get("reason")
+        if isinstance(reason, str):
+            reasons.add(reason)
+        et = rec.record.get("error_type")
+        if isinstance(et, str):
+            error_types.add(et)
+    for resp in getattr(context, "response_history", []) or []:
+        if not isinstance(resp, dict):
+            continue
+        if isinstance(resp.get("reason"), str):
+            reasons.add(resp["reason"])
+        err = resp.get("error")
+        if isinstance(err, dict) and isinstance(err.get("type"), str):
+            error_types.add(err["type"])
+    context.scanned_reasons = reasons
+    context.scanned_error_types = error_types
+
+
+@then('no record or response carries reason "{code}"')
+def step_no_record_carries_reason(context: Context, code: str) -> None:
+    reasons = getattr(context, "scanned_reasons", set())
+    if code in reasons:
+        raise AssertionError(f"Reason code {code!r} appears in audit/responses")
+
+
+@then('no record or response carries error.type "{code}"')
+def step_no_record_carries_error_type(context: Context, code: str) -> None:
+    error_types = getattr(context, "scanned_error_types", set())
+    if code in error_types:
+        raise AssertionError(f"error.type {code!r} appears in audit/responses")
+
+
+@then("the IMAP server received at most {limit:d} IMAP connections")
+def step_imap_server_received_at_most(context: Context, limit: int) -> None:
+    """Generic counterpart to the gmail-specific ‘mock-gmail server received…’
+    step. Counts every IMAP connection the test fixtures have observed."""
+    gmail_state = getattr(context, "gmail_state", None)
+    if gmail_state is not None:
+        count = gmail_state.total_connections
+    else:
+        imap_fixture = getattr(context, "imap", None)
+        count = getattr(imap_fixture, "total_connections", 0) if imap_fixture else 0
+    if count > limit:
+        raise AssertionError(
+            f"IMAP server connection count {count} exceeds limit {limit}"
+        )

@@ -1,4 +1,10 @@
-"""Per-message fetch handlers: envelope, body, headers, attachment."""
+"""Per-message fetch handlers: envelope, body, headers, attachment.
+
+ADR 0026 split the original `fetch_attachment` into `list_attachments`
+(metadata-only, BODY level) and `fetch_attachment` (single blob, FULL
+level, `part_id` required). ADR 0027 normalises every ERROR shape via
+the unified envelope.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,7 @@ from ._common import (
     _facts_from_envelope,
     _password_for,
     _resolve_imap_folder,
+    error_envelope,
 )
 
 if TYPE_CHECKING:
@@ -27,49 +34,48 @@ class AttachmentMetaEntry(TypedDict):
     size_bytes: int
 
 
-class FetchResponse(TypedDict, total=False):
-    """Union shape over the four fetch handlers.
-
-    Each handler returns a strict subset of these keys; ``total=False``
-    keeps every field optional so that a single TypedDict can capture
-    the union without splitting it per-tool. The non-public ``_blob*``
-    keys are stripped by the dispatcher's ``_emit`` before the wire
-    response is built (ADR 0021 §8).
-    """
-
-    decision: Literal["ALLOW", "DENY"]
-    result: NotRequired[Literal["OK", "ERROR"]]
-    error_type: NotRequired[str | None]
-    reason: NotRequired[str]
-    visibility_applied: NotRequired[str]
-    matched_rule_index: NotRequired[int | None]
-    account: str
-    folder: str
-    uid: int
-    # Envelope payload
-    from_: NotRequired[str]  # not actually used; "from" is reserved keyword
-    to: NotRequired[tuple[str, ...] | list[str]]
-    subject: NotRequired[str]
-    message_id: NotRequired[str | None]
-    date: NotRequired[str | None]
-    body: NotRequired[str | None]
-    text_body: NotRequired[str]
-    attachments: NotRequired[list[AttachmentMetaEntry] | list[Any] | None]
-    redacted_fields: NotRequired[list[str]]
-    redaction_reason: NotRequired[str | None]
-    # fetch_headers payload
-    headers: NotRequired[dict[str, str]]
-    # fetch_attachment selected-part payload
-    part_id: NotRequired[int]
-    mime_type: NotRequired[str]
-    size_bytes: NotRequired[int]
-    content_hash: NotRequired[str]
-    # Dispatcher-stripped blob keys (private)
-    _blob: NotRequired[str]
-    _blob_mime_type: NotRequired[str]
-    _blob_uri: NotRequired[str]
-    # Private hint for audit sender-hashing in dispatch
-    _matched_sender: NotRequired[str]
+# Functional form so the JSON-wire key `from` is the actual Python key
+# (no `from_` placeholder lie). Annotations stay loose because the
+# overall shape is a union across handlers.
+FetchResponse = TypedDict(
+    "FetchResponse",
+    {
+        "decision": Literal["ALLOW", "DENY"],
+        "result": NotRequired[Literal["OK", "ERROR"]],
+        "reason": NotRequired[str],
+        "error": NotRequired[dict[str, str]],
+        "visibility_applied": NotRequired[str],
+        "matched_rule_index": NotRequired[int | None],
+        "account": str,
+        "folder": str,
+        "uid": int,
+        # Envelope payload
+        "from": NotRequired[str],
+        "to": NotRequired[list[str]],
+        "subject": NotRequired[str],
+        "message_id": NotRequired[str | None],
+        "date": NotRequired[str | None],
+        "body": NotRequired[str | None],
+        "text_body": NotRequired[str],
+        "attachments": NotRequired[list[AttachmentMetaEntry] | list[Any] | None],
+        "redacted_fields": NotRequired[list[str]],
+        "redaction_reason": NotRequired[str | None],
+        # fetch_headers payload
+        "headers": NotRequired[dict[str, str]],
+        # fetch_attachment selected-part payload
+        "part_id": NotRequired[int],
+        "mime_type": NotRequired[str],
+        "size_bytes": NotRequired[int],
+        "content_hash": NotRequired[str],
+        # Dispatcher-stripped blob keys (private)
+        "_blob": NotRequired[str],
+        "_blob_mime_type": NotRequired[str],
+        "_blob_uri": NotRequired[str],
+        # Private hint for audit sender-hashing in dispatch
+        "_matched_sender": NotRequired[str],
+    },
+    total=False,
+)
 
 
 def _deny_fetch(
@@ -99,18 +105,14 @@ def _error_fetch(
     folder: str,
     uid: int,
     reason: str | None = None,
+    detail: str = "",
 ) -> FetchResponse:
-    response: FetchResponse = {
-        "decision": "ALLOW",
-        "result": "ERROR",
-        "error_type": error_type,
-        "account": account,
-        "folder": folder,
-        "uid": uid,
-    }
-    if reason is not None:
-        response["reason"] = reason
-    return response
+    return error_envelope(  # type: ignore[return-value]
+        error_type=error_type,
+        detail=detail,
+        reason=reason or "folder_default_applied",
+        extra={"account": account, "folder": folder, "uid": uid},
+    )
 
 
 async def handle_fetch_envelope(
@@ -348,6 +350,7 @@ def _build_attachment_blob_response(
     filename = part.get_filename() or "attachment"
     return {
         "decision": "ALLOW",
+        "result": "OK",
         "reason": message_decision.reason,
         "visibility_applied": message_decision.visibility,
         "account": account_id,
@@ -363,19 +366,88 @@ def _build_attachment_blob_response(
     }
 
 
-async def handle_fetch_attachment(
+async def handle_list_attachments(
     context: "ServerContext", arguments: dict[str, Any]
 ) -> FetchResponse:
-    """Orchestrator: validate, fetch the raw message, walk for
-    attachment parts, then either list metadata (``part_id is None``)
-    or return the selected part's bytes as a blob."""
+    """Return attachment metadata at BODY visibility (ADR 0026 §1).
+
+    No `part_id` argument; the caller learns the indices and then asks
+    for individual blobs via `fetch_attachment`. Same MIME-walk as the
+    legacy `fetch_attachment(without part_id)` branch — that branch is
+    now this handler's body.
+    """
     import email
 
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
-    raw_part_id = arguments.get("part_id")
-    part_id: int | None = int(raw_part_id) if raw_part_id is not None else None
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return _deny_fetch(
+            reason=folder_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
+    assert folder_decision.folder_policy is not None
+    account, password = await _password_for(context, account_id)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    envelope = await imap_fetch_envelope(account, password, imap_folder, uid)
+    if envelope is None:
+        return _error_fetch(
+            error_type="uid_not_found", account=account_id, folder=folder_path, uid=uid
+        )
+    facts = _facts_from_envelope(envelope)
+    message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
+    if not message_decision.allowed:
+        return _deny_fetch(
+            reason=message_decision.reason, account=account_id, folder=folder_path, uid=uid
+        )
+    if level_rank(message_decision.visibility) < level_rank("BODY"):
+        return _deny_fetch(
+            reason="visibility_below_BODY", account=account_id, folder=folder_path, uid=uid
+        )
+    raw = await imap_fetch_full_message(account, password, imap_folder, uid)
+    if raw is None:
+        return _error_fetch(
+            error_type="uid_not_found", account=account_id, folder=folder_path, uid=uid
+        )
+    msg = email.message_from_bytes(raw)
+    all_parts = _walk_attachment_parts(msg)
+    attachments_meta: list[AttachmentMetaEntry] = []
+    for i, p in enumerate(all_parts):
+        p_payload = p.get_payload(decode=True) or b""
+        attachments_meta.append(
+            {
+                "index": i,
+                "filename": p.get_filename(),
+                "mime_type": p.get_content_type(),
+                "size_bytes": len(p_payload),
+            }
+        )
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": message_decision.reason,
+        "visibility_applied": message_decision.visibility,
+        "account": account_id,
+        "folder": folder_path,
+        "uid": uid,
+        "attachments": attachments_meta,
+    }
+
+
+async def handle_fetch_attachment(
+    context: "ServerContext", arguments: dict[str, Any]
+) -> FetchResponse:
+    """Return one attachment part's bytes as a blob (ADR 0026 §1).
+
+    `part_id` is now required at the JSON-Schema layer, so this handler
+    always operates in the single-part-fetch mode.
+    """
+    import email
+
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+    uid = int(arguments["uid"])
+    part_id = int(arguments["part_id"])
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return _deny_fetch(
@@ -406,33 +478,6 @@ async def handle_fetch_attachment(
         )
     msg = email.message_from_bytes(raw)
     all_parts = _walk_attachment_parts(msg)
-    if not all_parts:
-        return _error_fetch(
-            error_type="attachment_not_found", account=account_id, folder=folder_path, uid=uid
-        )
-
-    if part_id is None:
-        attachments_meta: list[AttachmentMetaEntry] = []
-        for i, p in enumerate(all_parts):
-            p_payload = p.get_payload(decode=True) or b""
-            attachments_meta.append(
-                {
-                    "index": i,
-                    "filename": p.get_filename(),
-                    "mime_type": p.get_content_type(),
-                    "size_bytes": len(p_payload),
-                }
-            )
-        return {
-            "decision": "ALLOW",
-            "reason": message_decision.reason,
-            "visibility_applied": message_decision.visibility,
-            "account": account_id,
-            "folder": folder_path,
-            "uid": uid,
-            "attachments": attachments_meta,
-        }
-
     selected_part = _select_attachment_part(all_parts, part_id)
     if selected_part is None:
         return _error_fetch(

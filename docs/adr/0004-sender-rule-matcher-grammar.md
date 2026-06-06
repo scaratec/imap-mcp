@@ -1,6 +1,6 @@
 # ADR 0004: Sender Rule Matcher Grammar
 
-- **Status:** Accepted
+- **Status:** Superseded in part by [ADR-0024](0024-duration-grammar-single-source.md) for the `newer_than`/`older_than` rows; otherwise Accepted
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

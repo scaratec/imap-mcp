@@ -67,3 +67,4 @@ Feature: Search on blacklist folders with permissive defaults responds quickly
     Then the response field uids contains exactly [301]
     And the response field matched_visible equals 1
     And the response field filtered_out equals 1
+    And the response field applied_scope equals "explicit_window"

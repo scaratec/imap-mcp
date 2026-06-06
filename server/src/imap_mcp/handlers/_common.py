@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 _FORBIDDEN_SYSTEM_FLAGS = frozenset(["\\Deleted", "\\Draft", "\\Recent"])
 
-TOOL_SET_VERSION = "1.0.0"
+TOOL_SET_VERSION = "2.0.0"
 READ_TOOL_MIN_VIS = {
     "list_accounts": None,
     "list_folders": "COUNT",
@@ -36,12 +36,14 @@ READ_TOOL_MIN_VIS = {
     "fetch_envelope": "ENVELOPE",
     "fetch_headers": "HEADERS",
     "fetch_body": "BODY",
+    "list_attachments": "BODY",
     "fetch_attachment": "FULL",
 }
 WRITE_TOOL_CAP = {
     "mark_seen": "mark_seen",
     "bulk_mark_seen": "mark_seen",
     "mark_tagged": "mark_tagged",
+    "bulk_mark_tagged": "mark_tagged",
     "move": "move_out",
     "copy": "accept_incoming",
     "create_draft": "draft_append",
@@ -50,6 +52,64 @@ WRITE_TOOL_CAP = {
     "replace_attachment": "modify_message",
     "delete_attachment": "modify_message",
 }
+
+
+# --------------------------------------------------------------------- envelope
+
+
+_ERROR_DETAIL_MAX_LEN = 256
+_KNOWN_ERROR_TYPES = frozenset(
+    {
+        # Folder operations
+        "folder_absent",
+        "select_failed",
+        # Append (drafts)
+        "append_rejected",
+        "append_timeout",
+        "append_failed",
+        # Reply construction
+        "uid_not_found",
+        "empty_reply_text",
+        # Attachment access / modify
+        "attachment_not_found",
+        "rewrite_failed",
+        # Move / copy
+        "saga_aborted",
+        "transient_imap_failure",
+    }
+)
+
+
+def error_envelope(
+    *,
+    error_type: str,
+    detail: str = "",
+    reason: str = "folder_default_applied",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build an ALLOW+ERROR response per ADR 0027.
+
+    `error_type` must be in the closed enumeration of ADR 0027.  `detail`
+    is bounded to 256 characters and is the caller-visible single line;
+    callers must pre-sanitize the string (no reflected input).  `extra`
+    holds the tool-specific identifying fields like account/folder/uid;
+    those fields are merged at the top level of the envelope, not under
+    the `error` block.
+    """
+    if error_type not in _KNOWN_ERROR_TYPES:
+        raise ValueError(f"error_type {error_type!r} is not in the ADR 0027 enumeration")
+    truncated = (detail or "")[:_ERROR_DETAIL_MAX_LEN]
+    payload: dict[str, Any] = {
+        "decision": "ALLOW",
+        "result": "ERROR",
+        "reason": reason,
+        "error": {"type": error_type, "detail": truncated},
+    }
+    if extra:
+        for key, value in extra.items():
+            if key not in payload:
+                payload[key] = value
+    return payload
 
 
 def _facts_from_envelope(envelope: Any) -> MessageFacts:
@@ -191,6 +251,7 @@ __all__ = [
     "TOOL_SET_VERSION",
     "READ_TOOL_MIN_VIS",
     "WRITE_TOOL_CAP",
+    "error_envelope",
     "_facts_from_envelope",
     "_get_folder_aliases",
     "_is_google_provider",

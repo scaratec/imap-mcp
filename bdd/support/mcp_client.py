@@ -147,7 +147,23 @@ class MCPClient:
                 "clientInfo": {"name": "imap-mcp-bdd", "version": "0.1.0"},
             },
         )
-        self.server_info = result.get("serverInfo", {})
+        self.server_info = dict(result.get("serverInfo", {}))
+        # ADR 0027: the surface version travels inside `instructions`
+        # because the MCP SDK does not surface custom `serverInfo.metadata`
+        # natively. The server prefixes the JSON envelope with a fixed
+        # marker so this parser is stable.
+        instructions = result.get("instructions") or ""
+        marker = "imap-mcp surface metadata: "
+        if marker in instructions:
+            import json as _json
+
+            tail = instructions.split(marker, 1)[1].strip()
+            try:
+                metadata = _json.loads(tail)
+            except _json.JSONDecodeError:
+                metadata = {}
+            if isinstance(metadata, dict):
+                self.server_info["metadata"] = metadata
         self._notify("notifications/initialized", {})
         self._initialized = True
 

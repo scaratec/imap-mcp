@@ -35,7 +35,7 @@ Feature: replace_attachment swaps content of an existing attachment
     When att-agent calls replace_attachment with account "gupta-scaratec", folder "INBOX", uid 861, filename "nonexistent.pdf", new_content "dGVzdA=="
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "attachment_not_found"
+    And the response field error.type equals "attachment_not_found"
 
   Scenario: WAL records committed state after replace_attachment
     Given the folder "INBOX" holds a message with:

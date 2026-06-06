@@ -1,9 +1,11 @@
 Feature: Reason code vocabulary contract
 
-  ADR 0017 §2 declares the canonical reason-code table. This feature
-  is its contract test: it asserts that every code in the table is
-  reachable from at least one documented condition and that the server
-  never emits a code outside the canonical set. See LIM-0001.
+  ADR 0017 §2 declares the canonical reason-code table; ADR 0025 amends
+  it (folder_not_found is removed, folder_hidden stays, folder_absent
+  and select_failed are added as error.type values not reason codes).
+  This feature is the contract test: every reason code in the canonical
+  set is reachable from at least one documented condition, and the
+  server never emits a reason code outside the set. See LIM-0001.
 
   Scenarios in this file are vocabulary contract checks, not behavior
   tests — they exist so that a regression that introduces a new code
@@ -14,7 +16,8 @@ Feature: Reason code vocabulary contract
   Covered error layers (per BDD Guidelines §4.5):
     - Each declared reason code reachable          : 1 (per code)
     - No undeclared code emitted by server         : 1 (negative-shape)
-    Total enumerated                                : 17  covered by this feature: 17
+    - folder_not_found removal: never emitted      : 1
+    Total enumerated                                : 18  covered by this feature: 18
 
   Background:
     Given the IMAP account "gupta-scaratec" exists with folders:
@@ -89,7 +92,7 @@ Feature: Reason code vocabulary contract
     Given the folder "INBOX/Rechnungen" holds a message with:
       | uid | from                 |
       | 906 | rechnung@hornbach.de |
-    When invoice-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 906
+    When invoice-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 906, part_id 0
     Then the response decision is DENY
     And the response field reason equals "visibility_below_FULL"
 
@@ -179,7 +182,17 @@ Feature: Reason code vocabulary contract
   Scenario: every reason code emitted by the server in this run is in the canonical set
     Given a sequence of operations over a day creates 20 audit records across ALLOW, DENY, saga, and token_refresh
     When the current audit file is read
-    Then every distinct reason code in the audit file is present in ADR-0017 §2.1
+    Then every distinct reason code in the audit file is present in ADR-0017 §2.1 as amended by ADR-0025
 
   Scenario: every canonical reason code is exercised by at least two non-pending scenarios
-    Then the canonical reason-code table in ADR-0017 §2.1 has variance discipline
+    Then the canonical reason-code table in ADR-0017 §2.1 as amended by ADR-0025 has variance discipline
+
+  Scenario: folder_not_found is never emitted by the server after the ADR-0025 hard cut
+    # folder_not_found was removed by ADR 0025 in favour of three more
+    # specific signals: folder_hidden (reason), folder_absent (error.type),
+    # and select_failed (error.type). A regression that reintroduces the
+    # old code under any condition fails this assertion.
+    Given a sequence of operations exercises every folder-opening tool with valid, hidden, typo'd, and SELECT-failing folder targets
+    When the current audit file and the captured tool responses are scanned
+    Then no record or response carries reason "folder_not_found"
+    And no record or response carries error.type "folder_not_found"

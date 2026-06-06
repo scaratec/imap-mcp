@@ -28,7 +28,7 @@ from mcp.types import (
 )
 
 from .context import ServerContext, _package_version
-from .handlers._common import READ_TOOL_MIN_VIS, WRITE_TOOL_CAP
+from .handlers._common import READ_TOOL_MIN_VIS, TOOL_SET_VERSION, WRITE_TOOL_CAP
 from .handlers.accounts import (
     handle_list_accounts,
     handle_list_folders,
@@ -45,15 +45,18 @@ from .handlers.fetch import (
     handle_fetch_body,
     handle_fetch_envelope,
     handle_fetch_headers,
+    handle_list_attachments,
 )
 from .handlers.folder import handle_folder_stats
 from .handlers.introspection import (
     handle_describe_policy,
     handle_get_caller_identity,
     handle_get_transaction_status,
+    handle_tool_surface_info,
 )
 from .handlers.mark import (
     handle_bulk_mark_seen,
+    handle_bulk_mark_tagged,
     handle_mark_seen,
     handle_mark_tagged,
 )
@@ -66,438 +69,24 @@ from .handlers.test_only import (
 
 
 def build_server(context: ServerContext) -> Server:
-    app: Server = Server("imap-mcp", version=_package_version())
+    # The MCP SDK passes `instructions` verbatim into the Initialize
+    # response.  ADR 0027 requires the tool-set version to be reachable
+    # before any tools/call; embedding it as a JSON envelope inside
+    # `instructions` keeps us SDK-clean and lets clients parse the
+    # `serverInfo.metadata` they expect (the test client carries a
+    # tiny parser that lifts the JSON back out — see `mcp_client.py`).
+    import json as _json
+
+    surface_metadata = {
+        "tool_set_version": TOOL_SET_VERSION,
+        "package_version": _package_version(),
+    }
+    instructions = "imap-mcp surface metadata: " + _json.dumps(surface_metadata)
+    app: Server = Server("imap-mcp", version=_package_version(), instructions=instructions)
 
     @app.list_tools()
     async def _list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name="list_accounts",
-                description=(
-                    "List available email accounts. Call this FIRST to "
-                    "discover which accounts you can access. Returns "
-                    "account ids and their state (active/needs_rebootstrap)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                    "x-mcp-imap": {"category": "read"},
-                },
-            ),
-            Tool(
-                name="list_folders",
-                description=(
-                    "List visible folders in an email account. "
-                    "Returns folder names and hidden_folders_count."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {"account": {"type": "string"}},
-                    "required": ["account"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="fetch_envelope",
-                description=(
-                    "Fetch from/to/subject/date for a single message by "
-                    "UID. Use list_messages instead when you need multiple "
-                    "messages — it is much faster."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                    },
-                    "required": ["account", "folder", "uid"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="search",
-                description=(
-                    "Search for message UIDs in a folder. Returns UIDs "
-                    "only (no envelope data). Use list_messages instead "
-                    "if you need from/subject/date. This tool is for "
-                    "counting or for feeding UIDs into fetch_envelope."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "criteria": {"type": "object"},
-                        "limit": {"type": "integer", "minimum": 1, "default": 50},
-                        "offset": {"type": "integer", "minimum": 0, "default": 0},
-                    },
-                    "required": ["account", "folder"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="list_messages",
-                description=(
-                    "THE PRIMARY TOOL for reading emails. Returns from, "
-                    "subject, date for each message in one call. "
-                    "Use this for: 'show me my emails', 'what arrived "
-                    "today', 'recent messages'. Supports criteria: "
-                    '{"newer_than": "1d"} for today, '
-                    '{"from_domain": "example.com"} for sender filter, '
-                    '{"subject_contains": "invoice"} for subject search. '
-                    "Always call list_accounts first to get the account id, "
-                    "then call this with account, folder='INBOX'."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "criteria": {"type": "object"},
-                        "limit": {"type": "integer", "minimum": 1, "default": 20},
-                        "offset": {"type": "integer", "minimum": 0, "default": 0},
-                    },
-                    "required": ["account", "folder"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="fetch_headers",
-                description=(
-                    "Fetch the full RFC 5322 header block of a message. "
-                    "Requires HEADERS-level visibility (ADR 0002)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                    },
-                    "required": ["account", "folder", "uid"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="fetch_attachment",
-                description=(
-                    "Fetch a single MIME attachment by index. "
-                    "Omit part_id to list all attachments with their metadata. "
-                    "Requires FULL visibility (ADR 0002)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                        "part_id": {
-                            "type": "integer",
-                            "description": (
-                                "0-based attachment index from fetch_body "
-                                "or from calling this tool without part_id"
-                            ),
-                        },
-                    },
-                    "required": ["account", "folder", "uid"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="fetch_body",
-                description=(
-                    "Fetch the plain/HTML body of a single message. "
-                    "Only works if your visibility for this message is "
-                    "BODY or FULL. Will return DENY if the sender is "
-                    "not in your whitelist or your visibility is only "
-                    "ENVELOPE. Use list_messages first to see which "
-                    "messages you can access."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                    },
-                    "required": ["account", "folder", "uid"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="mark_seen",
-                description="Toggle the \\Seen flag on a message (ADR 0005).",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                        "seen": {"type": "boolean"},
-                    },
-                    "required": ["account", "folder", "uid", "seen"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="bulk_mark_seen",
-                description=(
-                    "Mark all messages matching criteria as read (or "
-                    "unread) in one call. Use for 'mark all alerts as "
-                    "read'. Searches by criteria, then sets \\Seen on "
-                    "all matches in a single IMAP session. Returns "
-                    "marked_count."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "criteria": {"type": "object"},
-                        "seen": {"type": "boolean"},
-                    },
-                    "required": ["account", "folder", "criteria", "seen"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="mark_tagged",
-                description="Add/remove/replace keywords on a message (ADR 0005).",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                        "tags": {"type": "array", "items": {"type": "string"}},
-                        "mode": {"type": "string", "enum": ["add", "remove", "replace"]},
-                    },
-                    "required": ["account", "folder", "uid", "tags", "mode"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="move",
-                description="Move a message between folders (ADR 0006). Intra-account native MOVE, cross-account saga.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "source": {"type": "object"},
-                        "target": {"type": "object"},
-                    },
-                    "required": ["source", "target"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="copy",
-                description="Copy a message between folders (ADR 0006).",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "source": {"type": "object"},
-                        "target": {"type": "object"},
-                    },
-                    "required": ["source", "target"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="create_draft",
-                description=(
-                    "Append an RFC 5322 message to a folder as a draft. "
-                    "Call list_folders first to get the correct folder "
-                    "path. Gmail uses '[Gmail]/Drafts', not 'Drafts'."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "rfc822": {"type": "string"},
-                    },
-                    "required": ["account", "folder", "rfc822"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="create_reply_draft",
-                description=(
-                    "Build a top-posted reply to <account/source_folder/uid>"
-                    " and APPEND it as a draft to drafts_folder. The agent "
-                    "supplies only reply_text; the server derives Re:-subject"
-                    ", In-Reply-To and References headers, reply-all "
-                    "recipients (with the account identity removed from Cc),"
-                    " and the quoted original body."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "source_folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                        "drafts_folder": {"type": "string"},
-                        "reply_text": {"type": "string"},
-                    },
-                    "required": [
-                        "account",
-                        "source_folder",
-                        "uid",
-                        "drafts_folder",
-                        "reply_text",
-                    ],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="describe_policy",
-                description=(
-                    "Return the caller's own policy profile. The caller "
-                    "sees which accounts and folders are visible to them, "
-                    "which capabilities are granted, and the count of "
-                    "hidden accounts/folders — never the names of hidden "
-                    "items, never rule patterns, never other callers' "
-                    "policies (ADR 0017)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": True,
-                },
-            ),
-            Tool(
-                name="get_transaction_status",
-                description="Return the WAL state of a saga transaction.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {"tx_id": {"type": "string"}},
-                    "required": ["tx_id"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="get_caller_identity",
-                description=(
-                    "Return the resolved caller_id for the current "
-                    "session. Exposes no policy or token data (ADR 0015)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="add_attachment",
-                description=(
-                    "Add an attachment to an existing message. The message "
-                    "is rewritten via FETCH-APPEND-DELETE (WAL-backed). "
-                    "Requires modify_message capability and FULL visibility."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                        "filename": {"type": "string"},
-                        "mime_type": {"type": "string"},
-                        "content": {
-                            "type": "string",
-                            "description": "Base64-encoded attachment content",
-                        },
-                    },
-                    "required": ["account", "folder", "uid", "filename", "mime_type", "content"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="replace_attachment",
-                description=(
-                    "Replace an existing attachment identified by filename. "
-                    "The message is rewritten via FETCH-APPEND-DELETE (WAL-backed). "
-                    "Requires modify_message capability and FULL visibility."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                        "filename": {
-                            "type": "string",
-                            "description": "Name of the attachment to replace",
-                        },
-                        "new_content": {
-                            "type": "string",
-                            "description": "Base64-encoded new content",
-                        },
-                        "new_mime_type": {"type": "string"},
-                        "new_filename": {"type": "string"},
-                    },
-                    "required": ["account", "folder", "uid", "filename", "new_content"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="delete_attachment",
-                description=(
-                    "Remove an attachment identified by filename from a message. "
-                    "The message is rewritten via FETCH-APPEND-DELETE (WAL-backed). "
-                    "Requires modify_message capability and FULL visibility."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                        "uid": {"type": "integer"},
-                        "filename": {
-                            "type": "string",
-                            "description": "Name of the attachment to delete",
-                        },
-                    },
-                    "required": ["account", "folder", "uid", "filename"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="folder_stats",
-                description=(
-                    "Return aggregate counts for a folder: visible "
-                    "messages, hidden messages, and the caller's "
-                    "visibility level for this folder (ADR 0017)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                        "folder": {"type": "string"},
-                    },
-                    "required": ["account", "folder"],
-                    "additionalProperties": False,
-                },
-            ),
-            Tool(
-                name="list_labels",
-                description=(
-                    "List Gmail labels for a Google account. Returns "
-                    "label names, flags, and hierarchy separators. "
-                    "Only applicable for google/google-mock providers; "
-                    "returns DENY for non-Google accounts."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "account": {"type": "string"},
-                    },
-                    "required": ["account"],
-                    "additionalProperties": False,
-                },
-            ),
-        ]
+        return _build_tool_list()
 
     known_tools = (
         set(READ_TOOL_MIN_VIS.keys())
@@ -506,6 +95,7 @@ def build_server(context: ServerContext) -> Server:
             "describe_policy",
             "get_caller_identity",
             "get_transaction_status",
+            "tool_surface_info",
         }
     )
     if context.test_hooks.test_mode:
@@ -529,6 +119,12 @@ def build_server(context: ServerContext) -> Server:
 
         name = req.params.name
         arguments = req.params.arguments or {}
+        # Schema-layer validation that the MCP SDK does not enforce
+        # server-side: criteria field grammar (ADR 0024) and the
+        # required `part_id` on fetch_attachment (ADR 0026 §1).
+        schema_error = _validate_arguments_against_surface(name, arguments)
+        if schema_error is not None:
+            raise McpError(ErrorData(code=-32602, message=schema_error))
         if name not in known_tools:
             if context.audit is not None:
                 context.audit.write(
@@ -601,6 +197,8 @@ def build_server(context: ServerContext) -> Server:
             return await handle_fetch_body(context, arguments)
         if name == "fetch_headers":
             return await handle_fetch_headers(context, arguments)
+        if name == "list_attachments":
+            return await handle_list_attachments(context, arguments)
         if name == "fetch_attachment":
             return await handle_fetch_attachment(context, arguments)
         if name == "folder_stats":
@@ -611,6 +209,8 @@ def build_server(context: ServerContext) -> Server:
             return await handle_bulk_mark_seen(context, arguments)
         if name == "mark_tagged":
             return await handle_mark_tagged(context, arguments)
+        if name == "bulk_mark_tagged":
+            return await handle_bulk_mark_tagged(context, arguments)
         if name == "move":
             return await handle_move(context, arguments)
         if name == "copy":
@@ -631,6 +231,8 @@ def build_server(context: ServerContext) -> Server:
             return handle_get_caller_identity(context)
         if name == "get_transaction_status":
             return await handle_get_transaction_status(context, arguments)
+        if name == "tool_surface_info":
+            return handle_tool_surface_info(context)
         if name == "_test_run_recovery":
             return await handle_test_run_recovery(context, arguments)
         if name == "_test_run_audit_rotation":
@@ -718,13 +320,50 @@ def _audit_tool_call(
     context.audit.write(record)
 
 
+_DURATION_RE = None  # initialised lazily
+
+_TOOLS_WITH_CRITERIA = frozenset({"search", "list_messages", "bulk_mark_seen", "bulk_mark_tagged"})
+_DURATION_KEYS = ("newer_than", "older_than")
+
+
+def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) -> str | None:
+    """Reject the two argument shapes the in-handler code cannot
+    distinguish from runtime errors: malformed duration strings and
+    a missing `part_id` on fetch_attachment.
+
+    Returns the JSON-RPC error message string when invalid, None when
+    the call may proceed.
+    """
+    import re as _re
+
+    global _DURATION_RE
+    if _DURATION_RE is None:
+        _DURATION_RE = _re.compile(_DURATION_PATTERN)
+
+    if name in _TOOLS_WITH_CRITERIA:
+        criteria = arguments.get("criteria") or {}
+        if isinstance(criteria, dict):
+            for key in _DURATION_KEYS:
+                value = criteria.get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, str) or not _DURATION_RE.match(value):
+                    return (
+                        f"Invalid criteria.{key} {value!r}: must match "
+                        f"the duration pattern {_DURATION_PATTERN}"
+                    )
+    if name == "fetch_attachment" and "part_id" not in arguments:
+        return "fetch_attachment requires part_id (ADR 0026 §1)"
+    return None
+
+
 def _sanitise_args(arguments: dict[str, Any]) -> dict[str, Any]:
     safe: dict[str, Any] = {}
     for key, value in arguments.items():
         if key in ("rfc822", "tags"):
             safe[key] = "<redacted>" if key == "rfc822" else value
             continue
-        if key in ("account", "folder", "uid", "seen", "mode", "part_id"):
+        if key in ("account", "folder", "uid", "seen", "mode", "part_id", "scope"):
             safe[key] = value
             continue
         if key in ("source", "target") and isinstance(value, dict):
@@ -738,3 +377,297 @@ def _sanitise_args(arguments: dict[str, Any]) -> dict[str, Any]:
             safe["search_query_digest"] = hashlib.sha256(canonical).hexdigest()
             continue
     return safe
+
+
+# --------------------------------------------------------------------- schemas
+
+# Single source for the V2 search-criteria grammar (ADR 0024, ADR 0026).
+# Reused by search, list_messages, bulk_mark_seen, bulk_mark_tagged.
+_DURATION_PATTERN = r"^[0-9]+[smhdwy]$"
+_CRITERIA_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "from": {"type": "string"},
+        "from_domain": {"type": "string"},
+        "to": {"type": "string"},
+        "to_contains": {"type": "string"},
+        "subject_contains": {"type": "string"},
+        "has_attachment": {"type": "boolean"},
+        "flagged": {"type": "boolean"},
+        "newer_than": {"type": "string", "pattern": _DURATION_PATTERN},
+        "older_than": {"type": "string", "pattern": _DURATION_PATTERN},
+        "size_gt": {"type": "integer", "minimum": 1},
+        "size_lt": {"type": "integer", "minimum": 1},
+    },
+    "additionalProperties": False,
+}
+_SCOPE_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": ["recent", "all"],
+    "default": "recent",
+}
+_SOURCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "account": {"type": "string"},
+        "folder": {"type": "string"},
+        "uid": {"type": "integer", "minimum": 1},
+    },
+    "required": ["account", "folder", "uid"],
+    "additionalProperties": False,
+}
+_TARGET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "account": {"type": "string"},
+        "folder": {"type": "string"},
+    },
+    "required": ["account", "folder"],
+    "additionalProperties": False,
+}
+
+
+def _tool(
+    name: str,
+    description: str,
+    properties: dict[str, Any],
+    required: list[str] | None = None,
+    *,
+    category: str | None = None,
+) -> Tool:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = required
+    if category is not None:
+        schema["x-mcp-imap"] = {"category": category}
+    return Tool(name=name, description=description, inputSchema=schema)
+
+
+def _build_tool_list() -> list[Tool]:
+    """Return the V2 tool surface (ADR 0026, 26 tools)."""
+    account_field = {"account": {"type": "string"}}
+    folder_field = {"folder": {"type": "string"}}
+    uid_field = {"uid": {"type": "integer", "minimum": 1}}
+    return [
+        _tool(
+            "list_accounts",
+            "List accounts visible to the caller (ADR 0026).",
+            {},
+            category="read",
+        ),
+        _tool(
+            "list_folders",
+            "List folders the caller may see on an account (ADR 0025, 0026).",
+            {**account_field},
+            ["account"],
+        ),
+        _tool(
+            "list_labels",
+            "List Gmail labels for a Google account (ADR 0019, 0026).",
+            {**account_field},
+            ["account"],
+        ),
+        _tool(
+            "folder_stats",
+            "Return aggregate counts for a folder (ADR 0017, 0025, 0026).",
+            {**account_field, **folder_field},
+            ["account", "folder"],
+        ),
+        _tool(
+            "search",
+            "Search a folder for matching UIDs (ADR 0024, 0026).",
+            {
+                **account_field,
+                **folder_field,
+                "criteria": _CRITERIA_SCHEMA,
+                "scope": _SCOPE_SCHEMA,
+                "limit": {"type": "integer", "minimum": 1, "default": 50},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+            },
+            ["account", "folder"],
+        ),
+        _tool(
+            "list_messages",
+            "List messages with envelope data (ADR 0024, 0026).",
+            {
+                **account_field,
+                **folder_field,
+                "criteria": _CRITERIA_SCHEMA,
+                "scope": _SCOPE_SCHEMA,
+                "limit": {"type": "integer", "minimum": 1, "default": 20},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+            },
+            ["account", "folder"],
+        ),
+        _tool(
+            "fetch_envelope",
+            "Fetch envelope fields for one UID (ADR 0026).",
+            {**account_field, **folder_field, **uid_field},
+            ["account", "folder", "uid"],
+        ),
+        _tool(
+            "fetch_headers",
+            "Fetch full RFC 5322 headers (ADR 0026).",
+            {**account_field, **folder_field, **uid_field},
+            ["account", "folder", "uid"],
+        ),
+        _tool(
+            "fetch_body",
+            "Fetch the plain/HTML body parts (ADR 0026).",
+            {**account_field, **folder_field, **uid_field},
+            ["account", "folder", "uid"],
+        ),
+        _tool(
+            "list_attachments",
+            "List attachment metadata for one UID (ADR 0026).",
+            {**account_field, **folder_field, **uid_field},
+            ["account", "folder", "uid"],
+        ),
+        _tool(
+            "fetch_attachment",
+            "Fetch one attachment part by index (ADR 0026).",
+            {
+                **account_field,
+                **folder_field,
+                **uid_field,
+                "part_id": {"type": "integer", "minimum": 0},
+            },
+            ["account", "folder", "uid", "part_id"],
+        ),
+        _tool(
+            "mark_seen",
+            "Toggle the \\Seen flag on a message (ADR 0005).",
+            {**account_field, **folder_field, **uid_field, "seen": {"type": "boolean"}},
+            ["account", "folder", "uid", "seen"],
+        ),
+        _tool(
+            "bulk_mark_seen",
+            "Mark every message matching criteria as seen/unseen (ADR 0026).",
+            {
+                **account_field,
+                **folder_field,
+                "criteria": _CRITERIA_SCHEMA,
+                "scope": _SCOPE_SCHEMA,
+                "seen": {"type": "boolean"},
+            },
+            ["account", "folder", "criteria", "seen"],
+        ),
+        _tool(
+            "mark_tagged",
+            "Add, remove, or replace keywords on a message (ADR 0005).",
+            {
+                **account_field,
+                **folder_field,
+                **uid_field,
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "mode": {"type": "string", "enum": ["add", "remove", "replace"]},
+            },
+            ["account", "folder", "uid", "tags", "mode"],
+        ),
+        _tool(
+            "bulk_mark_tagged",
+            "Tag/untag every message matching criteria (ADR 0026).",
+            {
+                **account_field,
+                **folder_field,
+                "criteria": _CRITERIA_SCHEMA,
+                "scope": _SCOPE_SCHEMA,
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "mode": {"type": "string", "enum": ["add", "remove", "replace"]},
+            },
+            ["account", "folder", "criteria", "tags", "mode"],
+        ),
+        _tool(
+            "move",
+            "Move a message between folders (ADR 0006, 0026).",
+            {"source": _SOURCE_SCHEMA, "target": _TARGET_SCHEMA},
+            ["source", "target"],
+        ),
+        _tool(
+            "copy",
+            "Copy a message between folders (ADR 0006, 0026).",
+            {"source": _SOURCE_SCHEMA, "target": _TARGET_SCHEMA},
+            ["source", "target"],
+        ),
+        _tool(
+            "create_draft",
+            "Append an RFC 5322 message as a draft (ADR 0026, 0027).",
+            {**account_field, **folder_field, "rfc822": {"type": "string"}},
+            ["account", "folder", "rfc822"],
+        ),
+        _tool(
+            "create_reply_draft",
+            "Build and APPEND a top-posted reply draft (ADR 0026, 0027).",
+            {
+                **account_field,
+                "source_folder": {"type": "string"},
+                **uid_field,
+                "drafts_folder": {"type": "string"},
+                "reply_text": {"type": "string"},
+            },
+            ["account", "source_folder", "uid", "drafts_folder", "reply_text"],
+        ),
+        _tool(
+            "add_attachment",
+            "Add an attachment via FETCH/APPEND/DELETE (ADR 0026).",
+            {
+                **account_field,
+                **folder_field,
+                **uid_field,
+                "filename": {"type": "string"},
+                "mime_type": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            ["account", "folder", "uid", "filename", "mime_type", "content"],
+        ),
+        _tool(
+            "replace_attachment",
+            "Replace an attachment via FETCH/APPEND/DELETE (ADR 0026).",
+            {
+                **account_field,
+                **folder_field,
+                **uid_field,
+                "filename": {"type": "string"},
+                "new_content": {"type": "string"},
+                "new_mime_type": {"type": "string"},
+                "new_filename": {"type": "string"},
+            },
+            ["account", "folder", "uid", "filename", "new_content"],
+        ),
+        _tool(
+            "delete_attachment",
+            "Remove an attachment via FETCH/APPEND/DELETE (ADR 0026).",
+            {
+                **account_field,
+                **folder_field,
+                **uid_field,
+                "filename": {"type": "string"},
+            },
+            ["account", "folder", "uid", "filename"],
+        ),
+        _tool(
+            "describe_policy",
+            "Return the caller's own policy profile (ADR 0017).",
+            {},
+        ),
+        _tool(
+            "get_transaction_status",
+            "Return the WAL state of a saga transaction (ADR 0006).",
+            {"tx_id": {"type": "string"}},
+            ["tx_id"],
+        ),
+        _tool(
+            "get_caller_identity",
+            "Return the resolved caller_id (ADR 0015).",
+            {},
+        ),
+        _tool(
+            "tool_surface_info",
+            "Return tool-set version and breaking-changes log (ADR 0027).",
+            {},
+        ),
+    ]

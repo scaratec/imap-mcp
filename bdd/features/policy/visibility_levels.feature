@@ -34,7 +34,16 @@ Feature: Linear visibility levels
       | fetch_envelope     | METADATA | visibility_below_ENVELOPE |
       | fetch_headers      | ENVELOPE | visibility_below_HEADERS  |
       | fetch_body         | HEADERS  | visibility_below_BODY     |
-      | fetch_attachment   | BODY     | visibility_below_FULL     |
+
+  Scenario: fetch_attachment at BODY grant is denied with visibility_below_FULL
+    # Extracted from the outline above because fetch_attachment requires
+    # an explicit part_id (ADR 0026 §1); the outline does not pass one.
+    Given policy "invoice-policy" grants folder:
+      | folder            | mode      | default | rule                                     |
+      | INBOX/Rechnungen  | whitelist | NONE    | from_domain=hornbach.de -> BODY          |
+    When invoice-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 100, part_id 0
+    Then the response decision is DENY
+    And the response field reason equals "visibility_below_FULL"
 
   Scenario Outline: A fetch tool at or above its minimum level returns the permitted fields and flags the rest as redacted
     Given policy "invoice-policy" grants folder:

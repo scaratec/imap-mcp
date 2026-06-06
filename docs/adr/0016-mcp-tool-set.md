@@ -1,6 +1,6 @@
 # ADR 0016: MCP Tool Set
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0026](0026-tool-surface-consistency.md) for the tool list and by [ADR-0025](0025-folder-path-contract-and-error-taxonomy.md) for the `folder` argument semantics
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

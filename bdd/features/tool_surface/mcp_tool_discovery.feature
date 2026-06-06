@@ -1,38 +1,42 @@
 Feature: MCP tool discovery
 
   A connected client enumerates the server's tools via the standard
-  MCP list_tools handshake. V1 exposes exactly twenty-three tools
-  partitioned into ten read, six write, and three meta. The
-  advertised shape matches ADR 0016.
+  MCP list_tools handshake. The 2.0.0 surface exposes exactly 26
+  tools partitioned into 11 read, 11 write, and 4 meta. The
+  advertised shape matches ADR 0026 and the version bump to 2.0.0
+  is per ADR 0027.
 
   Covered error layers (per BDD Guidelines §4.5):
     - Tool presence           : 1 (exact set)
     - Tool absence            : 1 (no extras, especially no non-goals)
     - Tool metadata           : 3 (read: minimum-level, write: capability, meta: none)
-    - Version advertisement   : 1
+    - Version advertisement   : 2 (serverInfo + tool_surface_info tool)
     - Package version in serverInfo : 1
-    Total enumerated          : 7   covered by this feature: 7
+    Total enumerated          : 8   covered by this feature: 8
 
   Background:
     Given the server is started with a minimal caller configuration
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The V1 tool set consists of exactly these 23 tools
+  Scenario: The 2.0 tool set consists of exactly these 26 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
       | tool                      |
       | list_accounts             |
       | list_folders              |
+      | list_labels               |
       | folder_stats              |
       | search                    |
       | list_messages             |
       | fetch_envelope            |
       | fetch_headers             |
       | fetch_body                |
+      | list_attachments          |
       | fetch_attachment          |
       | mark_seen                 |
       | bulk_mark_seen            |
       | mark_tagged               |
+      | bulk_mark_tagged          |
       | move                      |
       | copy                      |
       | create_draft              |
@@ -43,7 +47,7 @@ Feature: MCP tool discovery
       | describe_policy           |
       | get_transaction_status    |
       | get_caller_identity       |
-      | list_labels               |
+      | tool_surface_info         |
 
   Scenario: Non-goal tool names are never advertised
     When invoice-agent calls the MCP list_tools method
@@ -62,6 +66,7 @@ Feature: MCP tool discovery
       | rotate_tokens         |
       | reload_policy         |
       | get_audit_log         |
+      | bulk_move             |
 
   Scenario: Read tools advertise their minimum visibility level in metadata
     When invoice-agent calls the MCP list_tools method
@@ -69,19 +74,24 @@ Feature: MCP tool discovery
       | tool               | minimum_visibility |
       | list_accounts      | (n/a)              |
       | list_folders       | COUNT              |
+      | list_labels        | COUNT              |
       | folder_stats       | COUNT              |
       | search             | METADATA           |
+      | list_messages      | METADATA           |
       | fetch_envelope     | ENVELOPE           |
       | fetch_headers      | HEADERS            |
       | fetch_body         | BODY               |
+      | list_attachments   | BODY               |
       | fetch_attachment   | FULL               |
 
   Scenario: Write tools advertise their required capability in metadata
     When invoice-agent calls the MCP list_tools method
     Then each write tool's metadata contains "required_capability" matching:
-      | tool          | required_capability |
+      | tool               | required_capability |
       | mark_seen          | mark_seen           |
+      | bulk_mark_seen     | mark_seen           |
       | mark_tagged        | mark_tagged         |
+      | bulk_mark_tagged   | mark_tagged         |
       | move               | move_out            |
       | copy               | accept_incoming     |
       | create_draft       | draft_append        |
@@ -97,11 +107,18 @@ Feature: MCP tool discovery
       | describe_policy          |
       | get_transaction_status   |
       | get_caller_identity      |
+      | tool_surface_info        |
 
-  Scenario: Server advertises a tool_set_version that follows semantic versioning
-    When invoice-agent calls the MCP list_tools method
-    Then the server metadata contains "tool_set_version" matching the regex "^\d+\.\d+\.\d+$"
-    And the major version equals 1
+  Scenario: serverInfo metadata advertises tool_set_version 2.x.y
+    Then the server info metadata contains "tool_set_version" matching the regex "^2\.\d+\.\d+$"
+    And the major version of tool_set_version equals 2
+
+  Scenario: tool_surface_info returns the same version as serverInfo
+    When invoice-agent calls tool_surface_info
+    Then the response decision is ALLOW
+    And the response field result equals "OK"
+    And the response field tool_set_version matches the regex "^2\.\d+\.\d+$"
+    And the response field tool_set_version matches the serverInfo tool_set_version
 
   Scenario: serverInfo.version matches the installed package version
     Then the server info version matches the installed sc-imap-mcp package version

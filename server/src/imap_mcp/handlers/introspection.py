@@ -176,5 +176,46 @@ async def handle_describe_policy(
         "hidden_accounts_count": hidden_accounts,
         "tool_set_available": list(READ_TOOL_MIN_VIS.keys())
         + list(WRITE_TOOL_CAP.keys())
-        + ["describe_policy", "get_caller_identity", "get_transaction_status"],
+        + [
+            "describe_policy",
+            "get_caller_identity",
+            "get_transaction_status",
+            "tool_surface_info",
+        ],
+    }
+
+
+# --------------------------------------------------------------------- ADR 0027
+
+
+_BREAKING_CHANGES_LOG = [
+    {
+        "version": "2.0.0",
+        "summary": (
+            "criteria + folder-path + envelope refactor (ADR 0024-0027): "
+            "duration grammar single source, canonical folder paths with "
+            "three-code error taxonomy, normalized error envelope, "
+            "list_attachments split, bulk_mark_tagged, explicit scope arg."
+        ),
+    }
+]
+
+
+def handle_tool_surface_info(context: "ServerContext") -> dict[str, Any]:
+    """Return the contract-version envelope per ADR 0027 §2.
+
+    The same metadata is also injected into the MCP `serverInfo`
+    instructions block at handshake time so a client can pin before any
+    `tools/call`.
+    """
+    from ..context import _package_version
+
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": "folder_default_applied",
+        "tool_set_version": TOOL_SET_VERSION,
+        "package_version": _package_version(),
+        "protocol_revision": "2024-11-05",
+        "breaking_changes_since": list(_BREAKING_CHANGES_LOG),
     }

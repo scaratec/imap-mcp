@@ -125,6 +125,10 @@ class PolicyBuilder:
     ) -> FolderPolicy:
         policy = next(p for p in self.policies if p.name == policy_name)
         folder_list = policy.accounts.setdefault(account_id, [])
+        # Replace any pre-existing entry on the same path so a later
+        # step that wants to tighten visibility takes effect instead
+        # of appending a shadow entry the server ignores.
+        folder_list[:] = [fp for fp in folder_list if fp.path != path]
         folder = FolderPolicy(path=path, mode=mode, default=default, **caps)
         folder_list.append(folder)
         return folder

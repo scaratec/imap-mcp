@@ -131,6 +131,13 @@ def before_scenario(context: Context, scenario: Scenario) -> None:
 
     context.mcp: MCPClient | None = None  # step files create it lazily
 
+    # Wipe per-scenario response state. The list grows on every tool
+    # call via _store_result so that multi-call assertions
+    # ("both responses report …") can compare the last two entries.
+    context.last_response = None
+    context.last_rpc_error = None
+    context.response_history = []
+
 
 def after_scenario(context: Context, scenario: Scenario) -> None:
     """Terminate the MCP server and remove scratch state."""

@@ -601,7 +601,11 @@ def _seed_message(context: Context, account_id: str, folder: str) -> None:
             if "size_bytes" in headings
             else 0,
             "date": row["date"] if "date" in headings else None,
-            "flags": _parse_flags(row["flags"]) if "flags" in headings else [],
+            "flags": (
+                _parse_flags(row["flags"])
+                if "flags" in headings
+                else (["\\Flagged"] if "flagged" in headings and _parse_bool(row["flagged"]) else [])
+            ),
             "extra_attachments": [],
             "extra_headers": extra_headers,
             "body_override": None,
@@ -911,6 +915,34 @@ def step_fault_next_append_error(context: Context, account_id: str, code: int) -
     _start_imap_proxy(
         context, account_id,
         inject_failure_on=[{"command": "APPEND", "remaining": 1}],
+    )
+
+
+@given(
+    'the IMAP server for "{account_id}" responds to the next SELECT of '
+    '"{folder}" with NO response text "{text}"'
+)
+def step_fault_next_select_no_text(
+    context: Context, account_id: str, folder: str, text: str
+) -> None:
+    """Inject NO for the next SELECT on the given folder.
+
+    The proxy fault-matcher is verb-only; the folder name is therefore
+    documented in the scenario for context but not enforced on the
+    wire (BDD Guidelines §1.3 — the fachliche Sache is "SELECT fails
+    with NO", and the next SELECT in the scenario is the one we mean).
+    """
+    _ = folder
+    _start_imap_proxy(
+        context, account_id,
+        inject_failure_on=[
+            {
+                "command": "SELECT",
+                "remaining": 1,
+                "mode": "no_response",
+                "response_text": text,
+            }
+        ],
     )
 
 
@@ -3289,4 +3321,153 @@ def step_imap_account_also_exists_with_folder(
         )
     instance, user = resolve_account(account_id)
     context.imap.create_folder(instance, user, folder)
+    builder.write()
+
+
+# --------------------------------------------------------------------- bulk seeds
+
+
+def _stage_n_simple_messages(
+    context: Context,
+    account_id: str,
+    folder: str,
+    count: int,
+    *,
+    from_addr: str,
+    tag: str | None = None,
+    starting_uid: int = 9000,
+) -> None:
+    """Stage `count` minimal-shape messages for deferred IMAP APPEND.
+
+    Used by bulk_* feature scenarios where the per-message content does
+    not matter — only the count, the sender (for criteria matching), and
+    optionally a pre-applied tag (for mode=remove/replace).
+    """
+    context.staged_messages = getattr(context, "staged_messages", [])
+    for offset in range(count):
+        context.staged_messages.append(
+            {
+                "_account_id": account_id,
+                "_folder": folder,
+                "uid_hint": starting_uid + offset,
+                "from": from_addr,
+                "to": None,
+                "subject": f"Bulk seed #{offset + 1}",
+                "message_id_override": None,
+                "has_attachment": False,
+                "size_hint": 0,
+                "date": None,
+                "flags": [tag] if tag else [],
+                "extra_attachments": [],
+                "extra_headers": [],
+                "body_override": None,
+                "html_body": None,
+                "html_only": False,
+            }
+        )
+
+
+@given('the folder "{folder}" on "{account_id}" holds {count:d} messages')
+def step_folder_holds_n_messages_explicit(
+    context: Context, folder: str, account_id: str, count: int
+) -> None:
+    _stage_n_simple_messages(
+        context, account_id, folder, count, from_addr="bulk@example.com"
+    )
+
+
+@given('the folder "{folder}" holds {count:d} messages')
+def step_folder_holds_n_messages(
+    context: Context, folder: str, count: int
+) -> None:
+    account_id = _find_account_for_folder(context, folder)
+    _stage_n_simple_messages(
+        context, account_id, folder, count, from_addr="bulk@example.com"
+    )
+
+
+@given('the folder "{folder}" holds {count:d} messages from "{from_addr}"')
+def step_folder_holds_n_messages_from(
+    context: Context, folder: str, count: int, from_addr: str
+) -> None:
+    account_id = _find_account_for_folder(context, folder)
+    _stage_n_simple_messages(context, account_id, folder, count, from_addr=from_addr)
+
+
+@given(
+    'the folder "{folder}" holds {count:d} messages from "{from_addr}" '
+    'each tagged "{tag}"'
+)
+def step_folder_holds_n_messages_from_tagged(
+    context: Context, folder: str, count: int, from_addr: str, tag: str
+) -> None:
+    account_id = _find_account_for_folder(context, folder)
+    _stage_n_simple_messages(
+        context, account_id, folder, count, from_addr=from_addr, tag=tag
+    )
+
+
+@given('the folder "{folder}" on "{account_id}" holds {count:d} message')
+def step_folder_holds_one_message_explicit(
+    context: Context, folder: str, account_id: str, count: int
+) -> None:
+    _stage_n_simple_messages(
+        context, account_id, folder, count, from_addr="bulk@example.com"
+    )
+
+
+@given('policy "{policy_name}" folder defaults are:')
+def step_policy_folder_defaults_table(context: Context, policy_name: str) -> None:
+    """Declare per-folder defaults on a policy in a single tabular step.
+
+    Each row is `| folder | mode | default |` plus optional capability
+    columns. The folder column may contain a leading ``ACCOUNT:`` prefix
+    to disambiguate cross-account scenarios; otherwise the policy's first
+    granted account is used.
+    """
+    from support.policy_builder import FolderPolicy
+
+    builder = _ensure_builder(context)
+    policy = next((p for p in builder.policies if p.name == policy_name), None)
+    if policy is None:
+        raise AssertionError(f"Policy {policy_name!r} not declared yet")
+    if not policy.accounts:
+        raise AssertionError(
+            f"Policy {policy_name!r} has no granted account; declare one first"
+        )
+    default_account = next(iter(policy.accounts.keys()))
+    capability_keys = (
+        "mark_seen",
+        "mark_tagged",
+        "move_out",
+        "accept_incoming",
+        "draft_append",
+        "modify_message",
+    )
+    for row in context.table:
+        folder = row["folder"]
+        account_id = default_account
+        if ":" in folder:
+            account_id, _, folder = folder.partition(":")
+        fp = FolderPolicy(path=folder, mode=row["mode"], default=row["default"])
+        for key in capability_keys:
+            if key in row.headings:
+                setattr(fp, key, _parse_bool(row[key]))
+        policy.accounts.setdefault(account_id, []).append(fp)
+    builder.write()
+
+
+@given('policy "{policy_name}" grants no accounts')
+def step_policy_grants_no_accounts(context: Context, policy_name: str) -> None:
+    """Declare an empty-grant policy.
+
+    Used by tool_surface_info.feature to assert that meta-tools work
+    even when the caller has no read/write grants whatsoever.
+    """
+    from support.policy_builder import Policy
+
+    builder = _ensure_builder(context)
+    if any(p.name == policy_name for p in builder.policies):
+        return
+    builder.policies.append(Policy(name=policy_name, accounts={}))
     builder.write()
