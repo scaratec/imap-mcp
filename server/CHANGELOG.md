@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.16.2 (2026-06-07)
+
+### Bug Fixes
+
+- **release**: Use dist/ artefacts, not HEAD tag, to detect a release
+  ([`b0b1191`](https://github.com/scaratec/imap-mcp/commit/b0b11913ff3ef9eed38cb9ae6fefba2b8c6399fb))
+
+
 ## v0.16.1 (2026-06-06)
 
 ### Bug Fixes
