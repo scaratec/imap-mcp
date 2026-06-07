@@ -94,12 +94,22 @@ jobs:
           # legitimate no-op conditions ("no commits to analyze", "next
           # version equals last released", "branch is detached / not in
           # release group"). We do NOT want those to fail the job — only
-          # a real CLI/network/parse error should. Differentiation is
-          # done after the call by inspecting whether HEAD now carries
-          # a release tag; that is the ground truth either way.
+          # a real CLI/network/parse error should. The exit code is
+          # therefore treated as advisory; the ground truth for "did
+          # *this* invocation produce a new release" is whether
+          # build_command populated server/dist/ with artefacts.
+          #
+          # Checking the tag at HEAD is NOT sufficient: on the
+          # bump-commit that semantic-release just pushed (the "0.16.1"
+          # commit), the tag is already present at HEAD from the
+          # previous run, but no new build happened — server/dist/ is
+          # empty. PyPI publish would then fail with
+          # "no Python distribution packages to publish".
+          rm -rf dist/
           OUTPUT=$(semantic-release version --no-vcs-release 2>&1) || true
           echo "$OUTPUT"
-          if git tag --points-at HEAD | grep -qE "^v[0-9]"; then
+          if compgen -G "dist/*.whl" > /dev/null && \
+             compgen -G "dist/*.tar.gz" > /dev/null; then
             VERSION=$(python -c "
           import tomllib, pathlib
           d = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
