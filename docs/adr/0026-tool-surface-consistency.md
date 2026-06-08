@@ -56,7 +56,7 @@ inconsistencies in place wastes the opportunity.
 ## Decision
 
 We **redefine the V1 tool set** (Hard Cut, tool-set version bumped to
-2.0.0 by [ADR 0027]) along five mechanical changes. The tool surface
+1.0.0 by [ADR 0027]) along five mechanical changes. The tool surface
 becomes 25 tools.
 
 ### 1. Split `fetch_attachment` into `list_attachments` + `fetch_attachment`
@@ -258,7 +258,7 @@ the surface.
 
 ### Negative
 
-- **Hard cut.** Existing callers break. The version bump to 2.0.0
+- **Hard cut.** Existing callers break. The version bump to 1.0.0
   ([ADR 0027]) signals this. Migration cost is borne once.
 - **More tools (26 vs 23).** Every additional tool is one more entry
   in `list_tools` and one more line in the dispatch table. We judge
@@ -273,7 +273,7 @@ the surface.
 
 ### Neutral
 
-- The tool-set version bumps to 2.0.0 with this ADR + [ADR 0027].
+- The tool-set version bumps to 1.0.0 with this ADR + [ADR 0027].
   Subsequent additive changes (a new tool) bump minor; further
   breaking changes bump major.
 
@@ -363,7 +363,7 @@ the surface.
 - [ADR 0025] — folder-path contract that every `folder`-typed
   argument now follows.
 - [ADR 0027] — error envelope, `tool_surface_info` meta-tool, and
-  the version bump to 2.0.0.
+  the version bump to 1.0.0.
 - [LIM-0011] — `bulk_move` deferred.
 
 [ADR 0004]: 0004-sender-rule-matcher-grammar.md

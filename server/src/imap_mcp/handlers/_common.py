@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 _FORBIDDEN_SYSTEM_FLAGS = frozenset(["\\Deleted", "\\Draft", "\\Recent"])
 
-TOOL_SET_VERSION = "2.0.0"
+TOOL_SET_VERSION = "1.0.0"
 READ_TOOL_MIN_VIS = {
     "list_accounts": None,
     "list_folders": "COUNT",

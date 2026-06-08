@@ -190,7 +190,7 @@ async def handle_describe_policy(
 
 _BREAKING_CHANGES_LOG = [
     {
-        "version": "2.0.0",
+        "version": "1.0.0",
         "summary": (
             "criteria + folder-path + envelope refactor (ADR 0024-0027): "
             "duration grammar single source, canonical folder paths with "

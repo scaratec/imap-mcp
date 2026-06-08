@@ -59,7 +59,14 @@ packages = ["imap_mcp"]
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
 branch = "main"
-major_on_zero = false
+# A `feat!` or `BREAKING CHANGE` on a 0.x project must bump major,
+# not minor. The previous default (major_on_zero=false) silently
+# turned the 2026-06 tool-surface hard cut into a 0.16.0 minor bump.
+# Honouring breaking changes as such is the contract SemVer
+# promises; leaving this off conflated "I am pre-1.0" with "my
+# breaking changes don't matter to my consumers" — they always
+# do, regardless of whether the version starts with 0 or 1.
+major_on_zero = true
 allow_zero_version = true
 tag_format = "v{version}"
 build_command = "python -m build"

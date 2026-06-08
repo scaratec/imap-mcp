@@ -38,10 +38,10 @@ will fail today against a real server because the field does not
 exist (the test currently mocks the metadata).
 
 A caller cannot pin a tool surface; a client library cannot detect a
-2.0.0 hard cut at handshake time. Both have to fall back on probing
+1.0.0 hard cut at handshake time. Both have to fall back on probing
 the tool list and inferring.
 
-A decision is needed now because ADR 0026 is a Hard Cut to a 2.0.0
+A decision is needed now because ADR 0026 is a Hard Cut to a 1.0.0
 surface. Hard Cut without an exposed version means clients break with
 no diagnostic; the right shape of the version field has to be settled
 first.
@@ -134,7 +134,7 @@ advertised in two places:
 
    ```json
    "metadata": {
-     "tool_set_version": "2.0.0",
+     "tool_set_version": "1.0.0",
      "package_version":  "0.16.0"
    }
    ```
@@ -149,11 +149,11 @@ advertised in two places:
      "decision": "ALLOW",
      "result":   "OK",
      "reason":   "folder_default_applied",
-     "tool_set_version":   "2.0.0",
+     "tool_set_version":   "1.0.0",
      "package_version":    "0.16.0",
      "protocol_revision":  "2024-11-05",
      "breaking_changes_since": [
-       { "version": "2.0.0", "summary": "criteria + folder-path + envelope refactor (ADR 0024-0027)" }
+       { "version": "1.0.0", "summary": "criteria + folder-path + envelope refactor (ADR 0024-0027)" }
      ]
    }
    ```
@@ -167,7 +167,7 @@ reason-code) bumps minor; a breaking change (renamed tool, removed
 reason-code, envelope-shape change, schema-tightening that rejects
 previously-accepted input) bumps major.
 
-`TOOL_SET_VERSION` jumps to `2.0.0` with the ADR 0024–0027 bundle.
+`TOOL_SET_VERSION` jumps to `1.0.0` with the ADR 0024–0027 bundle.
 
 ## Consequences
 
@@ -195,7 +195,7 @@ previously-accepted input) bumps major.
 
 - **Existing callers break.** Any client that parsed
   `imap_response` directly must migrate to `error.detail`. The
-  2.0.0 version bump signals this and `tool_surface_info` lets a
+  1.0.0 version bump signals this and `tool_surface_info` lets a
   client detect it before the first tool call.
 - **The envelope is slightly larger.** Three nested fields where
   one flat field used to live. The size cost is constant and
@@ -276,12 +276,12 @@ previously-accepted input) bumps major.
   closure.
 - [ADR 0021] — audit-log format; the additive `error.type`
   recording is compatible with the existing schema.
-- [ADR 0024] — duration grammar; shipped in the same 2.0.0 bundle.
+- [ADR 0024] — duration grammar; shipped in the same 1.0.0 bundle.
 - [ADR 0025] — folder-path contract and error taxonomy; the new
   `folder_absent` and `select_failed` codes are emitted via the
   envelope defined here.
 - [ADR 0026] — tool-surface consistency; shipped in the same
-  2.0.0 bundle.
+  1.0.0 bundle.
 - SemVer 2.0.0 — <https://semver.org/spec/v2.0.0.html>
 
 [ADR 0016]: 0016-mcp-tool-set.md

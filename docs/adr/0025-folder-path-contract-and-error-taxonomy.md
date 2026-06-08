@@ -169,7 +169,7 @@ ADR closes.
 - **Existing callers that constructed paths themselves break.** Any
   caller relying on `[Gmail]/Entwürfe` being accepted directly must
   switch to the canonical `[Gmail]/Drafts`. Hard cut, documented as
-  part of the 2.0.0 surface bump (ADR 0027).
+  part of the 1.0.0 surface bump (ADR 0027).
 - **`folder_not_found` disappears from the audit log.** Tooling that
   greps audit records for that string must be updated. The
   reason-code table is the contract; we update the table and any
