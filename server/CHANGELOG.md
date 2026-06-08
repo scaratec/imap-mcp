@@ -2,6 +2,23 @@
 
 <!-- version list -->
 
+## v1.0.0 (2026-06-08)
+
+### Features
+
+- **tool-surface**: Rename surface 2.0 -> 1.0; honour major on 0.x
+  ([`75cb29d`](https://github.com/scaratec/imap-mcp/commit/75cb29d2c75b329238296da4fc6ab8c1930df30f))
+
+### Breaking Changes
+
+- **tool-surface**: Tool_set_version advertised by serverInfo.metadata and tool_surface_info is now
+  "1.0.0" instead of "2.0.0". Any client that pinned on the "^2\." regex must move to "^1\.". The
+  contract shape (every tool, every response field, every error code, every reason code) is
+  unchanged from the 0.16.x series — only the version string moves. This commit also unblocks the
+  package side: with major_on_zero=true, this `feat!` will bump 0.16.2 -> 1.0.0 on the next release,
+  so package and surface end up on the same number for the first time in this project's history.
+
+
 ## v0.16.2 (2026-06-07)
 
 ### Bug Fixes
