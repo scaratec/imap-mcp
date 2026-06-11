@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v2.0.0 (2026-06-11)
+
+### Features
+
+- **fetch-attachment**: Deliver attachments via a configured file sink
+  ([`15ecb48`](https://github.com/scaratec/imap-mcp/commit/15ecb48bb2dd8833bf9c72932a38fa5c753edd57))
+
+### Breaking Changes
+
+- **fetch-attachment**: Fetch_attachment no longer returns the attachment bytes inline. Clients that
+  consumed `_blob`, `_blob_mime_type`, `_blob_uri`, or the EmbeddedResource content block must
+  migrate to reading the file the server wrote to `attachment_sink_directory`. The filename is in
+  the `saved_to` response field; the absolute sink path is in the `fetch_attachment` tool
+  description. Tool-set version bumps from 1.0.0 to 2.0.0. Operators must add an
+  `attachment_sink.directory` entry to `accounts.yaml` before fetch_attachment is callable; without
+  it, the tool stays listed but every call returns `error.type: "sink_not_configured"`.
+
+
 ## v1.0.0 (2026-06-08)
 
 ### Features
