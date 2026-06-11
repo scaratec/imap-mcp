@@ -54,6 +54,7 @@ class ServerContext:
     audit: "AuditWriter | None" = None
     saga: "SagaManager | None" = None
     test_hooks: TestHooks = field(default_factory=TestHooks)
+    attachment_sink_directory: "Path | None" = None
 
     @property
     def caller_id(self) -> str:
@@ -159,6 +160,9 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
 
     oauth_manager = OAuthManager(configuration, secret_store, test_hooks=test_hooks)
 
+    sink_cfg = configuration.accounts_file.attachment_sink
+    sink_dir = Path(sink_cfg.directory) if sink_cfg is not None and sink_cfg.directory else None
+
     live = _LiveState(pdp=pdp, configuration=configuration, oauth_manager=oauth_manager)
     context = ServerContext(
         default_caller_id=default_caller_id,
@@ -167,6 +171,7 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
         audit=audit_writer,
         saga=saga_mgr,
         test_hooks=test_hooks,
+        attachment_sink_directory=sink_dir,
     )
     if saga_mgr is not None:
 

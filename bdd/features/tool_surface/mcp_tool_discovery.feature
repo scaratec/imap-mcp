@@ -1,10 +1,10 @@
 Feature: MCP tool discovery
 
   A connected client enumerates the server's tools via the standard
-  MCP list_tools handshake. The 1.0.0 surface exposes exactly 26
+  MCP list_tools handshake. The 2.0.0 surface exposes exactly 26
   tools partitioned into 11 read, 11 write, and 4 meta. The
-  advertised shape matches ADR 0026 and the version bump to 1.0.0
-  is per ADR 0027.
+  advertised shape matches ADR 0026 + ADR 0028; the version bump
+  to 2.0.0 is per ADR 0028 (attachment file sink).
 
   Covered error layers (per BDD Guidelines §4.5):
     - Tool presence           : 1 (exact set)
@@ -18,7 +18,7 @@ Feature: MCP tool discovery
     Given the server is started with a minimal caller configuration
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The 1.0 tool set consists of exactly these 26 tools
+  Scenario: The 2.0 tool set consists of exactly these 26 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
       | tool                      |
@@ -109,15 +109,15 @@ Feature: MCP tool discovery
       | get_caller_identity      |
       | tool_surface_info        |
 
-  Scenario: serverInfo metadata advertises tool_set_version 1.x.y
-    Then the server info metadata contains "tool_set_version" matching the regex "^1\.\d+\.\d+$"
-    And the major version of tool_set_version equals 1
+  Scenario: serverInfo metadata advertises tool_set_version 2.x.y
+    Then the server info metadata contains "tool_set_version" matching the regex "^2\.\d+\.\d+$"
+    And the major version of tool_set_version equals 2
 
   Scenario: tool_surface_info returns the same version as serverInfo
     When invoice-agent calls tool_surface_info
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    And the response field tool_set_version matches the regex "^1\.\d+\.\d+$"
+    And the response field tool_set_version matches the regex "^2\.\d+\.\d+$"
     And the response field tool_set_version matches the serverInfo tool_set_version
 
   Scenario: serverInfo.version matches the installed package version

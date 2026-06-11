@@ -138,6 +138,12 @@ def before_scenario(context: Context, scenario: Scenario) -> None:
     context.last_rpc_error = None
     context.response_history = []
 
+    # Attachment-sink scenario state (ADR 0028). The sink directory is
+    # outside scratch_dir so a `chmod 0o500` does not also lock down
+    # the rest of the scenario's writable scratch.
+    context.attachment_sink_dir = None
+    context.attachment_sink_state = "unset"  # unset | configured | broken
+
 
 def after_scenario(context: Context, scenario: Scenario) -> None:
     """Terminate the MCP server and remove scratch state."""
@@ -166,6 +172,15 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
     scratch = getattr(context, "scratch_dir", None)
     if scratch is not None and scratch.exists():
         shutil.rmtree(scratch, ignore_errors=True)
+    sink = getattr(context, "attachment_sink_dir", None)
+    if sink is not None and Path(sink).exists():
+        # Restore writability in case a scenario chmod'd the dir
+        # read-only so rmtree can descend into it.
+        try:
+            Path(sink).chmod(0o755)
+        except OSError:
+            pass
+        shutil.rmtree(sink, ignore_errors=True)
 
 
 # --------------------------------------------------------------------- helpers

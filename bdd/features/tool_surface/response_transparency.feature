@@ -91,7 +91,7 @@ Feature: Response transparency and unified envelope
   Scenario: describe_policy exposes the caller's own profile
     When invoice-agent calls describe_policy
     Then the response field caller_id equals "invoice-agent"
-    And the response field tool_set_version matches the regex "^1\.\d+\.\d+$"
+    And the response field tool_set_version matches the regex "^2\.\d+\.\d+$"
     And the response field accounts contains exactly one entry with:
       | field                   | value                     |
       | id                      | gupta-scaratec            |

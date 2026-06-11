@@ -96,6 +96,7 @@ class PolicyBuilder:
     audit_delete_after_days: int | None = None
     audit_external_root_hook: str | None = None
     wal_path: Path | None = None
+    attachment_sink_directory: Path | None = None
 
     # ---------------------------------------------------------- collectors
 
@@ -207,6 +208,13 @@ class PolicyBuilder:
                         }
                     ),
                     "wal": {"path": str(self.wal_path) if self.wal_path else None},
+                    "attachment_sink": _clean(
+                        {
+                            "directory": str(self.attachment_sink_directory)
+                            if self.attachment_sink_directory
+                            else None,
+                        }
+                    ),
                 },
                 sort_keys=False,
             )

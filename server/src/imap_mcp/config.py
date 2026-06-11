@@ -79,6 +79,18 @@ class WALConfig(BaseModel):
     path: str | None = None
 
 
+class AttachmentSinkConfig(BaseModel):
+    """Per ADR 0028. Single operator-controlled directory that
+    fetch_attachment writes the decoded bytes into. Absent or null
+    `directory` disables fetch_attachment; the tool advertises the
+    state in its description and rejects calls with sink_not_configured.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    directory: str | None = None
+
+
 class AccountsFile(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -86,6 +98,7 @@ class AccountsFile(BaseModel):
     secret_store: SecretStore | None = None
     audit: AuditConfig | None = None
     wal: WALConfig | None = None
+    attachment_sink: AttachmentSinkConfig | None = None
 
 
 class CallerAuth(BaseModel):

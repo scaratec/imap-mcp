@@ -197,7 +197,17 @@ _BREAKING_CHANGES_LOG = [
             "three-code error taxonomy, normalized error envelope, "
             "list_attachments split, bulk_mark_tagged, explicit scope arg."
         ),
-    }
+    },
+    {
+        "version": "2.0.0",
+        "summary": (
+            "attachment file sink (ADR 0028): fetch_attachment writes "
+            "the decoded bytes to the operator-configured "
+            "attachment_sink_directory and returns the filename in "
+            "`saved_to`. Inline `_blob` / `_blob_mime_type` / "
+            "`_blob_uri` fields and EmbeddedResource blocks are gone."
+        ),
+    },
 ]
 
 

@@ -3471,3 +3471,93 @@ def step_policy_grants_no_accounts(context: Context, policy_name: str) -> None:
         return
     builder.policies.append(Policy(name=policy_name, accounts={}))
     builder.write()
+
+
+# --------------------------------------------------------------------- ADR 0028
+
+
+@given("the server attachment sink directory is a fresh writable directory")
+def step_sink_fresh_writable(context: Context) -> None:
+    """Create a brand-new writable sink dir for the scenario and wire
+    its path into the server config. The dir lives outside scratch_dir
+    so a later chmod 0o500 read-only step does not lock down the rest
+    of the scenario's writable scratch (audit, secrets, wal).
+    """
+    import tempfile
+
+    sink = Path(tempfile.mkdtemp(prefix="imap-mcp-sink-"))
+    context.attachment_sink_dir = sink
+    context.attachment_sink_state = "configured"
+    builder = _ensure_builder(context)
+    builder.attachment_sink_directory = sink
+    builder.write()
+
+
+@given("the server attachment sink directory is not configured")
+def step_sink_not_configured(context: Context) -> None:
+    """Explicitly leave the sink unset. The server config will not
+    carry an attachment_sink_directory; fetch_attachment must report
+    sink_not_configured.
+    """
+    context.attachment_sink_dir = None
+    context.attachment_sink_state = "unset"
+    builder = _ensure_builder(context)
+    builder.attachment_sink_directory = None
+    builder.write()
+
+
+@given("the server attachment sink directory points at a path that does not exist")
+def step_sink_points_at_missing_path(context: Context) -> None:
+    """Configure a path that is structurally absent: scratch_dir is
+    real, but the leaf component is never created. The server sees a
+    configured but missing directory."""
+    sink = context.scratch_dir / "sink-does-not-exist"
+    context.attachment_sink_dir = sink  # used for cleanup attempts
+    context.attachment_sink_state = "broken"
+    builder = _ensure_builder(context)
+    builder.attachment_sink_directory = sink
+    builder.write()
+
+
+@given("the server attachment sink directory is a read-only directory")
+def step_sink_read_only(context: Context) -> None:
+    """Real, present, mode 0o500 so even the owner cannot write."""
+    import tempfile
+
+    sink = Path(tempfile.mkdtemp(prefix="imap-mcp-sink-ro-"))
+    sink.chmod(0o500)
+    context.attachment_sink_dir = sink
+    context.attachment_sink_state = "broken"
+    builder = _ensure_builder(context)
+    builder.attachment_sink_directory = sink
+    builder.write()
+
+
+@given(
+    'the message has an attachment whose original filename is {n:d} bytes long, '
+    'mime type "{mime_type}", size {size:d} bytes'
+)
+def step_attachment_long_filename(
+    context: Context, n: int, mime_type: str, size: int
+) -> None:
+    """Stage an attachment whose filename is exactly n bytes of ASCII
+    `a`s plus a single-char extension so the sink's truncation /
+    sanitization rules are exercised on a fully-knowable input.
+
+    Re-uses the same staged-message infrastructure the `has attachment`
+    step uses; this is only a long-name variant.
+    """
+    staged = context.staged_messages[-1]
+    # Derive the extension from the mime type. Keep it simple: the
+    # scenarios we care about all use application/pdf -> ".pdf".
+    ext_map = {
+        "application/pdf": "pdf",
+        "application/octet-stream": "bin",
+        "text/plain": "txt",
+    }
+    ext = ext_map.get(mime_type, "bin")
+    base = "a" * max(1, n - len(ext) - 1)
+    filename = f"{base}.{ext}"
+    staged["extra_attachments"].append(
+        (filename, mime_type, b"x" * size)
+    )

@@ -8,6 +8,7 @@ the unified envelope.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
 
 from ..imap_core import (
@@ -20,7 +21,9 @@ from ._common import (
     _facts_from_envelope,
     _password_for,
     _resolve_imap_folder,
+    check_attachment_sink,
     error_envelope,
+    sanitize_attachment_filename,
 )
 
 if TYPE_CHECKING:
@@ -329,7 +332,7 @@ def _select_attachment_part(all_parts: list[Any], part_id: int) -> Any | None:
     return None
 
 
-def _build_attachment_blob_response(
+def _build_attachment_sink_response(
     part: Any,
     *,
     index: int,
@@ -337,17 +340,23 @@ def _build_attachment_blob_response(
     account_id: str,
     folder_path: str,
     uid: int,
+    sink_dir: "Path",
 ) -> FetchResponse:
-    """Encode a selected MIME part into the ALLOW + blob response
-    that the dispatcher's ``_emit`` will split into a TextContent
-    metadata header plus an EmbeddedResource blob."""
-    import base64
+    """Write the decoded MIME part to the configured sink and return
+    the ALLOW response per ADR 0028. The response carries the filename
+    (not the path) so bulk callers do not pay the path length on
+    every entry; the absolute path is in the tool description and in
+    the audit record.
+    """
     import hashlib
 
     payload = part.get_payload(decode=True) or b""
     mime_type = part.get_content_type()
     content_hash = hashlib.sha256(payload).hexdigest()
-    filename = part.get_filename() or "attachment"
+    original = part.get_filename() or "attachment"
+    filename = sanitize_attachment_filename(original, payload)
+    target = sink_dir / filename
+    target.write_bytes(payload)
     return {
         "decision": "ALLOW",
         "result": "OK",
@@ -360,9 +369,11 @@ def _build_attachment_blob_response(
         "mime_type": mime_type,
         "size_bytes": len(payload),
         "content_hash": content_hash,
-        "_blob": base64.b64encode(payload).decode("ascii"),
-        "_blob_mime_type": mime_type,
-        "_blob_uri": f"attachment://{account_id}/{folder_path}/{uid}/{filename}",
+        "saved_to": filename,
+        # `saved_to_absolute` is private to the audit pipeline; the
+        # dispatch _sanitise_args / audit emitter pulls it out and
+        # the public _emit drops it.
+        "_saved_to_absolute": str(target),
     }
 
 
@@ -437,10 +448,13 @@ async def handle_list_attachments(
 async def handle_fetch_attachment(
     context: "ServerContext", arguments: dict[str, Any]
 ) -> FetchResponse:
-    """Return one attachment part's bytes as a blob (ADR 0026 §1).
+    """Write one attachment part's bytes to the sink (ADR 0028).
 
-    `part_id` is now required at the JSON-Schema layer, so this handler
-    always operates in the single-part-fetch mode.
+    `part_id` is required at the JSON-Schema layer. The sink health
+    is checked here, before any IMAP I/O — a misconfigured or
+    unwritable sink is reported the same way regardless of whether
+    the account, folder, or message exists, so a misconfiguration
+    cannot be mistaken for a missing message.
     """
     import email
 
@@ -448,6 +462,15 @@ async def handle_fetch_attachment(
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
     part_id = int(arguments["part_id"])
+
+    # Authorization gate first: folder PDP -> envelope fetch ->
+    # sender-rule decision -> visibility >= FULL. A caller who is not
+    # authorized for the folder/message/level gets the same
+    # folder_hidden / sender_not_whitelisted / visibility_below_FULL
+    # response they get for every other tool, regardless of how the
+    # sink is configured. Sink diagnostics never leak information
+    # about which folders or messages exist to callers who have no
+    # authorization for them.
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
         return _deny_fetch(
@@ -471,6 +494,34 @@ async def handle_fetch_attachment(
         return _deny_fetch(
             reason="visibility_below_FULL", account=account_id, folder=folder_path, uid=uid
         )
+
+    # Caller is FULL-authorized; now check the sink. A misconfigured
+    # sink at this point is an operational error visible to a
+    # caller that already proved its right to the bytes.
+    sink_state, sink_detail = check_attachment_sink(context.attachment_sink_directory)
+    if sink_state == "not_configured":
+        return error_envelope(  # type: ignore[return-value]
+            error_type="sink_not_configured",
+            detail=sink_detail,
+            extra={
+                "account": account_id,
+                "folder": folder_path,
+                "uid": uid,
+                "part_id": part_id,
+            },
+        )
+    if sink_state != "ok":
+        return error_envelope(  # type: ignore[return-value]
+            error_type="sink_not_writable",
+            detail=sink_detail,
+            extra={
+                "account": account_id,
+                "folder": folder_path,
+                "uid": uid,
+                "part_id": part_id,
+            },
+        )
+    sink_dir = context.attachment_sink_directory  # type: ignore[assignment]
     raw = await imap_fetch_full_message(account, password, imap_folder, uid)
     if raw is None:
         return _error_fetch(
@@ -483,11 +534,12 @@ async def handle_fetch_attachment(
         return _error_fetch(
             error_type="attachment_not_found", account=account_id, folder=folder_path, uid=uid
         )
-    return _build_attachment_blob_response(
+    return _build_attachment_sink_response(
         selected_part,
         index=part_id,
         message_decision=message_decision,
         account_id=account_id,
         folder_path=folder_path,
         uid=uid,
+        sink_dir=sink_dir,
     )

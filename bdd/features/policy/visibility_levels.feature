@@ -79,12 +79,14 @@ Feature: Linear visibility levels
     Given policy "invoice-policy" grants folder:
       | folder            | mode      | default | rule                                    |
       | INBOX/Rechnungen  | whitelist | NONE    | from_domain=hornbach.de -> FULL         |
+    And the server attachment sink directory is a fresh writable directory
     When invoice-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 100, part_id 0
     Then the response decision is ALLOW
     And the response field visibility_applied equals "FULL"
     And the response field mime_type equals "application/pdf"
     And the response field size_bytes equals 32118
     And the response field content_hash matches sha256 of the stored attachment bytes
+    And the file named saved_to exists in the sink directory
 
   Scenario: COUNT level exposes folder_stats but not search
     Given policy "invoice-policy" grants folder:

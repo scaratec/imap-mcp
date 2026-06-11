@@ -17,10 +17,8 @@ from typing import Any
 from mcp.server import Server
 from mcp.shared.exceptions import McpError
 from mcp.types import (
-    BlobResourceContents,
     CallToolRequest,
     CallToolResult,
-    EmbeddedResource,
     ErrorData,
     ServerResult,
     TextContent,
@@ -86,7 +84,12 @@ def build_server(context: ServerContext) -> Server:
 
     @app.list_tools()
     async def _list_tools() -> list[Tool]:
-        return _build_tool_list()
+        # Tool descriptions are computed dynamically per call so that
+        # the attachment-sink state (ADR 0028 §3) is fresh: an agent
+        # that calls list_tools sees the current configured / writable
+        # / missing state of the sink before issuing its first
+        # fetch_attachment.
+        return _build_tool_list(context)
 
     known_tools = (
         set(READ_TOOL_MIN_VIS.keys())
@@ -166,10 +169,8 @@ def build_server(context: ServerContext) -> Server:
                     "headers",
                     "attachment",
                     "rfc822",
-                    "_blob",
-                    "_blob_mime_type",
-                    "_blob_uri",
                 )
+                and not k.startswith("_")
             }
             span.set_attribute("mcp.response", _json.dumps(_safe, default=str))
             span.set_attribute("mcp.request", _json.dumps(arguments, default=str))
@@ -257,27 +258,19 @@ def build_server(context: ServerContext) -> Server:
     return app
 
 
-def _emit(payload: dict[str, Any]) -> list[TextContent | EmbeddedResource]:
+def _emit(payload: dict[str, Any]) -> list[TextContent]:
+    """Per ADR 0028: tool responses are text-only. EmbeddedResource +
+    BlobResourceContents are gone — `fetch_attachment` writes the
+    bytes to the sink and returns only the filename in `saved_to`.
+
+    Private fields starting with `_` (e.g. `_saved_to_absolute`,
+    `_matched_sender`) are stripped here so they never reach the
+    caller; the audit emitter consumes them just before this call.
+    """
     import json
 
-    blob = payload.pop("_blob", None)
-    blob_mime = payload.pop("_blob_mime_type", None)
-    blob_uri = payload.pop("_blob_uri", None)
-    result: list[TextContent | EmbeddedResource] = [
-        TextContent(type="text", text=json.dumps(payload))
-    ]
-    if blob is not None:
-        result.append(
-            EmbeddedResource(
-                type="resource",
-                resource=BlobResourceContents(
-                    uri=blob_uri or "attachment://unknown",
-                    mimeType=blob_mime,
-                    blob=blob,
-                ),
-            )
-        )
-    return result
+    public = {k: v for k, v in payload.items() if not k.startswith("_")}
+    return [TextContent(type="text", text=json.dumps(public))]
 
 
 def _audit_tool_call(
@@ -317,6 +310,14 @@ def _audit_tool_call(
 
         domain = str(matched_sender).rsplit("@", 1)[-1]
         record["from_domain_sha256"] = hashlib.sha256(domain.encode("utf-8")).hexdigest()
+    # ADR 0028 §4: attachment writes record the full absolute path
+    # in the audit so a forensic reviewer does not need to also
+    # reconstruct the sink config at the time of the call. The
+    # field is consumed here and stripped from the public response
+    # by _emit's `_`-prefix filter.
+    saved_to_absolute = result.pop("_saved_to_absolute", None)
+    if saved_to_absolute is not None:
+        record["saved_to_absolute"] = saved_to_absolute
     context.audit.write(record)
 
 
@@ -447,8 +448,22 @@ def _tool(
     return Tool(name=name, description=description, inputSchema=schema)
 
 
-def _build_tool_list() -> list[Tool]:
-    """Return the V2 tool surface (ADR 0026, 26 tools)."""
+def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
+    """Return the V2 tool surface (ADR 0026, 26 tools).
+
+    `context` is consulted only to render the dynamic
+    `fetch_attachment` description per ADR 0028 §3. When called
+    without a context (e.g. in unit tests of the static shape),
+    the sink-state suffix is left empty.
+    """
+    from .handlers._common import describe_attachment_sink
+
+    sink_dir = getattr(context, "attachment_sink_directory", None) if context is not None else None
+    sink_description = describe_attachment_sink(sink_dir)
+    fetch_attachment_desc = (
+        "Fetch one attachment part by index (ADR 0026, 0028). " + sink_description
+    )
+
     account_field = {"account": {"type": "string"}}
     folder_field = {"folder": {"type": "string"}}
     uid_field = {"uid": {"type": "integer", "minimum": 1}}
@@ -529,7 +544,7 @@ def _build_tool_list() -> list[Tool]:
         ),
         _tool(
             "fetch_attachment",
-            "Fetch one attachment part by index (ADR 0026).",
+            fetch_attachment_desc,
             {
                 **account_field,
                 **folder_field,

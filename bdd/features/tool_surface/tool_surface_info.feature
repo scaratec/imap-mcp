@@ -29,7 +29,7 @@ Feature: tool_surface_info exposes the contract version a caller can pin
 
   Scenario: tool_set_version is SemVer 2.x.y
     When invoice-agent calls tool_surface_info
-    Then the response field tool_set_version matches the regex "^1\.\d+\.\d+$"
+    Then the response field tool_set_version matches the regex "^2\.\d+\.\d+$"
 
   Scenario: tool_surface_info agrees with serverInfo metadata
     When invoice-agent calls tool_surface_info
@@ -39,8 +39,8 @@ Feature: tool_surface_info exposes the contract version a caller can pin
   Scenario: breaking_changes_since enumerates the 2.0 hard cut
     When invoice-agent calls tool_surface_info
     Then the breaking_changes_since field has at least one entry
-    And one entry has field "version" equal to "1.0.0"
-    And one entry has field "summary" matching the regex "ADR 002[4-7]"
+    And one entry has field "version" equal to "2.0.0"
+    And one entry has field "summary" matching the regex "ADR 0028"
 
   Scenario: tool_surface_info is reachable without any policy grant
     Given the server is configured with caller "no-grants-agent" using policy "empty-policy"

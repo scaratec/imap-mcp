@@ -1175,6 +1175,27 @@ def step_response_field_contains_exactly(
         )
 
 
+@then('the response field {field} contains the literal string "{needle}"')
+def step_response_field_contains_literal(
+    context: Context, field: str, needle: str
+) -> None:
+    """Substring assertion on a string field; supports dotted paths
+    like `error.detail` so the ADR 0028 sink diagnostics can be
+    pinned."""
+    found, value = _resolve_dotted_field(_last_response(context), field)
+    if not found:
+        raise AssertionError(f"Response has no field {field!r}")
+    if not isinstance(value, str):
+        raise AssertionError(
+            f"Field {field!r}: expected str for substring check, "
+            f"got {type(value).__name__}"
+        )
+    if needle not in value:
+        raise AssertionError(
+            f"Field {field!r} does not contain {needle!r}: {value!r}"
+        )
+
+
 @then('the response field {field} contains {expected}')
 def step_response_field_contains(
     context: Context, field: str, expected: str
@@ -3308,4 +3329,225 @@ def step_imap_server_received_at_most(context: Context, limit: int) -> None:
     if count > limit:
         raise AssertionError(
             f"IMAP server connection count {count} exceeds limit {limit}"
+        )
+
+
+# --------------------------------------------------------------------- ADR 0028
+
+
+def _sink_dir(context: Context) -> "Path":
+    """Return the scenario's sink dir or fail with a helpful message."""
+    sink = getattr(context, "attachment_sink_dir", None)
+    if sink is None:
+        raise AssertionError(
+            "No attachment sink directory configured for this scenario. "
+            "Use a `Given the server attachment sink directory ...` step."
+        )
+    from pathlib import Path as _Path
+
+    return _Path(sink)
+
+
+@then("the file named saved_to exists in the sink directory")
+def step_file_saved_to_exists(context: Context) -> None:
+    response = _last_response(context)
+    name = response.get("saved_to")
+    if not isinstance(name, str):
+        raise AssertionError(f"Response has no string 'saved_to': {response!r}")
+    path = _sink_dir(context) / name
+    if not path.is_file():
+        raise AssertionError(f"Expected sink file {path} to exist; it does not")
+
+
+@then("the file named saved_to in the sink has size {size:d} bytes")
+def step_file_saved_to_size(context: Context, size: int) -> None:
+    response = _last_response(context)
+    name = response["saved_to"]
+    path = _sink_dir(context) / name
+    actual = path.stat().st_size
+    if actual != size:
+        raise AssertionError(
+            f"Sink file {path} size {actual} != expected {size}"
+        )
+
+
+@then("the sha256 of the file named saved_to in the sink equals the response field content_hash")
+def step_file_saved_to_sha256(context: Context) -> None:
+    import hashlib as _hashlib
+
+    response = _last_response(context)
+    name = response["saved_to"]
+    expected = response.get("content_hash")
+    path = _sink_dir(context) / name
+    actual = _hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise AssertionError(
+            f"sha256({path}) = {actual}; response.content_hash = {expected}"
+        )
+
+
+@then("the response content has no resource block")
+def step_response_no_resource_block(context: Context) -> None:
+    """The MCP CallToolResult must not carry an EmbeddedResource block
+    after ADR 0028; _emit emits text-only content."""
+    blob = getattr(context, "last_blob", None)
+    if blob is not None:
+        raise AssertionError(
+            f"Response unexpectedly carries a resource block: {blob!r}"
+        )
+
+
+@then("the response field {field} does NOT start with the literal \"{prefix}\"")
+def step_response_field_no_leading(context: Context, field: str, prefix: str) -> None:
+    found, value = _resolve_dotted_field(_last_response(context), field)
+    if not found:
+        raise AssertionError(f"Response has no field {field!r}")
+    if isinstance(value, str) and value.startswith(prefix):
+        raise AssertionError(
+            f"Field {field!r} unexpectedly starts with {prefix!r}: {value!r}"
+        )
+
+
+@then("the response field {field} has a byte length of at most {max_len:d}")
+def step_response_field_bytelen(context: Context, field: str, max_len: int) -> None:
+    found, value = _resolve_dotted_field(_last_response(context), field)
+    if not found:
+        raise AssertionError(f"Response has no field {field!r}")
+    if not isinstance(value, str):
+        raise AssertionError(f"Field {field!r}: expected str, got {type(value).__name__}")
+    n = len(value.encode("utf-8"))
+    if n > max_len:
+        raise AssertionError(
+            f"Field {field!r} byte length {n} exceeds max {max_len}: {value!r}"
+        )
+
+
+@then('the sink directory contains exactly {count:d} file')
+@then('the sink directory contains exactly {count:d} files')
+def step_sink_dir_exact_file_count(context: Context, count: int) -> None:
+    sink = _sink_dir(context)
+    if not sink.exists():
+        actual = 0
+    else:
+        actual = sum(1 for p in sink.iterdir() if p.is_file())
+    if actual != count:
+        listing = sorted(p.name for p in sink.iterdir() if p.is_file()) if sink.exists() else []
+        raise AssertionError(
+            f"Sink {sink} expected to hold {count} file(s); has {actual}: {listing}"
+        )
+
+
+@then("no file was written outside the sink directory")
+def step_no_file_outside_sink(context: Context) -> None:
+    """The sanitization contract guarantees no `../` traversal escapes
+    the sink. We assert the negative by spot-checking the parent and a
+    couple of known-bad targets the scenarios reference."""
+    sink = _sink_dir(context)
+    parent = sink.parent
+    # Anything new in the parent that is not the sink itself fails.
+    rogue = [
+        p for p in parent.iterdir()
+        if p.resolve() != sink.resolve() and p.is_file()
+        and p.name.endswith(".pdf")
+    ]
+    if rogue:
+        raise AssertionError(
+            f"Files appeared outside the sink in {parent}: {rogue!r}"
+        )
+    # Specifically check the path the malicious filename in the
+    # scenario would have hit: ../../etc/passwd.pdf relative to the
+    # sink would land at <sink-parent>/../etc/passwd.pdf.
+    for evil in ("etc/passwd.pdf", "passwd.pdf"):
+        candidate = (parent / evil).resolve()
+        if candidate.exists() and candidate.is_file():
+            raise AssertionError(f"Path-traversal artefact appeared: {candidate}")
+
+
+@then('the 8-hex segment in saved_to equals the first 8 hex chars of md5 of the file bytes')
+def step_saved_to_md5_segment(context: Context) -> None:
+    import hashlib as _hashlib
+    import re as _re
+
+    response = _last_response(context)
+    name = response["saved_to"]
+    m = _re.match(r"^.+_([0-9a-f]{8})\.[^.]+$", name)
+    if not m:
+        raise AssertionError(f"saved_to {name!r} does not match base_<8hex>.ext")
+    claimed = m.group(1)
+    path = _sink_dir(context) / name
+    actual = _hashlib.md5(path.read_bytes()).hexdigest()[:8]
+    if claimed != actual:
+        raise AssertionError(
+            f"saved_to hash segment {claimed} != md5(file_bytes)[:8] {actual}"
+        )
+
+
+@then('the saved_to value matches the bytes-md5 pattern "report_<hex>.pdf"')
+def step_saved_to_equals_pattern_using_md5(context: Context) -> None:
+    import hashlib as _hashlib
+    import re as _re
+
+    response = _last_response(context)
+    name = response["saved_to"]
+    # First parse out the claimed hash so we can verify against the
+    # actual file's bytes.
+    m = _re.match(r"^report_([0-9a-f]{8})\.pdf$", name)
+    if not m:
+        raise AssertionError(
+            f"saved_to {name!r} does not match report_<8hex>.pdf"
+        )
+    path = _sink_dir(context) / name
+    expected = _hashlib.md5(path.read_bytes()).hexdigest()[:8]
+    if m.group(1) != expected:
+        raise AssertionError(
+            f"saved_to hash {m.group(1)} != md5(bytes)[:8] {expected}"
+        )
+
+
+# ---- tool-description introspection -----------------------------------------
+
+
+def _tool_description(context: Context, tool_name: str) -> str:
+    tools = getattr(context, "last_tools", None)
+    if tools is None:
+        raise AssertionError(
+            "No tool list captured; precede with `calls the MCP list_tools method`."
+        )
+    for t in tools:
+        name = t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
+        if name == tool_name:
+            desc = t.get("description") if isinstance(t, dict) else getattr(t, "description", "")
+            return desc or ""
+    raise AssertionError(f"Tool {tool_name!r} not in list_tools output")
+
+
+@then('the description of tool "{tool}" contains the literal string "{needle}"')
+def step_tool_desc_contains(context: Context, tool: str, needle: str) -> None:
+    desc = _tool_description(context, tool)
+    if needle not in desc:
+        raise AssertionError(
+            f"Tool {tool!r} description does not contain {needle!r}:\n{desc}"
+        )
+
+
+@then('the description of tool "{tool}" does NOT contain the literal string "{needle}"')
+def step_tool_desc_no_contain(context: Context, tool: str, needle: str) -> None:
+    desc = _tool_description(context, tool)
+    if needle in desc:
+        raise AssertionError(
+            f"Tool {tool!r} description unexpectedly contains {needle!r}:\n{desc}"
+        )
+
+
+@then('the description of tool "{tool}" contains the configured sink path')
+def step_tool_desc_contains_sink_path(context: Context, tool: str) -> None:
+    desc = _tool_description(context, tool)
+    sink = getattr(context, "attachment_sink_dir", None)
+    if sink is None:
+        raise AssertionError(
+            "No sink configured; this assertion needs a `fresh writable` step."
+        )
+    if str(sink) not in desc:
+        raise AssertionError(
+            f"Tool {tool!r} description does not name sink {sink}:\n{desc}"
         )

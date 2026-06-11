@@ -14,7 +14,10 @@ _error.
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+import os
+import re
+from pathlib import Path
+from typing import Any, Literal, TYPE_CHECKING
 
 from ..imap_core import list_folders as imap_list_folders
 from ..policy import MessageFacts
@@ -25,7 +28,7 @@ if TYPE_CHECKING:
 
 _FORBIDDEN_SYSTEM_FLAGS = frozenset(["\\Deleted", "\\Draft", "\\Recent"])
 
-TOOL_SET_VERSION = "1.0.0"
+TOOL_SET_VERSION = "2.0.0"
 READ_TOOL_MIN_VIS = {
     "list_accounts": None,
     "list_folders": "COUNT",
@@ -76,6 +79,9 @@ _KNOWN_ERROR_TYPES = frozenset(
         # Move / copy
         "saga_aborted",
         "transient_imap_failure",
+        # Attachment sink (ADR 0028)
+        "sink_not_configured",
+        "sink_not_writable",
     }
 )
 
@@ -252,6 +258,9 @@ __all__ = [
     "READ_TOOL_MIN_VIS",
     "WRITE_TOOL_CAP",
     "error_envelope",
+    "sanitize_attachment_filename",
+    "check_attachment_sink",
+    "describe_attachment_sink",
     "_facts_from_envelope",
     "_get_folder_aliases",
     "_is_google_provider",
@@ -260,3 +269,121 @@ __all__ = [
     "_password_for_account",
     "_resolve_imap_folder",
 ]
+
+
+# --------------------------------------------------------------------- ADR 0028
+
+
+# Filename safety bounds (ADR 0028 §2):
+#  - 200 bytes for the sanitized base name (BEFORE underscore + hash + ext)
+#  - 8 hex chars md5 prefix
+#  - 1 underscore separator
+#  - extension preserved through sanitization (no length cap on it alone;
+#    the 255-byte total cap covers it)
+#  - 255-byte total cap, the per-name limit on ext4/ext3/XFS/NTFS.
+_SINK_FILENAME_BASE_MAX_BYTES = 200
+_SINK_FILENAME_TOTAL_MAX_BYTES = 255
+_SINK_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def sanitize_attachment_filename(original: str, payload: bytes) -> str:
+    """Produce the on-disk filename per ADR 0028 §2.
+
+    Steps:
+      1. Replace every character outside `[A-Za-z0-9._-]` with `_`.
+      2. Strip leading dots so the result is not a hidden file.
+      3. Split off the trailing `.ext` if present.
+      4. Truncate the base to 200 bytes (byte-based, not chars).
+      5. Append `_<md5(payload)[:8]>.<ext>`.
+      6. As a defence in depth, truncate the final name to 255 bytes.
+
+    The 8-hex prefix of md5(payload) makes re-fetch idempotent: the
+    same bytes always land on the same filename and overwrite in
+    place.
+    """
+    import hashlib as _hashlib
+
+    if not original:
+        original = "attachment"
+    sanitized = _SINK_FILENAME_SAFE_RE.sub("_", original)
+    # Collapse any "..", "..." etc. run to a single "_" so the final
+    # name never carries a path-element token even though "." itself
+    # is whitelisted (we need it for the extension separator).
+    sanitized = re.sub(r"\.{2,}", "_", sanitized)
+    sanitized = sanitized.lstrip(".")
+    if not sanitized:
+        sanitized = "attachment"
+    if "." in sanitized:
+        base, _, ext = sanitized.rpartition(".")
+        if not base:
+            base, ext = sanitized, ""
+    else:
+        base, ext = sanitized, ""
+    base_bytes = base.encode("utf-8")
+    if len(base_bytes) > _SINK_FILENAME_BASE_MAX_BYTES:
+        base = base_bytes[:_SINK_FILENAME_BASE_MAX_BYTES].decode("utf-8", errors="ignore")
+        if not base:
+            base = "attachment"
+    digest = _hashlib.md5(payload).hexdigest()[:8]
+    if ext:
+        name = f"{base}_{digest}.{ext}"
+    else:
+        name = f"{base}_{digest}"
+    name_bytes = name.encode("utf-8")
+    if len(name_bytes) > _SINK_FILENAME_TOTAL_MAX_BYTES:
+        # Total cap is reached only when the extension itself is huge;
+        # truncate from the end of the base, keeping the hash + ext
+        # intact so the re-fetch idempotency story still holds.
+        overshoot = len(name_bytes) - _SINK_FILENAME_TOTAL_MAX_BYTES
+        keep = max(1, len(base.encode("utf-8")) - overshoot)
+        base = base.encode("utf-8")[:keep].decode("utf-8", errors="ignore") or "a"
+        name = f"{base}_{digest}" + (f".{ext}" if ext else "")
+    return name
+
+
+def check_attachment_sink(
+    sink: "Path | None",
+) -> tuple[Literal["ok", "not_configured", "missing", "not_writable"], str]:
+    """Return (state, detail) for the configured attachment sink.
+
+    Called from both `list_tools` (to render the tool description)
+    and from `handle_fetch_attachment` (to gate the call). Per ADR
+    0028 §3 this must be cheap — a stat + os.access is microseconds.
+    The detail string is the human-readable diagnostic used either
+    way (description text or error.detail).
+    """
+    if sink is None:
+        return (
+            "not_configured",
+            "attachment_sink_directory is not set in the server config "
+            "(accounts.yaml -> attachment_sink.directory)",
+        )
+    if not sink.exists():
+        return (
+            "missing",
+            f"sink directory {sink} does not exist",
+        )
+    if not sink.is_dir():
+        return (
+            "not_writable",
+            f"sink path {sink} is not a directory",
+        )
+    if not os.access(sink, os.W_OK):
+        return (
+            "not_writable",
+            f"sink directory {sink} is not writable by user uid={os.geteuid()}",
+        )
+    return "ok", str(sink)
+
+
+def describe_attachment_sink(sink: "Path | None") -> str:
+    """Render the human-facing sink summary that gets pasted into the
+    fetch_attachment tool description. Stable shape for both happy
+    and error paths so scenarios can grep against it.
+    """
+    state, detail = check_attachment_sink(sink)
+    if state == "ok":
+        return f"Attachment bytes are written to: {detail}"
+    if state == "not_configured":
+        return f"Attachment sink not configured ({detail})"
+    return f"Attachment sink not writable ({detail})"
