@@ -124,6 +124,8 @@ Every record uses [`TEMPLATE.md`](TEMPLATE.md). No deviations.
 | 0001 | [Reason-code symmetry in BDD contract tests](0001-reason-code-symmetry-in-bdd.md) | Accepted | must-resolve | Randy Nel Gupta (2026-04-21) |
 | 0002 | [Gmail scenarios not runnable against current fixture](0002-gmail-scenarios-not-runnable.md) | Accepted | must-resolve | Randy Nel Gupta (2026-04-21) |
 | 0003 | [OAuth2 scenarios reference a nonexistent mock provider](0003-oauth2-scenarios-not-runnable.md) | Accepted | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0017 | [Expired OAuth refresh token not proactively or durably detectable](0017-expired-oauth-token-not-proactively-or-durably-detectable.md) | Proposed | must-resolve | — (pending) |
+| 0018 | [OAuth re-auth not initiable from MCP; deny carries no remediation guidance](0018-oauth-reauth-not-initiable-from-mcp-no-remediation-guidance.md) | Proposed | must-resolve | — (pending) |
 
 ## Relationship to ADRs
 
