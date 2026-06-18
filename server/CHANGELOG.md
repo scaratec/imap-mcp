@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v2.0.1 (2026-06-18)
+
+### Bug Fixes
+
+- **fetch-attachment**: Handle non-ASCII attachment filename headers
+  ([`c9ff5d7`](https://github.com/scaratec/imap-mcp/commit/c9ff5d73640cfaf1aabcd7575dfceadf2860d6da))
+
+### Documentation
+
+- **limitations**: Record LIM-0017/0018 for OAuth token recovery gaps
+  ([`9d49a05`](https://github.com/scaratec/imap-mcp/commit/9d49a05b9db67ce9e09cfef69fa3ad874688b096))
+
+
 ## v2.0.0 (2026-06-11)
 
 ### Features
