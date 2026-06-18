@@ -22,6 +22,7 @@ from ._common import (
     _password_for,
     _resolve_imap_folder,
     check_attachment_sink,
+    decode_mime_words,
     error_envelope,
     sanitize_attachment_filename,
 )
@@ -230,7 +231,7 @@ async def handle_fetch_body(context: "ServerContext", arguments: dict[str, Any])
             attachments_meta.append(
                 {
                     "index": i,
-                    "filename": p.get_filename(),
+                    "filename": decode_mime_words(p.get_filename() or "") or None,
                     "mime_type": p.get_content_type(),
                     "size_bytes": len(p_payload),
                 }
@@ -311,7 +312,10 @@ def _walk_attachment_parts(msg: Any) -> list[Any]:
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
             continue
-        disposition = (part.get("Content-Disposition") or "").lower()
+        # str() the header value before .lower(): a raw 8-bit (non-ASCII,
+        # non-RFC-2047) Content-Disposition parses to an email.header.Header,
+        # which has no .lower(). str(Header) decodes it to a plain string.
+        disposition = str(part.get("Content-Disposition") or "").lower()
         is_attachment = disposition.startswith("attachment")
         is_inline_file = disposition.startswith("inline") and part.get_filename() is not None
         is_named_binary = (
@@ -428,7 +432,7 @@ async def handle_list_attachments(
         attachments_meta.append(
             {
                 "index": i,
-                "filename": p.get_filename(),
+                "filename": decode_mime_words(p.get_filename() or "") or None,
                 "mime_type": p.get_content_type(),
                 "size_bytes": len(p_payload),
             }

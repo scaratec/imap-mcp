@@ -2856,6 +2856,69 @@ def step_message_has_attachment(
 
 
 @given(
+    'the message has attachment with raw wire filename "{wire_filename}" '
+    'of type "{mime_type}" with size {size:d} bytes'
+)
+def step_message_has_raw_wire_attachment(
+    context: Context, wire_filename: str, mime_type: str, size: int
+) -> None:
+    """Stage an attachment whose Content-Disposition filename is the
+    LITERAL given string on the wire — used to reproduce servers that
+    emit an RFC 2047 encoded-word in the filename parameter.
+
+    A plain `add_attachment(filename=...)` would RFC 2231-encode the
+    name and `get_filename()` would decode it transparently, hiding
+    the bug. The fixture detects the `raw_wire_filename` marker and
+    writes the Content-Disposition header verbatim instead.
+    """
+    staged_list = getattr(context, "staged_messages", [])
+    if not staged_list:
+        raise AssertionError(
+            'the "raw wire filename" step requires a prior Given-step '
+            'that stages a message'
+        )
+    staged_list[-1]["extra_attachments"].append(
+        {
+            "raw_wire_filename": wire_filename,
+            "mime_type": mime_type,
+            "payload": b"x" * size,
+        }
+    )
+
+
+@given(
+    'the message has attachment with raw 8-bit wire filename "{wire_filename}" '
+    'of type "{mime_type}" with size {size:d} bytes'
+)
+def step_message_has_raw_8bit_attachment(
+    context: Context, wire_filename: str, mime_type: str, size: int
+) -> None:
+    """Stage an attachment whose Content-Disposition filename carries
+    RAW 8-bit (non-ASCII UTF-8) bytes on the wire — NOT an RFC 2047
+    encoded-word.
+
+    This reproduces the 2026-06-18 crash: such a header parses to an
+    `email.header.Header` object rather than a `str`, and the
+    attachment walk calls `.lower()` on it. Unlike `raw_wire_filename`
+    (which substitutes via ASCII), this marker tells the fixture to
+    write the literal UTF-8 bytes into the serialized message.
+    """
+    staged_list = getattr(context, "staged_messages", [])
+    if not staged_list:
+        raise AssertionError(
+            'the "raw 8-bit wire filename" step requires a prior '
+            "Given-step that stages a message"
+        )
+    staged_list[-1]["extra_attachments"].append(
+        {
+            "raw_8bit_filename": wire_filename,
+            "mime_type": mime_type,
+            "payload": b"x" * size,
+        }
+    )
+
+
+@given(
     'the message has inline attachment "{filename}" of type "{mime_type}" '
     "with size {size:d} bytes"
 )

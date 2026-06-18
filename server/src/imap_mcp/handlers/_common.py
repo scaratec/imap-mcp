@@ -259,6 +259,7 @@ __all__ = [
     "WRITE_TOOL_CAP",
     "error_envelope",
     "sanitize_attachment_filename",
+    "decode_mime_words",
     "check_attachment_sink",
     "describe_attachment_sink",
     "_facts_from_envelope",
@@ -286,10 +287,31 @@ _SINK_FILENAME_TOTAL_MAX_BYTES = 255
 _SINK_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
+def decode_mime_words(raw: str) -> str:
+    """RFC 2047-decode any MIME encoded-words in a header value.
+
+    Some servers put a `=?charset?b?...?=` (B) or `=?charset?q?...?=`
+    (Q) encoded-word directly in the Content-Disposition filename
+    parameter. The default email.compat32 parser does not decode it,
+    so `part.get_filename()` hands us the raw token. Decoding it here,
+    before sanitization, is what turns `=?utf-8?b?ZmE...?=` into
+    `fa 2026-6 Kuba.pdf`. Falls back to the raw input on any decode
+    error so a malformed encoded-word degrades to sanitization rather
+    than raising.
+    """
+    from email.header import decode_header, make_header
+
+    try:
+        return str(make_header(decode_header(raw)))
+    except Exception:
+        return raw
+
+
 def sanitize_attachment_filename(original: str, payload: bytes) -> str:
     """Produce the on-disk filename per ADR 0028 §2.
 
     Steps:
+      0. RFC 2047-decode any MIME encoded-word in the raw filename.
       1. Replace every character outside `[A-Za-z0-9._-]` with `_`.
       2. Strip leading dots so the result is not a hidden file.
       3. Split off the trailing `.ext` if present.
@@ -305,6 +327,7 @@ def sanitize_attachment_filename(original: str, payload: bytes) -> str:
 
     if not original:
         original = "attachment"
+    original = decode_mime_words(original)
     sanitized = _SINK_FILENAME_SAFE_RE.sub("_", original)
     # Collapse any "..", "..." etc. run to a single "_" so the final
     # name never carries a path-element token even though "." itself

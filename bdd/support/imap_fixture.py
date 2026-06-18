@@ -300,7 +300,45 @@ class IMAPFixture:
             msg.set_content(body)
             if html_body:
                 msg.add_alternative(html_body, subtype="html")
-        for filename, mime_type, payload in attachments:
+        # Collect raw-wire-filename substitutions to apply after the
+        # message is serialized. EmailMessage normalizes any filename
+        # we set on the object (RFC 2231-encoding it), which would hide
+        # the RFC 2047 bug we are reproducing. So we attach with a
+        # unique ASCII placeholder filename and byte-replace it in the
+        # serialized output with the literal wire form the scenario
+        # asked for — the placeholder is emitted verbatim as
+        # `filename="<placeholder>"`, a stable replacement anchor.
+        raw_wire_substitutions: list[tuple[str, str]] = []
+        # Substitutions whose replacement bytes are non-ASCII (raw 8-bit
+        # UTF-8 in a header). Kept separate from raw_wire_substitutions
+        # because the replacement must be UTF-8 encoded, not ASCII.
+        raw_8bit_substitutions: list[tuple[str, str]] = []
+        for idx, att in enumerate(attachments):
+            if isinstance(att, dict) and "raw_wire_filename" in att:
+                mime_type = att["mime_type"]
+                payload = att["payload"]
+                maintype, _, subtype = mime_type.partition("/")
+                placeholder = f"__RAW_WIRE_FILENAME_{idx}__"
+                msg.add_attachment(
+                    payload, maintype=maintype, subtype=subtype, filename=placeholder
+                )
+                raw_wire_substitutions.append(
+                    (placeholder, att["raw_wire_filename"])
+                )
+                continue
+            if isinstance(att, dict) and "raw_8bit_filename" in att:
+                mime_type = att["mime_type"]
+                payload = att["payload"]
+                maintype, _, subtype = mime_type.partition("/")
+                placeholder = f"__RAW_8BIT_FILENAME_{idx}__"
+                msg.add_attachment(
+                    payload, maintype=maintype, subtype=subtype, filename=placeholder
+                )
+                raw_8bit_substitutions.append(
+                    (placeholder, att["raw_8bit_filename"])
+                )
+                continue
+            filename, mime_type, payload = att
             maintype, _, subtype = mime_type.partition("/")
             msg.add_attachment(
                 payload, maintype=maintype, subtype=subtype, filename=filename
@@ -316,6 +354,19 @@ class IMAPFixture:
             )
 
         raw = msg.as_bytes()
+        for placeholder, wire in raw_wire_substitutions:
+            raw = raw.replace(
+                f'filename="{placeholder}"'.encode("ascii"),
+                f'filename="{wire}"'.encode("ascii"),
+            )
+        for placeholder, wire in raw_8bit_substitutions:
+            # Replacement carries raw 8-bit UTF-8 bytes so the header
+            # parses to an email.header.Header, not a str — the exact
+            # condition that triggers the .lower() crash.
+            raw = raw.replace(
+                f'filename="{placeholder}"'.encode("ascii"),
+                'filename="'.encode("ascii") + wire.encode("utf-8") + b'"',
+            )
         if date:
             parsed_date = email.utils.parsedate_to_datetime(date)
             internaldate = imaplib.Time2Internaldate(parsed_date.timestamp())

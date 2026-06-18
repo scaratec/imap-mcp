@@ -14,6 +14,9 @@ Feature: fetch_attachment sink semantics — filename sanitization, length cap, 
     - Sanitization: path separators stripped              : 1
     - Sanitization: shell-active glyphs replaced          : 1
     - Sanitization: leading dot stripped                  : 1
+    - Sanitization: RFC 2047 B-encoded word decoded       : 1
+    - Sanitization: RFC 2047 Q-encoded word decoded       : 1
+    - Sanitization: raw 8-bit filename header (no crash)  : 1
     - Length cap: base name truncated to 200 bytes        : 1
     - sink_not_configured surfaces in tool description    : 1
     - sink_not_configured surfaces on fetch_attachment    : 1
@@ -21,7 +24,7 @@ Feature: fetch_attachment sink semantics — filename sanitization, length cap, 
     - sink_not_writable when dir is read-only             : 1
     - Tool description names the configured sink path     : 1
     - Health check passes silently when sink is healthy   : 1
-    Total enumerated                                       : 10   covered by this feature: 10
+    Total enumerated                                       : 13   covered by this feature: 13
 
   Background:
     Given the IMAP account "gupta-scaratec" exists with folder "INBOX/Documents"
@@ -73,6 +76,68 @@ Feature: fetch_attachment sink semantics — filename sanitization, length cap, 
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
     Then the response field saved_to has a byte length of at most 255
     And the response field saved_to matches the regex "^[A-Za-z0-9._-]{1,200}_[0-9a-f]{8}\.pdf$"
+    And the file named saved_to exists in the sink directory
+
+  # ----------------------------------------------------------- RFC 2047 decoding
+
+  # Some mail servers (e.g. sgh-net.de) put an RFC 2047 encoded-word
+  # directly in the Content-Disposition filename parameter on the
+  # wire. The default email.compat32 parser does NOT decode it, so
+  # get_filename() hands the server the raw `=?utf-8?b?...?=` token.
+  # The server must decode the encoded-word BEFORE sanitization, or
+  # the on-disk name becomes the unreadable mojibake reported on
+  # 2026-06-15 (`__utf-8_b_..._<hash>`).
+
+  Scenario: RFC 2047 B-encoded filename is decoded before sanitization
+    Given the server attachment sink directory is a fresh writable directory
+    And the message has attachment with raw wire filename "=?utf-8?b?ZmEgMjAyNi02IEt1YmEucGRm?=" of type "application/pdf" with size 96 bytes
+    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
+    Then the response decision is ALLOW
+    And the response field result equals "OK"
+    # decoded "fa 2026-6 Kuba.pdf" -> spaces sanitized to "_"
+    And the response field saved_to matches the regex "^fa_2026-6_Kuba_[0-9a-f]{8}\.pdf$"
+    And the response field saved_to does NOT contain the literal string "utf-8"
+    And the file named saved_to exists in the sink directory
+
+  Scenario: RFC 2047 Q-encoded filename is decoded before sanitization
+    Given the server attachment sink directory is a fresh writable directory
+    And the message has attachment with raw wire filename "=?utf-8?q?Rechnung_M=C3=A4rz.pdf?=" of type "application/pdf" with size 96 bytes
+    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
+    Then the response decision is ALLOW
+    And the response field result equals "OK"
+    # decoded "Rechnung März.pdf": Q-underscore -> space -> "_",
+    # the umlaut "ä" is outside [A-Za-z0-9._-] -> "_". The presence
+    # of "Rechnung_M" with NO "?q?" or "C3" proves the decode ran
+    # before sanitization.
+    And the response field saved_to matches the regex "^Rechnung_M_rz_[0-9a-f]{8}\.pdf$"
+    And the response field saved_to does NOT contain the literal string "?"
+    And the file named saved_to exists in the sink directory
+
+  # ------------------------------------------ raw 8-bit filename header (no crash)
+
+  # Reported 2026-06-18: fetch_attachment crashes with
+  #   "'Header' object has no attribute 'lower'"
+  # on any message whose headers carry RAW 8-bit (non-ASCII) bytes —
+  # e.g. a "Rechnungsausgang" PDF from a sender with a German umlaut.
+  # When a header value is not pure ASCII and is NOT an RFC 2047
+  # encoded-word, Python's email.compat32 parser returns an
+  # email.header.Header object, not a str. The attachment walk calls
+  # `.lower()` on the Content-Disposition value directly; Header has no
+  # `.lower()`, so the whole call dies with an unhandled AttributeError
+  # instead of writing the attachment. RFC 2047 encoded-words (the two
+  # scenarios above) parse to str and are unaffected — this is the
+  # distinct raw-8-bit path the bug report mis-attributed to RFC 2047.
+
+  Scenario: attachment on a message with a raw 8-bit Content-Disposition header is delivered, not crashed
+    Given the server attachment sink directory is a fresh writable directory
+    And the message has attachment with raw 8-bit wire filename "Rechnung Dürr.pdf" of type "application/pdf" with size 96 bytes
+    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
+    Then the response decision is ALLOW
+    And the response field result equals "OK"
+    # raw "Rechnung Dürr.pdf": space and the non-ASCII "ü" bytes are
+    # outside [A-Za-z0-9._-] and collapse to "_". The decisive proof is
+    # that a response comes back at all instead of an AttributeError.
+    And the response field saved_to matches the regex "^Rechnung_D.*_[0-9a-f]{8}\.pdf$"
     And the file named saved_to exists in the sink directory
 
   # ----------------------------------------------------------- sink_not_configured
