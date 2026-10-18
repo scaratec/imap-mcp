@@ -75,6 +75,7 @@ def _granted_caps(fp: "Any") -> list[str]:
         "accept_incoming",
         "draft_append",
         "modify_message",
+        "draft_edit",
     ):
         if getattr(fp, key, False):
             caps.append(key)

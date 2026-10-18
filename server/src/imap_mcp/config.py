@@ -175,7 +175,7 @@ class FolderPolicy(BaseModel):
     `mode` decides how `rules` are combined with `default`:
       - whitelist: effective = max(default, max(grant of matching rules))
       - blacklist: effective = min(default, min(cap of matching rules))
-    The five capability booleans gate the corresponding write tools
+    The capability booleans gate the corresponding write tools
     independently of the read-side visibility.
 
     Validation (ADR 0003) is enforced here so that a bad policy fails
@@ -195,6 +195,7 @@ class FolderPolicy(BaseModel):
     accept_incoming: bool = False
     draft_append: bool = False
     modify_message: bool = False
+    draft_edit: bool = False
 
     @model_validator(mode="after")
     def _check_mode_invariants(self) -> "FolderPolicy":

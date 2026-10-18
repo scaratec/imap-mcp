@@ -37,7 +37,13 @@ from .handlers.attachments import (
     handle_delete_attachment,
     handle_replace_attachment,
 )
-from .handlers.drafts import handle_create_draft, handle_create_reply_draft
+from .handlers.drafts import (
+    handle_create_draft,
+    handle_create_reply_draft,
+    handle_get_draft,
+    handle_list_drafts,
+    handle_update_draft,
+)
 from .handlers.fetch import (
     handle_fetch_attachment,
     handle_fetch_body,
@@ -204,6 +210,10 @@ def build_server(context: ServerContext) -> Server:
             return await handle_fetch_attachment(context, arguments)
         if name == "folder_stats":
             return await handle_folder_stats(context, arguments)
+        if name == "list_drafts":
+            return await handle_list_drafts(context, arguments)
+        if name == "get_draft":
+            return await handle_get_draft(context, arguments)
         if name == "mark_seen":
             return await handle_mark_seen(context, arguments)
         if name == "bulk_mark_seen":
@@ -220,6 +230,8 @@ def build_server(context: ServerContext) -> Server:
             return await handle_create_draft(context, arguments)
         if name == "create_reply_draft":
             return await handle_create_reply_draft(context, arguments)
+        if name == "update_draft":
+            return await handle_update_draft(context, arguments)
         if name == "add_attachment":
             return await handle_add_attachment(context, arguments)
         if name == "replace_attachment":
@@ -355,6 +367,17 @@ def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) ->
                     )
     if name == "fetch_attachment" and "part_id" not in arguments:
         return "fetch_attachment requires part_id (ADR 0026 §1)"
+    if name == "update_draft":
+        from .handlers.drafts import validate_changes
+
+        base_revision = arguments.get("base_revision")
+        if not isinstance(base_revision, int) or isinstance(base_revision, bool):
+            return "update_draft requires an integer base_revision (ADR 0031)"
+        if base_revision < 1:
+            return f"Invalid base_revision {base_revision!r}: draft revisions start at 1 (ADR 0031)"
+        changes_error = validate_changes(arguments.get("changes"))
+        if changes_error is not None:
+            return changes_error
     return None
 
 
@@ -364,8 +387,23 @@ def _sanitise_args(arguments: dict[str, Any]) -> dict[str, Any]:
         if key in ("rfc822", "tags"):
             safe[key] = "<redacted>" if key == "rfc822" else value
             continue
-        if key in ("account", "folder", "uid", "seen", "mode", "part_id", "scope"):
+        if key in (
+            "account",
+            "folder",
+            "uid",
+            "seen",
+            "mode",
+            "part_id",
+            "scope",
+            "draft_id",
+            "base_revision",
+        ):
             safe[key] = value
+            continue
+        if key == "changes" and isinstance(value, dict):
+            # ADR 0021: draft content is never audited. The member names
+            # record *what* was touched without recording the text.
+            safe["changed_fields"] = sorted(value.keys())
             continue
         if key in ("source", "target") and isinstance(value, dict):
             safe[key] = {k: v for k, v in value.items() if k in ("account", "folder", "uid")}
@@ -417,6 +455,29 @@ _SOURCE_SCHEMA: dict[str, Any] = {
     "required": ["account", "folder", "uid"],
     "additionalProperties": False,
 }
+# ADR 0031: the three-valued change surface of update_draft. A member
+# absent leaves the field alone, a value sets it, `null` (or `[]` for an
+# address list) removes it. `minProperties: 1` is what makes an empty
+# object a schema reject rather than a runtime error type.
+_ADDRESS_LIST_SCHEMA: dict[str, Any] = {
+    "type": ["array", "null"],
+    "items": {"type": "string"},
+}
+_NULLABLE_STRING_SCHEMA: dict[str, Any] = {"type": ["string", "null"]}
+_DRAFT_CHANGES_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "subject": _NULLABLE_STRING_SCHEMA,
+        "to": _ADDRESS_LIST_SCHEMA,
+        "cc": _ADDRESS_LIST_SCHEMA,
+        "bcc": _ADDRESS_LIST_SCHEMA,
+        "body_text": _NULLABLE_STRING_SCHEMA,
+        "body_html": _NULLABLE_STRING_SCHEMA,
+        "in_reply_to": _NULLABLE_STRING_SCHEMA,
+    },
+    "additionalProperties": False,
+    "minProperties": 1,
+}
 _TARGET_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -449,7 +510,7 @@ def _tool(
 
 
 def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
-    """Return the V2 tool surface (ADR 0026, 26 tools).
+    """Return the V2 tool surface (ADR 0026, ADR 0030, ADR 0031; 29 tools).
 
     `context` is consulted only to render the dynamic
     `fetch_attachment` description per ADR 0028 §3. When called
@@ -554,6 +615,18 @@ def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
             ["account", "folder", "uid", "part_id"],
         ),
         _tool(
+            "list_drafts",
+            "List the drafts in a folder with their handles (ADR 0030).",
+            {**account_field, **folder_field},
+            ["account", "folder"],
+        ),
+        _tool(
+            "get_draft",
+            "Return the composed fields of one draft by its handle (ADR 0030).",
+            {**account_field, **folder_field, "draft_id": {"type": "string"}},
+            ["account", "folder", "draft_id"],
+        ),
+        _tool(
             "mark_seen",
             "Toggle the \\Seen flag on a message (ADR 0005).",
             {**account_field, **folder_field, **uid_field, "seen": {"type": "boolean"}},
@@ -625,6 +698,18 @@ def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
                 "reply_text": {"type": "string"},
             },
             ["account", "source_folder", "uid", "drafts_folder", "reply_text"],
+        ),
+        _tool(
+            "update_draft",
+            "Revise a draft field-wise under its handle (ADR 0031).",
+            {
+                **account_field,
+                **folder_field,
+                "draft_id": {"type": "string"},
+                "base_revision": {"type": "integer", "minimum": 1},
+                "changes": _DRAFT_CHANGES_SCHEMA,
+            },
+            ["account", "folder", "draft_id", "base_revision", "changes"],
         ),
         _tool(
             "add_attachment",

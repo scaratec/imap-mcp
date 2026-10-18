@@ -434,6 +434,32 @@ class IMAPFixture:
             )
         return int(data[0].split()[-1])
 
+    def append_verbatim(
+        self,
+        instance: str,
+        user: str,
+        folder: str,
+        raw: bytes,
+        flags: tuple[str, ...] = (),
+    ) -> None:
+        """APPEND raw bytes exactly as given, no header synthesis.
+
+        `seed_message` composes a message from named fields; this one
+        does not touch the bytes at all, which is what a scenario needs
+        when the point is the absence of a header some other client
+        would never have written.
+        """
+        folder = self.to_wire(instance, user, folder)
+        conn = self.connect(instance, user)
+        quoted = self._q(folder)
+        conn.create(quoted)
+        flag_literal = "(" + " ".join(flags) + ")" if flags else None
+        status, response = conn.append(
+            quoted, flag_literal, imaplib.Time2Internaldate(time.time()), raw
+        )
+        if status != "OK":
+            raise RuntimeError(f"Verbatim APPEND to {folder} failed: {response!r}")
+
     # ---------------------------------------------------------- inspection
 
     def search_by_message_id(

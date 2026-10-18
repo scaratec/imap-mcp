@@ -319,7 +319,7 @@ def step_policy_grants_folder_inline_rules(
                 )
             account_id = builder.accounts[0].id
         caps: dict[str, bool] = {}
-        for cap_key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append", "modify_message"):
+        for cap_key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append", "modify_message", "draft_edit"):
             if cap_key in row.headings:
                 caps[cap_key] = _parse_bool(row[cap_key])
         folder = builder.folder(
@@ -504,6 +504,25 @@ def step_folder_holds_messages_plural_explicit(
 
 
 use_step_matcher("parse")
+
+
+@given('the folder "{folder}" holds a verbatim message:')
+def step_folder_holds_verbatim_message(context: Context, folder: str) -> None:
+    """APPEND the DocString exactly as written, byte for byte.
+
+    Unlike the column-driven seeding steps this one synthesises
+    nothing, so a scenario about a message that lacks a particular
+    header really gets a message without it.
+    """
+    if ":" in folder:
+        account_id, _, folder = folder.partition(":")
+    else:
+        account_id = _find_account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    context.imap.create_folder(instance, user, folder)
+    context.imap.append_verbatim(
+        instance, user, folder, (context.text or "").encode("utf-8")
+    )
 
 
 def _find_account_for_folder(context: Context, folder: str) -> str:
@@ -2280,36 +2299,42 @@ def step_uidvalidity_changes_mid_call(context: Context, folder: str) -> None:
     )
 
 
-@given('the server is configured to crash after WAL BEGIN persistence')
-def step_crash_at_post_begin(context: Context) -> None:
+def _arm_crash(context: Context, at: str) -> None:
+    """Prime IMAP_MCP_CRASH_AT for the server that runs the next call.
+
+    The hook is read once at process start (ADR 0023), so a server that
+    an earlier Given already spawned would ignore it. Stopping it here
+    makes the next tool call spawn a fresh one with the hook armed;
+    mailbox and WAL live on disk and survive that restart.
+    """
     context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
-    context.mcp_extra_env["IMAP_MCP_CRASH_AT"] = "post_begin"
+    context.mcp_extra_env["IMAP_MCP_CRASH_AT"] = at
     context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
     context.crash_expected = True
+    client = getattr(context, "mcp", None)
+    if client is not None:
+        client.close()
+        context.mcp = None
+
+
+@given('the server is configured to crash after WAL BEGIN persistence')
+def step_crash_at_post_begin(context: Context) -> None:
+    _arm_crash(context, "post_begin")
 
 
 @given("the server is configured to crash after WAL FETCH persistence")
 def step_crash_at_post_fetch(context: Context) -> None:
-    context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
-    context.mcp_extra_env["IMAP_MCP_CRASH_AT"] = "post_fetch"
-    context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
-    context.crash_expected = True
+    _arm_crash(context, "post_fetch")
 
 
 @given("the server is configured to crash after APPEND but before WAL staged persistence")
 def step_crash_at_post_append(context: Context) -> None:
-    context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
-    context.mcp_extra_env["IMAP_MCP_CRASH_AT"] = "post_append_pre_staged"
-    context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
-    context.crash_expected = True
+    _arm_crash(context, "post_append_pre_staged")
 
 
 @given("the server is configured to crash after DELETE but before WAL commit persistence")
 def step_crash_at_post_delete(context: Context) -> None:
-    context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
-    context.mcp_extra_env["IMAP_MCP_CRASH_AT"] = "post_delete"
-    context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
-    context.crash_expected = True
+    _arm_crash(context, "post_delete")
 
 
 @given('policy "{policy_name}" allows cross-account move between these folders')

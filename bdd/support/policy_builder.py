@@ -61,6 +61,7 @@ class FolderPolicy:
     accept_incoming: bool = False
     draft_append: bool = False
     modify_message: bool = False
+    draft_edit: bool = False
 
 
 @dataclass
@@ -269,6 +270,7 @@ def _folder_to_dict(folder: FolderPolicy) -> dict[str, Any]:
         "accept_incoming": folder.accept_incoming,
         "draft_append": folder.draft_append,
         "modify_message": folder.modify_message,
+        "draft_edit": folder.draft_edit,
         "rules": [_rule_to_dict(r) for r in folder.rules],
     }
     return payload

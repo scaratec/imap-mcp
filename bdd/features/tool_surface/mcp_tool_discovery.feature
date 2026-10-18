@@ -1,10 +1,12 @@
 Feature: MCP tool discovery
 
   A connected client enumerates the server's tools via the standard
-  MCP list_tools handshake. The 2.0.0 surface exposes exactly 26
-  tools partitioned into 11 read, 11 write, and 4 meta. The
-  advertised shape matches ADR 0026 + ADR 0028; the version bump
-  to 2.0.0 is per ADR 0028 (attachment file sink).
+  MCP list_tools handshake. The 2.1.0 surface exposes exactly 29
+  tools partitioned into 13 read, 12 write, and 4 meta. The
+  advertised shape matches ADR 0026 + ADR 0028 + ADR 0030 + ADR 0031;
+  the minor bump to 2.1.0 is the purely additive draft surface —
+  get_draft and list_drafts (ADR 0030) and update_draft (ADR 0031) —
+  which breaks nothing that came before.
 
   Covered error layers (per BDD Guidelines §4.5):
     - Tool presence           : 1 (exact set)
@@ -18,7 +20,7 @@ Feature: MCP tool discovery
     Given the server is started with a minimal caller configuration
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The 2.0 tool set consists of exactly these 26 tools
+  Scenario: The 2.1 tool set consists of exactly these 29 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
       | tool                      |
@@ -33,6 +35,8 @@ Feature: MCP tool discovery
       | fetch_body                |
       | list_attachments          |
       | fetch_attachment          |
+      | list_drafts               |
+      | get_draft                 |
       | mark_seen                 |
       | bulk_mark_seen            |
       | mark_tagged               |
@@ -41,6 +45,7 @@ Feature: MCP tool discovery
       | copy                      |
       | create_draft              |
       | create_reply_draft        |
+      | update_draft              |
       | add_attachment            |
       | replace_attachment        |
       | delete_attachment         |
@@ -83,6 +88,8 @@ Feature: MCP tool discovery
       | fetch_body         | BODY               |
       | list_attachments   | BODY               |
       | fetch_attachment   | FULL               |
+      | list_drafts        | METADATA           |
+      | get_draft          | BODY               |
 
   Scenario: Write tools advertise their required capability in metadata
     When invoice-agent calls the MCP list_tools method
@@ -96,6 +103,7 @@ Feature: MCP tool discovery
       | copy               | accept_incoming     |
       | create_draft       | draft_append        |
       | create_reply_draft | draft_append        |
+      | update_draft       | draft_edit          |
       | add_attachment     | modify_message      |
       | replace_attachment | modify_message      |
       | delete_attachment  | modify_message      |

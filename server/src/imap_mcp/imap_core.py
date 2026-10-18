@@ -1202,6 +1202,60 @@ async def fetch_raw_with_flags(
         await imap.logout()
 
 
+def _bytearray_literal_at(response: "list[bytes | bytearray]", start: int) -> bytes | None:
+    """Pick the literal payload of the FETCH frame starting at `start`.
+
+    aioimaplib hands protocol framing back as `bytes` and literal
+    content as `bytearray`, so the type is the discriminator. Unlike
+    `_extract_literal_at` this does not require the literal to contain
+    a particular header name — a header block that happens to carry
+    neither From:, Date: nor Subject: is still a valid header block.
+    """
+    for j in range(start, min(start + 2, len(response))):
+        part = response[j]
+        if isinstance(part, bytearray):
+            return bytes(part)
+    return None
+
+
+async def fetch_raw_headers_batch(
+    account: Account, password: str, folder: str, uids: list[int]
+) -> dict[int, bytes]:
+    """Fetch the raw header block of several UIDs in one IMAP session.
+
+    Returns a `{uid: raw_header_bytes}` map. UIDs the server does not
+    return are absent from the map. `BODY.PEEK` keeps `\\Seen`
+    untouched, so this is usable from read-only tools.
+    """
+    folder = _quote_mailbox(folder)
+    if not uids:
+        return {}
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    out: dict[int, bytes] = {}
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            return {}
+        uid_set = ",".join(str(u) for u in uids)
+        status, response = await imap.uid("fetch", uid_set, "(BODY.PEEK[HEADER])")
+        if status != "OK":
+            return {}
+        i = 0
+        while i < len(response):
+            raw_header = _bytearray_literal_at(response, i)
+            if raw_header is None:
+                i += 1
+                continue
+            uid_val = _extract_uid(response, i)
+            if uid_val is not None:
+                out[uid_val] = raw_header
+            i += 2
+    finally:
+        await imap.logout()
+    return out
+
+
 async def search_uids(
     account: Account, password: str, folder: str, criteria: str = "ALL"
 ) -> list[int]:
@@ -1224,6 +1278,38 @@ async def search_uids(
         return [int(token) for token in raw.split()]
     finally:
         await imap.logout()
+
+
+async def expunge_uids(account: Account, password: str, folder: str, uids: list[int]) -> int:
+    """Remove the named UIDs from `folder` and return how many were removed.
+
+    One STORE `\\Deleted` over the whole set followed by a single
+    EXPUNGE. Used by the draft residue sweep (ADR 0030 rule 2), where
+    the messages to remove are known by UID and no per-message
+    bookkeeping is wanted.
+    """
+    if not uids:
+        return 0
+    folder = _quote_mailbox(folder)
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, _ = await imap.select(folder)
+        if status != "OK":
+            raise RuntimeError(f"SELECT {folder!r} failed: {status}")
+        uid_set = ",".join(str(uid) for uid in uids)
+        status, _ = await imap.uid("store", uid_set, "+FLAGS", r"(\Deleted)")
+        if status != "OK":
+            raise RuntimeError(f"STORE \\Deleted failed: {status}")
+        status, _ = await imap.expunge()
+        if status != "OK":
+            raise RuntimeError(f"EXPUNGE failed: {status}")
+        return len(uids)
+    finally:
+        try:
+            await imap.logout()
+        except Exception:
+            pass
 
 
 def _extract_literal(response: list[bytes | bytearray]) -> bytes | None:

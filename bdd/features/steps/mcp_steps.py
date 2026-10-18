@@ -118,6 +118,10 @@ def _ensure_mcp_client(context: Context, caller_id: str) -> MCPClient:
     )
     client.start()
     context.mcp = client
+    # Remembered so that steps which restart the server on their own —
+    # the recovery loop after a crash — can put the scenario's caller
+    # back rather than inventing one.
+    context.mcp_caller_id = caller_id
     return client
 
 
@@ -151,6 +155,13 @@ def _store_result(context: Context, payload: dict[str, object]) -> None:
             f"Raw text: {text!r}"
         )
     context.last_response = parsed
+    # Draft handles are opaque and server-assigned (ADR 0030), so a
+    # scenario cannot name one. It refers to "the returned draft_id",
+    # which is the one the previous call handed back.
+    if isinstance(parsed, dict):
+        returned_draft_id = parsed.get("draft_id")
+        if isinstance(returned_draft_id, str) and returned_draft_id:
+            context.last_draft_id = returned_draft_id
     history = getattr(context, "response_history", None)
     if history is None:
         history = []
@@ -764,8 +775,12 @@ def step_recovery_loop_runs(context: Context, passes: int) -> None:
     client = context.mcp
     if client is None:
         # Client not yet started — crash-recovery scenarios may have
-        # reached this step without an active server. Start one now.
-        client = _ensure_mcp_client(context, "invoice-agent")
+        # reached this step without an active server. Start one now,
+        # under the caller the scenario has been using, so the steps
+        # after recovery still speak with the identity they were
+        # granted a policy for.
+        caller_id = getattr(context, "mcp_caller_id", None) or "invoice-agent"
+        client = _ensure_mcp_client(context, caller_id)
     payload = client.raw_call(
         "tools/call",
         {"name": "_test_run_recovery", "arguments": {"passes": passes}},
@@ -1523,6 +1538,84 @@ def step_caller_calls_create_reply_draft_empty(
     _store_result(context, payload)
 
 
+@when(
+    '{caller_id} calls create_reply_draft with account "{account}", '
+    'source_folder "{src_folder}", uid {uid:d}, '
+    'drafts_folder "{drafts_folder}", reply_text "{reply_text}"'
+)
+def step_caller_calls_create_reply_draft_inline(
+    context: Context,
+    caller_id: str,
+    account: str,
+    src_folder: str,
+    uid: int,
+    drafts_folder: str,
+    reply_text: str,
+) -> None:
+    """Inline form for a one-line reply body."""
+    client = _ensure_mcp_client(context, caller_id)
+    lookup = getattr(context, "message_uids", {})
+    actual_uid = lookup.get((account, src_folder, uid), uid)
+    payload = client.call_tool(
+        "create_reply_draft",
+        {
+            "account": account,
+            "source_folder": src_folder,
+            "uid": actual_uid,
+            "drafts_folder": drafts_folder,
+            "reply_text": reply_text,
+        },
+    )
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls get_draft with account "{account}", '
+    'folder "{folder}", the returned draft_id'
+)
+def step_caller_calls_get_draft_returned_handle(
+    context: Context, caller_id: str, account: str, folder: str
+) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    draft_id = getattr(context, "last_draft_id", None)
+    if not draft_id:
+        raise AssertionError(
+            "No draft_id has been returned in this scenario yet; "
+            "the step needs a preceding create_draft or create_reply_draft."
+        )
+    payload = client.call_tool(
+        "get_draft",
+        {"account": account, "folder": folder, "draft_id": draft_id},
+    )
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls get_draft with account "{account}", '
+    'folder "{folder}", draft_id "{draft_id}"'
+)
+def step_caller_calls_get_draft_literal_handle(
+    context: Context, caller_id: str, account: str, folder: str, draft_id: str
+) -> None:
+    """Handle named in the scenario, for drafts the harness seeded
+    verbatim instead of letting create_draft mint the identifier."""
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool(
+        "get_draft",
+        {"account": account, "folder": folder, "draft_id": draft_id},
+    )
+    _store_result(context, payload)
+
+
+@when('{caller_id} calls list_drafts with account "{account}", folder "{folder}"')
+def step_caller_calls_list_drafts(
+    context: Context, caller_id: str, account: str, folder: str
+) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("list_drafts", {"account": account, "folder": folder})
+    _store_result(context, payload)
+
+
 @when('{caller_id} calls fetch_body on the only message in folder "{folder}"')
 def step_caller_calls_fetch_body_on_only_message(
     context: Context, caller_id: str, folder: str
@@ -1555,3 +1648,102 @@ def step_caller_calls_fetch_body_on_only_message(
         {"account": account, "folder": folder, "uid": uid},
     )
     _store_result(context, body_payload)
+
+
+# --------------------------------------------------------- update_draft
+
+
+def _call_update_draft(
+    context: Context,
+    caller_id: str,
+    account: str,
+    folder: str,
+    draft_id: str,
+    base_revision: int,
+) -> None:
+    """Issue one update_draft call, keeping either the payload or the
+    JSON-RPC error. The malformed-argument scenarios of ADR 0031 are
+    rejected at the protocol layer, so the error must survive as
+    `context.last_rpc_error` instead of aborting the scenario."""
+    client = _ensure_mcp_client(context, caller_id)
+    changes = json.loads(context.text or "{}")
+    context.last_response = None
+    context.last_rpc_error = None
+    try:
+        payload = client.call_tool(
+            "update_draft",
+            {
+                "account": account,
+                "folder": folder,
+                "draft_id": draft_id,
+                "base_revision": base_revision,
+                "changes": changes,
+            },
+        )
+        _store_result(context, payload)
+    except MCPRPCError as exc:
+        context.last_rpc_error = {
+            "code": exc.code,
+            "message": exc.message,
+            "data": exc.data,
+        }
+    except Exception:
+        # A crash-recovery scenario has primed IMAP_MCP_CRASH_AT; the
+        # revision saga terminates the subprocess mid-flight and there
+        # is no response to read. Pick the tx_id out of the WAL so the
+        # recovery steps that follow can reference it.
+        if not getattr(context, "crash_expected", False):
+            raise
+        from support.wal_reader import WALReader
+
+        reader = WALReader(context.wal_path)
+        txs = reader.all_transactions()
+        if not txs:
+            raise
+        latest = txs[-1]
+        context.last_tx_id = latest.tx_id
+        context.last_response = {"tx_id": latest.tx_id}
+
+
+@when(
+    '{caller_id} calls update_draft with account "{account}", folder "{folder}", '
+    "the returned draft_id, base_revision {base_revision:d}, changes:"
+)
+def step_caller_calls_update_draft_returned_handle(
+    context: Context,
+    caller_id: str,
+    account: str,
+    folder: str,
+    base_revision: int,
+) -> None:
+    draft_id = getattr(context, "last_draft_id", None)
+    if not draft_id:
+        raise AssertionError(
+            "No draft_id has been returned in this scenario yet; "
+            "the step needs a preceding create_draft or create_reply_draft."
+        )
+    _call_update_draft(context, caller_id, account, folder, draft_id, base_revision)
+
+
+@when(
+    '{caller_id} calls update_draft with account "{account}", folder "{folder}", '
+    'draft_id "{draft_id}", base_revision {base_revision:d}, changes:'
+)
+def step_caller_calls_update_draft_literal_handle(
+    context: Context,
+    caller_id: str,
+    account: str,
+    folder: str,
+    draft_id: str,
+    base_revision: int,
+) -> None:
+    _call_update_draft(context, caller_id, account, folder, draft_id, base_revision)
+
+
+# create_draft is also a precondition: the revision scenarios set up the
+# draft under test in a Background/Given before exercising update_draft.
+# Same handler, second step type.
+given(
+    '{caller_id} calls create_draft with account "{account}", folder "{folder}", '
+    "rfc822 payload:"
+)(step_caller_calls_create_draft)

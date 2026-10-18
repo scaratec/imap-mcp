@@ -198,13 +198,24 @@ class WAL:
             self._event(conn, tx_id, "retry", "ERROR", error)
             return new
 
-    def mark_needs_operator(self, tx_id: str) -> None:
+    def mark_needs_operator(self, tx_id: str, reason: str = "retry_limit_reached") -> None:
+        """Park a transaction in the operator queue.
+
+        The default reason is the historical one: the retry budget ran
+        out. Other incidents escalate too — draft ambiguity (ADR 0030)
+        is opened and escalated in one breath — and they say so, so the
+        operator does not read every parked transaction as a retry
+        failure. The reason also fills `last_error` when nothing has
+        written there yet — on the retry path the real error message is
+        already in that column and is worth more than this label.
+        """
         with self._conn() as conn:
             conn.execute(
-                "UPDATE transactions SET status = 'needs_operator' WHERE tx_id = ?",
-                (tx_id,),
+                "UPDATE transactions SET status = 'needs_operator', "
+                "last_error = COALESCE(last_error, ?) WHERE tx_id = ?",
+                (reason, tx_id),
             )
-            self._event(conn, tx_id, "escalated", None, "retry_limit_reached")
+            self._event(conn, tx_id, "escalated", None, reason)
 
     def abort(self, tx_id: str, reason: str) -> None:
         with self._conn() as conn:

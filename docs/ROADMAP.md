@@ -35,6 +35,7 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 | 0017 | Proposed   | must-resolve      | offen — OAuth-Ablauf nicht erkennbar |
 | 0018 | Proposed   | must-resolve      | offen — keine Re-Auth über MCP |
 | 0019 | Proposed   | permanent         | offen — Policy-Integrität braucht Trust-Boundary |
+| 0022 | Proposed   | permanent         | offen — extern bearbeitete Entwürfe verlieren den Handle |
 
 ### Nächster Block
 

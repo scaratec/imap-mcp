@@ -587,12 +587,21 @@ class SagaManager:
         folder: str,
         uid: int,
         transform: Callable[[bytes], bytes],
+        mechanism: str = "message_rewrite",
+        locate: "Callable[[], Awaitable[int | None]] | None" = None,
     ) -> SagaResult:
         """WAL-backed message rewrite: FETCH → transform → APPEND → DELETE.
 
         Same account and folder. Preserves IMAP flags from the original
         message. On crash after APPEND (staged), recovery resumes the
         DELETE step.
+
+        `mechanism` names the caller-visible operation this rewrite
+        implements; the draft-revision path (ADR 0031) reports
+        `draft_revision`. `locate`, when given, replaces the
+        `Message-ID` heuristic for finding the appended message with an
+        exact lookup the caller supplies — the draft path searches on
+        the new revision number instead.
         """
         tx_id = self.wal.begin(
             caller_id=caller_id,
@@ -609,7 +618,7 @@ class SagaManager:
             self.wal.abort(tx_id, "uid_not_found")
             return SagaResult(
                 tx_id=tx_id,
-                mechanism="message_rewrite",
+                mechanism=mechanism,
                 result="ERROR",
                 error_type="uid_not_found",
             )
@@ -627,7 +636,7 @@ class SagaManager:
             error_type = "attachment_not_found" if "not found" in error_msg else error_msg
             return SagaResult(
                 tx_id=tx_id,
-                mechanism="message_rewrite",
+                mechanism=mechanism,
                 result="ERROR",
                 error_type=error_type,
             )
@@ -639,7 +648,7 @@ class SagaManager:
             self.wal.bump_retry(tx_id, f"append_failed: {exc}")
             return SagaResult(
                 tx_id=tx_id,
-                mechanism="message_rewrite",
+                mechanism=mechanism,
                 result="ERROR",
                 error_type="append_failed",
             )
@@ -647,13 +656,24 @@ class SagaManager:
             self.wal.bump_retry(tx_id, "append_failed: server rejected")
             return SagaResult(
                 tx_id=tx_id,
-                mechanism="message_rewrite",
+                mechanism=mechanism,
                 result="ERROR",
                 error_type="append_failed",
             )
+        # The rewrite is now half-done: the new message is in the folder
+        # and the old one is not yet gone. ADR 0031 calls this the only
+        # interesting interruption window on the draft path, so the
+        # crash hook of ADR 0023 fires here as it does on the
+        # cross-account path.
+        _maybe_crash("post_append_pre_staged")
 
         target_uid: int | None = None
-        if message_id is not None:
+        if locate is not None:
+            try:
+                target_uid = await locate()
+            except Exception:
+                target_uid = None
+        elif message_id is not None:
             try:
                 hits = await search_uids(
                     account,
@@ -677,7 +697,7 @@ class SagaManager:
             src_folder=folder,
             src_uid=uid,
             delete_source=True,
-            mechanism="message_rewrite",
+            mechanism=mechanism,
         )
 
     async def run_pending_recovery(self) -> int:

@@ -294,12 +294,20 @@ def step_wal_no_entries(context: Context) -> None:
         )
 
 
-@then("the response field tx_id is a non-empty string")
-def step_response_tx_id_non_empty(context: Context) -> None:
+@then("the response field {field} is a non-empty string")
+def step_response_field_non_empty_string(context: Context, field: str) -> None:
+    """For server-assigned opaque values — a transaction id, a draft
+    handle — where the scenario cannot name the value but can insist
+    that one was handed out."""
     response = _last_response(context)
-    tx_id = response.get("tx_id")
-    if not isinstance(tx_id, str) or not tx_id:
-        raise AssertionError(f"tx_id is not a non-empty string: {tx_id!r}")
+    found, value = _resolve_dotted_field(response, field)
+    if not found:
+        raise AssertionError(
+            f"Response has no field {field!r}. Available top-level fields: "
+            f"{sorted(response.keys())}"
+        )
+    if not isinstance(value, str) or not value:
+        raise AssertionError(f"Field {field!r} is not a non-empty string: {value!r}")
 
 
 @then('the status response field state equals "{state}"')
@@ -624,10 +632,35 @@ def step_response_field_matches_regex(
         )
 
 
+def _table_value_matches(expected: str, actual: object) -> bool:
+    """Compare a table cell against a response value.
+
+    The cell is plain text; the response value is typed. The coercion
+    is driven by the type the response actually carries, so the cell
+    never has to spell out JSON.
+    """
+    if isinstance(actual, bool):
+        if expected.lower() in ("true", "false"):
+            return actual is (expected.lower() == "true")
+        return False
+    if expected.isdigit():
+        return actual == int(expected)
+    return actual == expected
+
+
 @then("the response field {field} contains exactly one entry with:")
 def step_response_field_contains_exactly_one_entry(
     context: Context, field: str
 ) -> None:
+    """The list holds exactly one entry, and it matches every column.
+
+    Two assertions in one sentence, both load-bearing: the list has
+    length 1, *and* that single entry carries the described values. A
+    scenario that means "one matching entry among several" says so with
+    the `has exactly one entry matching:` step below; it must not borrow
+    this one, because the length claim is what several existing
+    scenarios bought here.
+    """
     response = _last_response(context)
     value = response.get(field)
     if not isinstance(value, list):
@@ -642,16 +675,41 @@ def step_response_field_contains_exactly_one_entry(
     for row in context.table:
         key = row["field"]
         expected = row["value"]
-        actual = entry.get(key)
-        if expected.isdigit():
-            if actual != int(expected):
-                raise AssertionError(
-                    f"{field}[0].{key}: expected {expected!r}, got {actual!r}"
-                )
-        elif actual != expected:
+        actual = entry.get(key) if isinstance(entry, dict) else None
+        if not _table_value_matches(expected, actual):
             raise AssertionError(
                 f"{field}[0].{key}: expected {expected!r}, got {actual!r}"
             )
+
+
+@then("the response field {field} has exactly one entry matching:")
+def step_response_field_has_exactly_one_entry_matching(
+    context: Context, field: str
+) -> None:
+    """Exactly one entry of a longer list matches every column.
+
+    The complement of the step above: the list length is deliberately
+    *not* pinned here, so a scenario using this one owes a separate
+    length assertion if the length matters.
+    """
+    response = _last_response(context)
+    value = response.get(field)
+    if not isinstance(value, list):
+        raise AssertionError(
+            f"Field {field!r} is not a list; got {value!r}"
+        )
+    expectations = [(row["field"], row["value"]) for row in context.table]
+    matches = [
+        entry
+        for entry in value
+        if isinstance(entry, dict)
+        and all(_table_value_matches(cell, entry.get(key)) for key, cell in expectations)
+    ]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"Field {field!r}: expected exactly one entry matching "
+            f"{expectations!r}, found {len(matches)}. Entries: {value!r}"
+        )
 
 
 @then("the returned tool names equal exactly:")
@@ -1196,10 +1254,38 @@ def step_response_field_contains_literal(
         )
 
 
+def _assert_field_equals_table(context: Context, field: str) -> None:
+    """Single-column table form of the list-equality assertion, for
+    values that are too punctuated for the inline JSON form."""
+    response = _last_response(context)
+    if field not in response:
+        raise AssertionError(
+            f"Response has no field {field!r}. Available fields: "
+            f"{sorted(response.keys())}"
+        )
+    actual = response[field]
+    if not isinstance(actual, list):
+        raise AssertionError(
+            f"Field {field!r} is not a list; 'contains exactly' requires a list."
+        )
+    column = context.table.headings[0]
+    expected = [row[column] for row in context.table]
+    if sorted(actual) != sorted(expected):
+        raise AssertionError(
+            f"Field {field!r}: expected exactly {expected!r}, got {actual!r}"
+        )
+
+
 @then('the response field {field} contains {expected}')
 def step_response_field_contains(
     context: Context, field: str, expected: str
 ) -> None:
+    # `... contains exactly:` with a one-column table is the table form
+    # of the list-equality assertion. It cannot carry its own step
+    # registration: this pattern already matches that sentence.
+    if expected == "exactly:" and context.table is not None:
+        _assert_field_equals_table(context, field)
+        return
     response = _last_response(context)
     if field not in response:
         raise AssertionError(
@@ -3539,6 +3625,272 @@ def step_tool_desc_no_contain(context: Context, tool: str, needle: str) -> None:
         )
 
 
+# ------------------------------------------------------------------
+# Draft handle assertions (ADR 0030)
+#
+# The IMAP-side steps below read the mailbox through the fixture's own
+# imaplib connection, independent of the MCP server's view of it (BDD
+# Guidelines §13.2 Prüfung 1).
+# ------------------------------------------------------------------
+
+
+def _draft_header_value(message: Any, header: str) -> str | None:
+    """Return one header value, RFC 2047-decoded, or None if absent.
+
+    Distinct from `_decoded_header` above, which answers "" for an
+    absent header: the draft assertions need to tell "header missing"
+    apart from "header present but empty", so they cannot share it.
+    """
+    from email.header import decode_header, make_header
+
+    raw = message.get(header)
+    if raw is None:
+        return None
+    return str(make_header(decode_header(raw))).strip()
+
+
+def _folder_messages(context: Context, folder: str) -> list[Any]:
+    from support.imap_fixture import resolve_account
+
+    account_id = _account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    messages = []
+    for uid in context.imap.folder_uids(instance, user, folder):
+        messages.append(context.imap.fetch_message(instance, user, folder, uid))
+    return messages
+
+
+@then(
+    'the IMAP folder "{folder}" contains exactly {count:d} message '
+    'with header "{header}" set'
+)
+@then(
+    'the IMAP folder "{folder}" contains exactly {count:d} messages '
+    'with header "{header}" set'
+)
+def step_imap_folder_header_set_count(
+    context: Context, folder: str, count: int, header: str
+) -> None:
+    messages = _folder_messages(context, folder)
+    carrying = [m for m in messages if (_draft_header_value(m, header) or "") != ""]
+    if len(carrying) != count:
+        raise AssertionError(
+            f"Folder {folder!r} holds {len(carrying)} message(s) with header "
+            f"{header!r} set; expected {count}. Folder holds "
+            f"{len(messages)} message(s) in total."
+        )
+
+
+@then('the IMAP folder "{folder}" contains exactly one message with headers:')
+def step_imap_folder_one_message_with_headers(context: Context, folder: str) -> None:
+    expectations = [(row["header"], row["value"]) for row in context.table]
+    messages = _folder_messages(context, folder)
+    matches = [
+        m
+        for m in messages
+        if all(_draft_header_value(m, header) == value for header, value in expectations)
+    ]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"Folder {folder!r}: expected exactly one message with headers "
+            f"{expectations!r}, found {len(matches)} among "
+            f"{len(messages)} message(s)."
+        )
+
+
+@then('the IMAP message in folder "{folder}" with subject "{subject}" has flags:')
+def step_imap_message_with_subject_has_flags(
+    context: Context, folder: str, subject: str
+) -> None:
+    from support.imap_fixture import resolve_account
+
+    account_id = _account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    uid = context.imap.find_uid_by_decoded_subject(instance, user, folder, subject)
+    if uid is None:
+        raise AssertionError(
+            f"Folder {folder!r} holds no message with subject {subject!r}."
+        )
+    actual = context.imap.fetch_flags(instance, user, folder, uid)
+    missing = [row["flag"] for row in context.table if row["flag"] not in actual]
+    if missing:
+        raise AssertionError(
+            f"Message {subject!r} in {folder!r} carries flags {actual!r}; "
+            f"missing {missing!r}"
+        )
+
+
+def _draft_message_by_subject(context: Context, folder: str, subject: str) -> Any:
+    from support.imap_fixture import resolve_account
+
+    account_id = _account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    uid = context.imap.find_uid_by_decoded_subject(instance, user, folder, subject)
+    if uid is None:
+        raise AssertionError(
+            f"Folder {folder!r} holds no message with subject {subject!r}."
+        )
+    return context.imap.fetch_message(instance, user, folder, uid)
+
+
+@then(
+    'the IMAP message in folder "{folder}" with subject "{subject}" '
+    'carries exactly {count:d} header "{header}"'
+)
+def step_imap_message_header_occurrence_count(
+    context: Context, folder: str, subject: str, count: int, header: str
+) -> None:
+    """Count *occurrences*, not presence.
+
+    ADR 0030 assigns the handle server-side; a caller that already put
+    an `X-SC-Draft-Id` in its payload must not end up with two of them,
+    which a presence check would happily accept.
+    """
+    message = _draft_message_by_subject(context, folder, subject)
+    present = message.get_all(header) or []
+    if len(present) != count:
+        raise AssertionError(
+            f"Message {subject!r} in {folder!r} carries {len(present)} "
+            f"{header!r} header(s), expected {count}: {present!r}"
+        )
+
+
+@then(
+    'the header "{header}" of the IMAP message in folder "{folder}" '
+    'with subject "{subject}" is remembered as "{label}"'
+)
+def step_remember_header_value(
+    context: Context, header: str, folder: str, subject: str, label: str
+) -> None:
+    """Park a header value so a later revision can be compared to it."""
+    message = _draft_message_by_subject(context, folder, subject)
+    value = _draft_header_value(message, header)
+    if value is None or value == "":
+        raise AssertionError(
+            f"Message {subject!r} in {folder!r} carries no {header!r} header, "
+            f"so there is nothing to remember under {label!r}."
+        )
+    if not hasattr(context, "remembered_headers"):
+        context.remembered_headers = {}
+    context.remembered_headers[label] = value
+
+
+@then(
+    'the header "{header}" of the IMAP message in folder "{folder}" '
+    'with subject "{subject}" differs from the remembered "{label}"'
+)
+def step_header_differs_from_remembered(
+    context: Context, header: str, folder: str, subject: str, label: str
+) -> None:
+    remembered = getattr(context, "remembered_headers", {}).get(label)
+    if remembered is None:
+        raise AssertionError(
+            f"No header value was remembered under {label!r} in this scenario."
+        )
+    message = _draft_message_by_subject(context, folder, subject)
+    value = _draft_header_value(message, header)
+    if value is None or value == "":
+        raise AssertionError(
+            f"Message {subject!r} in {folder!r} carries no {header!r} header at all."
+        )
+    if value == remembered:
+        raise AssertionError(
+            f"{header!r} on {subject!r} in {folder!r} is unchanged: "
+            f"still {value!r} (remembered as {label!r})."
+        )
+
+
+@then(
+    'the header "{header}" of the IMAP message in folder "{folder}" '
+    'with subject "{subject}" is not "{value}"'
+)
+def step_header_is_not(
+    context: Context, header: str, folder: str, subject: str, value: str
+) -> None:
+    message = _draft_message_by_subject(context, folder, subject)
+    actual = _draft_header_value(message, header)
+    if actual == value:
+        raise AssertionError(
+            f"{header!r} on {subject!r} in {folder!r} still carries the "
+            f"value the caller supplied: {actual!r}"
+        )
+
+
+@then(
+    'the header "{header}" of the IMAP message in folder "{folder}" '
+    'with subject "{subject}" is a non-empty value'
+)
+def step_header_is_non_empty(
+    context: Context, header: str, folder: str, subject: str
+) -> None:
+    message = _draft_message_by_subject(context, folder, subject)
+    actual = _draft_header_value(message, header)
+    if actual is None or actual == "":
+        raise AssertionError(
+            f"Message {subject!r} in {folder!r} carries no usable {header!r} "
+            f"header: {actual!r}"
+        )
+
+
+@then(
+    'the header "{header}" of the IMAP message in folder "{folder}" '
+    'with subject "{subject}" is a timestamp within the last {seconds:d} seconds'
+)
+def step_header_is_recent_timestamp(
+    context: Context, header: str, folder: str, subject: str, seconds: int
+) -> None:
+    """A wall-clock window rather than "changed since the last read".
+
+    Two revisions can land inside the same second, so comparing two
+    `Date` values would be a coin flip. Asserting that the value is a
+    parseable timestamp close to now pins "regenerated at edit time"
+    without racing the clock.
+    """
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+
+    message = _draft_message_by_subject(context, folder, subject)
+    raw = _draft_header_value(message, header)
+    if raw is None or raw == "":
+        raise AssertionError(
+            f"Message {subject!r} in {folder!r} carries no {header!r} header."
+        )
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except (TypeError, ValueError) as exc:
+        raise AssertionError(
+            f"{header!r} on {subject!r} in {folder!r} is not a parseable "
+            f"timestamp: {raw!r} ({exc})"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - parsed).total_seconds()
+    if not -seconds <= age <= seconds:
+        raise AssertionError(
+            f"{header!r} on {subject!r} in {folder!r} is {age:.0f}s away from "
+            f"now ({raw!r}); expected it to be regenerated within "
+            f"{seconds}s of the edit."
+        )
+
+
+@then('the response field {field} does not equal "{expected}"')
+def step_response_field_does_not_equal(
+    context: Context, field: str, expected: str
+) -> None:
+    response = _last_response(context)
+    found, value = _resolve_dotted_field(response, field)
+    if not found:
+        raise AssertionError(
+            f"Response has no field {field!r}. Available top-level fields: "
+            f"{sorted(response.keys())}"
+        )
+    if value == expected:
+        raise AssertionError(
+            f"Field {field!r} equals {expected!r}, which this scenario "
+            f"asserts it must not."
+        )
+
+
 @then('the description of tool "{tool}" contains the configured sink path')
 def step_tool_desc_contains_sink_path(context: Context, tool: str) -> None:
     desc = _tool_description(context, tool)
@@ -3550,4 +3902,70 @@ def step_tool_desc_contains_sink_path(context: Context, tool: str) -> None:
     if str(sink) not in desc:
         raise AssertionError(
             f"Tool {tool!r} description does not name sink {sink}:\n{desc}"
+        )
+
+
+@then("the tool call fails with an invalid-arguments error")
+def step_tool_call_invalid_arguments(context: Context) -> None:
+    """ADR 0031: a malformed call is a protocol-level reject, not a
+    response payload. JSON-RPC -32602 is the only acceptable shape."""
+    error = getattr(context, "last_rpc_error", None)
+    if error is None:
+        response = getattr(context, "last_response", None)
+        raise AssertionError(
+            "Expected the tool call to fail with JSON-RPC -32602 "
+            f"(invalid arguments), but it returned a payload: {response!r}"
+        )
+    if error.get("code") != -32602:
+        raise AssertionError(
+            f"Expected JSON-RPC error code -32602 (invalid arguments), "
+            f"got {error.get('code')!r}: {error.get('message')!r}"
+        )
+
+
+@then('the IMAP folder "{folder}" contains no message with subject "{subject}"')
+def step_imap_folder_contains_no_subject(
+    context: Context, folder: str, subject: str
+) -> None:
+    _assert_subject_presence(context, folder, subject, should_exist=False, exact_count=None)
+
+
+@then(
+    'the IMAP folder "{folder}" contains exactly {count:d} message '
+    'with subject "{subject}"'
+)
+@then(
+    'the IMAP folder "{folder}" contains exactly {count:d} messages '
+    'with subject "{subject}"'
+)
+def step_imap_folder_contains_n_with_subject(
+    context: Context, folder: str, count: int, subject: str
+) -> None:
+    _assert_subject_presence(
+        context, folder, subject, should_exist=count > 0, exact_count=count
+    )
+
+
+@then(
+    'the IMAP message in folder "{folder}" with subject "{subject}" '
+    'has no header "{header}"'
+)
+def step_imap_message_with_subject_has_no_header(
+    context: Context, folder: str, subject: str, header: str
+) -> None:
+    from support.imap_fixture import resolve_account
+
+    account_id = _account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    uid = context.imap.find_uid_by_decoded_subject(instance, user, folder, subject)
+    if uid is None:
+        raise AssertionError(
+            f"Folder {folder!r} holds no message with subject {subject!r}."
+        )
+    message = context.imap.fetch_message(instance, user, folder, uid)
+    present = message.get_all(header)
+    if present:
+        raise AssertionError(
+            f"Message {subject!r} in {folder!r} still carries header "
+            f"{header!r}: {present!r}"
         )

@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 _FORBIDDEN_SYSTEM_FLAGS = frozenset(["\\Deleted", "\\Draft", "\\Recent"])
 
-TOOL_SET_VERSION = "2.0.0"
+TOOL_SET_VERSION = "2.1.0"
 READ_TOOL_MIN_VIS = {
     "list_accounts": None,
     "list_folders": "COUNT",
@@ -41,6 +41,8 @@ READ_TOOL_MIN_VIS = {
     "fetch_body": "BODY",
     "list_attachments": "BODY",
     "fetch_attachment": "FULL",
+    "list_drafts": "METADATA",
+    "get_draft": "BODY",
 }
 WRITE_TOOL_CAP = {
     "mark_seen": "mark_seen",
@@ -51,6 +53,7 @@ WRITE_TOOL_CAP = {
     "copy": "accept_incoming",
     "create_draft": "draft_append",
     "create_reply_draft": "draft_append",
+    "update_draft": "draft_edit",
     "add_attachment": "modify_message",
     "replace_attachment": "modify_message",
     "delete_attachment": "modify_message",
@@ -82,6 +85,11 @@ _KNOWN_ERROR_TYPES = frozenset(
         # Attachment sink (ADR 0028)
         "sink_not_configured",
         "sink_not_writable",
+        # Draft identity and revisions (ADR 0030, ADR 0031)
+        "draft_not_found",
+        "draft_not_editable",
+        "draft_ambiguous",
+        "draft_revision_conflict",
     }
 )
 
@@ -138,6 +146,32 @@ def _facts_from_envelope(envelope: Any) -> MessageFacts:
         size_bytes=envelope.size_bytes,
         date_iso=envelope.date,
     )
+
+
+def _walk_attachment_parts(msg: Any) -> list[Any]:
+    """Walk the MIME tree and return parts that count as an
+    attachment from the agent's perspective: any non-multipart part
+    whose Content-Disposition is ``attachment``, or which is
+    ``inline`` but carries a filename, or which is a non-text part
+    with a filename. The same rule is used by the fetch handlers and
+    by ``get_draft``."""
+    all_parts: list[Any] = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        # str() the header value before .lower(): a raw 8-bit (non-ASCII,
+        # non-RFC-2047) Content-Disposition parses to an email.header.Header,
+        # which has no .lower(). str(Header) decodes it to a plain string.
+        disposition = str(part.get("Content-Disposition") or "").lower()
+        is_attachment = disposition.startswith("attachment")
+        is_inline_file = disposition.startswith("inline") and part.get_filename() is not None
+        is_named_binary = (
+            part.get_content_maintype() not in ("text", "multipart")
+            and part.get_filename() is not None
+        )
+        if is_attachment or is_inline_file or is_named_binary:
+            all_parts.append(part)
+    return all_parts
 
 
 def _is_google_provider(account: Any) -> bool:
@@ -269,6 +303,7 @@ __all__ = [
     "_password_for",
     "_password_for_account",
     "_resolve_imap_folder",
+    "_walk_attachment_parts",
 ]
 
 

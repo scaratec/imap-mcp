@@ -21,6 +21,7 @@ from ._common import (
     _facts_from_envelope,
     _password_for,
     _resolve_imap_folder,
+    _walk_attachment_parts,
     check_attachment_sink,
     decode_mime_words,
     error_envelope,
@@ -299,32 +300,6 @@ async def handle_fetch_headers(
         "uid": uid,
         "headers": headers,
     }
-
-
-def _walk_attachment_parts(msg: Any) -> list[Any]:
-    """Walk the MIME tree and return parts that count as an
-    attachment from the agent's perspective: any non-multipart part
-    whose Content-Disposition is ``attachment``, or which is
-    ``inline`` but carries a filename, or which is a non-text part
-    with a filename. The same rule is used both for the meta-list
-    ``part_id is None`` branch and the selection branch."""
-    all_parts: list[Any] = []
-    for part in msg.walk():
-        if part.get_content_maintype() == "multipart":
-            continue
-        # str() the header value before .lower(): a raw 8-bit (non-ASCII,
-        # non-RFC-2047) Content-Disposition parses to an email.header.Header,
-        # which has no .lower(). str(Header) decodes it to a plain string.
-        disposition = str(part.get("Content-Disposition") or "").lower()
-        is_attachment = disposition.startswith("attachment")
-        is_inline_file = disposition.startswith("inline") and part.get_filename() is not None
-        is_named_binary = (
-            part.get_content_maintype() not in ("text", "multipart")
-            and part.get_filename() is not None
-        )
-        if is_attachment or is_inline_file or is_named_binary:
-            all_parts.append(part)
-    return all_parts
 
 
 def _select_attachment_part(all_parts: list[Any], part_id: int) -> Any | None:
