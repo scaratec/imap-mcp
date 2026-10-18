@@ -169,8 +169,18 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
         context.imap_proxy_procs = {}
     if hasattr(context, "imap_proxy_ports"):
         context.imap_proxy_ports = {}
+    for instance in list((getattr(context, "server_instances", None) or {}).values()):
+        instance.close()
     scratch = getattr(context, "scratch_dir", None)
     if scratch is not None and scratch.exists():
+        # A scenario may have stripped write permission from parts of
+        # the scratch tree (audit_multi_instance.feature).
+        for root, dirs, _files in os.walk(scratch):
+            for name in dirs:
+                try:
+                    os.chmod(os.path.join(root, name), 0o700)
+                except OSError:
+                    pass
         shutil.rmtree(scratch, ignore_errors=True)
     sink = getattr(context, "attachment_sink_dir", None)
     if sink is not None and Path(sink).exists():

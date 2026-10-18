@@ -206,24 +206,25 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # Write an audit log entry
-    if configuration.accounts_file.audit and configuration.accounts_file.audit.directory:
-        audit_dir = Path(configuration.accounts_file.audit.directory)
-        audit_dir.mkdir(parents=True, exist_ok=True)
-        import json
-        from datetime import datetime, timezone
+    audit_cfg = configuration.accounts_file.audit
+    if audit_cfg and audit_cfg.directory:
+        from ..audit import AuditWriter
 
-        today = datetime.now(timezone.utc).date().isoformat()
-        audit_file = audit_dir / f"{today}.jsonl"
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tool": "oauth_bootstrap",
-            "decision": "ALLOW",
-            "result": "OK",
-            "account": args.account,
-            "message": "Bootstrap completed successfully",
-        }
-        with open(audit_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        AuditWriter(
+            directory=Path(audit_cfg.directory),
+            hot_days=audit_cfg.hot_days,
+            warm_days=audit_cfg.warm_days,
+            delete_after_days=audit_cfg.delete_after_days,
+            external_root_hook=audit_cfg.external_root_hook,
+        ).write(
+            {
+                "tool": "oauth_bootstrap",
+                "decision": "ALLOW",
+                "result": "OK",
+                "account": args.account,
+                "message": "Bootstrap completed successfully",
+            }
+        )
 
     return 0
 

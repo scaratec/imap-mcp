@@ -34,6 +34,14 @@ class TestHooks:
     """ISO-8601 UTC timestamp that ``audit._now_utc`` returns instead
     of the real wall clock. Bound to ``IMAP_MCP_FAKE_NOW_UTC``."""
 
+    fake_now_file: Optional[str] = None
+    """Path to a file holding an ISO-8601 UTC timestamp. Unlike
+    ``fake_now_utc`` the file is re-read on every ``audit._now_utc``
+    call, so a scenario can move the clock of an already running
+    server (and of several servers at once) across a day boundary.
+    Takes precedence over ``fake_now_utc`` while the file exists and
+    parses. Bound to ``IMAP_MCP_FAKE_NOW_FILE``."""
+
     oauth_inject_error: Optional[str] = None
     """If set, the OAuth refresh flow raises with this error code
     before talking to the token endpoint. Bound to
@@ -76,6 +84,7 @@ class TestHooks:
         return cls(
             test_mode=os.environ.get("IMAP_MCP_TEST_MODE") == "1",
             fake_now_utc=os.environ.get("IMAP_MCP_FAKE_NOW_UTC") or None,
+            fake_now_file=os.environ.get("IMAP_MCP_FAKE_NOW_FILE") or None,
             oauth_inject_error=os.environ.get("IMAP_MCP_TEST_OAUTH_INJECT_ERROR") or None,
             oauth_token_lifetime_override=_int_or_none(
                 os.environ.get("IMAP_MCP_TEST_TOKEN_LIFETIME")

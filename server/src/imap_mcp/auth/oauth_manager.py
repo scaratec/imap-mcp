@@ -4,14 +4,12 @@ import asyncio
 import os
 import pathlib
 import time
-from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 import logging
 
-import json
-
+from ..audit import AuditWriter
 from ..config import Account, Configuration
 from ..secrets import SecretStore
 from ..test_hooks import TestHooks
@@ -25,10 +23,12 @@ class OAuthManager:
         config: Configuration,
         secret_store: SecretStore,
         test_hooks: TestHooks | None = None,
+        audit: AuditWriter | None = None,
     ):
         self.config = config
         self.secret_store = secret_store
         self._test_hooks = test_hooks or TestHooks()
+        self._audit = audit
         self._tokens: dict[str, dict[str, Any]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._needs_rebootstrap: dict[str, bool] = {}
@@ -156,17 +156,10 @@ class OAuthManager:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(access_token, encoding="utf-8")
 
-    def _log_audit(self, account_id: str, decision: str, reason_or_result: str):
-        audit_dir = (
-            self.config.accounts_file.audit.directory if self.config.accounts_file.audit else None
-        )
-        if not audit_dir:
+    def _log_audit(self, account_id: str, decision: str, reason_or_result: str) -> None:
+        if self._audit is None:
             return
-        today = datetime.now(timezone.utc).date().isoformat()
-        path = pathlib.Path(audit_dir) / f"{today}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": "token_refresh",
             "decision": decision,
             "account": account_id,
@@ -175,8 +168,7 @@ class OAuthManager:
             entry["result"] = reason_or_result
         else:
             entry["reason"] = reason_or_result
-        with open(path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        self._audit.write(entry)
 
 
 class _RefreshHTTPError(RuntimeError):

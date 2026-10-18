@@ -158,7 +158,9 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
 
     from .auth.oauth_manager import OAuthManager
 
-    oauth_manager = OAuthManager(configuration, secret_store, test_hooks=test_hooks)
+    oauth_manager = OAuthManager(
+        configuration, secret_store, test_hooks=test_hooks, audit=audit_writer
+    )
 
     sink_cfg = configuration.accounts_file.attachment_sink
     sink_dir = Path(sink_cfg.directory) if sink_cfg is not None and sink_cfg.directory else None

@@ -83,3 +83,4 @@ edit its Status line and link the replacement. Do not delete the file.
 | 0020 | [imap-agent as a Future Client, not a Component](0020-imap-agent-as-future-client.md) | Accepted |
 | 0021 | [Audit Log Format](0021-audit-log-format.md) | Accepted |
 | 0022 | [Audit Retention and Access Model](0022-audit-retention-and-access-model.md) | Accepted |
+| 0032 | [One Audit Chain Shared by Local Server Instances](0032-shared-audit-chain-across-local-instances.md) | Proposed |

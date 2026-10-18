@@ -213,6 +213,15 @@ must extend the list below.
 
 ## References
 
+- Amendment 2026-10-18 ([ADR-0032](0032-shared-audit-chain-across-local-instances.md)):
+  `IMAP_MCP_FAKE_NOW_FILE` names a file holding an ISO-8601 UTC
+  timestamp that `audit._now_utc` re-reads on every call. Unlike
+  `IMAP_MCP_FAKE_NOW_UTC`, which is fixed at start-up, it lets a
+  scenario move the clock of several running servers across a day
+  boundary (`audit_multi_instance.feature`). It takes precedence over
+  `IMAP_MCP_FAKE_NOW_UTC` while the file exists and parses. Like the
+  other `IMAP_MCP_*` hooks it is not gated by `IMAP_MCP_TEST_MODE`.
+
 - [LIM-0004](../limitations/0004-imap-fault-injection-via-env-var.md)
   — env-based fault injection for IMAP I/O. Resolved 2026-04-29:
   superseded by wire-level proxy hooks in `bdd/support/imap_proxy.py`.
