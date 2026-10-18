@@ -89,6 +89,7 @@ edit its Status line and link the replacement. Do not delete the file.
 | 0026 | [Tool-Surface Consistency](0026-tool-surface-consistency.md) | Accepted |
 | 0027 | [Error Envelope and Tool-Surface Versioning](0027-error-envelope-and-tool-surface-versioning.md) | Accepted |
 | 0028 | [Attachment File-Sink Delivery](0028-attachment-file-sink-delivery.md) | Accepted |
+| 0029 | [Kubernetes Sidecar Deployment Topology](0029-kubernetes-sidecar-deployment-topology.md) | Proposed |
 | 0030 | [Draft Identity via In-Message Handle and Revision Counter](0030-draft-identity-and-revisions.md) | Proposed |
 | 0031 | [Draft Revision via the Message-Rewrite Saga](0031-draft-revision-via-rewrite-saga.md) | Proposed |
 | 0032 | [One Audit Chain Shared by Local Server Instances](0032-shared-audit-chain-across-local-instances.md) | Proposed |

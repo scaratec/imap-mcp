@@ -141,6 +141,8 @@ Every record uses [`TEMPLATE.md`](TEMPLATE.md). No deviations.
 | 0017 | [Expired OAuth refresh token not proactively or durably detectable](0017-expired-oauth-token-not-proactively-or-durably-detectable.md) | Proposed | must-resolve | — (pending) |
 | 0018 | [OAuth re-auth not initiable from MCP; deny carries no remediation guidance](0018-oauth-reauth-not-initiable-from-mcp-no-remediation-guidance.md) | Proposed | must-resolve | — (pending) |
 | 0019 | [Policy integrity requires an out-of-process trust boundary](0019-policy-integrity-requires-out-of-process-trust-boundary.md) | Proposed | permanent | — (pending) |
+| 0020 | [Audit chain fragments across per-agent instances](0020-audit-chain-fragments-across-per-agent-instances.md) | Proposed | permanent | — (pending) |
+| 0021 | [OAuth bootstrap and token persistence are not possible in-pod](0021-oauth-bootstrap-and-token-persistence-not-possible-in-pod.md) | Proposed | must-resolve | — (pending) |
 | 0022 | [Externally edited drafts lose their handle](0022-externally-edited-drafts-lose-their-handle.md) | Proposed | permanent | — (pending) |
 
 > **Numbering defect:** `0011` is used twice — by

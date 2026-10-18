@@ -35,6 +35,8 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 | 0017 | Proposed   | must-resolve      | offen — OAuth-Ablauf nicht erkennbar |
 | 0018 | Proposed   | must-resolve      | offen — keine Re-Auth über MCP |
 | 0019 | Proposed   | permanent         | offen — Policy-Integrität braucht Trust-Boundary |
+| 0020 | Proposed   | permanent         | offen — Audit-Kette fragmentiert je Agent (k8s) |
+| 0021 | Proposed   | must-resolve      | offen — OAuth-Bootstrap im Pod unmöglich |
 | 0022 | Proposed   | permanent         | offen — extern bearbeitete Entwürfe verlieren den Handle |
 
 ### Nächster Block
@@ -104,6 +106,41 @@ cd /home/randy/Projekte/scaratec/imap-mcp/server
 | ~~17~~ | ~~Phase C-Rest — UIDVALIDITY + CAPABILITY-Strip via MITM~~ | Plan Phase C-Rest | **Resolved 2026-04-22** — `bdd/support/imap_proxy.py` + Server-UIDVALIDITY-Check via NOOP; LIM-0005 geschlossen. |
 | ~~18~~ | ~~Phase R — Fault-Injection auf MITM-Proxy migrieren~~ | Plan Phase R | **Resolved 2026-04-29** — `fault_injection.py` entfernt, alle 5 Modi wire-level via `imap_proxy.py`; LIM-0004 geschlossen. |
 | ~~19~~ | ~~Phase D-Rest — LIM-0007 HTTP-Transport-Restarbeiten~~ | Plan Phase D-Rest | **Resolved 2026-04-29** — alle 12 Restszenarien grün; env_var + gpg_file Secret-Stores, stdio Initialize-Failure-Pfad, HTTP-Identity-Immutability, oauth-bootstrap-Stub; LIM-0007 geschlossen. |
+
+## Cluster-Betrieb (ADR-0029, aufgenommen 2026-08-25)
+
+[ADR-0029](adr/0029-kubernetes-sidecar-deployment-topology.md) legt die
+Topologie fest: ein `imap-mcp`-Sidecar je Agent-Pod, genau ein Caller je
+Instanz, HTTP über den Pod-Loopback. Betriebsanleitung:
+[`ops/kubernetes-sidecar-deployment.md`](ops/kubernetes-sidecar-deployment.md).
+
+Der Transport ist **nicht** die offene Arbeit — er existiert seit
+LIM-0007 (Resolved). Offen sind die folgenden Punkte. Die als **Defekt**
+markierten Zeilen sind keine akzeptierten Schwächen, sondern Fehler, und
+bekommen deshalb bewusst keine LIM — eine Limitation Record ist nicht
+dafür da, eine saubere Lösung zu ersetzen, die nur aufwendig ist:
+
+| #  | Titel | Verweis | Art |
+|----|---|---|---|
+| 20 | `get_transaction_status` prüft den Caller nicht gegen den im WAL hinterlegten `caller_id` | ADR-0029 §3, Security Implications, [Betriebsanleitung P13](ops/kubernetes-sidecar-deployment.md) | **Defekt** — Autorisierungslücke, im Code verifiziert; siehe Einschränkung unter der Tabelle |
+| 21 | Verbindungspool aus ADR-0013 ist Accepted, aber nicht implementiert | [ADR-0013](adr/0013-hybrid-connection-pool.md) | **Defekt** — Kapazitätsgrenze je Provider bei N Sidecars |
+| 22 | Saga-Recovery beim Start | ADR-0029 §8, `bdd/features/transactions/startup_saga_recovery.feature` | Feature — Neustarts sind im Cluster Routine |
+| 23 | `GET /healthz` | ADR-0029 §7, `bdd/features/deployment/health_probe.feature` | Feature |
+| 24 | Projizierte Config + SIGHUP | ADR-0029 §5, `bdd/features/deployment/projected_config_reload.feature` | Feature |
+| 25 | Container-Image neben dem PyPI-Paket (inkl. `gpg`, fester Nicht-Root-UID) | ADR-0029 §9 | Auslieferung |
+| 26 | `caller_addr` ist auf HTTP hartkodiert `stdio:pid=<pid>` | ADR-0029 Security Implications | **Defekt** — Audit-Feld ohne Aussagewert |
+| 27 | ~~Zwei Audit-Schreibpfade umgehen die Hash-Kette~~ | ADR-0029 Security Implications, [ADR-0021](adr/0021-audit-log-format.md), [ADR-0032](adr/0032-shared-audit-chain-across-local-instances.md) | **Behoben** in 8e60c98 — `token_refresh` und `oauth_bootstrap` schreiben über den AuditWriter |
+| 28 | Kein `expanduser` auf konfigurierten Pfaden | ADR-0029 §1 | Stolperfalle im Manifest |
+| 29 | Keine Startprüfung „jede `policy:`-Referenz eines Callers löst auf" | ADR-0029 Consequences (Negative), [Betriebsanleitung P1](ops/kubernetes-sidecar-deployment.md) | **Defekt** — fehlendes/leeres `policies/` oder ein unbekannter Policy-Name ergibt einen scheinbar gesunden Server, der alles verweigert; keine Warnung, kein Audit-Eintrag |
+| 30 | `/healthz` ist mit der Loopback-Bindung aus ADR-0029 §2 für kubelet-Proben nicht erreichbar | ADR-0029 §7 (Amendment 2026-08-25) | Entscheidung offen — bis dahin nur `exec`-Probe; außerdem ist zu klären, ob der 503-Zustand überhaupt beobachtbar ist |
+
+Einschränkung zu Eintrag 20: die Kompensation „ein Caller je Instanz"
+trägt auf stdio, aber der HTTP-Transport ist von sich aus mehr-Caller-fähig
+— er authentifiziert gegen eine gemeinsame `callers.yaml` und schreibt in
+ein gemeinsames WAL. Für jede HTTP-Instanz mit mehr als einem Caller in
+`callers.yaml` ist die Lücke erreichbar, und der Server weist eine solche
+Konfiguration nicht zurück. ADR-0029 §3 ist deshalb keine Ordnungsfrage,
+sondern die einzige Absicherung.
 
 ## Querschnitt
 

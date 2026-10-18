@@ -37,17 +37,40 @@ corresponding layer here.
 | L6 | IMAP response parsing                   | 9     | 2       | 7        | 0   |
 | L7 | Data integrity (IMAP content)           | 11    | 5       | 6        | 0   |
 | L8 | OAuth2 lifecycle                        | 10    | 0 (+6 covered_by_LIM-0003) | 4 | 0 |
-| L9 | Saga / WAL / recovery                   | 15    | 13 (+2 covered_by_LIM-0006) | 0 | 0 |
+| L9 | Saga / WAL / recovery                   | 27    | 13 (+2 covered_by_LIM-0006, +8 specified @pending) | 4 | 0 |
 | L10| Secret store                            | 10    | 7       | 3        | 0   |
 | L11| Audit log                               | 11    | 8 (+3 covered_by_LIM-0009) | 0 | 0 |
 | L12| Configuration loading                   | 13    | 12      | 1        | 0   |
 | L13| Connection pool / IMAP session          | 8     | 0       | 8        | 0   |
 | L14| Gmail-specific semantics                | 10    | 0 (+7 covered_by_LIM-0002) | 3 | 0 |
-|    | **Total**                               | 171   | 110 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009) | 44 | 0 |
+| L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
+|    | **Total**                               | 199   | 110 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009, +24 specified @pending) | 48 | 0 |
+
+Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
+while the L9 section itself listed nineteen rows, four of them
+`deferred A` (L9.16–L9.19). The summary was stale, not the section. The
+row above now counts them.
 
 Counts are best-effort enumerations. They are updated by the author of
 any change that adds or removes a failure mode, and reviewed as part of
 the spec audit (Guideline §13).
+
+**`specified @pending`** is a fourth state, introduced 2026-08-25 with
+[ADR-0029](adr/0029-kubernetes-sidecar-deployment-topology.md). It means
+a scenario exists and states the required behaviour, but the behaviour
+is not implemented, so the scenario is tagged `@pending` and excluded by
+`bdd/behave.ini`. It is neither `covered` (nothing is verified) nor
+`deferred` (no argument was made that it need not be specified) nor a
+`gap` (the specification is written). Each one is an IOU with a named
+scenario attached, and it converts to `covered` in the change that
+removes the tag.
+
+L9 grew from 15 to 23 in the same change. The eight added cases are all
+variants of one question the previous enumeration never asked: *what
+triggers recovery?* The old rows exhaustively covered what recovery
+does once something calls it, and the layer therefore read as complete
+with zero gaps. It was complete only along the axis it was cut on. This
+is worth remembering when reading any other layer's zero.
 
 ---
 
@@ -299,6 +322,24 @@ step, and how do we recover?
 | L9.17 | WAL disk full                                            | deferred A | — |
 | L9.18 | WAL database corrupted at startup                        | deferred A | — |
 | L9.19 | Clock skew between server and IMAP servers               | deferred A | — |
+| L9.20 | Pending saga at process start, recoverable               | specified @pending | startup_saga_recovery: interrupted after APPEND |
+| L9.21 | Pending saga at process start, before APPEND             | specified @pending | startup_saga_recovery: interrupted before APPEND |
+| L9.22 | Pending saga at start, target unreachable                | specified @pending | startup_saga_recovery: target unreachable |
+| L9.23 | Start with no pending sagas performs no work             | specified @pending | startup_saga_recovery: no pending sagas |
+| L9.24 | Saga at retry_limit is not retried on restart            | specified @pending | startup_saga_recovery: retry limit |
+| L9.25 | Recovery does not block the tool surface                 | specified @pending | startup_saga_recovery: surface available |
+| L9.26 | WAL file absent at start (fresh volume)                  | specified @pending | startup_saga_recovery: WAL absent |
+| L9.27 | Second restart does not re-apply a commit                | specified @pending | startup_saga_recovery: second restart |
+
+L9.20–L9.27 all interrogate the recovery *trigger*, not the recovery
+*logic* that L9.7–L9.13 cover. Those older rows drive recovery with an
+explicit test step; nothing verifies that a bare process start drives
+it. It does not — `run_pending_recovery` has exactly one call site, the
+test-only `_test_run_recovery` tool (ADR-0023). In production the only
+path that advances a stalled saga is a caller happening to poll
+`get_transaction_status` for that exact `tx_id`. A pod killed mid-saga
+therefore leaves a `staged` row that nothing will ever advance. See
+ADR-0029 §8.
 
 **Deferred reason A** — Operational/resource-exhaustion failures not
 tied to business semantics. Handled by unit tests + operator alerting.
@@ -409,6 +450,58 @@ needs to verify), the entry moves to covered.
 knowledge of Gmail's label model side effects. Will be covered by
 integration tests against a real Gmail account (gated out of the BDD
 suite by config).
+
+---
+
+## L15 — Deployment / process lifecycle
+
+Introduced 2026-08-25 with
+[ADR-0029](adr/0029-kubernetes-sidecar-deployment-topology.md). This
+layer covers what happens to the process as an orchestrated container
+rather than as an operator's subprocess: how it announces its own
+health, and how it takes configuration that arrives through a projected
+volume instead of an editor. Nothing in L1–L14 asks these questions,
+because before ADR-0029 nothing changed the config file underneath a
+running server and nothing but a human decided the process was alive.
+
+| ID     | Error case                                              | Status | Reference |
+|--------|---------------------------------------------------------|--------|-----------|
+| L15.1  | Health probe: configuration loaded, server serving       | specified @pending | health_probe: reports healthy |
+| L15.2  | Health probe: configuration not yet loaded               | specified @pending | health_probe: reports unavailable |
+| L15.3  | Health probe: no credentials presented                   | specified @pending | health_probe: no credentials |
+| L15.4  | Health probe: wrong credentials presented                | specified @pending | health_probe: wrong bearer token |
+| L15.5  | Health probe: body discloses nothing further             | specified @pending | health_probe: discloses nothing |
+| L15.6  | Health probe: non-GET method                             | specified @pending | health_probe: only GET |
+| L15.7  | Health probe: neighbouring paths remain 404              | specified @pending | health_probe: surface not widened |
+| L15.8  | Health probe: probe traffic is not audited               | specified @pending | health_probe: not in audit chain |
+| L15.9  | Projection swapped, no signal sent                       | specified @pending | projected_config_reload: swap alone |
+| L15.10 | Projection swapped, SIGHUP sent                          | specified @pending | projected_config_reload: SIGHUP |
+| L15.11 | Superseded generation removed before reload              | specified @pending | projected_config_reload: stale generation |
+| L15.12 | Several swaps between two signals                        | specified @pending | projected_config_reload: newest wins |
+| L15.13 | Malformed generation delivered by swap                   | specified @pending | projected_config_reload: malformed |
+| L15.14 | Policy file added by swap                                | specified @pending | projected_config_reload: policy added |
+| L15.15 | Policy file removed while a caller references it         | specified @pending | projected_config_reload: policy removed |
+| L15.16 | Secret volume re-projected: token rotation               | specified @pending | projected_config_reload: token rotation |
+
+Three deployment failure modes are deliberately **not** in this table,
+because they are configuration-loading behaviour and belong to L12 —
+but they are recorded here as a pointer, since every one of them
+produces a server that looks healthy and denies everything, and an
+operator debugging that will start reading at this section:
+
+- `policies/` not projected at all → startup succeeds, zero policies
+  loaded, every request default-denies.
+- `policies/` projected but empty → identical, indistinguishable.
+- A caller's `policy:` naming a policy no file declares → startup
+  succeeds, that caller sees nothing.
+
+None of the three logs a warning or writes an audit record. They are
+covered from the config side in L12 but not from the *silence* side: no
+scenario asserts that a policy-less start is distinguishable from a
+correctly configured one, because it is not. This is the single
+highest-value gap the deployment work exposed, and it is left as an
+observation rather than a new row so that the next author decides
+whether the fix is a scenario or a startup check.
 
 ---
 

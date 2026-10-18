@@ -63,12 +63,24 @@ claude mcp add --scope user imap-mcp \
   -- imap-mcp --transport stdio
 ```
 
-### Run on HTTP (for multi-agent setups)
+### Run on HTTP (for callers that cannot use stdio)
 
 ```bash
 IMAP_MCP_CONFIG_DIR=~/.config/imap-mcp \
   imap-mcp --transport http --host 127.0.0.1 --port 8080
 ```
+
+> This heading previously read "for multi-agent setups". That is not a
+> supported shape: `get_transaction_status` does not check the
+> requesting caller against the transaction's owner, so on an instance
+> with several entries in `callers.yaml` any caller holding a `tx_id`
+> can read another caller's transaction and trigger IMAP writes under
+> that caller's credentials. Run **one caller per instance** until that
+> is fixed — see [ADR 0029](docs/adr/0029-kubernetes-sidecar-deployment-topology.md) §3
+> and `docs/ROADMAP.md` entry 20.
+>
+> For agents in Kubernetes pods, deploy one sidecar per agent:
+> [Kubernetes sidecar deployment](docs/ops/kubernetes-sidecar-deployment.md).
 
 ## Architecture
 
@@ -461,10 +473,17 @@ cd server && .venv/bin/pytest tests/policy/ -q
 
 ## Documentation
 
-The design is captured in 23 ADRs under [`docs/adr/`](docs/adr/).
+The design is captured in 33 ADRs under [`docs/adr/`](docs/adr/).
 Limitation records under [`docs/limitations/`](docs/limitations/).
 Error-path analysis at
 [`docs/error_path_analysis.md`](docs/error_path_analysis.md).
+Open work at [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+Operations:
+
+- [Kubernetes sidecar deployment](docs/ops/kubernetes-sidecar-deployment.md)
+  — image, manifest, pitfalls, pre-flight checklist, day-2 procedures.
+- [Self-hosted CI runner setup](docs/ops/arc-runner-setup.md)
 
 ## License
 
