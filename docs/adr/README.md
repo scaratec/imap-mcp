@@ -83,4 +83,10 @@ edit its Status line and link the replacement. Do not delete the file.
 | 0020 | [imap-agent as a Future Client, not a Component](0020-imap-agent-as-future-client.md) | Accepted |
 | 0021 | [Audit Log Format](0021-audit-log-format.md) | Accepted |
 | 0022 | [Audit Retention and Access Model](0022-audit-retention-and-access-model.md) | Accepted |
+| 0023 | [Test-Only Control Surface](0023-test-only-control-surface.md) | Accepted |
+| 0024 | [Duration Grammar Single Source](0024-duration-grammar-single-source.md) | Accepted |
+| 0025 | [Folder-Path Contract and Error Taxonomy](0025-folder-path-contract-and-error-taxonomy.md) | Accepted |
+| 0026 | [Tool-Surface Consistency](0026-tool-surface-consistency.md) | Accepted |
+| 0027 | [Error Envelope and Tool-Surface Versioning](0027-error-envelope-and-tool-surface-versioning.md) | Accepted |
+| 0028 | [Attachment File-Sink Delivery](0028-attachment-file-sink-delivery.md) | Accepted |
 | 0032 | [One Audit Chain Shared by Local Server Instances](0032-shared-audit-chain-across-local-instances.md) | Proposed |

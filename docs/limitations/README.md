@@ -121,11 +121,35 @@ Every record uses [`TEMPLATE.md`](TEMPLATE.md). No deviations.
 
 | #    | Title | Status | Intent | Approved by |
 |------|-------|--------|--------|-------------|
-| 0001 | [Reason-code symmetry in BDD contract tests](0001-reason-code-symmetry-in-bdd.md) | Accepted | must-resolve | Randy Nel Gupta (2026-04-21) |
-| 0002 | [Gmail scenarios not runnable against current fixture](0002-gmail-scenarios-not-runnable.md) | Accepted | must-resolve | Randy Nel Gupta (2026-04-21) |
-| 0003 | [OAuth2 scenarios reference a nonexistent mock provider](0003-oauth2-scenarios-not-runnable.md) | Accepted | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0001 | [Reason-code symmetry in BDD contract tests](0001-reason-code-symmetry-in-bdd.md) | Resolved | must-resolve | Randy Nel Gupta |
+| 0002 | [Gmail scenarios not runnable against current fixture](0002-gmail-scenarios-not-runnable.md) | Resolved | must-resolve | Randy Nel Gupta |
+| 0003 | [OAuth2 scenarios reference a nonexistent mock provider](0003-oauth2-scenarios-not-runnable.md) | Resolved | must-resolve | Randy Nel Gupta |
+| 0004 | [IMAP fault injection via in-process env var](0004-imap-fault-injection-via-env-var.md) | Resolved | must-resolve | Randy N. Gupta |
+| 0005 | [IMAP MITM scenarios deferred](0005-imap-mitm-scenarios-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
+| 0006 | [5-tuple fallback identity deferred](0006-5-tuple-fallback-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
+| 0007 | [HTTP transport deferred](0007-http-transport-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
+| 0008 | [SIGHUP policy reload deferred](0008-sighup-policy-reload-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
+| 0009 | [Audit day-roll and retention deferred](0009-audit-day-roll-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
+| 0010 | [Production IMAP scenarios not covered by BDD](0010-production-imap-bdd-gaps.md) | Accepted | must-resolve | — |
+| 0011 | [bulk_move tool deferred](0011-bulk-move-deferred.md) | Accepted | must-resolve | Randy Nel Gupta |
+| 0011 | [Search performance on large mailboxes](0011-search-performance-large-mailbox.md) | Resolved | must-resolve | — |
+| 0012 | [Wire-level response transparency uneven across tools](0012-wire-response-transparency-uneven-across-tools.md) | Proposed | must-resolve | — (pending) |
+| 0013 | [Single attachment sink path](0013-single-attachment-sink-path.md) | Accepted | permanent | Randy Nel Gupta |
+| 0014 | [Attachment sink requires caller filesystem access](0014-attachment-sink-requires-caller-filesystem-access.md) | Accepted | permanent | Randy Nel Gupta |
+| 0015 | [Attachment sink cleanup is out of scope](0015-attachment-sink-cleanup-out-of-scope.md) | Accepted | permanent | Randy Nel Gupta |
+| 0016 | [Attachment sink path is disclosed in the tool description](0016-attachment-sink-path-disclosed-in-tool-description.md) | Accepted | permanent | Randy Nel Gupta |
 | 0017 | [Expired OAuth refresh token not proactively or durably detectable](0017-expired-oauth-token-not-proactively-or-durably-detectable.md) | Proposed | must-resolve | — (pending) |
 | 0018 | [OAuth re-auth not initiable from MCP; deny carries no remediation guidance](0018-oauth-reauth-not-initiable-from-mcp-no-remediation-guidance.md) | Proposed | must-resolve | — (pending) |
+
+> **Numbering defect:** `0011` is used twice — by
+> [`0011-bulk-move-deferred.md`](0011-bulk-move-deferred.md) and by
+> [`0011-search-performance-large-mailbox.md`](0011-search-performance-large-mailbox.md).
+> This violates the "numbers are never reused" rule above. Both records
+> are live and neither can be silently renumbered, because external
+> references may already point at either file. Resolving the collision
+> requires an owner decision (renumber the later one to the next free
+> number and leave a redirect stub, or accept the duplicate as
+> historical). Recorded here so the next author does not rediscover it.
 
 ## Relationship to ADRs
 

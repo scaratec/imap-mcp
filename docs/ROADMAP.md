@@ -26,6 +26,14 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 | 0009 | Resolved   | must-resolve      | 2026-05-06                     |
 | 0010 | Accepted   | must-resolve      | offen — Production IMAP BDD gaps |
 | 0011 | Resolved   | must-resolve      | 2026-05-07                     |
+| 0011 | Accepted   | must-resolve      | offen — `bulk_move` (Nummernkollision, siehe LIM-README) |
+| 0012 | Proposed   | must-resolve      | offen — Wire-Transparenz ungleich |
+| 0013 | Accepted   | permanent         | 2026-06-08                     |
+| 0014 | Accepted   | permanent         | 2026-06-08                     |
+| 0015 | Accepted   | permanent         | 2026-06-08                     |
+| 0016 | Accepted   | permanent         | 2026-06-08                     |
+| 0017 | Proposed   | must-resolve      | offen — OAuth-Ablauf nicht erkennbar |
+| 0018 | Proposed   | must-resolve      | offen — keine Re-Auth über MCP |
 
 ### Nächster Block
 
