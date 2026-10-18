@@ -41,7 +41,10 @@ imap-mcp = "imap_mcp.__main__:main"
 imap-mcp-oauth-bootstrap = "imap_mcp.auth.oauth_bootstrap:main"
 
 [build-system]
-requires = ["hatchling"]
+# hatchling 1.32 rejects a readme outside the project directory, and the
+# PyPI page is rendered from the repository README one level up. Lift the
+# cap once that README is shipped from within server/.
+requires = ["hatchling<1.32"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
