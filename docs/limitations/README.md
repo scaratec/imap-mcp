@@ -140,6 +140,7 @@ Every record uses [`TEMPLATE.md`](TEMPLATE.md). No deviations.
 | 0016 | [Attachment sink path is disclosed in the tool description](0016-attachment-sink-path-disclosed-in-tool-description.md) | Accepted | permanent | Randy Nel Gupta |
 | 0017 | [Expired OAuth refresh token not proactively or durably detectable](0017-expired-oauth-token-not-proactively-or-durably-detectable.md) | Proposed | must-resolve | — (pending) |
 | 0018 | [OAuth re-auth not initiable from MCP; deny carries no remediation guidance](0018-oauth-reauth-not-initiable-from-mcp-no-remediation-guidance.md) | Proposed | must-resolve | — (pending) |
+| 0019 | [Policy integrity requires an out-of-process trust boundary](0019-policy-integrity-requires-out-of-process-trust-boundary.md) | Proposed | permanent | — (pending) |
 
 > **Numbering defect:** `0011` is used twice — by
 > [`0011-bulk-move-deferred.md`](0011-bulk-move-deferred.md) and by

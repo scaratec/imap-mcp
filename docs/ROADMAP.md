@@ -34,6 +34,7 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 | 0016 | Accepted   | permanent         | 2026-06-08                     |
 | 0017 | Proposed   | must-resolve      | offen — OAuth-Ablauf nicht erkennbar |
 | 0018 | Proposed   | must-resolve      | offen — keine Re-Auth über MCP |
+| 0019 | Proposed   | permanent         | offen — Policy-Integrität braucht Trust-Boundary |
 
 ### Nächster Block
 
