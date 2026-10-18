@@ -2,6 +2,43 @@
 
 <!-- version list -->
 
+## v2.1.0 (2026-10-18)
+
+### Bug Fixes
+
+- **audit**: Share one hash chain across local server instances
+  ([`8e60c98`](https://github.com/scaratec/imap-mcp/commit/8e60c9892d88f87bf9696a4707bb3721ef045f63))
+
+- **deps**: Keep the MCP SDK below 2.0
+  ([`6cfb6e5`](https://github.com/scaratec/imap-mcp/commit/6cfb6e5b0d4a35da0f123a2da33de182fac2ccaf))
+
+### Build System
+
+- **server**: Cap hatchling below 1.32
+  ([`139bf55`](https://github.com/scaratec/imap-mcp/commit/139bf55e01106031b1c5bc3cd27d547562fd72ce))
+
+### Chores
+
+- **secrets**: Encrypt the mock Gmail credential with git-crypt
+  ([`cfcff4f`](https://github.com/scaratec/imap-mcp/commit/cfcff4fc2ac083f7d1596e397870006b914db820))
+
+### Documentation
+
+- Bring the ADR and limitation indexes up to date
+  ([`625eb8b`](https://github.com/scaratec/imap-mcp/commit/625eb8b32eab1f6de23679e4865c258d58c05d5c))
+
+- **deployment**: Specify the Kubernetes sidecar topology
+  ([`15f2508`](https://github.com/scaratec/imap-mcp/commit/15f2508018097be4f4ac9464bf6ffe2efea160df))
+
+- **limitations**: Record LIM-0019 on policy integrity
+  ([`d0e8be7`](https://github.com/scaratec/imap-mcp/commit/d0e8be7ec8e089e4ff2b7fa45ff6ba6118d1d94f))
+
+### Features
+
+- **drafts**: Revise drafts in place under a stable handle
+  ([`d758209`](https://github.com/scaratec/imap-mcp/commit/d75820996b7f7922f662595479a8a31732fe9e75))
+
+
 ## v2.0.1 (2026-06-18)
 
 ### Bug Fixes
