@@ -10,7 +10,9 @@ readme = "../README.md"
 # from ../bdd/ or any other sibling directory.
 dependencies = [
     "aioimaplib>=1.1.0",
-    "mcp>=1.0.0",
+    # mcp 2.x renames the exception and server APIs the server is built on
+    # (McpError -> MCPError, among others). Lift the cap with the port.
+    "mcp>=1.0.0,<2",
     "aiosqlite>=0.20.0",
     "pydantic>=2.6",
     "httpx>=0.27.0",
