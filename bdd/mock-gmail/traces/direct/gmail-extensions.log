@@ -1,0 +1,170 @@
+============================================================
+LIST
+============================================================
+(\HasNoChildren) "/" "Hornbach"
+(\HasNoChildren) "/" "INBOX"
+(\HasNoChildren) "/" "Rechnungen"
+(\HasChildren \Noselect) "/" "[Gmail]"
+(\All \HasNoChildren) "/" "[Gmail]/All Mail"
+(\Drafts \HasNoChildren) "/" "[Gmail]/Drafts"
+(\HasNoChildren \Important) "/" "[Gmail]/Important"
+(\HasNoChildren \Sent) "/" "[Gmail]/Sent Mail"
+(\HasNoChildren \Junk) "/" "[Gmail]/Spam"
+(\Flagged \HasNoChildren) "/" "[Gmail]/Starred"
+(\HasNoChildren \Trash) "/" "[Gmail]/Trash"
+
+============================================================
+SELECT INBOX
+============================================================
+  EXISTS: 9
+  UIDs: ['1', '2', '3', '4', '5', '6', '7', '8', '9']
+
+  UID 1 ENVELOPE:
+    1 (UID 1 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:45:18 GMT" "Sicherheitswarnung" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<LNU2IKgapDtYQnalFx9T8A@notifications.google.com>"))
+  UID 1 GMAIL-EXT:
+    1 (X-GM-THRID 1864454446257853112 X-GM-MSGID 1864454446257853112 X-GM-LABELS () UID 1)
+
+  UID 2 ENVELOPE:
+    2 (UID 2 FLAGS () ENVELOPE ("Wed, 06 May 2026 08:40:32 -0700" "Information about your new Google Account" (("Google" NIL "no-reply" "google.com")) (("Google" NIL "no-reply" "google.com")) (("Google" NIL "no-reply" "google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<d3af06fed713c730adbf9f1296e2ca5427c9d1b9-20113407-111435302@google.com>"))
+  UID 2 GMAIL-EXT:
+    2 (X-GM-THRID 1864454481893599974 X-GM-MSGID 1864454481893599974 X-GM-LABELS () UID 2)
+
+  UID 3 ENVELOPE:
+    3 (UID 3 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:46:55 GMT" "2-Faktor-Authentifizierung aktiviert" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<xHKywFttvo9gCvS9lSMOMA@notifications.google.com>"))
+  UID 3 GMAIL-EXT:
+    3 (X-GM-THRID 1864454547844722331 X-GM-MSGID 1864454547844722331 X-GM-LABELS () UID 3)
+
+  UID 4 ENVELOPE:
+    4 (UID 4 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:47:55 GMT" "Sicherheitswarnung" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<dvV0cctHN_-Rw5JCkHY4Mg@notifications.google.com>"))
+  UID 4 GMAIL-EXT:
+    4 (X-GM-THRID 1864454446257853112 X-GM-MSGID 1864454611191573548 X-GM-LABELS () UID 4)
+
+  UID 5 ENVELOPE:
+    5 (UID 5 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:48:13 GMT" "Sicherheitswarnung" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<9acw15T-bxQ0D0pU9aZMaQ@notifications.google.com>"))
+  UID 5 GMAIL-EXT:
+    5 (X-GM-THRID 1864454446257853112 X-GM-MSGID 1864454629645119667 X-GM-LABELS () UID 5)
+
+  UID 6 ENVELOPE:
+    6 (UID 6 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:48:20 GMT" "Sicherheitswarnung" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<M3ns00LaleS_LfkaNHQXxw@notifications.google.com>"))
+  UID 6 GMAIL-EXT:
+    6 (X-GM-THRID 1864454446257853112 X-GM-MSGID 1864454637523994798 X-GM-LABELS () UID 6)
+
+  UID 7 ENVELOPE:
+    7 (UID 7 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:56:32 -0000" "Rechnung 7823" ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<177808299228.207180.8106905697611967297@test.local>"))
+  UID 7 GMAIL-EXT:
+    7 (X-GM-THRID 1864455152023682407 X-GM-MSGID 1864455152023682407 X-GM-LABELS (Hornbach Rechnungen) UID 7)
+
+  UID 8 ENVELOPE:
+    8 (UID 8 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:56:32 -0000" "Bestellung 4711" ((NIL NIL "service" "obi.de")) ((NIL NIL "service" "obi.de")) ((NIL NIL "service" "obi.de")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<177808299260.207180.17623483636065153811@test.local>"))
+  UID 8 GMAIL-EXT:
+    8 (X-GM-THRID 1864455152364081510 X-GM-MSGID 1864455152364081510 X-GM-LABELS () UID 8)
+
+  UID 9 ENVELOPE:
+    9 (UID 9 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:56:33 -0000" "Grosse Aktion Mai 2026" ((NIL NIL "newsletter" "bauhaus.info")) ((NIL NIL "newsletter" "bauhaus.info")) ((NIL NIL "newsletter" "bauhaus.info")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<177808299359.207180.5571621255208291637@test.local>"))
+  UID 9 GMAIL-EXT:
+    9 (X-GM-THRID 1864455153336913914 X-GM-MSGID 1864455153336913914 X-GM-LABELS () UID 9)
+
+============================================================
+SELECT Rechnungen
+============================================================
+  EXISTS: 1
+  UIDs: ['1']
+
+  UID 1 ENVELOPE:
+    1 (UID 1 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:56:32 -0000" "Rechnung 7823" ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<177808299228.207180.8106905697611967297@test.local>"))
+  UID 1 GMAIL-EXT:
+    1 (X-GM-THRID 1864455152023682407 X-GM-MSGID 1864455152023682407 X-GM-LABELS ("\\Inbox" Hornbach) UID 1)
+
+============================================================
+SELECT Hornbach
+============================================================
+  EXISTS: 1
+  UIDs: ['1']
+
+  UID 1 ENVELOPE:
+    1 (UID 1 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:56:32 -0000" "Rechnung 7823" ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<177808299228.207180.8106905697611967297@test.local>"))
+  UID 1 GMAIL-EXT:
+    1 (X-GM-THRID 1864455152023682407 X-GM-MSGID 1864455152023682407 X-GM-LABELS ("\\Inbox" Rechnungen) UID 1)
+
+============================================================
+SELECT [Gmail]/All Mail
+============================================================
+  EXISTS: 9
+  UIDs: ['1', '2', '3', '4', '5', '6', '7', '8', '9']
+
+  UID 1 ENVELOPE:
+    1 (UID 1 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:45:18 GMT" "Sicherheitswarnung" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<LNU2IKgapDtYQnalFx9T8A@notifications.google.com>"))
+  UID 1 GMAIL-EXT:
+    1 (X-GM-THRID 1864454446257853112 X-GM-MSGID 1864454446257853112 X-GM-LABELS ("\\Inbox") UID 1)
+
+  UID 2 ENVELOPE:
+    2 (UID 2 FLAGS () ENVELOPE ("Wed, 06 May 2026 08:40:32 -0700" "Information about your new Google Account" (("Google" NIL "no-reply" "google.com")) (("Google" NIL "no-reply" "google.com")) (("Google" NIL "no-reply" "google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<d3af06fed713c730adbf9f1296e2ca5427c9d1b9-20113407-111435302@google.com>"))
+  UID 2 GMAIL-EXT:
+    2 (X-GM-THRID 1864454481893599974 X-GM-MSGID 1864454481893599974 X-GM-LABELS ("\\Inbox") UID 2)
+
+  UID 3 ENVELOPE:
+    3 (UID 3 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:46:55 GMT" "2-Faktor-Authentifizierung aktiviert" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<xHKywFttvo9gCvS9lSMOMA@notifications.google.com>"))
+  UID 3 GMAIL-EXT:
+    3 (X-GM-THRID 1864454547844722331 X-GM-MSGID 1864454547844722331 X-GM-LABELS ("\\Inbox") UID 3)
+
+  UID 4 ENVELOPE:
+    4 (UID 4 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:47:55 GMT" "Sicherheitswarnung" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<dvV0cctHN_-Rw5JCkHY4Mg@notifications.google.com>"))
+  UID 4 GMAIL-EXT:
+    4 (X-GM-THRID 1864454446257853112 X-GM-MSGID 1864454611191573548 X-GM-LABELS ("\\Inbox") UID 4)
+
+  UID 5 ENVELOPE:
+    5 (UID 5 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:48:13 GMT" "Sicherheitswarnung" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<9acw15T-bxQ0D0pU9aZMaQ@notifications.google.com>"))
+  UID 5 GMAIL-EXT:
+    5 (X-GM-THRID 1864454446257853112 X-GM-MSGID 1864454629645119667 X-GM-LABELS ("\\Inbox") UID 5)
+
+  UID 6 ENVELOPE:
+    6 (UID 6 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:48:20 GMT" "Sicherheitswarnung" (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) (("Google" NIL "no-reply" "accounts.google.com")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<M3ns00LaleS_LfkaNHQXxw@notifications.google.com>"))
+  UID 6 GMAIL-EXT:
+    6 (X-GM-THRID 1864454446257853112 X-GM-MSGID 1864454637523994798 X-GM-LABELS ("\\Inbox") UID 6)
+
+  UID 7 ENVELOPE:
+    7 (UID 7 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:56:32 -0000" "Rechnung 7823" ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "rechnung" "hornbach.de")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<177808299228.207180.8106905697611967297@test.local>"))
+  UID 7 GMAIL-EXT:
+    7 (X-GM-THRID 1864455152023682407 X-GM-MSGID 1864455152023682407 X-GM-LABELS ("\\Inbox" Hornbach Rechnungen) UID 7)
+
+  UID 8 ENVELOPE:
+    8 (UID 8 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:56:32 -0000" "Bestellung 4711" ((NIL NIL "service" "obi.de")) ((NIL NIL "service" "obi.de")) ((NIL NIL "service" "obi.de")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<177808299260.207180.17623483636065153811@test.local>"))
+  UID 8 GMAIL-EXT:
+    8 (X-GM-THRID 1864455152364081510 X-GM-MSGID 1864455152364081510 X-GM-LABELS ("\\Inbox") UID 8)
+
+  UID 9 ENVELOPE:
+    9 (UID 9 FLAGS () ENVELOPE ("Wed, 06 May 2026 15:56:33 -0000" "Grosse Aktion Mai 2026" ((NIL NIL "newsletter" "bauhaus.info")) ((NIL NIL "newsletter" "bauhaus.info")) ((NIL NIL "newsletter" "bauhaus.info")) ((NIL NIL "scimapmcp" "gmail.com")) NIL NIL NIL "<177808299359.207180.5571621255208291637@test.local>"))
+  UID 9 GMAIL-EXT:
+    9 (X-GM-THRID 1864455153336913914 X-GM-MSGID 1864455153336913914 X-GM-LABELS ("\\Inbox") UID 9)
+
+============================================================
+SELECT [Gmail]/Drafts
+============================================================
+  EXISTS: 0
+  UIDs: []
+
+============================================================
+SELECT [Gmail]/Trash
+============================================================
+  EXISTS: 0
+  UIDs: []
+
+============================================================
+X-GM-MSGID SEARCH TEST
+============================================================
+All Mail UIDs: ['1', '2', '3', '4', '5', '6', '7', '8', '9']
+First msg FETCH X-GM-MSGID: 1 (X-GM-MSGID 1864454446257853112 UID 1)
+Extracted X-GM-MSGID: 1864454446257853112
+SEARCH X-GM-MSGID 1864454446257853112: 1
+
+============================================================
+LABEL OPERATIONS
+============================================================
+Bestellung 4711 UIDs in INBOX: ['8']
+Before: [b'8 (X-GM-LABELS () UID 8)']
+STORE +X-GM-LABELS Rechnungen: OK [b'8 (X-GM-LABELS (Rechnungen) UID 8)']
+After add: [b'8 (X-GM-LABELS (Rechnungen) UID 8)']
+STORE -X-GM-LABELS Rechnungen: OK [b'8 (X-GM-LABELS () UID 8)']
+After remove: [b'8 (X-GM-LABELS () UID 8)']
+
+Done.

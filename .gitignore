@@ -47,5 +47,7 @@ Thumbs.db
 
 # Logs & runtime state
 *.log
+# Reference captures of the real Gmail IMAP server (bdd/mock-gmail/README.md)
+!bdd/mock-gmail/traces/**/*.log
 logs/
 wal/
