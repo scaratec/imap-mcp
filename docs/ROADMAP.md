@@ -4,12 +4,20 @@ Index der offenen Schulden. Jeder Eintrag verweist auf das ausführliche
 Artefakt (LIM, ADR, Task) — Inhalte werden hier nicht dupliziert.
 Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
-## Status (Stand 2026-05-12)
+## Status (Stand 2026-10-27)
 
-- **BDD-Suite:** 241 passed · 0 failed · 0 skipped.
+- **Release:** `sc-imap-mcp` 2.1.0 (Tool-Set 2.1.0), Tag `v2.1.0`. Auf
+  PyPI liegt nur das Wheel; das sdist wurde abgelehnt, der GitHub-Release
+  fehlt (Einträge 31, 32).
+- **BDD-Suite:** 419 passed · 0 failed · 34 skipped (`@pending`), lokal
+  und in CI auf `6cfb6e5`.
 - **Server-Property-Tests:** 8 passed (`server/tests/policy/`).
-- **HEAD:** 0.8.1 + localized Gmail folders + explicit IMAP user +
-  flagged predicate.
+- **Audit:** seit 8e60c98 eine gemeinsame Hash-Kette für alle lokalen
+  Instanzen ([ADR-0032](adr/0032-shared-audit-chain-across-local-instances.md)).
+  Der Tageswechsel 2026-10-18 → 2026-10-19 wurde im Betrieb geprüft:
+  genau ein `eof_day`, Datei versiegelt, Folgetag kettet an `final_hash`.
+- **Abhängigkeiten:** `mcp<2` und Build mit `hatchling<1.32` begrenzt
+  (Einträge 31, 41).
 
 ### LIM-Übersicht
 
@@ -41,27 +49,21 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
 ### Nächster Block
 
-**Roadmap-Punkt #9 — LIM-0003 Phase 1: Mock-OAuth-Container.**
-LIM-0003 muss vor LIM-0002 stehen, weil Gmail-XOAUTH2 den OAuth-Mock
-braucht. Konkrete Schritte:
-
-1. `navikt/mock-oauth2-server` Service in
-   `bdd/docker/docker-compose.yml` ergänzen, Port-Exposition für die
-   Admin-API.
-2. `bdd/features/environment.py` `before_all` ergänzen: warten bis
-   `/.well-known/openid-configuration` antwortet.
-3. Sanity-Check: `curl` gegen die Discovery-URL liefert ein OIDC-
-   Doc.
-
-Doku-Pflichtlektüre vor Einstieg:
-[LIM-0003](limitations/0003-oauth2-scenarios-not-runnable.md).
+Einträge 31 bis 40 unter *Audit und Auslieferung*. Entschieden sind 31,
+32, 33 und 40; zuerst 31 und 32, weil jeder Release-Lauf bis dahin rot
+endet. Offen und als Nächstes mit dem Owner zu klären: 34 bis 39, in
+dieser Reihenfolge.
 
 ### Smoke-Test beim Wieder-Einstieg
 
 ```sh
 cd /home/randy/Projekte/scaratec/imap-mcp/bdd
 .venv/bin/behave --no-color --format=progress features/
-# erwartet: 174 passed, 0 failed, 18 skipped
+# erwartet: 419 passed, 0 failed, 34 skipped
+# Hat semantic-release die Version angehoben, vorher die Metadaten der
+# Entwicklungsumgebung auffrischen, sonst schlägt in
+# mcp_tool_discovery.feature der Versionsvergleich fehl:
+#   cd ../server && .venv/bin/pip install --no-deps -e .
 
 cd /home/randy/Projekte/scaratec/imap-mcp/server
 .venv/bin/pytest tests/policy/ -q
@@ -141,6 +143,33 @@ ein gemeinsames WAL. Für jede HTTP-Instanz mit mehr als einem Caller in
 `callers.yaml` ist die Lücke erreichbar, und der Server weist eine solche
 Konfiguration nicht zurück. ADR-0029 §3 ist deshalb keine Ordnungsfrage,
 sondern die einzige Absicherung.
+
+## Audit und Auslieferung (aufgenommen 2026-10-18)
+
+Anlass war der Ausfall vom 2026-10-16: Nach dem Tageswechsel schlug jeder
+Tool-Aufruf mit `[Errno 13] Permission denied` auf der versiegelten
+Audit-Datei des Vortags fehl, bis der Prozess neu gestartet wurde.
+Ursache waren mehrere lokale Server-Instanzen (ein stdio-Server je
+MCP-Client-Sitzung), die sich gegenseitig Dateien versiegelten. Behoben in
+8e60c98, Regressionstest `bdd/features/audit/audit_multi_instance.feature`,
+Entscheidung [ADR-0032](adr/0032-shared-audit-chain-across-local-instances.md).
+Die Einträge unten sind dabei aufgefallen und nicht Teil des Fixes.
+
+| #  | Titel | Verweis | Art / Stand |
+|----|---|---|---|
+| 31 | `readme = "../README.md"` liegt außerhalb von `server/`: hatchling ≥ 1.32 bricht den Build ab, das sdist enthält `../README.md` und wird von PyPI mit 400 abgelehnt | `server/pyproject.toml`, 139bf55, Release-Lauf vom 2026-10-18 | **Defekt** — **entschieden 2026-10-19:** `server/README.md` wird Kopie des Haupt-README, CI prüft Gleichheit, bisheriger Inhalt nach `server/DEVELOPMENT.md`, danach Begrenzung `hatchling<1.32` aufheben |
+| 32 | GitHub-Release v2.1.0 fehlt, weil der Release-Job am sdist abbrach | Tag `v2.1.0`, `server/CHANGELOG.md` | Auslieferung — **entschieden 2026-10-19:** mit `gh release create` nachholen (Text aus dem CHANGELOG, Artefakte aus dem Tag gebaut); das sdist wird auf PyPI nicht nachgereicht |
+| 33 | Audit-Eintrag entsteht erst nach dem Handler: scheitert das Schreiben, ist die IMAP-Aktion schon ausgeführt, aber nicht protokolliert; ein erneuter Versuch kann doppelt anlegen | `server/src/imap_mcp/dispatch.py` (`_audit_tool_call`), [ADR-0021](adr/0021-audit-log-format.md) | **Defekt** — **entschieden 2026-10-19:** schreibende Tools bekommen vorab einen `intent`-Eintrag; ist das Audit nicht schreibbar, wird nichts ausgeführt. Braucht ADR (Erweiterung von ADR-0021) und Feature File; lesende Tools bleiben bei einem Eintrag danach |
+| 34 | Wirft ein Handler eine unerwartete Exception, entsteht kein Audit-Eintrag | `dispatch.py` | **Defekt** — Entscheidung offen. Empfehlung: immer protokollieren mit `result: ERROR`, `reason: internal_error` und dem Exception-Typ, ohne Fehlertext (kann Inhalte enthalten) |
+| 35 | Aufbewahrung läuft im Betrieb nie: `AuditWriter.rotate()` wird nur vom Test-Tool `_test_run_audit_rotation` aufgerufen; nichts wird komprimiert oder gelöscht | `server/src/imap_mcp/audit.py`, [ADR-0022](adr/0022-audit-retention-and-access-model.md) | **Defekt** — Entscheidung offen, wann die Aufbewahrung läuft (z. B. beim Versiegeln eines Tages unter der Sperre aus ADR-0032) |
+| 36 | Altbestand vor 8e60c98: wiederholte `eof_day`-Einträge in versiegelten Dateien (bis über 4000 je Datei), Kettenbrüche durch parallele Instanzen (zuletzt in `2026-10-18.jsonl` vor seq 14) und Einträge ohne Kettenfelder aus dem alten OAuth-Pfad (`<tag>.jsonl` mit nur `token_refresh`, Rechte 0664, nie versiegelt) | ADR-0032 *Neutral* | Entscheidung offen. Empfehlung: Bestand nicht umschreiben, als LIM dokumentieren und einen künftigen Verifier diese Muster tolerieren lassen |
+| 37 | Kein Status-Signal, ob das Audit schreibbar ist; der Client sieht einen gesunden Server, bis ein Aufruf scheitert | Bugreport 2026-10-17, Punkt 4 | Feature — Entscheidung offen (Feld in `tool_surface_info` oder `describe_policy`, oder eigenes Tool) |
+| 38 | ADR-0032 steht auf *Proposed* | [ADR-0032](adr/0032-shared-audit-chain-across-local-instances.md) | Owner-Entscheidung offen |
+| 39 | Während des Ausfalls (2026-10-16 ca. 21:50 bis Neustart) können `create_draft`-Aufrufe Entwürfe angelegt und trotzdem einen Fehler gemeldet haben; Wiederholungen ergeben dann Duplikate | Folge von Eintrag 33 | Betrieb — offen: `[Gmail]/Drafts` der betroffenen Konten lesend auf Duplikate prüfen |
+| 40 | Das Gmail-App-Passwort des Mock-Testkontos lag bis cfcff4f unverschlüsselt im öffentlichen Repository und bleibt in der Historie lesbar | `bdd/mock-gmail/credentials/app-password.secret` | Sicherheit — **entschieden 2026-10-19:** beim Provider widerrufen, Historie nicht umschreiben. Widerruf durch den Kontoinhaber offen |
+| 41 | Server läuft nicht mit dem MCP-SDK 2.x (u. a. `McpError` → `MCPError`); derzeit `mcp>=1.0.0,<2` | 6cfb6e5 | Wartung — Portierung auf mcp 2 als eigene Arbeit |
+| 42 | CI installiert Abhängigkeiten ohne Versionsstand; ein neues Release eines Pakets (hier mcp 2.0) ließ nahezu alle BDD-Szenarien mit Fehler enden, ohne dass sich Code geändert hatte | `.github/workflows/bdd.yml`, `ci.yml` | Wartung — Entscheidung offen (Constraints- oder Lock-Datei für CI, getrennt von den Bereichen im Paket) |
+| 43 | GitHub Actions: `actions/checkout@v4` und `actions/setup-python@v5` laufen auf Node 20 (veraltet); `ubuntu-latest` wechselt ab 2026-10-19 auf Ubuntu 26 | Annotationen der Läufe vom 2026-10-18 | Wartung — Aktionen anheben, Release-Workflow auf dem neuen Image prüfen |
 
 ## Querschnitt
 
