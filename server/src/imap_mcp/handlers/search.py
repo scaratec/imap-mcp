@@ -199,15 +199,18 @@ async def handle_search(context: ServerContext, arguments: dict[str, Any]) -> Se
         return _deny_search(reason=folder_decision.reason, account=account_id, folder=folder_path)
     assert folder_decision.folder_policy is not None
     minimum_for_tool = level_rank("METADATA")
-    if level_rank(folder_decision.visibility) < minimum_for_tool and not any(
-        level_rank(rule.grant) >= minimum_for_tool  # type: ignore[arg-type]
-        for rule in folder_decision.folder_policy.rules
-        if rule.grant is not None
+    if (
+        level_rank(folder_decision.visibility) < minimum_for_tool
+        and not any(
+            level_rank(rule.grant) >= minimum_for_tool  # type: ignore[arg-type]
+            for rule in folder_decision.folder_policy.rules
+            if rule.grant is not None
+        )
+        and folder_decision.folder_policy.mode == "whitelist"
     ):
-        if folder_decision.folder_policy.mode == "whitelist":
-            return _deny_search(
-                reason="visibility_below_METADATA", account=account_id, folder=folder_path
-            )
+        return _deny_search(
+            reason="visibility_below_METADATA", account=account_id, folder=folder_path
+        )
 
     imap_criteria = _criteria_to_imap_search(criteria_raw)
     applied_scope, since_term = _resolve_scope(criteria_raw, scope_arg)
@@ -287,7 +290,7 @@ async def handle_search(context: ServerContext, arguments: dict[str, Any]) -> Se
                     )
                     if all_mail_hits:
                         entry["canonical_all_mail_uid"] = all_mail_hits[0]
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - canonical UID is optional
                 pass
             results_with_gmail.append(entry)
 

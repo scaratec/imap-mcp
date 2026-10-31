@@ -85,7 +85,7 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
             return context.secret_store.get(secret_ref), None  # type: ignore[attr-defined]
         except SecretDecryptionFailed:
             return None, "secret_decryption_failed"
-        except Exception:
+        except Exception:  # noqa: BLE001 - fail closed, no token
             return None, None
 
     class BearerAuthMiddleware(BaseHTTPMiddleware):

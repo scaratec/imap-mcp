@@ -63,7 +63,7 @@ def decode_mutf7(wire: str) -> str:
         try:
             raw = base64.b64decode(b64 + "=" * pad)
             out.append(raw.decode("utf-16-be"))
-        except Exception:
+        except ValueError:  # binascii.Error and UnicodeDecodeError
             return wire
         i = end + 1
     return "".join(out)
@@ -168,7 +168,7 @@ async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
                 _w.close()
                 try:
                     await _w.wait_closed()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - best-effort close of probe
                     pass
             except ConnectionRefusedError:
                 raise
@@ -191,7 +191,7 @@ async def _authenticate_imap(imap: IMAP4, account: Account, password: str) -> No
             try:
                 await imap.xoauth2(user, password)
             except Exception as e:
-                raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}")
+                raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}") from e
         else:
             await imap.login(user, password)
 
@@ -356,7 +356,7 @@ def _decode_header(raw: str) -> str:
 
     try:
         decoded = str(make_header(decode_header(raw)))
-    except Exception:
+    except Exception:  # noqa: BLE001 - untrusted header, keep raw
         decoded = raw
     return re.sub(r"\r?\n\s+", " ", decoded)
 
@@ -1049,7 +1049,7 @@ async def move_message(
         # 0006 §uidvalidity_consistency.
         try:
             _, noop_lines = await imap.noop()
-        except Exception:
+        except Exception:  # noqa: BLE001 - NOOP probe is best effort
             noop_lines = None
         uidvalidity_after = _extract_uidvalidity(noop_lines)
         if (
@@ -1068,7 +1068,7 @@ async def move_message(
                 status, _ = await imap.uid("move", str(uid), target_folder)
                 if status == "OK":
                     return "native_move"
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - fall back to COPY
                 pass
         status, _ = await imap.uid("copy", str(uid), target_folder)
         if status != "OK":
@@ -1172,7 +1172,7 @@ async def append_message(
     finally:
         try:
             await imap.logout()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - best-effort logout
             pass
 
 
@@ -1305,7 +1305,7 @@ async def expunge_uids(account: Account, password: str, folder: str, uids: list[
     finally:
         try:
             await imap.logout()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - best-effort logout
             pass
 
 

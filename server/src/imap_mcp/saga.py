@@ -59,7 +59,7 @@ def _maybe_crash(at: str) -> None:
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - crash hook must reach _exit
         pass
     os._exit(1)
 
@@ -165,7 +165,7 @@ class SagaManager:
                     dst_folder,
                     f'HEADER "Message-Id" "{message_id}"',
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - lookup failure means no match
                 hits = []
             return list(hits)
 
@@ -203,7 +203,7 @@ class SagaManager:
         criteria = " ".join(terms)
         try:
             candidates = await search_uids(dst_account, dst_password, dst_folder, criteria)
-        except Exception:
+        except Exception:  # noqa: BLE001 - lookup failure means no match
             return []
         # Confirm size + 4-KiB hash for each candidate. Same size +
         # same 4-KiB SHA-256 = the same payload to the precision the
@@ -212,7 +212,7 @@ class SagaManager:
         for uid in candidates:
             try:
                 payload = await fetch_full_message(dst_account, dst_password, dst_folder, uid)
-            except Exception:
+            except Exception:  # noqa: BLE001, S112 - skip unreadable candidate
                 continue
             if payload is None:
                 continue
@@ -309,13 +309,13 @@ class SagaManager:
                         if all_mail_hits:
                             fetch_folder = "[Gmail]/All Mail"
                             fetch_uid = all_mail_hits[0]
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - optional All Mail lookup
                     pass  # fall back to direct fetch from source folder
 
             # FETCH
             try:
                 raw = await fetch_full_message(src_account, src_password, fetch_folder, fetch_uid)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - retried, escalates at limit
                 count = self.wal.bump_retry(tx_id, f"fetch_failed: {exc}")
                 if count >= self.retry_limit:
                     self.wal.mark_needs_operator(tx_id)
@@ -408,7 +408,7 @@ class SagaManager:
                     result="ERROR",
                     error_type="target_unreachable",
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - retried, escalates at limit
                 count = self.wal.bump_retry(tx_id, f"append_failed: {exc}")
                 if count >= self.retry_limit:
                     self.wal.mark_needs_operator(tx_id)
@@ -442,7 +442,7 @@ class SagaManager:
                         f'HEADER "Message-Id" "{message_id}"',
                     )
                     target_uid = hits[0] if hits else None
-                except Exception:
+                except Exception:  # noqa: BLE001 - target UID stays unknown
                     target_uid = None
             self.wal.mark_staged(tx_id, target_uid)
             self._audit_step(tx_id, "staged")
@@ -475,12 +475,12 @@ class SagaManager:
                 existing = await search_uids(
                     src_account, src_password, src_folder, f"UID {src_uid}"
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - assume source still exists
                 existing = [src_uid]
             if src_uid in existing:
                 try:
                     await _delete_source(src_account, src_password, src_folder, src_uid)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - retried, escalates at limit
                     count = self.wal.bump_retry(tx_id, f"delete_failed: {exc}")
                     if count >= self.retry_limit:
                         self.wal.mark_needs_operator(tx_id)
@@ -520,7 +520,7 @@ class SagaManager:
         try:
             src_account, src_password = await self.account_resolver(tx["src_account"])
             dst_account, dst_password = await self.account_resolver(tx["dst_account"])
-        except Exception:
+        except Exception:  # noqa: BLE001 - unresolvable, see docstring
             return None
 
         # Staged-but-no-target_uid: a Message-ID-less message whose
@@ -646,7 +646,7 @@ class SagaManager:
         try:
             append_result = await append_message(account, password, folder, modified, flags=flags)
             ok = append_result.outcome == "ok"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - retried via WAL
             self.wal.bump_retry(tx_id, f"append_failed: {exc}")
             return SagaResult(
                 tx_id=tx_id,
@@ -673,7 +673,7 @@ class SagaManager:
         if locate is not None:
             try:
                 target_uid = await locate()
-            except Exception:
+            except Exception:  # noqa: BLE001 - target UID stays unknown
                 target_uid = None
         elif message_id is not None:
             try:
@@ -687,7 +687,7 @@ class SagaManager:
                     if h != uid:
                         target_uid = h
                         break
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - target UID stays unknown
                 pass
         self.wal.mark_staged(tx_id, target_uid)
         self._audit_step(tx_id, "staged")
@@ -773,5 +773,5 @@ async def _delete_source(account: Account, password: str, folder: str, uid: int)
     finally:
         try:
             await imap.logout()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - best-effort logout
             pass

@@ -402,7 +402,7 @@ async def handle_create_draft(
         )
     except TimeoutError:
         return _error_draft(error_type="append_timeout", account=account_id, folder=folder_path)
-    except Exception:
+    except Exception:  # noqa: BLE001 - any APPEND failure is reported
         return _error_draft(error_type="append_failed", account=account_id, folder=folder_path)
     if append_result.outcome == "ok":
         return _ok_draft(
@@ -1135,7 +1135,7 @@ async def _sweep_draft_residue(
         if len(uids) < 2:
             return
         raw_headers = await imap_fetch_raw_headers_batch(account, password, imap_folder, uids)
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort residue cleanup
         return
     residue: list[int] = []
     for uid, raw in sorted(raw_headers.items()):
@@ -1148,7 +1148,7 @@ async def _sweep_draft_residue(
         return
     try:
         await imap_expunge_uids(account, password, imap_folder, residue)
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort residue cleanup
         return
 
 

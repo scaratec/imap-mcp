@@ -39,7 +39,7 @@ class OAuthManager:
         shutdown path; safe to call more than once."""
         try:
             await self._http_client.aclose()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - best-effort shutdown
             pass
 
     def is_rebootstrap_needed(self, account_id: str) -> bool:

@@ -100,7 +100,7 @@ async def handle_get_transaction_status(
     if row["status"] in ("pending", "staged"):
         try:
             await context.saga.resume(row)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - WAL re-read reports state
             pass
         row = context.saga.wal.get(tx_id) or row
     return {
@@ -156,7 +156,7 @@ async def handle_describe_policy(
             )
             visible_paths = {fp.path for fp in folder_policies}
             hidden_folders = len([fi for fi in all_folder_infos if fi.path not in visible_paths])
-        except Exception:
+        except Exception:  # noqa: BLE001 - informational count only
             hidden_folders = 0
         visible_accounts.append(
             {

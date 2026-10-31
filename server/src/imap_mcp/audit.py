@@ -383,7 +383,7 @@ class AuditWriter:
         cmd = (self.external_root_hook or "").replace("%FINAL_HASH%", final_hash)
         try:
             subprocess.run(cmd, shell=True, check=False, timeout=5)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             # Hook failures must not break audit writing.
             pass
 

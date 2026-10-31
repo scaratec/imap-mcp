@@ -32,7 +32,7 @@ def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
     old_config: Configuration = context.configuration  # type: ignore[assignment]
     try:
         new_config: Configuration = load_configuration(config_dir)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - keep old config on any error
         if audit is not None:
             reason = (
                 "parse_error"

@@ -66,11 +66,11 @@ _initialized = False
 
 
 def _get_version() -> str:
-    try:
-        from importlib.metadata import version
+    from importlib.metadata import PackageNotFoundError, version
 
+    try:
         return version("sc-imap-mcp")
-    except Exception:
+    except PackageNotFoundError:
         return "dev"
 
 

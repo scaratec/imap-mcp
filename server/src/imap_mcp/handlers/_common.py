@@ -336,7 +336,7 @@ def decode_mime_words(raw: str) -> str:
 
     try:
         return str(make_header(decode_header(raw)))
-    except Exception:
+    except Exception:  # noqa: BLE001 - untrusted header, keep raw
         return raw
 
 

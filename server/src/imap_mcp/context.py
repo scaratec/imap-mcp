@@ -90,11 +90,11 @@ class ServerContext:
 
 
 def _package_version() -> str:
-    from importlib.metadata import version
+    from importlib.metadata import PackageNotFoundError, version
 
     try:
         return version("sc-imap-mcp")
-    except Exception:
+    except PackageNotFoundError:
         pass
     import re
     from pathlib import Path
