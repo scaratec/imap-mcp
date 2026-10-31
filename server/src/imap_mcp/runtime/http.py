@@ -43,7 +43,9 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
     # stdio_trusted caller in the configured set therefore makes the
     # config invalid for HTTP, fatal at startup.
     stdio_trusted = [
-        c.id for c in configuration.callers_file.callers if c.auth.type == "stdio_trusted"
+        c.id
+        for c in configuration.callers_file.callers
+        if c.auth is not None and c.auth.type == "stdio_trusted"
     ]
     if stdio_trusted:
         names = ", ".join(f'"{c}"' for c in stdio_trusted)
@@ -114,7 +116,7 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
                 # callers.
                 masquerade = False
                 for other in configuration.callers_file.callers:
-                    if other.auth.type != "shared_token":
+                    if other.auth is None or other.auth.type != "shared_token":
                         continue
                     other_expected, _ = _resolve_token(other.auth.token_secret_ref)
                     if other_expected is not None and hmac.compare_digest(token, other_expected):
@@ -124,7 +126,8 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
                     return JSONResponse({"error": "identity_immutable"}, status_code=401)
                 _audit_auth_failed(caller_id_claim, "unknown_caller_id", f"http:{addr}")
                 return JSONResponse({"error": "unknown_caller_id"}, status_code=401)
-            if caller.auth.type != "shared_token":
+            # A caller without an auth block cannot present a token.
+            if caller.auth is None or caller.auth.type != "shared_token":
                 _audit_auth_failed(caller_id_claim, "wrong_auth_type", f"http:{addr}")
                 return JSONResponse({"error": "auth_failed"}, status_code=401)
             expected, lookup_error = _resolve_token(caller.auth.token_secret_ref)
@@ -140,7 +143,11 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
                 # for constant-time comparison.
                 token_matches_other = False
                 for other in configuration.callers_file.callers:
-                    if other.id == caller_id_claim or other.auth.type != "shared_token":
+                    if (
+                        other.id == caller_id_claim
+                        or other.auth is None
+                        or other.auth.type != "shared_token"
+                    ):
                         continue
                     other_expected, _ = _resolve_token(other.auth.token_secret_ref)
                     if other_expected is not None and hmac.compare_digest(token, other_expected):

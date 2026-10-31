@@ -164,13 +164,18 @@ def step_server_configured_with_caller(context: Context) -> None:
 
     A missing `policy` column derives `<caller_id>-policy` so the
     loader's "policy must exist" invariant is satisfied without the
-    feature having to spell it out for auth-only scenarios.
+    feature having to spell it out for auth-only scenarios. An
+    `auth_type` of `(none)` omits the caller's auth block entirely.
     """
     builder = _ensure_builder(context)
     for row in context.table:
         caller_id = row["caller_id"]
         policy = row["policy"] if "policy" in row.headings else f"{caller_id}-policy"
-        auth_type = row["auth_type"] if "auth_type" in row.headings else "stdio_trusted"
+        auth_type: str | None = (
+            row["auth_type"] if "auth_type" in row.headings else "stdio_trusted"
+        )
+        if auth_type == "(none)":
+            auth_type = None
         token_secret_ref = (
             row["token_secret_ref"] if "token_secret_ref" in row.headings else None
         )

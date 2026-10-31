@@ -15,8 +15,9 @@ Feature: Caller identity and authentication
     - shared_token  : correct token        : 1
     - Immutability  : mid-session claim    : 1
     - Config error  : stdio_trusted over HTTP : 1
+    - Config error  : caller without auth over HTTP : 2
     - Timing        : constant-time compare : 1 (indirectly via audit latency variance)
-    Total enumerated                        : 8   covered by this feature: 7
+    Total enumerated                        : 10  covered by this feature: 9
 
   Background:
     Given the server is configured with callers:
@@ -87,3 +88,34 @@ Feature: Caller identity and authentication
     And the server process is started with transport "http"
     Then the server refuses to start
     And the startup error indicates caller "wrong-config" as "stdio_trusted not permitted on non-stdio transport"
+
+  # callers.yaml accepts a caller without an auth block. Over HTTP such
+  # a caller has no token to present, so it must be refused like any
+  # other non-shared_token caller, and its presence must not affect how
+  # the other callers authenticate.
+  Scenario: A caller without an auth block is refused over HTTP
+    Given the server is configured with caller:
+      | caller_id     | auth_type |
+      | no-auth-agent | (none)    |
+    And the server process is started with transport "http" on a random port
+    When the MCP client performs an Initialize handshake with caller_id "no-auth-agent" and bearer token "correct-horse-battery"
+    Then the handshake fails with error "auth_failed"
+    And the audit log contains an entry with:
+      | field               | value           |
+      | tool                | auth_failed     |
+      | decision            | DENY            |
+      | reason              | auth_failed     |
+      | auth_failure_reason | wrong_auth_type |
+
+  Scenario Outline: A caller without an auth block does not affect other callers over HTTP
+    Given the server is configured with caller:
+      | caller_id     | auth_type |
+      | no-auth-agent | (none)    |
+    And the server process is started with transport "http" on a random port
+    When the MCP client performs an Initialize handshake with caller_id "<caller_id>" and bearer token "<token>"
+    Then the handshake fails with error "<error>"
+
+    Examples:
+      | caller_id     | token         | error             |
+      | invoice-agent | wrong-token   | auth_failed       |
+      | ghost-agent   | wrong-token   | unknown_caller_id |

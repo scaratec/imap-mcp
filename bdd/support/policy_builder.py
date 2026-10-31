@@ -74,7 +74,8 @@ class Policy:
 class Caller:
     id: str
     policy: str
-    auth_type: str = "stdio_trusted"  # or "shared_token"
+    # "stdio_trusted", "shared_token", or None to omit the auth block.
+    auth_type: str | None = "stdio_trusted"
     token_secret_ref: str | None = None
 
 
@@ -234,7 +235,8 @@ class PolicyBuilder:
                                         "type": c.auth_type,
                                         "token_secret_ref": c.token_secret_ref,
                                     }
-                                ),
+                                )
+                                or None,
                             }
                         )
                         for c in self.callers
