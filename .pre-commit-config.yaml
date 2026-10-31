@@ -1,8 +1,9 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.13
+    # Keep in sync with the ruff pin in .github/workflows/ci.yml.
+    rev: v0.17.3
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
         files: ^server/src/
       - id: ruff-format
