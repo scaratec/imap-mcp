@@ -2,6 +2,50 @@
 
 <!-- version list -->
 
+## v2.1.1 (2026-10-31)
+
+### Bug Fixes
+
+- **http**: Refuse callers without an auth block instead of crashing
+  ([`045a867`](https://github.com/scaratec/imap-mcp/commit/045a867edd9531c4320675cfa64edd07dc7cc1a5))
+
+### Build System
+
+- Declare and test support for Python 3.11 to 3.14
+  ([`dc1a3dc`](https://github.com/scaratec/imap-mcp/commit/dc1a3dc811cccbfc0711e91db69c7ded2e744569))
+
+### Chores
+
+- **mock-gmail**: Track the captured Gmail IMAP traces
+  ([`79c18bb`](https://github.com/scaratec/imap-mcp/commit/79c18bbaef3de52b1898f1539da4d291e439ac7d))
+
+### Code Style
+
+- **server**: Apply the ruff autofixes for the 0.16 default rules
+  ([`ef682d3`](https://github.com/scaratec/imap-mcp/commit/ef682d37000abc7f7c2850ff053645305e8630e8))
+
+### Continuous Integration
+
+- Make the typecheck job blocking and pin mypy
+  ([`b39c2ee`](https://github.com/scaratec/imap-mcp/commit/b39c2ee739dfd41ec724a7545bdc866fface7be0))
+
+- Pin ruff to 0.17.3 in CI and the pre-commit hook
+  ([`b2cf720`](https://github.com/scaratec/imap-mcp/commit/b2cf720d14d7eb3e1a95579fa33f22b73029e3b0))
+
+### Documentation
+
+- **roadmap**: Record the state after the audit fix and 2.1.0
+  ([`c4ee95b`](https://github.com/scaratec/imap-mcp/commit/c4ee95be5b82e0c75c5a761f4ff219a73f41d0af))
+
+### Refactoring
+
+- **server**: Make the server pass mypy --strict
+  ([`7a6e1df`](https://github.com/scaratec/imap-mcp/commit/7a6e1dfbb98132f47fc60132d6ac67943e8cf215))
+
+- **server**: Resolve the remaining ruff findings per site
+  ([`e0eda8d`](https://github.com/scaratec/imap-mcp/commit/e0eda8dbe071dedc92d4dcac9d2298fa7b408ed8))
+
+
 ## v2.1.0 (2026-10-18)
 
 ### Bug Fixes
