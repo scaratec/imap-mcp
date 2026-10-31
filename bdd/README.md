@@ -23,7 +23,7 @@ requirement.
 
 ```sh
 cd bdd
-python3.11 -m venv .venv
+python3 -m venv .venv          # any Python >= 3.11
 . .venv/bin/activate
 pip install -e '.[dev]'
 ```
