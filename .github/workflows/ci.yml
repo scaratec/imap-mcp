@@ -23,15 +23,12 @@ jobs:
       - run: ruff check src/
       - run: ruff format --check src/
 
-  # mypy is currently tracking a known backlog of typing debt (see the
-  # mypy_debt.md note in docs/ — TODO once the file is added). The job
-  # is informational so the release gate is not held hostage by it, but
-  # the output is visible on every push so the debt cannot grow silently.
-  # When the backlog is resolved, drop `continue-on-error` and tighten
-  # the invocation back to `--check-untyped-defs`.
+  # Strict mode comes from [tool.mypy] in server/pyproject.toml. The
+  # tracing extra is installed so that opentelemetry resolves. mypy is
+  # pinned for the same reason as ruff: a new release must not turn CI
+  # red on code nobody touched.
   typecheck:
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: server
@@ -40,8 +37,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev]"
-      - run: mypy --check-untyped-defs src/imap_mcp/
+      - run: pip install -e ".[dev,tracing]" mypy==2.4.1
+      - run: mypy src/imap_mcp/
 
   test:
     runs-on: ubuntu-latest
