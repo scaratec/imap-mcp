@@ -37,9 +37,8 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS transactions (
@@ -76,7 +75,7 @@ CREATE TABLE IF NOT EXISTS transaction_events (
 
 
 def _now() -> str:
-    return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
 
 
 class WAL:

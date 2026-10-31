@@ -22,13 +22,13 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
     routes return HTTP 404 (ADR 0018, non_goal_rejection.feature).
     """
     import hmac
+
     import uvicorn
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse, Response
     from starlette.routing import Mount
-
-    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
     # `default_caller_id` is unused on HTTP — every request supplies its
     # own. We still need a non-empty placeholder because the dataclass

@@ -3,7 +3,7 @@ get_transaction_status, plus policy-projection helpers."""
 
 from __future__ import annotations
 
-from typing import Any, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 from ..policy import level_rank
 from ._common import READ_TOOL_MIN_VIS, TOOL_SET_VERSION, WRITE_TOOL_CAP
@@ -54,7 +54,7 @@ class DescribePolicyResponse(TypedDict):
     tool_set_available: list[str]
 
 
-def _max_visibility(fp: "Any") -> str:
+def _max_visibility(fp: Any) -> str:
     default_rank = level_rank(fp.default)
     best = default_rank
     for rule in fp.rules:
@@ -66,7 +66,7 @@ def _max_visibility(fp: "Any") -> str:
     return "NONE"
 
 
-def _granted_caps(fp: "Any") -> list[str]:
+def _granted_caps(fp: Any) -> list[str]:
     caps: list[str] = []
     for key in (
         "mark_seen",
@@ -82,12 +82,12 @@ def _granted_caps(fp: "Any") -> list[str]:
     return caps
 
 
-def handle_get_caller_identity(context: "ServerContext") -> CallerIdentityResponse:
+def handle_get_caller_identity(context: ServerContext) -> CallerIdentityResponse:
     return {"caller_id": context.caller_id}
 
 
 async def handle_get_transaction_status(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> TransactionStatusResponse:
     tx_id = str(arguments["tx_id"])
     if context.saga is None:
@@ -117,7 +117,7 @@ async def handle_get_transaction_status(
 
 
 async def handle_describe_policy(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> DescribePolicyResponse:
     _ = arguments  # extra arguments are ignored deliberately (ADR 0018)
     from ..config import Configuration
@@ -212,7 +212,7 @@ _BREAKING_CHANGES_LOG = [
 ]
 
 
-def handle_tool_surface_info(context: "ServerContext") -> dict[str, Any]:
+def handle_tool_surface_info(context: ServerContext) -> dict[str, Any]:
     """Return the contract-version envelope per ADR 0027 §2.
 
     The same metadata is also injected into the MCP `serverInfo`

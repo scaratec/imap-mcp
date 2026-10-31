@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import (
     search_uids as imap_search_uids,
+)
+from ..imap_core import (
     store_flag as imap_store_flag,
+)
+from ..imap_core import (
     store_keywords as imap_store_keywords,
 )
 from ._common import (
@@ -102,7 +106,7 @@ def _error_mark(
     )
 
 
-async def handle_mark_seen(context: "ServerContext", arguments: dict[str, Any]) -> MarkResponse:
+async def handle_mark_seen(context: ServerContext, arguments: dict[str, Any]) -> MarkResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
@@ -150,7 +154,7 @@ async def handle_mark_seen(context: "ServerContext", arguments: dict[str, Any]) 
 
 
 async def _bulk_search_uids(
-    context: "ServerContext",
+    context: ServerContext,
     account_id: str,
     folder_path: str,
     arguments: dict[str, Any],
@@ -174,9 +178,7 @@ async def _bulk_search_uids(
     return account, password, imap_folder, uids
 
 
-async def handle_bulk_mark_seen(
-    context: "ServerContext", arguments: dict[str, Any]
-) -> MarkResponse:
+async def handle_bulk_mark_seen(context: ServerContext, arguments: dict[str, Any]) -> MarkResponse:
     from ..imap_core import store_flags_batch as imap_store_flags_batch
 
     account_id = str(arguments["account"])
@@ -208,7 +210,7 @@ async def handle_bulk_mark_seen(
 
 
 async def handle_bulk_mark_tagged(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> MarkResponse:
     """Mirror of bulk_mark_seen for keywords.
 
@@ -261,7 +263,7 @@ async def handle_bulk_mark_tagged(
     )
 
 
-async def handle_mark_tagged(context: "ServerContext", arguments: dict[str, Any]) -> MarkResponse:
+async def handle_mark_tagged(context: ServerContext, arguments: dict[str, Any]) -> MarkResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])

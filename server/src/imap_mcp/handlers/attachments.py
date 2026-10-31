@@ -9,7 +9,7 @@ defines the bytes-transform callback and passes it down.
 from __future__ import annotations
 
 import base64
-from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import (
     mime_add_attachment,
@@ -68,7 +68,7 @@ def _error_attachment(
 
 
 async def _attachment_modify(
-    context: "ServerContext",
+    context: ServerContext,
     arguments: dict[str, Any],
     tool_name: str,
     build_transform: Any,
@@ -145,7 +145,7 @@ async def _attachment_modify(
 
 
 async def handle_add_attachment(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> AttachmentModifyResponse:
     def _build(args: dict[str, Any]) -> Any:
         content = base64.b64decode(args["content"])
@@ -161,7 +161,7 @@ async def handle_add_attachment(
 
 
 async def handle_replace_attachment(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> AttachmentModifyResponse:
     def _build(args: dict[str, Any]) -> Any:
         new_content = base64.b64decode(args["new_content"])
@@ -184,7 +184,7 @@ async def handle_replace_attachment(
 
 
 async def handle_delete_attachment(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> AttachmentModifyResponse:
     def _build(args: dict[str, Any]) -> Any:
         filename = args["filename"]

@@ -7,15 +7,21 @@ IMAP MOVE because Gmail folders are label projections.
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import (
     LabelMutationFailed,
     TargetFolderMissing,
     UidNotFound,
     UidStale,
+)
+from ..imap_core import (
     copy_message as imap_copy_message,
+)
+from ..imap_core import (
     gmail_label_swap as imap_gmail_label_swap,
+)
+from ..imap_core import (
     move_message as imap_move_message,
 )
 from ._common import (
@@ -123,7 +129,7 @@ def _error_saga(
 
 
 async def _handle_move_gmail_label_swap(
-    context: "ServerContext",
+    context: ServerContext,
     *,
     src_account: str,
     src_folder: str,
@@ -171,7 +177,7 @@ async def _handle_move_gmail_label_swap(
 
 
 async def _handle_move_intra_account_standard(
-    context: "ServerContext",
+    context: ServerContext,
     *,
     src_account: str,
     src_folder: str,
@@ -213,7 +219,7 @@ async def _handle_move_intra_account_standard(
 
 
 async def _handle_move_cross_account(
-    context: "ServerContext",
+    context: ServerContext,
     *,
     src_account: str,
     src_folder: str,
@@ -254,7 +260,7 @@ async def _handle_move_cross_account(
     }
 
 
-async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> MoveCopyResponse:
+async def handle_move(context: ServerContext, arguments: dict[str, Any]) -> MoveCopyResponse:
     """Top-level orchestrator: validation gates first, then dispatch
     to one of the three branches (Gmail label-swap, native IMAP MOVE,
     cross-account saga). The validation gates are pre-policy, then
@@ -331,7 +337,7 @@ async def handle_move(context: "ServerContext", arguments: dict[str, Any]) -> Mo
     )
 
 
-async def handle_copy(context: "ServerContext", arguments: dict[str, Any]) -> MoveCopyResponse:
+async def handle_copy(context: ServerContext, arguments: dict[str, Any]) -> MoveCopyResponse:
     src = arguments["source"]
     dst = arguments["target"]
     src_account = str(src["account"])

@@ -7,12 +7,18 @@ ADR 0024 anchors the duration grammar; ADR 0026 introduces the explicit
 from __future__ import annotations
 
 import math
-from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import (
     fetch_envelopes_batch as imap_fetch_envelopes_batch,
+)
+from ..imap_core import (
     gmail_fetch_msgid as imap_gmail_fetch_msgid,
+)
+from ..imap_core import (
     gmail_search_by_msgid as imap_gmail_search_by_msgid,
+)
+from ..imap_core import (
     search_uids as imap_search_uids,
 )
 from ..policy import (
@@ -127,9 +133,7 @@ def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
             parts.append(f'FROM "{value}"')
         elif key == "from_domain":
             parts.append(f'FROM "@{value}"')
-        elif key == "to":
-            parts.append(f'TO "{value}"')
-        elif key == "to_contains":
+        elif key == "to" or key == "to_contains":
             parts.append(f'TO "{value}"')
         elif key == "subject_contains":
             parts.append(f'SUBJECT "{value}"')
@@ -183,7 +187,7 @@ def _resolve_scope(
     return "recent_7d", f"SINCE {since.strftime('%d-%b-%Y')}"
 
 
-async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> SearchResponse:
+async def handle_search(context: ServerContext, arguments: dict[str, Any]) -> SearchResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     criteria_raw = arguments.get("criteria") or {}
@@ -307,7 +311,7 @@ async def handle_search(context: "ServerContext", arguments: dict[str, Any]) -> 
 
 
 async def handle_list_messages(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> ListMessagesResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])

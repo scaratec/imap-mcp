@@ -39,7 +39,7 @@ import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -89,7 +89,7 @@ def _now_utc() -> datetime:
         parsed = _parse_utc(hooks.fake_now_utc)
         if parsed is not None:
             return parsed
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def _parse_utc(raw: str) -> datetime | None:
@@ -98,7 +98,7 @@ def _parse_utc(raw: str) -> datetime | None:
     if raw.endswith("Z"):
         raw = raw[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(raw).astimezone(timezone.utc)
+        return datetime.fromisoformat(raw).astimezone(UTC)
     except ValueError:
         return None
 
@@ -427,7 +427,7 @@ class AuditWriter:
         for path in sorted(self.directory.glob("*.jsonl")):
             if path == active:
                 continue
-            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
             if mtime < cutoff:
                 self._gzip_file(path)
                 n += 1
@@ -459,7 +459,7 @@ class AuditWriter:
             if path == active:
                 continue
             try:
-                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
             except OSError:
                 continue
             if mtime < cutoff:

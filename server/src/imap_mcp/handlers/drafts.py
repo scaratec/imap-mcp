@@ -16,19 +16,32 @@ second edit.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
-from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, TypedDict
 
 from .. import reply as reply_builder
 from ..imap_core import (
     append_message as imap_append_message,
+)
+from ..imap_core import (
     expunge_uids as imap_expunge_uids,
+)
+from ..imap_core import (
     fetch_body as imap_fetch_body,
+)
+from ..imap_core import (
     fetch_envelopes_batch as imap_fetch_envelopes_batch,
+)
+from ..imap_core import (
     fetch_message_for_reply as imap_fetch_message_for_reply,
+)
+from ..imap_core import (
     fetch_raw_headers_batch as imap_fetch_raw_headers_batch,
+)
+from ..imap_core import (
     folder_stats as imap_folder_stats,
+)
+from ..imap_core import (
     search_uids as imap_search_uids,
 )
 from ..policy import MessageFacts, evaluate_message_against_folder, level_rank
@@ -360,7 +373,7 @@ def _error_reply(
 
 
 async def handle_create_draft(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> CreateDraftResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
@@ -387,7 +400,7 @@ async def handle_create_draft(
         append_result = await imap_append_message(
             account, password, imap_folder, rfc822_bytes, flags=DRAFT_APPEND_FLAGS
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return _error_draft(error_type="append_timeout", account=account_id, folder=folder_path)
     except Exception:
         return _error_draft(error_type="append_failed", account=account_id, folder=folder_path)
@@ -407,13 +420,13 @@ async def handle_create_draft(
 
 
 def _validate_reply_preconditions(
-    context: "ServerContext",
+    context: ServerContext,
     *,
     account_id: str,
     source_folder: str,
     drafts_folder: str,
     reply_text: str,
-) -> "tuple[CreateReplyDraftResponse | None, Any, Any]":
+) -> tuple[CreateReplyDraftResponse | None, Any, Any]:
     """Run pre-fetch validation chain. Returns
     ``(deny_response, src_decision, drafts_decision)``: when
     ``deny_response`` is non-None the caller short-circuits; otherwise
@@ -473,7 +486,8 @@ def _assemble_reply_rfc822(
     subject/recipient derivation, attribution, body quoting, and
     threading headers via ``reply_builder``.
     """
-    from email.header import decode_header as _dh, make_header as _mh
+    from email.header import decode_header as _dh
+    from email.header import make_header as _mh
 
     src_from = str(_mh(_dh(source_msg.get("From") or "")))
     src_reply_to = source_msg.get("Reply-To")
@@ -504,7 +518,7 @@ def _assemble_reply_rfc822(
 
 
 async def handle_create_reply_draft(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> CreateReplyDraftResponse:
     account_id = str(arguments["account"])
     source_folder = str(arguments["source_folder"])
@@ -722,7 +736,7 @@ def _attachment_meta(message: Any) -> list[AttachmentMetaEntry]:
     return entries
 
 
-async def handle_get_draft(context: "ServerContext", arguments: dict[str, Any]) -> GetDraftResponse:
+async def handle_get_draft(context: ServerContext, arguments: dict[str, Any]) -> GetDraftResponse:
     """Return the composed fields of one draft, addressed by its handle."""
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
@@ -804,7 +818,7 @@ async def handle_get_draft(context: "ServerContext", arguments: dict[str, Any]) 
 
 
 async def handle_list_drafts(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> ListDraftsResponse:
     """List the drafts in one folder, editable ones under their handle.
 
@@ -1155,7 +1169,7 @@ class UpdateDraftResponse(TypedDict, total=False):
 
 
 def _escalate_ambiguity(
-    context: "ServerContext",
+    context: ServerContext,
     *,
     account_id: str,
     folder: str,
@@ -1191,7 +1205,7 @@ def _escalate_ambiguity(
 
 
 async def handle_update_draft(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> UpdateDraftResponse:
     """Revise one draft field-wise under an optimistic revision check."""
     account_id = str(arguments["account"])

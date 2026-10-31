@@ -161,7 +161,7 @@ class SenderRule(BaseModel):
     cap: VisibilityLevel | None = None
 
     @model_validator(mode="after")
-    def _check_matcher_keys(self) -> "SenderRule":
+    def _check_matcher_keys(self) -> SenderRule:
         unknown = set(self.match.keys()) - _CORE_MATCHER_KEYS
         if unknown:
             for key in sorted(unknown):
@@ -198,7 +198,7 @@ class FolderPolicy(BaseModel):
     draft_edit: bool = False
 
     @model_validator(mode="after")
-    def _check_mode_invariants(self) -> "FolderPolicy":
+    def _check_mode_invariants(self) -> FolderPolicy:
         if self.mode == "whitelist":
             if self.default != "NONE":
                 raise ValueError(

@@ -1,13 +1,13 @@
 """OAuth token lifecycle management."""
 
 import asyncio
+import logging
 import os
 import pathlib
 import time
 from typing import Any
 
 import httpx
-import logging
 
 from ..audit import AuditWriter
 from ..config import Account, Configuration

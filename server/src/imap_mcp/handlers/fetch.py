@@ -9,11 +9,15 @@ the unified envelope.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import (
     fetch_body as imap_fetch_body,
+)
+from ..imap_core import (
     fetch_envelope as imap_fetch_envelope,
+)
+from ..imap_core import (
     fetch_full_message as imap_fetch_full_message,
 )
 from ..policy import evaluate_message_against_folder, level_rank
@@ -120,9 +124,7 @@ def _error_fetch(
     )
 
 
-async def handle_fetch_envelope(
-    context: "ServerContext", arguments: dict[str, Any]
-) -> FetchResponse:
+async def handle_fetch_envelope(context: ServerContext, arguments: dict[str, Any]) -> FetchResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
@@ -189,7 +191,7 @@ async def handle_fetch_envelope(
     }
 
 
-async def handle_fetch_body(context: "ServerContext", arguments: dict[str, Any]) -> FetchResponse:
+async def handle_fetch_body(context: ServerContext, arguments: dict[str, Any]) -> FetchResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     uid = int(arguments["uid"])
@@ -254,9 +256,7 @@ async def handle_fetch_body(context: "ServerContext", arguments: dict[str, Any])
     }
 
 
-async def handle_fetch_headers(
-    context: "ServerContext", arguments: dict[str, Any]
-) -> FetchResponse:
+async def handle_fetch_headers(context: ServerContext, arguments: dict[str, Any]) -> FetchResponse:
     import email
 
     account_id = str(arguments["account"])
@@ -319,7 +319,7 @@ def _build_attachment_sink_response(
     account_id: str,
     folder_path: str,
     uid: int,
-    sink_dir: "Path",
+    sink_dir: Path,
 ) -> FetchResponse:
     """Write the decoded MIME part to the configured sink and return
     the ALLOW response per ADR 0028. The response carries the filename
@@ -357,7 +357,7 @@ def _build_attachment_sink_response(
 
 
 async def handle_list_attachments(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> FetchResponse:
     """Return attachment metadata at BODY visibility (ADR 0026 §1).
 
@@ -425,7 +425,7 @@ async def handle_list_attachments(
 
 
 async def handle_fetch_attachment(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> FetchResponse:
     """Write one attachment part's bytes to the sink (ADR 0028).
 

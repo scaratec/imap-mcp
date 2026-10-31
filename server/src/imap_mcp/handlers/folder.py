@@ -7,7 +7,7 @@ unified ALLOW + ERROR envelope.
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import folder_stats as imap_folder_stats
 from ..policy import level_rank
@@ -34,7 +34,7 @@ def _deny_folder_stats(*, reason: str, account: str, folder: str) -> FolderStats
 
 
 async def handle_folder_stats(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> FolderStatsResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])

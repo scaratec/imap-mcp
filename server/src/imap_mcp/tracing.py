@@ -17,16 +17,16 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Self
 
 try:
     from opentelemetry import trace
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
         OTLPSpanExporter,
     )
     from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
     _HAS_OTEL = True
 except ImportError:
@@ -46,10 +46,10 @@ class _NoOpSpan:
     def add_event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
         pass
 
-    def __enter__(self) -> "_NoOpSpan":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         pass
 
 

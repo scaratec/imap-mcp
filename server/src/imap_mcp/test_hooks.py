@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -30,11 +29,11 @@ class TestHooks:
     """Gates discovery of the ``_test_run_*`` tools (ADR 0023).
     Bound to ``IMAP_MCP_TEST_MODE=1``."""
 
-    fake_now_utc: Optional[str] = None
+    fake_now_utc: str | None = None
     """ISO-8601 UTC timestamp that ``audit._now_utc`` returns instead
     of the real wall clock. Bound to ``IMAP_MCP_FAKE_NOW_UTC``."""
 
-    fake_now_file: Optional[str] = None
+    fake_now_file: str | None = None
     """Path to a file holding an ISO-8601 UTC timestamp. Unlike
     ``fake_now_utc`` the file is re-read on every ``audit._now_utc``
     call, so a scenario can move the clock of an already running
@@ -42,12 +41,12 @@ class TestHooks:
     Takes precedence over ``fake_now_utc`` while the file exists and
     parses. Bound to ``IMAP_MCP_FAKE_NOW_FILE``."""
 
-    oauth_inject_error: Optional[str] = None
+    oauth_inject_error: str | None = None
     """If set, the OAuth refresh flow raises with this error code
     before talking to the token endpoint. Bound to
     ``IMAP_MCP_TEST_OAUTH_INJECT_ERROR``."""
 
-    oauth_token_lifetime_override: Optional[int] = None
+    oauth_token_lifetime_override: int | None = None
     """Seconds. Overrides ``expires_in`` returned by the token
     endpoint. Bound to ``IMAP_MCP_TEST_TOKEN_LIFETIME``."""
 
@@ -56,26 +55,26 @@ class TestHooks:
     string so the server rejects the bootstrap. Bound to
     ``IMAP_MCP_TEST_TAMPER_PKCE``."""
 
-    append_timeout_override: Optional[int] = None
+    append_timeout_override: int | None = None
     """Seconds. Overrides the default 60s append timeout. Bound to
     ``IMAP_MCP_APPEND_TIMEOUT``."""
 
-    saga_crash_at: Optional[str] = None
+    saga_crash_at: str | None = None
     """Saga step name. When the named step is about to execute, the
     saga process terminates with ``os._exit(1)``. Bound to
     ``IMAP_MCP_CRASH_AT``."""
 
-    saga_pause_at: Optional[str] = None
+    saga_pause_at: str | None = None
     """Saga step name. When the named step is about to execute, the
     saga writes a marker file and polls for a ``.resume`` sibling
     before continuing. Bound to ``IMAP_MCP_SAGA_PAUSE_AT``."""
 
-    saga_pause_marker: Optional[str] = None
+    saga_pause_marker: str | None = None
     """Path to the marker file used together with ``saga_pause_at``.
     Bound to ``IMAP_MCP_SAGA_PAUSE_MARKER``."""
 
     @classmethod
-    def from_environment(cls) -> "TestHooks":
+    def from_environment(cls) -> TestHooks:
         """Read every IMAP_MCP_TEST_* env var once at startup."""
 
         def _int_or_none(value: str | None) -> int | None:

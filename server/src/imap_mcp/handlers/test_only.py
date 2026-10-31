@@ -7,7 +7,7 @@ recovery and audit-rotation scenarios.
 
 from __future__ import annotations
 
-from typing import Any, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 from mcp.shared.exceptions import McpError
 from mcp.types import ErrorData
@@ -30,7 +30,7 @@ class TestAuditRotationResponse(TypedDict, total=False):
 
 
 async def handle_test_run_recovery(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> TestRecoveryResponse:
     """Test-only: run N recovery passes. Not listed in tool discovery.
 
@@ -49,7 +49,7 @@ async def handle_test_run_recovery(
 
 
 async def handle_test_run_audit_rotation(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> dict[str, Any]:
     """Test-only: trigger AuditWriter.rotate() once. ``audit._now_utc``
     reads ``TestHooks.fake_now_utc`` to advance the clock.

@@ -21,9 +21,11 @@ import asyncio
 import hashlib
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from .config import Account
 from .imap_core import (
@@ -147,7 +149,7 @@ class SagaManager:
         message_id: str | None,
         raw: bytes | None,
         fallback: dict[str, Any] | None = None,
-    ) -> "list[int] | str":
+    ) -> list[int] | str:
         """Idempotency lookup. Returns:
         - `[]`        if the message is not yet on target,
         - `[uid]`     if exactly one match (Message-ID or unique 5-tuple),
@@ -384,7 +386,7 @@ class SagaManager:
             try:
                 append_result = await append_message(dst_account, dst_password, dst_folder, raw)
                 ok = append_result.outcome == "ok"
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 count = self.wal.bump_retry(tx_id, "append_failed: timeout")
                 if count >= self.retry_limit:
                     self.wal.mark_needs_operator(tx_id)
@@ -588,7 +590,7 @@ class SagaManager:
         uid: int,
         transform: Callable[[bytes], bytes],
         mechanism: str = "message_rewrite",
-        locate: "Callable[[], Awaitable[int | None]] | None" = None,
+        locate: Callable[[], Awaitable[int | None]] | None = None,
     ) -> SagaResult:
         """WAL-backed message rewrite: FETCH → transform → APPEND → DELETE.
 
@@ -724,7 +726,6 @@ def _extract_fallback_key(raw: bytes) -> dict[str, Any]:
     bytes: From, Date (parsed to ISO 8601), Subject, byte size,
     SHA-256 of the first 4 KiB."""
     import email
-    from datetime import timezone
     from email.utils import parsedate_to_datetime
 
     msg = email.message_from_bytes(raw)
@@ -736,8 +737,8 @@ def _extract_fallback_key(raw: bytes) -> dict[str, Any]:
         try:
             parsed = parsedate_to_datetime(raw_date)
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            date_iso = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                parsed = parsed.replace(tzinfo=UTC)
+            date_iso = parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
         except (TypeError, ValueError):
             date_iso = None
     return {

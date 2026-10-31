@@ -13,6 +13,7 @@ means it is also trivial to reason about and unit-test.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC
 from enum import IntEnum
 
 from .config import Configuration, FolderPolicy, VisibilityLevel
@@ -136,7 +137,7 @@ def _match_single_predicate(key: str, expected: object, *, facts: MessageFacts) 
     loader should already have refused such rules, so this is a
     defence in depth.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     if key == "from":
         return isinstance(expected, str) and facts.from_address.lower() == expected.lower()
@@ -167,11 +168,11 @@ def _match_single_predicate(key: str, expected: object, *, facts: MessageFacts) 
             return False
         seconds = parse_duration(expected)
         try:
-            parsed = datetime.fromisoformat(facts.date_iso.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(facts.date_iso)
         except ValueError:
             return False
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
         from .audit import _now_utc
 
         now = _now_utc()

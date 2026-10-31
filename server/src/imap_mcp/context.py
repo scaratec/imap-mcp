@@ -12,7 +12,7 @@ import contextvars
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from .audit import AuditWriter
 from .config import load_configuration
@@ -21,10 +21,6 @@ from .saga import SagaManager
 from .secrets import build_secret_store
 from .test_hooks import TestHooks, set_global_hooks
 from .wal import WAL
-
-if TYPE_CHECKING:
-    pass
-
 
 # Per-request override for the caller identity. The HTTP transport
 # (ADR 0015 + LIM-0007 paydown) sets this in the bearer-auth middleware
@@ -41,8 +37,8 @@ class _LiveState:
     """Mutable holder for state that SIGHUP swaps atomically (ADR 0014)."""
 
     pdp: PolicyDecisionPoint
-    configuration: "object"  # Configuration; intentionally untyped here
-    oauth_manager: "object | None" = None
+    configuration: object  # Configuration; intentionally untyped here
+    oauth_manager: object | None = None
     folder_aliases: dict[str, dict[str, str]] | None = None
 
 
@@ -50,11 +46,11 @@ class _LiveState:
 class ServerContext:
     default_caller_id: str
     _live: _LiveState
-    secret_store: "object"  # SecretStore protocol
-    audit: "AuditWriter | None" = None
-    saga: "SagaManager | None" = None
+    secret_store: object  # SecretStore protocol
+    audit: AuditWriter | None = None
+    saga: SagaManager | None = None
     test_hooks: TestHooks = field(default_factory=TestHooks)
-    attachment_sink_directory: "Path | None" = None
+    attachment_sink_directory: Path | None = None
 
     @property
     def caller_id(self) -> str:
@@ -83,7 +79,7 @@ class ServerContext:
             raise RuntimeError("OAuthManager not initialized")
         return self._live.oauth_manager
 
-    def account_by_id(self, account_id: str) -> "object | None":
+    def account_by_id(self, account_id: str) -> object | None:
         from .config import Configuration
 
         config: Configuration = self.configuration  # type: ignore[assignment]

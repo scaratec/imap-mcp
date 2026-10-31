@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import (
     build_folder_alias_map,
+)
+from ..imap_core import (
     gmail_list_labels as imap_gmail_list_labels,
+)
+from ..imap_core import (
     list_folders as imap_list_folders,
 )
 from ._common import _is_google_provider, _password_for, _password_for_account
@@ -59,9 +63,7 @@ def _deny_labels(*, reason: str, account: str) -> ListLabelsResponse:
     return {"decision": "DENY", "reason": reason, "account": account}
 
 
-def handle_list_accounts(
-    context: "ServerContext", arguments: dict[str, Any]
-) -> ListAccountsResponse:
+def handle_list_accounts(context: ServerContext, arguments: dict[str, Any]) -> ListAccountsResponse:
     _ = arguments
     visibility = context.pdp.visible_accounts_for(context.caller_id)
     accounts: list[AccountEntry] = []
@@ -78,7 +80,7 @@ def handle_list_accounts(
 
 
 async def handle_list_folders(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> ListFoldersResponse:
     account_id = str(arguments["account"])
     visible = context.pdp.visible_accounts_for(context.caller_id)
@@ -113,7 +115,7 @@ async def handle_list_folders(
 
 
 async def handle_list_labels(
-    context: "ServerContext", arguments: dict[str, Any]
+    context: ServerContext, arguments: dict[str, Any]
 ) -> ListLabelsResponse:
     account_id = str(arguments["account"])
     # Provider gate: list_labels is only meaningful for Google accounts.

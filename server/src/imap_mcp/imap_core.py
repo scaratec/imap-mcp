@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Literal
 
 from aioimaplib import IMAP4, IMAP4_SSL
@@ -331,7 +331,7 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
             try:
                 parsed = parsedate_to_datetime(date_header)
                 if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
+                    parsed = parsed.replace(tzinfo=UTC)
                 date_iso = parsed.isoformat().replace("+00:00", "Z")
             except (TypeError, ValueError):
                 date_iso = None
@@ -402,7 +402,7 @@ async def fetch_envelopes_batch(
                 try:
                     parsed = parsedate_to_datetime(date_header)
                     if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=timezone.utc)
+                        parsed = parsed.replace(tzinfo=UTC)
                     date_iso = parsed.isoformat().replace("+00:00", "Z")
                 except (TypeError, ValueError):
                     pass
@@ -526,7 +526,7 @@ def _extract_flags_at(response: list[bytes | bytearray], start: int) -> tuple[st
 
 async def fetch_full_message(
     account: Account, password: str, folder: str, uid: int
-) -> "bytes | None":
+) -> bytes | None:
     """Return the raw RFC822 bytes for a UID."""
     folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
@@ -545,9 +545,8 @@ async def fetch_full_message(
 
 def mime_add_attachment(rfc822: bytes, filename: str, mime_type: str, content: bytes) -> bytes:
     import email
-    from email.message import EmailMessage
-
     import email.policy as _ep
+    from email.message import EmailMessage
 
     msg = email.message_from_bytes(rfc822, policy=_ep.default)
     maintype, _, subtype = mime_type.partition("/")
@@ -579,7 +578,6 @@ def mime_replace_attachment(
     new_filename: str | None = None,
 ) -> bytes:
     import email
-
     import email.policy as _ep
 
     msg = email.message_from_bytes(rfc822, policy=_ep.default)
@@ -609,9 +607,8 @@ def mime_replace_attachment(
 
 def mime_delete_attachment(rfc822: bytes, filename: str) -> bytes:
     import email
-    from email.message import EmailMessage
-
     import email.policy as _ep
+    from email.message import EmailMessage
 
     msg = email.message_from_bytes(rfc822, policy=_ep.default)
     if not msg.is_multipart():
@@ -684,7 +681,7 @@ def _strip_html(html: str) -> str:
 
 async def fetch_body(
     account: Account, password: str, folder: str, uid: int
-) -> "tuple[Envelope, str, object] | None":
+) -> tuple[Envelope, str, object] | None:
     """Fetch headers + plain-text body for one UID. Returns None if absent.
 
     The third element is the parsed ``email.message.Message`` so that
@@ -808,7 +805,7 @@ async def fetch_message_for_reply(account: Account, password: str, folder: str, 
         await imap.logout()
 
 
-async def folder_stats(account: Account, password: str, folder: str) -> "FolderStatsResult":
+async def folder_stats(account: Account, password: str, folder: str) -> FolderStatsResult:
     """Return folder existence + uid list, distinguishing failure modes.
 
     Per ADR 0025, three outcomes are reported separately so the handler
@@ -997,7 +994,7 @@ class LabelMutationFailed(RuntimeError):
         self.response_text = response_text
 
 
-def _extract_uidvalidity(lines: "list[bytes | bytearray] | None") -> int | None:
+def _extract_uidvalidity(lines: list[bytes | bytearray] | None) -> int | None:
     """Pull `UIDVALIDITY <n>` from the untagged response lines of a
     SELECT or NOOP. Returns None if absent."""
     if not lines:
@@ -1153,11 +1150,11 @@ async def append_message(
                     rfc822,
                     mailbox=folder,
                     flags=flags_str,
-                    date=datetime.now(tz=timezone.utc),
+                    date=datetime.now(tz=UTC),
                 ),
                 timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if _connection_lost(imap):
                 raise ConnectionResetError("IMAP connection lost while waiting for APPEND response")
             raise
@@ -1202,7 +1199,7 @@ async def fetch_raw_with_flags(
         await imap.logout()
 
 
-def _bytearray_literal_at(response: "list[bytes | bytearray]", start: int) -> bytes | None:
+def _bytearray_literal_at(response: list[bytes | bytearray], start: int) -> bytes | None:
     """Pick the literal payload of the FETCH frame starting at `start`.
 
     aioimaplib hands protocol framing back as `bytes` and literal
@@ -1411,7 +1408,7 @@ async def gmail_fetch_msgid(account: Account, password: str, folder: str, uid: i
         await imap.logout()
 
 
-def _response_text(lines: "list[bytes | bytearray] | None") -> str:
+def _response_text(lines: list[bytes | bytearray] | None) -> str:
     if not lines:
         return ""
     parts: list[str] = []

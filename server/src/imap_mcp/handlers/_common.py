@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any, Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..imap_core import list_folders as imap_list_folders
 from ..policy import MessageFacts
@@ -179,7 +179,7 @@ def _is_google_provider(account: Any) -> bool:
     return getattr(account, "provider", "imap-standard") in ("google", "google-mock")
 
 
-def _get_folder_aliases(context: "ServerContext", account_id: str) -> dict[str, str]:
+def _get_folder_aliases(context: ServerContext, account_id: str) -> dict[str, str]:
     """Return the cached folder alias map for a Google account.
 
     The map is populated by ``handle_list_folders`` as a side effect
@@ -192,9 +192,7 @@ def _get_folder_aliases(context: "ServerContext", account_id: str) -> dict[str, 
     return context._live.folder_aliases.get(account_id, {})
 
 
-async def _resolve_imap_folder(
-    context: "ServerContext", account_id: str, canonical_path: str
-) -> str:
+async def _resolve_imap_folder(context: ServerContext, account_id: str, canonical_path: str) -> str:
     """Resolve a canonical policy path to the actual IMAP folder path.
 
     For Google accounts with localized folder names the canonical path
@@ -209,7 +207,7 @@ async def _resolve_imap_folder(
     return aliases.get(canonical_path, canonical_path)
 
 
-async def _known_folders_for(context: "ServerContext", account_id: str) -> list[str]:
+async def _known_folders_for(context: ServerContext, account_id: str) -> list[str]:
     """Ask IMAP for the full folder list on a configured account.
 
     Returns an empty list when the account is not configured at all —
@@ -244,7 +242,7 @@ async def _known_folders_for(context: "ServerContext", account_id: str) -> list[
     return [fi.path for fi in folder_infos]
 
 
-async def _password_for_account(context: "ServerContext", account_id: str) -> tuple[Any, str]:
+async def _password_for_account(context: ServerContext, account_id: str) -> tuple[Any, str]:
     """Resolve account model and password. Raises on missing config."""
     from ..config import Account
 
@@ -266,7 +264,7 @@ async def _password_for_account(context: "ServerContext", account_id: str) -> tu
     return account_model, password
 
 
-async def _password_for(context: "ServerContext", account_id: str) -> tuple[Any, str]:
+async def _password_for(context: ServerContext, account_id: str) -> tuple[Any, str]:
     """Resolve (account_model, password) or raise with a clear error."""
     account = context.account_by_id(account_id)
     if account is None:
@@ -287,15 +285,10 @@ async def _password_for(context: "ServerContext", account_id: str) -> tuple[Any,
 
 
 __all__ = [
-    "_FORBIDDEN_SYSTEM_FLAGS",
-    "TOOL_SET_VERSION",
     "READ_TOOL_MIN_VIS",
+    "TOOL_SET_VERSION",
     "WRITE_TOOL_CAP",
-    "error_envelope",
-    "sanitize_attachment_filename",
-    "decode_mime_words",
-    "check_attachment_sink",
-    "describe_attachment_sink",
+    "_FORBIDDEN_SYSTEM_FLAGS",
     "_facts_from_envelope",
     "_get_folder_aliases",
     "_is_google_provider",
@@ -304,6 +297,11 @@ __all__ = [
     "_password_for_account",
     "_resolve_imap_folder",
     "_walk_attachment_parts",
+    "check_attachment_sink",
+    "decode_mime_words",
+    "describe_attachment_sink",
+    "error_envelope",
+    "sanitize_attachment_filename",
 ]
 
 
@@ -400,7 +398,7 @@ def sanitize_attachment_filename(original: str, payload: bytes) -> str:
 
 
 def check_attachment_sink(
-    sink: "Path | None",
+    sink: Path | None,
 ) -> tuple[Literal["ok", "not_configured", "missing", "not_writable"], str]:
     """Return (state, detail) for the configured attachment sink.
 
@@ -413,8 +411,10 @@ def check_attachment_sink(
     if sink is None:
         return (
             "not_configured",
-            "attachment_sink_directory is not set in the server config "
-            "(accounts.yaml -> attachment_sink.directory)",
+            (
+                "attachment_sink_directory is not set in the server config "
+                "(accounts.yaml -> attachment_sink.directory)"
+            ),
         )
     if not sink.exists():
         return (
@@ -434,7 +434,7 @@ def check_attachment_sink(
     return "ok", str(sink)
 
 
-def describe_attachment_sink(sink: "Path | None") -> str:
+def describe_attachment_sink(sink: Path | None) -> str:
     """Render the human-facing sink summary that gets pasted into the
     fetch_attachment tool description. Stable shape for both happy
     and error paths so scenarios can grep against it.
