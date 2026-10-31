@@ -56,7 +56,8 @@ class OAuthManager:
             cached = self._tokens.get(account.id)
             now = time.time()
             if cached and cached.get("expires_at", 0) > now + 10:
-                return cached["access_token"]
+                token: str = cached["access_token"]
+                return token
             return await self._refresh_token(account)
 
     async def _refresh_token(self, account: Account) -> str:

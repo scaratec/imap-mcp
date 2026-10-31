@@ -16,7 +16,7 @@ from ..imap_core import (
     mime_delete_attachment,
     mime_replace_attachment,
 )
-from ._common import _password_for, _resolve_imap_folder, error_envelope
+from ._common import _password_for, _require_saga, _resolve_imap_folder, error_envelope
 
 if TYPE_CHECKING:
     from ..context import ServerContext
@@ -106,7 +106,8 @@ async def _attachment_modify(
         )
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    saga_result = await context.saga.run_message_rewrite(
+    saga = _require_saga(context, tool_name)
+    saga_result = await saga.run_message_rewrite(
         caller_id=context.caller_id,
         account=account,
         password=password,
@@ -138,7 +139,7 @@ async def _attachment_modify(
         "folder": folder_path,
         "old_uid": uid,
     }
-    tx = context.saga.wal.get(saga_result.tx_id)
+    tx = saga.wal.get(saga_result.tx_id)
     if tx and tx.get("target_uid"):
         result["new_uid"] = tx["target_uid"]
     return result

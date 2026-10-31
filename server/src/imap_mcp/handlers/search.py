@@ -44,7 +44,7 @@ AppliedScope = Literal["recent_7d", "explicit_window", "all_time"]
 
 class GmailSearchEntry(TypedDict, total=False):
     uid: int
-    gm_msgid: NotRequired[str]
+    gm_msgid: NotRequired[int]
     canonical_all_mail_uid: NotRequired[int]
 
 
@@ -202,7 +202,7 @@ async def handle_search(context: ServerContext, arguments: dict[str, Any]) -> Se
     if (
         level_rank(folder_decision.visibility) < minimum_for_tool
         and not any(
-            level_rank(rule.grant) >= minimum_for_tool  # type: ignore[arg-type]
+            level_rank(rule.grant) >= minimum_for_tool
             for rule in folder_decision.folder_policy.rules
             if rule.grant is not None
         )

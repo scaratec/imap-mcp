@@ -76,12 +76,15 @@ FetchResponse = TypedDict(
         "mime_type": NotRequired[str],
         "size_bytes": NotRequired[int],
         "content_hash": NotRequired[str],
+        "saved_to": NotRequired[str],
         # Dispatcher-stripped blob keys (private)
         "_blob": NotRequired[str],
         "_blob_mime_type": NotRequired[str],
         "_blob_uri": NotRequired[str],
         # Private hint for audit sender-hashing in dispatch
         "_matched_sender": NotRequired[str],
+        # Private absolute sink path for the audit record (ADR 0028 §4)
+        "_saved_to_absolute": NotRequired[str],
     },
     total=False,
 )
@@ -179,7 +182,7 @@ async def handle_fetch_envelope(context: ServerContext, arguments: dict[str, Any
         "account": account_id,
         "folder": folder_path,
         "uid": uid,
-        "from": envelope.from_address,  # type: ignore[typeddict-unknown-key]
+        "from": envelope.from_address,
         "to": envelope.to_addresses,
         "subject": envelope.subject,
         "message_id": envelope.message_id,
@@ -246,7 +249,7 @@ async def handle_fetch_body(context: ServerContext, arguments: dict[str, Any]) -
         "account": account_id,
         "folder": folder_path,
         "uid": uid,
-        "from": envelope.from_address,  # type: ignore[typeddict-unknown-key]
+        "from": envelope.from_address,
         "subject": envelope.subject,
         "text_body": body_text,
         "matched_rule_index": message_decision.matched_rule_index,
@@ -477,8 +480,9 @@ async def handle_fetch_attachment(
     # Caller is FULL-authorized; now check the sink. A misconfigured
     # sink at this point is an operational error visible to a
     # caller that already proved its right to the bytes.
-    sink_state, sink_detail = check_attachment_sink(context.attachment_sink_directory)
-    if sink_state == "not_configured":
+    sink_dir = context.attachment_sink_directory
+    sink_state, sink_detail = check_attachment_sink(sink_dir)
+    if sink_state == "not_configured" or sink_dir is None:
         return error_envelope(  # type: ignore[return-value]
             error_type="sink_not_configured",
             detail=sink_detail,
@@ -500,7 +504,6 @@ async def handle_fetch_attachment(
                 "part_id": part_id,
             },
         )
-    sink_dir = context.attachment_sink_directory  # type: ignore[assignment]
     raw = await imap_fetch_full_message(account, password, imap_folder, uid)
     if raw is None:
         return _error_fetch(

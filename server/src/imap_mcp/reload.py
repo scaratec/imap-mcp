@@ -29,7 +29,7 @@ def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
     from .config import Configuration
 
     audit = context.audit
-    old_config: Configuration = context.configuration  # type: ignore[assignment]
+    old_config: Configuration = context.configuration
     try:
         new_config: Configuration = load_configuration(config_dir)
     except Exception as exc:  # noqa: BLE001 - keep old config on any error

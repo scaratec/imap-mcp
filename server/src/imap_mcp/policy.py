@@ -244,8 +244,8 @@ def evaluate_message_against_folder(
             )
 
     for level in ("NONE", "COUNT", "METADATA", "ENVELOPE", "HEADERS", "BODY", "FULL"):
-        if level_rank(level) == effective:  # type: ignore[arg-type]
-            visibility: VisibilityLevel = level  # type: ignore[assignment]
+        if level_rank(level) == effective:
+            visibility: VisibilityLevel = level
             break
     else:
         raise AssertionError(f"Unknown rank {effective!r}")

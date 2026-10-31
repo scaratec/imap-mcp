@@ -48,6 +48,7 @@ from ..policy import MessageFacts, evaluate_message_against_folder, level_rank
 from ._common import (
     _facts_from_envelope,
     _password_for,
+    _require_saga,
     _resolve_imap_folder,
     _walk_attachment_parts,
     decode_mime_words,
@@ -1187,7 +1188,7 @@ def _escalate_ambiguity(
     together with `draft_ambiguous`, so the report the caller files and
     the entry the operator works on are the same case.
     """
-    wal = context.saga.wal
+    wal = _require_saga(context, "update_draft").wal
     tx_id = wal.begin(
         caller_id=context.caller_id,
         src_account=account_id,
@@ -1306,7 +1307,7 @@ async def handle_update_draft(
     async def locate() -> int | None:
         return await _resolve_revision_uid(account, password, imap_folder, draft_id, new_revision)
 
-    saga_result = await context.saga.run_message_rewrite(
+    saga_result = await _require_saga(context, "update_draft").run_message_rewrite(
         caller_id=context.caller_id,
         account=account,
         password=password,

@@ -84,7 +84,7 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
         if secret_ref is None:
             return None, None
         try:
-            return context.secret_store.get(secret_ref), None  # type: ignore[attr-defined]
+            return context.secret_store.get(secret_ref), None
         except SecretDecryptionFailed:
             return None, "secret_decryption_failed"
         except Exception:  # noqa: BLE001 - fail closed, no token

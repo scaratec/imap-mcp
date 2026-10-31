@@ -19,11 +19,14 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from aioimaplib import IMAP4, IMAP4_SSL
 
 from .config import Account
+
+if TYPE_CHECKING:
+    from email.message import Message
 
 # --------------------------------------------------------------- mUTF-7
 # RFC 3501 §5.1.3 — Modified UTF-7 codec for IMAP mailbox names.
@@ -679,6 +682,15 @@ def _strip_html(html: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def _decode_text_part(part: Message) -> str:
+    """Decode a text MIME part to str. A part without a byte payload
+    yields an empty string instead of raising."""
+    payload = part.get_payload(decode=True)
+    if not isinstance(payload, bytes):
+        return ""
+    return payload.decode(part.get_content_charset("utf-8"), errors="replace")
+
+
 async def fetch_body(
     account: Account, password: str, folder: str, uid: int
 ) -> tuple[Envelope, str, object] | None:
@@ -713,26 +725,21 @@ async def fetch_body(
         if message.is_multipart():
             for part in message.walk():
                 if part.get_content_type() == "text/plain":
-                    body_text = part.get_payload(decode=True).decode(
-                        part.get_content_charset("utf-8"), errors="replace"
-                    )
+                    body_text = _decode_text_part(part)
                     break
             if not body_text:
                 for part in message.walk():
                     if part.get_content_type() == "text/html":
-                        raw_html = part.get_payload(decode=True).decode(
-                            part.get_content_charset("utf-8"), errors="replace"
-                        )
-                        body_text = _strip_html(raw_html)
+                        body_text = _strip_html(_decode_text_part(part))
                         break
         else:
             payload = message.get_payload(decode=True)
             if isinstance(payload, bytes):
-                raw = payload.decode(message.get_content_charset("utf-8"), errors="replace")
+                decoded = payload.decode(message.get_content_charset("utf-8"), errors="replace")
                 if message.get_content_type() == "text/html":
-                    body_text = _strip_html(raw)
+                    body_text = _strip_html(decoded)
                 else:
-                    body_text = raw
+                    body_text = decoded
         body_text = body_text.rstrip("\r\n")
         envelope = Envelope(
             uid=uid,
@@ -748,7 +755,9 @@ async def fetch_body(
         await imap.logout()
 
 
-async def fetch_message_for_reply(account: Account, password: str, folder: str, uid: int):
+async def fetch_message_for_reply(
+    account: Account, password: str, folder: str, uid: int
+) -> tuple[Message, str] | None:
     """Fetch the parsed email.Message and the extracted plain-text body.
 
     Same I/O path as `fetch_body` but returns the full Message object so
@@ -759,7 +768,6 @@ async def fetch_message_for_reply(account: Account, password: str, folder: str, 
     Returns ``None`` when the UID is absent.
     """
     import email
-    from email.message import Message
 
     folder = _quote_mailbox(folder)
     imap = await _open_imap(account)
@@ -779,17 +787,12 @@ async def fetch_message_for_reply(account: Account, password: str, folder: str, 
         if message.is_multipart():
             for part in message.walk():
                 if part.get_content_type() == "text/plain":
-                    body_text = part.get_payload(decode=True).decode(
-                        part.get_content_charset("utf-8"), errors="replace"
-                    )
+                    body_text = _decode_text_part(part)
                     break
             if not body_text:
                 for part in message.walk():
                     if part.get_content_type() == "text/html":
-                        raw_html = part.get_payload(decode=True).decode(
-                            part.get_content_charset("utf-8"), errors="replace"
-                        )
-                        body_text = _strip_html(raw_html)
+                        body_text = _strip_html(_decode_text_part(part))
                         break
         else:
             payload = message.get_payload(decode=True)
@@ -877,7 +880,7 @@ async def store_flag(
             return False
         op = "+FLAGS" if add else "-FLAGS"
         status, _ = await imap.uid("store", str(uid), op, f"({flag})")
-        return status == "OK"
+        return bool(status == "OK")
     finally:
         await imap.logout()
 
@@ -929,7 +932,7 @@ async def store_keywords(
         op = op_map[mode]
         joined = " ".join(keywords)
         status, _ = await imap.uid("store", str(uid), op, f"({joined})")
-        return status == "OK"
+        return bool(status == "OK")
     finally:
         await imap.logout()
 
@@ -1096,7 +1099,7 @@ async def copy_message(
         if status != "OK":
             return False
         status, _ = await imap.uid("copy", str(uid), target_folder)
-        return status == "OK"
+        return bool(status == "OK")
     finally:
         await imap.logout()
 
@@ -1458,7 +1461,7 @@ async def gmail_label_swap(
         await imap.logout()
 
 
-async def gmail_list_labels(account: Account, password: str) -> list[dict]:
+async def gmail_list_labels(account: Account, password: str) -> list[dict[str, str]]:
     """LIST all folders and return label info dicts.
 
     Each dict contains: ``name`` (folder path), ``flags`` (raw IMAP
@@ -1470,7 +1473,7 @@ async def gmail_list_labels(account: Account, password: str) -> list[dict]:
         status, response = await imap.list('""', "*")
         if status != "OK":
             raise RuntimeError(f"IMAP LIST failed: {status} {response!r}")
-        labels: list[dict] = []
+        labels: list[dict[str, str]] = []
         for raw in response:
             if isinstance(raw, bytes) is False:
                 continue

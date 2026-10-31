@@ -12,15 +12,19 @@ import contextvars
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 from .audit import AuditWriter
-from .config import load_configuration
+from .config import Account, Configuration, load_configuration
 from .policy import PolicyDecisionPoint
 from .saga import SagaManager
 from .secrets import build_secret_store
 from .test_hooks import TestHooks, set_global_hooks
 from .wal import WAL
+
+if TYPE_CHECKING:
+    from .auth.oauth_manager import OAuthManager
+    from .secrets import SecretStore
 
 # Per-request override for the caller identity. The HTTP transport
 # (ADR 0015 + LIM-0007 paydown) sets this in the bearer-auth middleware
@@ -37,8 +41,8 @@ class _LiveState:
     """Mutable holder for state that SIGHUP swaps atomically (ADR 0014)."""
 
     pdp: PolicyDecisionPoint
-    configuration: object  # Configuration; intentionally untyped here
-    oauth_manager: object | None = None
+    configuration: Configuration
+    oauth_manager: OAuthManager | None = None
     folder_aliases: dict[str, dict[str, str]] | None = None
 
 
@@ -46,7 +50,7 @@ class _LiveState:
 class ServerContext:
     default_caller_id: str
     _live: _LiveState
-    secret_store: object  # SecretStore protocol
+    secret_store: SecretStore
     audit: AuditWriter | None = None
     saga: SagaManager | None = None
     test_hooks: TestHooks = field(default_factory=TestHooks)
@@ -69,21 +73,18 @@ class ServerContext:
         return self._live.pdp
 
     @property
-    def configuration(self):  # type: ignore[no-untyped-def]
+    def configuration(self) -> Configuration:
         """Live configuration. Replaced atomically by SIGHUP reload."""
         return self._live.configuration
 
     @property
-    def oauth_manager(self):  # type: ignore[no-untyped-def]
+    def oauth_manager(self) -> OAuthManager:
         if self._live.oauth_manager is None:
             raise RuntimeError("OAuthManager not initialized")
         return self._live.oauth_manager
 
-    def account_by_id(self, account_id: str) -> object | None:
-        from .config import Configuration
-
-        config: Configuration = self.configuration  # type: ignore[assignment]
-        for account in config.accounts_file.accounts:
+    def account_by_id(self, account_id: str) -> Account | None:
+        for account in self.configuration.accounts_file.accounts:
             if account.id == account_id:
                 return account
         return None
@@ -107,14 +108,12 @@ def _package_version() -> str:
     return "0.0.0-dev"
 
 
-def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerContext, object]:
+def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerContext, Configuration]:
     """Load configuration and assemble a ServerContext.
 
     Shared by `run_stdio` and `run_http`. The transport-specific code
     around it is the only thing that differs.
     """
-    from .config import Configuration
-
     test_hooks = TestHooks.from_environment()
     set_global_hooks(test_hooks)
 
@@ -173,7 +172,7 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
     )
     if saga_mgr is not None:
 
-        async def _resolver(account_id: str) -> tuple[Any, str]:
+        async def _resolver(account_id: str) -> tuple[Account, str]:
             from .handlers._common import _password_for
 
             return await _password_for(context, account_id)

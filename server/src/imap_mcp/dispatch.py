@@ -12,6 +12,7 @@ and the audit record around each call.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from mcp.server import Server
@@ -19,6 +20,7 @@ from mcp.shared.exceptions import McpError
 from mcp.types import (
     CallToolRequest,
     CallToolResult,
+    ContentBlock,
     ErrorData,
     ServerResult,
     TextContent,
@@ -88,7 +90,9 @@ def build_server(context: ServerContext) -> Server:
     instructions = "imap-mcp surface metadata: " + _json.dumps(surface_metadata)
     app: Server = Server("imap-mcp", version=_package_version(), instructions=instructions)
 
-    @app.list_tools()
+    # mcp 1.x leaves Server.list_tools() unannotated, so mypy cannot see
+    # through the decorator. Revisit with the mcp 2.x port.
+    @app.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
     async def _list_tools() -> list[Tool]:
         # Tool descriptions are computed dynamically per call so that
         # the attachment-sink state (ADR 0028 §3) is fresh: an agent
@@ -187,7 +191,7 @@ def build_server(context: ServerContext) -> Server:
 
     async def _dispatch(
         context: ServerContext, name: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> Mapping[str, Any]:
         if name == "list_accounts":
             return handle_list_accounts(context, arguments)
         if name == "list_folders":
@@ -270,7 +274,7 @@ def build_server(context: ServerContext) -> Server:
     return app
 
 
-def _emit(payload: dict[str, Any]) -> list[TextContent]:
+def _emit(payload: Mapping[str, Any]) -> list[ContentBlock]:
     """Per ADR 0028: tool responses are text-only. EmbeddedResource +
     BlobResourceContents are gone — `fetch_attachment` writes the
     bytes to the sink and returns only the filename in `saved_to`.
@@ -289,7 +293,7 @@ def _audit_tool_call(
     context: ServerContext,
     tool: str,
     arguments: dict[str, Any],
-    result: dict[str, Any],
+    result: Mapping[str, Any],
     latency_ms: int = 0,
 ) -> None:
     if context.audit is None:
@@ -314,9 +318,9 @@ def _audit_tool_call(
     # Sender-blacklisted records hash the sender domain so the
     # operator can correlate without exposing the pattern. The
     # handler passes the triggering sender through the private
-    # `_matched_sender` key which we consume and strip here so it
-    # never reaches the JSON response.
-    matched_sender = result.pop("_matched_sender", None)
+    # `_matched_sender` key, which _emit's `_`-prefix filter keeps out
+    # of the JSON response.
+    matched_sender = result.get("_matched_sender")
     if result.get("reason") == "sender_blacklisted" and matched_sender:
         import hashlib
 
@@ -325,9 +329,9 @@ def _audit_tool_call(
     # ADR 0028 §4: attachment writes record the full absolute path
     # in the audit so a forensic reviewer does not need to also
     # reconstruct the sink config at the time of the call. The
-    # field is consumed here and stripped from the public response
+    # field is read here and stripped from the public response
     # by _emit's `_`-prefix filter.
-    saved_to_absolute = result.pop("_saved_to_absolute", None)
+    saved_to_absolute = result.get("_saved_to_absolute")
     if saved_to_absolute is not None:
         record["saved_to_absolute"] = saved_to_absolute
     context.audit.write(record)

@@ -61,7 +61,7 @@ def _max_visibility(fp: Any) -> str:
         if rule.grant is not None:
             best = max(best, level_rank(rule.grant))
     for level in ("NONE", "COUNT", "METADATA", "ENVELOPE", "HEADERS", "BODY", "FULL"):
-        if level_rank(level) == best:  # type: ignore[arg-type]
+        if level_rank(level) == best:
             return level
     return "NONE"
 
@@ -122,7 +122,7 @@ async def handle_describe_policy(
     _ = arguments  # extra arguments are ignored deliberately (ADR 0018)
     from ..config import Configuration
 
-    config: Configuration = context.configuration  # type: ignore[assignment]
+    config: Configuration = context.configuration
     caller = config.caller_by_id(context.caller_id)
     policy = config.policy_by_name(caller.policy) if caller is not None else None
     granted_accounts = set(policy.accounts.keys()) if policy is not None else set()

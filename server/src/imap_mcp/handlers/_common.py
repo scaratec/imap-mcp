@@ -23,7 +23,9 @@ from ..imap_core import list_folders as imap_list_folders
 from ..policy import MessageFacts
 
 if TYPE_CHECKING:
+    from ..config import Account
     from ..context import ServerContext
+    from ..saga import SagaManager
 
 
 _FORBIDDEN_SYSTEM_FLAGS = frozenset(["\\Deleted", "\\Draft", "\\Recent"])
@@ -215,12 +217,9 @@ async def _known_folders_for(context: ServerContext, account_id: str) -> list[st
     correct answer for an unknown account because the caller should
     not learn about server-side state they have no grant for.
     """
-    from ..config import Account
-
-    account = context.account_by_id(account_id)
-    if account is None:
+    account_model = context.account_by_id(account_id)
+    if account_model is None:
         return []
-    account_model: Account = account  # type: ignore[assignment]
     if account_model.auth is None:
         raise RuntimeError(
             f"Account {account_id!r} has no auth configuration; "
@@ -228,6 +227,7 @@ async def _known_folders_for(context: ServerContext, account_id: str) -> list[st
             "and a secret_ref."
         )
 
+    password: str | None
     if account_model.auth.type == "xoauth2":
         password = await context.oauth_manager.get_access_token(account_model)
     else:
@@ -242,16 +242,25 @@ async def _known_folders_for(context: ServerContext, account_id: str) -> list[st
     return [fi.path for fi in folder_infos]
 
 
-async def _password_for_account(context: ServerContext, account_id: str) -> tuple[Any, str]:
-    """Resolve account model and password. Raises on missing config."""
-    from ..config import Account
+def _require_saga(context: ServerContext, tool: str) -> SagaManager:
+    """Return the saga manager, or fail loudly if no WAL is configured.
 
-    account = context.account_by_id(account_id)
-    if account is None:
+    Message rewrites and draft escalations are only defined on top of
+    the WAL (ADR 0007), so their absence is a provisioning error.
+    """
+    if context.saga is None:
+        raise RuntimeError(f"{tool} requires the saga WAL; set wal.path in accounts.yaml")
+    return context.saga
+
+
+async def _password_for_account(context: ServerContext, account_id: str) -> tuple[Account, str]:
+    """Resolve account model and password. Raises on missing config."""
+    account_model = context.account_by_id(account_id)
+    if account_model is None:
         raise RuntimeError(f"Account {account_id!r} not configured")
-    account_model: Account = account  # type: ignore[assignment]
     if account_model.auth is None:
         raise RuntimeError(f"Account {account_id!r} has no auth configuration")
+    password: str | None
     if account_model.auth.type == "xoauth2":
         password = await context.oauth_manager.get_access_token(account_model)
     else:
@@ -264,20 +273,19 @@ async def _password_for_account(context: ServerContext, account_id: str) -> tupl
     return account_model, password
 
 
-async def _password_for(context: ServerContext, account_id: str) -> tuple[Any, str]:
+async def _password_for(context: ServerContext, account_id: str) -> tuple[Account, str]:
     """Resolve (account_model, password) or raise with a clear error."""
     account = context.account_by_id(account_id)
     if account is None:
         raise RuntimeError(f"Account {account_id!r} is not configured")
-    if account.auth is None:  # type: ignore[attr-defined]
+    if account.auth is None:
         raise RuntimeError(f"Account {account_id!r} has no auth configuration")
 
-    if account.auth.type == "xoauth2":  # type: ignore[attr-defined]
+    password: str | None
+    if account.auth.type == "xoauth2":
         password = await context.oauth_manager.get_access_token(account)
     else:
-        password = context.secret_store.get(
-            account.auth.password_secret_ref()  # type: ignore[attr-defined]
-        )
+        password = context.secret_store.get(account.auth.password_secret_ref())
 
     if password is None:
         raise RuntimeError(f"Password not resolvable for {account_id!r}")

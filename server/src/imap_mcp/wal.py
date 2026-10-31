@@ -39,6 +39,7 @@ import sqlite3
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS transactions (
@@ -224,12 +225,12 @@ class WAL:
             )
             self._event(conn, tx_id, "aborted", "ERROR", reason)
 
-    def get(self, tx_id: str) -> dict | None:
+    def get(self, tx_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM transactions WHERE tx_id = ?", (tx_id,)).fetchone()
             return dict(row) if row else None
 
-    def pending_transactions(self) -> list[dict]:
+    def pending_transactions(self) -> list[dict[str, Any]]:
         """Return txs that have not reached a terminal state.
 
         Used by the saga recovery loop. Terminal states are

@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .config import Account
 from .imap_core import (
@@ -91,7 +91,7 @@ async def _maybe_pause(at: str) -> None:
 class SagaResult:
     tx_id: str
     mechanism: str
-    result: str  # "OK" or "ERROR"
+    result: Literal["OK", "ERROR"]
     error_type: str | None = None
 
 
@@ -149,7 +149,7 @@ class SagaManager:
         message_id: str | None,
         raw: bytes | None,
         fallback: dict[str, Any] | None = None,
-    ) -> list[int] | str:
+    ) -> list[int] | Literal["ambiguous"]:
         """Idempotency lookup. Returns:
         - `[]`        if the message is not yet on target,
         - `[uid]`     if exactly one match (Message-ID or unique 5-tuple),
@@ -499,7 +499,7 @@ class SagaManager:
         self._audit_step(tx_id, "commit")
         return SagaResult(tx_id=tx_id, mechanism=mechanism, result="OK")
 
-    async def resume(self, tx: dict) -> SagaResult | None:
+    async def resume(self, tx: dict[str, Any]) -> SagaResult | None:
         """Resume a single non-terminal transaction. Returns None if
         the resolver cannot produce credentials (e.g. the account was
         removed from config after the tx began)."""

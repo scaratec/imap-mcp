@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Self
 
@@ -57,7 +58,7 @@ class _NoOpTracer:
     @contextmanager
     def start_as_current_span(
         self, name: str, *, attributes: dict[str, Any] | None = None, **kwargs: Any
-    ):
+    ) -> Iterator[_NoOpSpan]:
         yield _NoOpSpan()
 
 
