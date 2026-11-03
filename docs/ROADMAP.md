@@ -4,7 +4,7 @@ Index der offenen Schulden. Jeder Eintrag verweist auf das ausführliche
 Artefakt (LIM, ADR, Task) — Inhalte werden hier nicht dupliziert.
 Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
-## Status (Stand 2026-10-27)
+## Status (Stand 2026-11-03)
 
 - **Release:** `sc-imap-mcp` 2.1.0 (Tool-Set 2.1.0), Tag `v2.1.0`. Auf
   PyPI liegt nur das Wheel; das sdist wurde abgelehnt, der GitHub-Release
@@ -125,7 +125,7 @@ dafür da, eine saubere Lösung zu ersetzen, die nur aufwendig ist:
 | #  | Titel | Verweis | Art |
 |----|---|---|---|
 | 20 | `get_transaction_status` prüft den Caller nicht gegen den im WAL hinterlegten `caller_id` | ADR-0029 §3, Security Implications, [Betriebsanleitung P13](ops/kubernetes-sidecar-deployment.md) | **Defekt** — Autorisierungslücke, im Code verifiziert; siehe Einschränkung unter der Tabelle |
-| 21 | Verbindungspool aus ADR-0013 ist Accepted, aber nicht implementiert | [ADR-0013](adr/0013-hybrid-connection-pool.md) | **Defekt** — Kapazitätsgrenze je Provider bei N Sidecars |
+| 21 | Verbindungspool aus ADR-0013 ist Accepted, aber nicht implementiert (in Arbeit 2026-11-03, Ziel 2.3.0, `bdd/features/performance/connection_pool.feature`) | [ADR-0013](adr/0013-hybrid-connection-pool.md) | **Defekt** — Kapazitätsgrenze je Provider bei N Sidecars |
 | 22 | Saga-Recovery beim Start | ADR-0029 §8, `bdd/features/transactions/startup_saga_recovery.feature` | Feature — Neustarts sind im Cluster Routine |
 | 23 | `GET /healthz` | ADR-0029 §7, `bdd/features/deployment/health_probe.feature` | Feature |
 | 24 | Projizierte Config + SIGHUP | ADR-0029 §5, `bdd/features/deployment/projected_config_reload.feature` | Feature |
@@ -157,8 +157,8 @@ Die Einträge unten sind dabei aufgefallen und nicht Teil des Fixes.
 
 | #  | Titel | Verweis | Art / Stand |
 |----|---|---|---|
-| 31 | `readme = "../README.md"` liegt außerhalb von `server/`: hatchling ≥ 1.32 bricht den Build ab, das sdist enthält `../README.md` und wird von PyPI mit 400 abgelehnt | `server/pyproject.toml`, 139bf55, Release-Lauf vom 2026-10-18 | **Defekt** — **entschieden 2026-10-19:** `server/README.md` wird Kopie des Haupt-README, CI prüft Gleichheit, bisheriger Inhalt nach `server/DEVELOPMENT.md`, danach Begrenzung `hatchling<1.32` aufheben |
-| 32 | GitHub-Release v2.1.0 fehlt, weil der Release-Job am sdist abbrach | Tag `v2.1.0`, `server/CHANGELOG.md` | Auslieferung — **entschieden 2026-10-19:** mit `gh release create` nachholen (Text aus dem CHANGELOG, Artefakte aus dem Tag gebaut); das sdist wird auf PyPI nicht nachgereicht |
+| ~~31~~ | ~~`readme = "../README.md"` liegt außerhalb von `server/`: hatchling ≥ 1.32 bricht den Build ab, das sdist enthält `../README.md` und wird von PyPI mit 400 abgelehnt~~ | `server/pyproject.toml`, 37941fe | **Erledigt 2026-11-03, abweichend von der Entscheidung vom 2026-10-19:** statt einer Kopie `server/README.md` mit Gleichheitsprüfung liefert `server/hatch_build.py` die Haupt-README als `readme` (im Repository aus `../README.md`, im sdist aus der dort als `PYPI_README.md` eingebundenen Kopie); kein Duplikat, das gepflegt werden muss. hatchling-Begrenzung aufgehoben. Ursache des 400 war der sdist-Eintrag `../README.md`. sdist von 2.1.1 nachgereicht; für 2.1.0 lehnt PyPI neue Dateien ab (Release älter als 14 Tage). Owner bitte bestätigen oder Rückbau auf die entschiedene Variante anordnen |
+| ~~32~~ | ~~GitHub-Release v2.1.0 fehlt, weil der Release-Job am sdist abbrach~~ | Tag `v2.1.0` | **Erledigt 2026-11-03** wie entschieden: Release mit Text aus dem CHANGELOG und aus dem Tag gebauten Artefakten; v2.1.1 über den neuen `workflow_dispatch`-Nachtrag (97394bd) einschließlich sdist auf PyPI |
 | 33 | Audit-Eintrag entsteht erst nach dem Handler: scheitert das Schreiben, ist die IMAP-Aktion schon ausgeführt, aber nicht protokolliert; ein erneuter Versuch kann doppelt anlegen | `server/src/imap_mcp/dispatch.py` (`_audit_tool_call`), [ADR-0021](adr/0021-audit-log-format.md) | **Defekt** — **entschieden 2026-10-19:** schreibende Tools bekommen vorab einen `intent`-Eintrag; ist das Audit nicht schreibbar, wird nichts ausgeführt. Braucht ADR (Erweiterung von ADR-0021) und Feature File; lesende Tools bleiben bei einem Eintrag danach |
 | 34 | Wirft ein Handler eine unerwartete Exception, entsteht kein Audit-Eintrag | `dispatch.py` | **Defekt** — Entscheidung offen. Empfehlung: immer protokollieren mit `result: ERROR`, `reason: internal_error` und dem Exception-Typ, ohne Fehlertext (kann Inhalte enthalten) |
 | 35 | Aufbewahrung läuft im Betrieb nie: `AuditWriter.rotate()` wird nur vom Test-Tool `_test_run_audit_rotation` aufgerufen; nichts wird komprimiert oder gelöscht | `server/src/imap_mcp/audit.py`, [ADR-0022](adr/0022-audit-retention-and-access-model.md) | **Defekt** — Entscheidung offen, wann die Aufbewahrung läuft (z. B. beim Versiegeln eines Tages unter der Sperre aus ADR-0032) |
@@ -170,6 +170,28 @@ Die Einträge unten sind dabei aufgefallen und nicht Teil des Fixes.
 | 41 | Server läuft nicht mit dem MCP-SDK 2.x (u. a. `McpError` → `MCPError`); derzeit `mcp>=1.0.0,<2` | 6cfb6e5 | Wartung — Portierung auf mcp 2 als eigene Arbeit |
 | 42 | CI installiert Abhängigkeiten ohne Versionsstand; ein neues Release eines Pakets (hier mcp 2.0) ließ nahezu alle BDD-Szenarien mit Fehler enden, ohne dass sich Code geändert hatte | `.github/workflows/bdd.yml`, `ci.yml` | Wartung — Entscheidung offen (Constraints- oder Lock-Datei für CI, getrennt von den Bereichen im Paket) |
 | 43 | GitHub Actions: `actions/checkout@v4` und `actions/setup-python@v5` laufen auf Node 20 (veraltet); `ubuntu-latest` wechselt ab 2026-10-19 auf Ubuntu 26 | Annotationen der Läufe vom 2026-10-18 | Wartung — Aktionen anheben, Release-Workflow auf dem neuen Image prüfen |
+
+## Agenten-Nutzbarkeit (aufgenommen 2026-11-03)
+
+Anlass waren Rückmeldungen der Agenten: Entwürfe ließen sich nicht ändern
+oder löschen, Suchen endeten still nach sieben Tagen, HTML-Mails waren
+mühsam. Behoben in 2.2.0 und 2.2.1 (ADR-0033 bis ADR-0038); gemessen wird
+das Verhalten der Agenten künftig mit der Usability-Matrix (ADR-0039,
+`usability/`). Bei der Abnahme gegen das echte Gmail nach 2.2.0 fielen
+falsch maskierte System-Labels und eine fehlende mUTF-7-Kodierung beim
+Löschen der alten Entwurfsfassung auf; beides deckte der Mock nicht ab
+(`bdd/features/providers/gmail_draft_lifecycle.feature`).
+
+| #  | Titel | Verweis | Art / Stand |
+|----|---|---|---|
+| 44 | Sporadisch „IMAP AUTHENTICATE failed:“ mit leerer Meldung, beobachtet 2026-11-01 (2.1.0) und 2026-11-03 (2.2.0), vermutlich direkt nach einer Token-Erneuerung; ein zweiter Versuch gelingt | `imap_core._authenticate_imap` | **Defekt** — offen: Fehlertext von Gmail mitliefern, einmaliger Wiederholungsversuch mit frischem Token |
+| 45 | Aus HTML abgeleiteter Klartext verliert Absätze (`<p>A</p><p>B</p>` → `AB`); betrifft `fetch_body` und die Textalternative von `create_draft`/`create_reply_draft` | `imap_core._strip_html`, ADR-0035 | **Defekt** — offen: Blockelemente als Zeilenumbrüche; ändert die Ausgabe von `fetch_body` (Feature File anpassen) |
+| 46 | `search`/`list_messages` mit `scope: "all"` oder Kalenderfenster auf einem nicht vorhandenen Ordner liefern eine leere Liste statt `folder_absent`; nur das 7-Tage-Fenster meldet es | `handlers/search.py`, ADR-0025 | **Defekt** — offen |
+| 47 | `list_labels` gibt Label-Namen mUTF-7-kodiert zurück | `imap_core.gmail_list_labels` | Defekt (Anzeige) — offen |
+| 48 | Gmail-Annahmen des Mocks ohne Abnahme am echten Konto: Entwurf in ein eigenes Label verschieben, Verhalten bei Auto-Expunge-Einstellung „archivieren“, `\Inbox` nach `\Trash`, All Mail ohne Spam | `bdd/mock-gmail/README.md` | Prüfen — bei der nächsten Abnahme mit Probe-Nachrichten verifizieren |
+| 49 | Strukturierte `create_draft`-Entwürfe haben keinen `From`-Header; Mail-Clients setzen ihn aus der gewählten Identität | ADR-0035 | Entscheidung offen: Konto-Identität wie bei `create_reply_draft` verwenden? |
+| 50 | Pilot der Usability-Matrix (120 Läufe) | `usability/matrix.yaml` | Owner startet bewusst (Kosten, Kontingente) |
+| 51 | Traces vom Desktop per OTLP an Grafana Tempo (talos-3l), Payload-Modus `full` | Trello „Meta Projects“ → ToDo | Eigenes Arbeitspaket, wartet auf Abschluss der laufenden Grafana-Umbauten |
 
 ## Querschnitt
 
