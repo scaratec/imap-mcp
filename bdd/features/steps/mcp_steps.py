@@ -1507,6 +1507,35 @@ def step_caller_calls_search_no_criteria(
     _store_result(context, payload)
 
 
+@when(
+    r"(?P<caller_id>\S+) calls (?P<tool>[a-z_]+) with the arguments "
+    r"(?P<arguments_raw>\{.*\})"
+)
+def step_caller_calls_tool_with_arguments(
+    context: Context, caller_id: str, tool: str, arguments_raw: str
+) -> None:
+    """Send the JSON object exactly as written as the tool's arguments:
+    nothing added, nothing coerced. A JSON-RPC error is captured for
+    the Then-steps; a payload is stored as the last response."""
+    import json as _json
+
+    arguments = _json.loads(arguments_raw)
+    if not isinstance(arguments, dict):
+        raise AssertionError(f"The arguments must be a JSON object, got {arguments_raw!r}")
+    client = _ensure_mcp_client(context, caller_id)
+    context.last_response = None
+    context.last_rpc_error = None
+    try:
+        payload = client.call_tool(tool, arguments)
+        _store_result(context, payload)
+    except MCPRPCError as exc:
+        context.last_rpc_error = {
+            "code": exc.code,
+            "message": exc.message,
+            "data": exc.data,
+        }
+
+
 _use_step_matcher("parse")
 
 

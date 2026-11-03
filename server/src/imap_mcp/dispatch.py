@@ -11,6 +11,7 @@ and the audit record around each call.
 
 from __future__ import annotations
 
+import functools
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -141,8 +142,9 @@ def build_server(context: ServerContext) -> Server:
         name = req.params.name
         arguments = req.params.arguments or {}
         # Schema-layer validation that the MCP SDK does not enforce
-        # server-side: criteria field grammar (ADR 0024) and the
-        # required `part_id` on fetch_attachment (ADR 0026 §1).
+        # server-side: required arguments and JSON types of the
+        # inputSchema, criteria field grammar (ADR 0024) and the draft
+        # arguments (ADR 0031, 0035).
         schema_error = _validate_arguments_against_surface(name, arguments)
         if schema_error is not None:
             raise McpError(ErrorData(code=-32602, message=schema_error))
@@ -424,9 +426,10 @@ _DURATION_KEYS = ("newer_than", "older_than")
 
 def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) -> str | None:
     """Reject the argument shapes the in-handler code cannot
-    distinguish from runtime errors: malformed duration strings and
-    calendar bounds (ADR 0024, 0036), a missing `part_id` on
-    fetch_attachment, and malformed draft arguments.
+    distinguish from runtime errors: a required argument missing or an
+    argument of the wrong JSON type (the tool's inputSchema), malformed
+    duration strings and calendar bounds (ADR 0024, 0036), and
+    malformed draft arguments.
 
     Returns the JSON-RPC error message string when invalid, None when
     the call may proceed.
@@ -436,6 +439,12 @@ def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) ->
     global _DURATION_RE
     if _DURATION_RE is None:
         _DURATION_RE = _re.compile(_DURATION_PATTERN)
+
+    schema = _input_schemas().get(name)
+    if schema is not None:
+        violation = _object_violation(schema, arguments, "")
+        if violation is not None:
+            return f"{name}: {violation}"
 
     if name in _TOOLS_WITH_CRITERIA:
         criteria = arguments.get("criteria") or {}
@@ -454,8 +463,6 @@ def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) ->
             calendar_error = validate_calendar_bounds(criteria)
             if calendar_error is not None:
                 return calendar_error
-    if name == "fetch_attachment" and "part_id" not in arguments:
-        return "fetch_attachment requires part_id (ADR 0026 §1)"
     if name == "update_draft":
         from .handlers.drafts import validate_changes
 
@@ -475,6 +482,105 @@ def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) ->
         for key in ("reply_text", "reply_html"):
             if key in arguments and not isinstance(arguments[key], str):
                 return f"create_reply_draft `{key}` must be a string (ADR 0035)"
+    return None
+
+
+@functools.cache
+def _input_schemas() -> dict[str, dict[str, Any]]:
+    """The inputSchema of every published tool, by name. The schemas
+    are static; only descriptions depend on the context."""
+    return {tool.name: tool.inputSchema for tool in _build_tool_list()}
+
+
+def _json_type(value: object) -> str:
+    """The JSON type name of a decoded JSON value (JSON Schema §4.2.1)."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _schema_types(schema: Mapping[str, Any]) -> list[str]:
+    declared = schema.get("type")
+    if isinstance(declared, str):
+        return [declared]
+    if isinstance(declared, list):
+        return [t for t in declared if isinstance(t, str)]
+    return []
+
+
+_TYPE_PHRASES = {
+    "string": "a string",
+    "integer": "an integer",
+    "number": "a number",
+    "boolean": "a boolean",
+    "object": "an object",
+    "array": "an array",
+    "null": "null",
+}
+
+
+def _type_phrase(schema: Mapping[str, Any]) -> str:
+    phrases: list[str] = []
+    for declared in _schema_types(schema):
+        items = schema.get("items")
+        item_types = _schema_types(items) if isinstance(items, Mapping) else []
+        if declared == "array" and len(item_types) == 1:
+            phrases.append(f"an array of {item_types[0]}s")
+        else:
+            phrases.append(_TYPE_PHRASES.get(declared, declared))
+    return " or ".join(phrases)
+
+
+def _value_violation(schema: Mapping[str, Any], value: object, path: str) -> str | None:
+    """Check `value` against the type of `schema`, recursing into object
+    members and array items. The value itself is never echoed."""
+    declared = _schema_types(schema)
+    actual = _json_type(value)
+    if declared and not any(
+        actual == expected or (expected == "number" and actual == "integer")
+        for expected in declared
+    ):
+        return f"argument '{path}' must be {_type_phrase(schema)}, got {actual}"
+    if isinstance(value, dict) and "object" in declared:
+        return _object_violation(schema, value, f"{path}.")
+    items = schema.get("items")
+    if isinstance(value, list) and isinstance(items, Mapping):
+        for index, item in enumerate(value):
+            violation = _value_violation(items, item, f"{path}[{index}]")
+            if violation is not None:
+                return violation
+    return None
+
+
+def _object_violation(
+    schema: Mapping[str, Any], value: Mapping[str, Any], prefix: str
+) -> str | None:
+    """Required members first, then the type of every declared member
+    present. Undeclared members are not judged here (ADR 0018: extra
+    arguments are ignored)."""
+    required = schema.get("required") or []
+    missing = [f"'{prefix}{key}'" for key in required if key not in value]
+    if missing:
+        noun = "argument" if len(missing) == 1 else "arguments"
+        return f"missing required {noun} {', '.join(missing)}"
+    properties = schema.get("properties") or {}
+    for key, member_schema in properties.items():
+        if key in value and isinstance(member_schema, Mapping):
+            violation = _value_violation(member_schema, value[key], f"{prefix}{key}")
+            if violation is not None:
+                return violation
     return None
 
 

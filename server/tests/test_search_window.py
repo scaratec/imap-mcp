@@ -34,6 +34,14 @@ from imap_mcp.policy import MessageFacts, PolicyDecisionPoint
 
 NOW = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
 CRITERIA_TOOLS = ("search", "list_messages", "bulk_mark_seen", "bulk_mark_tagged")
+# The other required arguments of each tool, so a refusal can only come
+# from the criteria under test.
+TOOL_REQUIRED_EXTRAS: dict[str, dict[str, Any]] = {
+    "search": {},
+    "list_messages": {},
+    "bulk_mark_seen": {"seen": True},
+    "bulk_mark_tagged": {"tags": ["Erledigt"], "mode": "add"},
+}
 
 # ------------------------------------------------------------ calendar grammar
 
@@ -137,8 +145,15 @@ def test_a_malformed_date_is_reported_before_the_mix_with_a_duration() -> None:
 def test_every_tool_with_criteria_refuses_an_invalid_window(
     tool: str, criteria: dict[str, Any]
 ) -> None:
-    arguments = {"account": "a", "folder": "INBOX", "criteria": criteria}
-    assert _validate_arguments_against_surface(tool, arguments) is not None
+    arguments = {
+        "account": "a",
+        "folder": "INBOX",
+        "criteria": criteria,
+        **TOOL_REQUIRED_EXTRAS[tool],
+    }
+    message = _validate_arguments_against_surface(tool, arguments)
+    assert message is not None
+    assert "criteria" in message
 
 
 @pytest.mark.parametrize("tool", CRITERIA_TOOLS)
@@ -147,6 +162,7 @@ def test_every_tool_with_criteria_accepts_a_calendar_window(tool: str) -> None:
         "account": "a",
         "folder": "INBOX",
         "criteria": {"since": "2026-07-01", "before": "2026-10-01"},
+        **TOOL_REQUIRED_EXTRAS[tool],
     }
     assert _validate_arguments_against_surface(tool, arguments) is None
 
@@ -352,7 +368,6 @@ class _FakeImap:
 
     async def uid_search(self, criteria: str) -> tuple[str, list[bytes]]:
         return self._search
-
 
 
 def _patch_connection(monkeypatch: pytest.MonkeyPatch, fake: _FakeImap) -> None:
