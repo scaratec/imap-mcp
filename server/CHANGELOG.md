@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v2.3.0 (2026-11-03)
+
+### Bug Fixes
+
+- **tools**: Refuse missing or mistyped arguments with -32602
+  ([`d68db28`](https://github.com/scaratec/imap-mcp/commit/d68db2875ccd9d553d8d86db5741e445fd71c413))
+
+### Features
+
+- **imap**: Pool IMAP connections per account
+  ([`548de6d`](https://github.com/scaratec/imap-mcp/commit/548de6dd23afa904befaaa50d19c18e5ca273758))
+
+### Testing
+
+- **mock-gmail**: Search dates, attachments and counts like Gmail
+  ([`116b873`](https://github.com/scaratec/imap-mcp/commit/116b873a71642d9bcdcebe6d2f6b9cbcc79f6ee1))
+
+- **usability**: Run the agent usability matrix
+  ([`83e0e95`](https://github.com/scaratec/imap-mcp/commit/83e0e957e3bb4a28b63d6ad86055bcc8b3510bbe))
+
+
 ## v2.2.1 (2026-11-03)
 
 ### Bug Fixes
