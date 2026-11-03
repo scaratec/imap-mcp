@@ -41,10 +41,12 @@ corresponding layer here.
 | L10| Secret store                            | 10    | 7       | 3        | 0   |
 | L11| Audit log                               | 11    | 8 (+3 covered_by_LIM-0009) | 0 | 0 |
 | L12| Configuration loading                   | 13    | 12      | 1        | 0   |
-| L13| Connection pool / IMAP session          | 8     | 0       | 8        | 0   |
-| L14| Gmail-specific semantics                | 10    | 0 (+7 covered_by_LIM-0002) | 3 | 0 |
+| L13| Connection pool / IMAP session          | 12    | 0 (+7 specified @pending) | 5 | 0 |
+| L14| Gmail-specific semantics                | 24    | 0 (+7 covered_by_LIM-0002, +14 specified @pending) | 3 | 0 |
 | L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
-|    | **Total**                               | 199   | 110 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009, +24 specified @pending) | 48 | 0 |
+| L16| Agent-facing draft and search contract  | 27    | 0 (+27 specified @pending) | 0 | 0 |
+| L17| Observability (traces)                  | 23    | 0 (+23 specified @pending) | 0 | 0 |
+|    | **Total**                               | 267   | 110 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009, +95 specified @pending) | 45 | 0 |
 
 Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
 while the L9 section itself listed nineteen rows, four of them
@@ -414,20 +416,35 @@ by pydantic; one negative scenario will cover the class.
 
 | ID     | Error case                                      | Status  | Reference |
 |--------|-------------------------------------------------|---------|-----------|
-| L13.1  | Acquire from empty pool creates new connection  | deferred B | — |
-| L13.2  | Acquire reuses a healthy pooled connection      | deferred B | — |
-| L13.3  | Acquire skips a connection that fails NOOP      | deferred B | — |
+| L13.1  | Acquire from empty pool creates new connection  | specified @pending | connection_pool: five sequential calls |
+| L13.2  | Acquire reuses a healthy pooled connection      | specified @pending | connection_pool: five sequential calls |
+| L13.3  | Acquire skips a connection that fails NOOP      | specified @pending | connection_pool: stale connection replaced |
 | L13.4  | Acquire times out when pool is exhausted         | deferred B | — |
 | L13.5  | Max-age reached, connection force-closed         | deferred B | — |
 | L13.6  | Idle TTL reached, connection closed               | deferred B | — |
 | L13.7  | Token refresh drains the pool                     | deferred B | — |
 | L13.8  | Long-lived IDLE session not recycled by pool      | deferred B | — |
+| L13.9  | Two accounts keep separate pools                  | specified @pending | connection_pool: two accounts |
+| L13.10 | Folder switch on a reused connection selects first | specified @pending | connection_pool: folder switch |
+| L13.11 | Concurrent calls bounded by max_size              | specified @pending | connection_pool: concurrent calls |
+| L13.12 | Pooled connections logged out on shutdown          | specified @pending | connection_pool: logout on shutdown |
 
 **Deferred reason B** — The connection pool has no separately
 observable behaviour at the MCP surface; it affects latency and log
 entries. Unit-tested in the server module. If a behaviour becomes
 externally observable (e.g. a `pool_drain` audit event that a test
 needs to verify), the entry moves to covered.
+
+Update 2026-11-02: reason B no longer holds for connection counts and
+command order. The mock-gmail server counts connections and the IMAP
+proxy logs every command, both independent of the server
+(`performance/connection_reuse.feature` already relies on it). L13.1–3
+and L13.9–12 are therefore specified in
+`performance/connection_pool.feature`. ADR 0013 is Accepted but not
+implemented: every tool call still opens and closes its own connection.
+L13.4–8 stay deferred: idle TTL and max age need a controllable clock
+inside the pool, the token-refresh drain needs the OAuth mock to rotate
+a token mid-session.
 
 ---
 
@@ -445,11 +462,34 @@ needs to verify), the entry moves to covered.
 | L14.8  | Move target is a Gmail label currently empty           | deferred A | — |
 | L14.9  | Move target includes the label `All Mail` directly    | deferred A | — |
 | L14.10 | Concurrent label rewrite from outside imap-mcp        | deferred A | — |
+| L14.11 | Localized mock refuses the English name (fidelity)   | specified @pending | localized_gmail_resolution: mock refuses English name |
+| L14.12 | search on canonical Sent as first call of a session  | specified @pending | localized_gmail_resolution: read tool, first call (search) |
+| L14.13 | list_messages on canonical Trash as first call        | specified @pending | localized_gmail_resolution: read tool, first call (list_messages) |
+| L14.14 | folder_stats on canonical All Mail as first call      | specified @pending | localized_gmail_resolution: read tool, first call (folder_stats) |
+| L14.15 | create_draft on canonical Drafts as first call        | specified @pending | localized_gmail_resolution: create_draft first call |
+| L14.16 | Label-swap move canonical → canonical, localized acct | specified @pending | localized_gmail_resolution: draft to trash (row 1) |
+| L14.17 | Label-swap move localized → localized                 | specified @pending | localized_gmail_resolution: draft to trash (row 2) |
+| L14.18 | Label-swap move canonical → localized                 | specified @pending | localized_gmail_resolution: draft to trash (row 3) |
+| L14.19 | Unselectable source in label swap → folder_absent      | specified @pending | localized_gmail_resolution: folder_absent, never uid_not_found |
+| L14.20 | Cross-account saga resolves localized All Mail         | specified @pending | localized_gmail_resolution: cross-account All Mail |
+| L14.21 | Canonical-only policy governs the localized name       | specified @pending | localized_gmail_resolution: canonical-only policy |
+| L14.22 | Localized-only policy entry governs the canonical name | specified @pending | localized_gmail_resolution: localized-only policy |
+| L14.23 | Conflicting entries for one special-use folder         | specified @pending | localized_gmail_resolution: fail closed |
+| L14.24 | Responses echo the canonical folder name               | specified @pending | localized_gmail_resolution: canonical echo |
 
 **Deferred reason A** — Edge cases for Gmail that require deep
 knowledge of Gmail's label model side effects. Will be covered by
 integration tests against a real Gmail account (gated out of the BDD
 suite by config).
+
+Added 2026-11-02 (L14.11–24): the alias map for localized folder names
+was filled only by `list_folders`, and the label-swap move, the saga's
+All Mail lookup and policy evaluation never consulted it. Production
+audit data shows 9 failed draft discards and 12 failed `create_draft`
+calls on a German account. The existing localized scenarios all called
+`list_folders` first and ran against a mock that also accepted the
+English names, so none of them could see it. L14.11 pins the mock
+itself (Guideline §7.2).
 
 ---
 
@@ -502,6 +542,90 @@ correctly configured one, because it is not. This is the single
 highest-value gap the deployment work exposed, and it is left as an
 observation rather than a new row so that the next author decides
 whether the fix is a scenario or a startup check.
+
+---
+
+## L16 — Agent-facing draft and search contract
+
+Introduced 2026-11-02. L1–L15 enumerate how the server fails; this
+layer enumerates where the surface is correct but leaves a caller
+without a way to do the obvious thing: discard a draft it only knows by
+handle (ADR 0030 hides UIDs, ADR 0031 says discard with `move`, which
+needs one), choose a body format without hand-building MIME, learn that
+a search window hid older matches, and express a calendar window.
+Decided in ADR 0033 to ADR 0036 (2026-11-03).
+
+| ID     | Error case                                                  | Status | Reference |
+|--------|-------------------------------------------------------------|--------|-----------|
+| L16.1  | discard_draft, standard IMAP with \Trash                    | specified @pending | discard_draft: standard IMAP |
+| L16.2  | discard_draft, Gmail with localized names                   | specified @pending | discard_draft: Gmail localized |
+| L16.3  | discard_draft takes residue revisions along                 | specified @pending | discard_draft: residue |
+| L16.4  | discard_draft without move_out on drafts                    | specified @pending | discard_draft: capability (row 1) |
+| L16.5  | discard_draft without accept_incoming on trash              | specified @pending | discard_draft: capability (row 2) |
+| L16.6  | discard_draft on an account without \Trash                  | specified @pending | discard_draft: trash_unavailable |
+| L16.7  | discard_draft with an unknown handle                        | specified @pending | discard_draft: draft_not_found |
+| L16.8  | discard_draft leaves handle-less drafts alone               | specified @pending | discard_draft: owner's draft untouched |
+| L16.9  | create_draft description presents the format as a choice    | specified @pending | create_draft_format: description |
+| L16.10 | create_draft reports format text/plain                      | specified @pending | create_draft_format: reports text/plain |
+| L16.11 | create_draft reports format text/html                       | specified @pending | create_draft_format: reports text/html |
+| L16.12 | create_draft reports format multipart/alternative           | specified @pending | create_draft_format: reports multipart/alternative |
+| L16.13 | Structured create_draft, body_text only                     | specified @pending | create_draft_format: structured (row 1) |
+| L16.14 | Structured create_draft, body_html only                     | specified @pending | create_draft_format: structured (row 2) |
+| L16.15 | Structured create_draft, both bodies                        | specified @pending | create_draft_format: structured (row 3) |
+| L16.16 | Non-ASCII subject and body in structured composition        | specified @pending | create_draft_format: non-ASCII |
+| L16.17 | rfc822 and structured fields together                       | specified @pending | create_draft_format: mutually exclusive |
+| L16.18 | Neither rfc822 nor a body field                             | specified @pending | create_draft_format: no body |
+| L16.19 | create_reply_draft with reply_html                          | specified @pending | create_draft_format: HTML reply |
+| L16.20 | Default window hides matches, count reported (from_domain)  | specified @pending | search_completeness: outside count (row 1) |
+| L16.21 | Default window hides matches, count reported (subject)      | specified @pending | search_completeness: outside count (row 2) |
+| L16.22 | scope all reports no outside count                          | specified @pending | search_completeness: scope all |
+| L16.23 | Calendar window since + before                              | specified @pending | search_completeness: calendar window (row 1) |
+| L16.24 | Calendar window since only                                  | specified @pending | search_completeness: calendar window (row 2) |
+| L16.25 | Malformed calendar date                                     | specified @pending | search_completeness: invalid (row 1) |
+| L16.26 | since not before before                                     | specified @pending | search_completeness: invalid (row 2) |
+| L16.27 | Calendar and duration bounds mixed                          | specified @pending | search_completeness: invalid (row 3) |
+
+Whether agents actually use this contract well is not a server error
+path and is not counted here. It is measured, never asserted, in
+`usability/` (see `usability/README.md`).
+
+---
+
+## L17 — Observability (traces)
+
+Introduced 2026-11-02. Telemetry is behaviour
+(`.scaratec/handbuch/observability.md` §1, §6) and is witnessed through
+a test collector's sink, never through server internals.
+
+| ID     | Error case                                                  | Status | Reference |
+|--------|-------------------------------------------------------------|--------|-----------|
+| L17.1  | Default payload mode is redacted                            | specified @pending | tracing_payload_mode: default |
+| L17.2  | redacted: no content in the request (write tool)            | specified @pending | tracing_payload_mode: redacted request |
+| L17.3  | redacted: no content in the response (read tool)            | specified @pending | tracing_payload_mode: redacted response |
+| L17.4  | full: request and response complete                         | specified @pending | tracing_payload_mode: full |
+| L17.5  | full: oversized payload cut and marked                      | specified @pending | tracing_payload_mode: truncation |
+| L17.6  | off: no payload attributes, span still present              | specified @pending | tracing_payload_mode: off |
+| L17.7  | Active mode on the span (off)                               | specified @pending | tracing_payload_mode: invariants (row 1) |
+| L17.8  | Active mode on the span (redacted)                          | specified @pending | tracing_payload_mode: invariants (row 2) |
+| L17.9  | Active mode on the span (full)                              | specified @pending | tracing_payload_mode: invariants (row 3) |
+| L17.10 | Secrets absent (off)                                        | specified @pending | tracing_payload_mode: invariants (row 1) |
+| L17.11 | Secrets absent (redacted)                                   | specified @pending | tracing_payload_mode: invariants (row 2) |
+| L17.12 | Secrets absent (full)                                       | specified @pending | tracing_payload_mode: invariants (row 3) |
+| L17.13 | Unknown payload mode refused at startup                     | specified @pending | tracing_payload_mode: unknown mode |
+| L17.14 | OTEL_RESOURCE_ATTRIBUTES on every span                      | specified @pending | tracing_spans: run attributes |
+| L17.15 | Mandatory resource attributes of the standard               | specified @pending | tracing_spans: standard resource attributes |
+| L17.16 | MCP client name and version on tool spans                   | specified @pending | tracing_spans: client identity |
+| L17.17 | Response size equals what the client received               | specified @pending | tracing_spans: response size |
+| L17.18 | Result counts on listing tools                              | specified @pending | tracing_spans: result counts |
+| L17.19 | Policy denial is a rejected outcome, not an error           | specified @pending | tracing_spans: denial |
+| L17.20 | Error envelope sets error.type and status ERROR             | specified @pending | tracing_spans: error envelope |
+| L17.21 | IMAP commands as child spans of the tool span               | specified @pending | tracing_spans: IMAP child spans |
+| L17.22 | Last span survives stdin closed                             | specified @pending | tracing_spans: flush (row 1) |
+| L17.23 | Last span survives SIGTERM                                  | specified @pending | tracing_spans: flush (row 2) |
+
+Mode `full` deviates from the observability standard's ban on personal
+data in telemetry (§7). It is an explicit operator opt-in, visible on
+every span, and must be recorded in an ADR together with the default.
 
 ---
 
