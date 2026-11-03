@@ -12,6 +12,7 @@ means it is also trivial to reason about and unit-test.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC
 from enum import IntEnum
@@ -265,10 +266,64 @@ class PolicyDecisionPoint:
     the same outputs. This is what makes the PDP independently
     unit-testable and what keeps the tool-dispatch layer a thin
     adapter (ADR 0001).
+
+    The one piece of state beyond the configuration is the per-account
+    Gmail folder alias map (ADR 0033): handlers hand it in after an
+    IMAP LIST, the PDP never fetches it. It lives here because policy
+    keys are normalized through it, and because a configuration reload
+    replaces the PDP, which is exactly when the map must be rebuilt.
     """
 
     def __init__(self, configuration: Configuration) -> None:
         self._configuration = configuration
+        self._folder_aliases: dict[str, dict[str, str]] = {}
+
+    def folder_aliases(self, account_id: str) -> dict[str, str] | None:
+        """Return `{canonical_path: wire_path}` for an account, or None
+        when no map has been registered for it yet."""
+        return self._folder_aliases.get(account_id)
+
+    def set_folder_aliases(self, account_id: str, aliases: Mapping[str, str]) -> None:
+        """Register (or refresh) the alias map of one account."""
+        self._folder_aliases[account_id] = dict(aliases)
+
+    def canonical_folder(self, account_id: str, folder_path: str) -> str:
+        """Map a localized special-use path to its canonical path.
+
+        Canonical paths and every path without an alias entry pass
+        through unchanged, so non-Gmail accounts are unaffected.
+        """
+        for canonical, wire in self._folder_aliases.get(account_id, {}).items():
+            if wire == folder_path:
+                return canonical
+        return folder_path
+
+    def _normalized_folder_policies(
+        self, account_id: str, folder_policies: list[FolderPolicy]
+    ) -> dict[str, FolderPolicy | None]:
+        """Key the account's folder policies by canonical path.
+
+        Two entries that name one physical folder (canonical and
+        localized name) collapse into one. If they differ in any
+        setting the key maps to None: the folder is in conflict and
+        must be denied (ADR 0033, fail closed). Identical duplicates
+        are accepted. A repeated entry under the very same path keeps
+        the pre-ADR-0033 rule: the first one wins.
+        """
+        normalized: dict[str, FolderPolicy | None] = {}
+        first: dict[str, FolderPolicy] = {}
+        for fp in folder_policies:
+            key = self.canonical_folder(account_id, fp.path)
+            if key not in first:
+                first[key] = fp
+                normalized[key] = fp
+                continue
+            winner = first[key]
+            if fp.path == winner.path:
+                continue
+            if fp.model_dump(exclude={"path"}) != winner.model_dump(exclude={"path"}):
+                normalized[key] = None
+        return normalized
 
     def _policy_for(self, caller_id: str) -> tuple[set[str], dict[str, list[FolderPolicy]]]:
         caller = self._configuration.caller_by_id(caller_id)
@@ -305,10 +360,12 @@ class PolicyDecisionPoint:
             return FolderVisibility(visible_folder_paths=[], hidden_folder_count=0)
 
         policies = by_account.get(account_id, [])
-        declared_paths = {fp.path: fp for fp in policies}
+        declared_paths = self._normalized_folder_policies(account_id, policies)
         visible: list[str] = []
         for path in known_folders:
-            fp = declared_paths.get(path)
+            # A conflicting alias pair (None) hides the folder: it
+            # fails closed exactly like decide_folder_access does.
+            fp = declared_paths.get(self.canonical_folder(account_id, path))
             if fp is None:
                 continue
             if fp.mode == "whitelist":
@@ -341,6 +398,11 @@ class PolicyDecisionPoint:
         message-level checks. The returned `visibility` is the folder's
         declared default; sender rules may raise it on a per-message
         basis.
+
+        For Gmail accounts with a registered alias map, both the
+        requested path and the policy keys are normalized to the
+        canonical special-use path first (ADR 0033). Two entries for
+        one folder that disagree deny with `policy_alias_conflict`.
         """
         granted_ids, by_account = self._policy_for(caller_id)
         if account_id not in granted_ids:
@@ -350,15 +412,25 @@ class PolicyDecisionPoint:
                 visibility="NONE",
                 folder_policy=None,
             )
-        folder_policies = by_account.get(account_id, [])
-        for fp in folder_policies:
-            if fp.path == folder_path:
+        folder_policies = self._normalized_folder_policies(
+            account_id, by_account.get(account_id, [])
+        )
+        key = self.canonical_folder(account_id, folder_path)
+        if key in folder_policies:
+            fp = folder_policies[key]
+            if fp is None:
                 return FolderDecision(
-                    allowed=True,
-                    reason="folder_default_applied",
-                    visibility=fp.default,
-                    folder_policy=fp,
+                    allowed=False,
+                    reason="policy_alias_conflict",
+                    visibility="NONE",
+                    folder_policy=None,
                 )
+            return FolderDecision(
+                allowed=True,
+                reason="folder_default_applied",
+                visibility=fp.default,
+                folder_policy=fp,
+            )
         return FolderDecision(
             allowed=False,
             reason="folder_hidden",

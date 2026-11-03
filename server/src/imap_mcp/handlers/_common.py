@@ -19,7 +19,9 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from ..imap_core import build_folder_alias_map
 from ..imap_core import list_folders as imap_list_folders
+from ..imap_core import list_mailboxes as imap_list_mailboxes
 from ..policy import MessageFacts
 
 if TYPE_CHECKING:
@@ -184,14 +186,34 @@ def _is_google_provider(account: Any) -> bool:
 def _get_folder_aliases(context: ServerContext, account_id: str) -> dict[str, str]:
     """Return the cached folder alias map for a Google account.
 
-    The map is populated by ``handle_list_folders`` as a side effect
-    of its IMAP LIST call — no extra connection is needed.  If
-    ``list_folders`` has not been called yet for this account the map
-    is empty and canonical paths pass through unchanged.
+    Empty when no map has been built yet in this configuration
+    generation; `_ensure_folder_aliases` builds it on demand.
     """
-    if context._live.folder_aliases is None:
+    return context.pdp.folder_aliases(account_id) or {}
+
+
+async def _ensure_folder_aliases(context: ServerContext, account_id: str) -> dict[str, str]:
+    """Return the alias map of a Google account, building it on first use.
+
+    ADR 0033: the first call that needs a Gmail folder on an account
+    issues one IMAP LIST and derives `{canonical_path: wire_path}` from
+    the RFC 6154 special-use flags. The map is cached on the live PDP,
+    so a configuration reload (which replaces the PDP) discards it and
+    `list_folders` refreshes it. Non-Google accounts get an empty map
+    without any IMAP traffic. A failing LIST propagates: guessing a
+    name would address the wrong folder.
+    """
+    account = context.account_by_id(account_id)
+    if account is None or not _is_google_provider(account):
         return {}
-    return context._live.folder_aliases.get(account_id, {})
+    pdp = context.pdp
+    cached = pdp.folder_aliases(account_id)
+    if cached is not None:
+        return cached
+    account_model, password = await _password_for(context, account_id)
+    alias_map = build_folder_alias_map(await imap_list_mailboxes(account_model, password))
+    pdp.set_folder_aliases(account_id, alias_map)
+    return alias_map
 
 
 async def _resolve_imap_folder(context: ServerContext, account_id: str, canonical_path: str) -> str:
@@ -202,11 +224,62 @@ async def _resolve_imap_folder(context: ServerContext, account_id: str, canonica
     (e.g. ``[Gmail]/Entwürfe``).  Non-Google accounts and paths
     without an alias entry pass through unchanged.
     """
-    account = context.account_by_id(account_id)
-    if account is None or not _is_google_provider(account):
+    if _never_aliased(canonical_path):
         return canonical_path
-    aliases = _get_folder_aliases(context, account_id)
+    aliases = await _ensure_folder_aliases(context, account_id)
     return aliases.get(canonical_path, canonical_path)
+
+
+def _never_aliased(folder_path: str) -> bool:
+    """INBOX has one protocol-fixed name (RFC 3501 §5.1) on every
+    server and in every locale, so it never needs the alias map; this
+    spares the LIST on the most common path."""
+    return folder_path.upper() == "INBOX"
+
+
+# Top-level argument names that carry a folder path of `account`.
+_FOLDER_ARGUMENT_KEYS = ("folder", "source_folder", "drafts_folder")
+
+
+async def canonicalize_folder_arguments(
+    context: ServerContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Return a copy of `arguments` with every Gmail folder path canonical.
+
+    ADR 0033: a caller may name a Gmail special-use folder by its
+    canonical or its localized path; both must reach policy evaluation
+    and the response as the one canonical path. Runs before the
+    handler, so every tool sees canonical names. Accounts outside the
+    caller's grant, accounts awaiting OAuth re-bootstrap and
+    non-Google accounts are left untouched; the handler's own checks
+    answer for those.
+    """
+    granted = set(context.pdp.visible_accounts_for(context.caller_id).visible_account_ids)
+
+    async def canonical(account_id: object, folder: object) -> object:
+        if not isinstance(account_id, str) or not isinstance(folder, str):
+            return folder
+        if _never_aliased(folder):
+            return folder
+        if account_id not in granted or context.oauth_manager.is_rebootstrap_needed(account_id):
+            return folder
+        account = context.account_by_id(account_id)
+        if account is None or not _is_google_provider(account):
+            return folder
+        await _ensure_folder_aliases(context, account_id)
+        return context.pdp.canonical_folder(account_id, folder)
+
+    result = dict(arguments)
+    for key in _FOLDER_ARGUMENT_KEYS:
+        if key in result:
+            result[key] = await canonical(result.get("account"), result[key])
+    for key in ("source", "target"):
+        nested = result.get(key)
+        if isinstance(nested, dict) and "folder" in nested:
+            nested = dict(nested)
+            nested["folder"] = await canonical(nested.get("account"), nested["folder"])
+            result[key] = nested
+    return result
 
 
 async def _known_folders_for(context: ServerContext, account_id: str) -> list[str]:
@@ -297,6 +370,7 @@ __all__ = [
     "TOOL_SET_VERSION",
     "WRITE_TOOL_CAP",
     "_FORBIDDEN_SYSTEM_FLAGS",
+    "_ensure_folder_aliases",
     "_facts_from_envelope",
     "_get_folder_aliases",
     "_is_google_provider",
@@ -305,6 +379,7 @@ __all__ = [
     "_password_for_account",
     "_resolve_imap_folder",
     "_walk_attachment_parts",
+    "canonicalize_folder_arguments",
     "check_attachment_sink",
     "decode_mime_words",
     "describe_attachment_sink",

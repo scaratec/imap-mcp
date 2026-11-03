@@ -309,10 +309,24 @@ def step_policy_grants_folder_inline_rules(
     The step remains a thin adapter — the parser above only splits
     strings, it does not evaluate policy semantics.
     """
+    _grant_folders_from_table(context, policy_name, account_id=None)
+
+
+@given('policy "{policy_name}" grants folder on account "{account_id}":')
+def step_policy_grants_folder_on_account(
+    context: Context, policy_name: str, account_id: str
+) -> None:
+    """Same table shape as `grants folder:`, for the named account."""
+    _grant_folders_from_table(context, policy_name, account_id=account_id)
+
+
+def _grant_folders_from_table(
+    context: Context, policy_name: str, account_id: str | None
+) -> None:
     builder = _ensure_builder(context)
     for row in context.table:
-        account_id = row.get("account")
-        if account_id is None:
+        row_account = row.get("account") or account_id
+        if row_account is None:
             # When no `account` column is present, pick the only
             # account that is currently registered. Scenarios that
             # use this shorthand have exactly one account in play.
@@ -322,14 +336,14 @@ def step_policy_grants_folder_inline_rules(
                     f"requires exactly one registered account; found "
                     f"{len(builder.accounts)}."
                 )
-            account_id = builder.accounts[0].id
+            row_account = builder.accounts[0].id
         caps: dict[str, bool] = {}
         for cap_key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append", "modify_message", "draft_edit"):
             if cap_key in row.headings:
                 caps[cap_key] = _parse_bool(row[cap_key])
         folder = builder.folder(
             policy_name=policy_name,
-            account_id=account_id,
+            account_id=row_account,
             path=row["folder"],
             mode=row["mode"],
             default=row["default"],

@@ -13,7 +13,13 @@ import email.utils
 import re
 from typing import Any
 
-from .state import FOLDER_TO_LABEL, GmailState, Message, decode_mutf7
+from .state import FOLDER_TO_LABEL, CommandRecord, GmailState, Message, decode_mutf7
+
+# Commands whose first argument is a mailbox name (RFC 3501 §6.3).
+_MAILBOX_COMMANDS = frozenset({
+    "SELECT", "EXAMINE", "STATUS", "APPEND", "CREATE", "DELETE",
+    "RENAME", "SUBSCRIBE", "UNSUBSCRIBE",
+})
 
 
 class GmailIMAPHandler:
@@ -26,20 +32,20 @@ class GmailIMAPHandler:
         self._w = writer
         self._state = state
         self._authed = False
+        self._user: str | None = None
         self._selected_folder: str | None = None
         state.total_connections += 1
 
-    def _resolve_folder(self, folder: str) -> str:
-        """Map a localized folder name back to the canonical name.
+    def _resolve_folder(self, folder: str) -> str | None:
+        """Map a wire mailbox name to the mock's internal folder name.
 
-        When localization is active the IMAP client will use the
-        localized name it received from LIST.  The mock's internal
-        state uses canonical names, so we translate back here.
+        When localization is active the IMAP client must use the
+        localized name it received from LIST; the mock's internal
+        state uses canonical names, so we translate back here. The
+        canonical name of a localized folder resolves to None: real
+        Gmail does not know that mailbox (ADR 0033).
         """
-        for canonical, (localized, _flags) in self._state._localized_folders.items():
-            if folder == localized:
-                return canonical
-        return folder
+        return self._state.mailbox_for_wire_name(folder)
 
     async def run(self) -> None:
         self._send_untagged("OK Gimap ready for requests (mock-gmail)")
@@ -66,6 +72,7 @@ class GmailIMAPHandler:
             self._w.close()
 
     async def _dispatch(self, tag: str, cmd: str, args: str) -> None:
+        self._record(cmd, args)
         handler = {
             "CAPABILITY": self._cmd_capability,
             "LOGIN": self._cmd_login,
@@ -95,6 +102,8 @@ class GmailIMAPHandler:
 
     async def _cmd_login(self, tag: str, args: str) -> None:
         self._authed = True
+        parts = args.split(None, 1)
+        self._user = _unquote(parts[0]) if parts else None
         self._send(tag, "OK", "LOGIN completed")
 
     async def _cmd_list(self, tag: str, args: str) -> None:
@@ -110,7 +119,18 @@ class GmailIMAPHandler:
         self._send(tag, "OK", "LIST completed")
 
     async def _cmd_select(self, tag: str, args: str) -> None:
-        folder = self._resolve_folder(_unquote(args))
+        wire = _unquote(args)
+        folder = self._resolve_folder(wire)
+        if folder is None or not self._state.folder_exists(folder):
+            # A failed SELECT leaves the connection unselected (RFC 3501
+            # §6.3.1); the text is what Gmail answers.
+            self._selected_folder = None
+            self._send(
+                tag,
+                "NO",
+                f"[NONEXISTENT] Unknown Mailbox: {wire} (now in authenticated state) (Failure)",
+            )
+            return
         self._selected_folder = folder
         msgs = self._state.messages_in_folder(folder)
         uidval = self._state.uidvalidity(folder)
@@ -157,6 +177,9 @@ class GmailIMAPHandler:
             self._send(tag, "BAD", "APPEND parse error")
             return
         folder = self._resolve_folder(m.group(1))
+        if folder is None:
+            self._send(tag, "NO", "[TRYCREATE] Folder doesn't exist. (Failure)")
+            return
         size = int(m.group(2))
         self._send_untagged_raw("+ Ready for literal data\r\n")
         data = await self._r.readexactly(size)
@@ -423,6 +446,9 @@ class GmailIMAPHandler:
             return
         uid = int(m.group(1))
         target = self._resolve_folder(m.group(2))
+        if target is None:
+            self._send(tag, "NO", "[TRYCREATE] Folder doesn't exist. (Failure)")
+            return
         msg = self._state.message_by_uid(folder, uid)
         if msg is None:
             self._send(tag, "NO", "Message not found")
@@ -439,6 +465,9 @@ class GmailIMAPHandler:
             return
         uid = int(m.group(1))
         target = self._resolve_folder(m.group(2))
+        if target is None:
+            self._send(tag, "NO", "[TRYCREATE] Folder doesn't exist. (Failure)")
+            return
         msg = self._state.message_by_uid(folder, uid)
         if msg is None:
             self._send(tag, "NO", "Message not found")
@@ -453,6 +482,22 @@ class GmailIMAPHandler:
         self._send(tag, "OK", "MOVE completed")
 
     # ---------------------------------------------------------- helpers
+
+    def _record(self, cmd: str, args: str) -> None:
+        """Append the command to the shared command log."""
+        command = cmd
+        mailbox: str | None = None
+        if cmd in _MAILBOX_COMMANDS:
+            mailbox = _first_astring(args)
+        elif cmd == "UID":
+            parts = args.split(None, 2)
+            if parts:
+                command = f"UID {parts[0].upper()}"
+            if command in ("UID COPY", "UID MOVE") and len(parts) > 2:
+                mailbox = _first_astring(parts[2])
+        self._state.command_log.append(
+            CommandRecord(user=self._user, command=command, mailbox=mailbox)
+        )
 
     def _send(self, tag: str, status: str, text: str) -> None:
         self._w.write(f"{tag} {status} {text}\r\n".encode())
@@ -484,6 +529,28 @@ def _unquote(s: str) -> str:
     if s.startswith('"') and s.endswith('"'):
         return s[1:-1]
     return s
+
+
+def _first_astring(args: str) -> str | None:
+    """Return the first quoted string or atom of an argument list, unquoted."""
+    s = args.lstrip()
+    if not s:
+        return None
+    if s.startswith('"'):
+        out: list[str] = []
+        i = 1
+        while i < len(s):
+            ch = s[i]
+            if ch == "\\" and i + 1 < len(s):
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                break
+            out.append(ch)
+            i += 1
+        return "".join(out)
+    return s.split(None, 1)[0]
 
 
 def _quote_label(label: str) -> str:

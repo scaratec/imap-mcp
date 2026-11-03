@@ -244,13 +244,16 @@ use_step_matcher("re")
 def step_message_carries_gmail_labels(context: Context, labels_raw: str) -> None:
     """Attach labels to the pending Gmail message.
 
-    Parses a list like ["INBOX", "Rechnungen", "Hornbach"].
+    Parses a list like ["INBOX", "Rechnungen", "Hornbach"]. The list is
+    read as JSON, so ["\\\\Drafts"] names the system label \\Drafts.
     """
     msg = getattr(context, "_gmail_pending_msg", None)
     if msg is None:
         raise AssertionError("No pending Gmail message to attach labels to.")
-    # Parse label list from the raw string
-    labels = [s.strip().strip('"').strip("'") for s in labels_raw.split(",")]
+    try:
+        labels = json.loads(f"[{labels_raw}]")
+    except json.JSONDecodeError:
+        labels = [s.strip().strip('"').strip("'") for s in labels_raw.split(",")]
     # Convert folder names to Gmail labels where appropriate
     from mock_gmail.state import FOLDER_TO_LABEL
 
@@ -851,3 +854,112 @@ def step_recorded_store_ops_in_order(context: Context, uid: int) -> None:
             f"X-GM-LABELS STORE ops on UID {uid}: "
             f"expected {expected!r}, got {recorded!r}"
         )
+
+
+# ---------------------------------------- mock IMAP command log (ADR 0033)
+
+
+@when('a direct IMAP SELECT of "{mailbox}" is issued against "{account_id}"')
+def step_direct_imap_select(context: Context, mailbox: str, account_id: str) -> None:
+    """Issue SELECT with the mailbox name exactly as written (wire form)."""
+    from support.imap_fixture import IMAPFixture
+
+    instance, user = resolve_account(account_id)
+    conn = context.imap.connect(instance, user)
+    status, _data = conn.select(IMAPFixture._q(mailbox))
+    context.last_direct_imap_status = status
+
+
+@then('the direct IMAP command is answered with status "{status}"')
+def step_direct_imap_status(context: Context, status: str) -> None:
+    actual = getattr(context, "last_direct_imap_status", None)
+    if actual is None:
+        raise AssertionError("No direct IMAP command has been issued in this scenario.")
+    if actual != status:
+        raise AssertionError(f"Direct IMAP command: expected status {status!r}, got {actual!r}")
+
+
+@given("no tool has been called in this server session yet")
+def step_no_tool_called_yet(context: Context) -> None:
+    """Precondition: the server process has not been started, so the
+    next tool call is the first of its session (no cached state)."""
+    if getattr(context, "mcp", None) is not None:
+        raise AssertionError("An MCP server session is already running in this scenario.")
+    if getattr(context, "response_history", None):
+        raise AssertionError(
+            f"Tool calls already happened in this scenario: {context.response_history!r}"
+        )
+
+
+def _server_command_log(context: Context, account_id: str) -> list:
+    """Commands the mock-gmail server received from anyone but the harness.
+
+    The harness's own direct IMAP connection logs in as the fixture
+    user of the account; everything else on the mock came from the
+    server under test. An empty result is a harness error: absence
+    assertions would pass vacuously.
+    """
+    instance, harness_user = resolve_account(account_id)
+    if instance != "mock-gmail":
+        raise AssertionError(
+            f"Account {account_id!r} is not backed by the mock-gmail server; "
+            "no IMAP command log is recorded for it."
+        )
+    records = [r for r in _gmail_state(context).command_log if r.user != harness_user]
+    if not records:
+        raise AssertionError(
+            f"The mock-gmail server recorded no command from the server for {account_id!r}."
+        )
+    return records
+
+
+def _format_log(records: list) -> str:
+    return "\n".join(f"  {r.command} {r.mailbox or ''}".rstrip() for r in records)
+
+
+@then(
+    'the IMAP command log for "{account_id}" contains a SELECT or EXAMINE '
+    'of the wire mailbox "{mailbox}"'
+)
+def step_command_log_has_select(context: Context, account_id: str, mailbox: str) -> None:
+    records = _server_command_log(context, account_id)
+    if not any(r.command in ("SELECT", "EXAMINE") and r.mailbox == mailbox for r in records):
+        raise AssertionError(
+            f"No SELECT/EXAMINE of {mailbox!r} in the command log:\n{_format_log(records)}"
+        )
+
+
+@then(
+    'the IMAP command log for "{account_id}" contains no SELECT or EXAMINE '
+    'of the wire mailbox "{mailbox}"'
+)
+def step_command_log_has_no_select(context: Context, account_id: str, mailbox: str) -> None:
+    records = _server_command_log(context, account_id)
+    hits = [r for r in records if r.command in ("SELECT", "EXAMINE") and r.mailbox == mailbox]
+    if hits:
+        raise AssertionError(
+            f"Unexpected SELECT/EXAMINE of {mailbox!r} in the command log:\n"
+            f"{_format_log(records)}"
+        )
+
+
+@then(
+    'the IMAP command log for "{account_id}" contains no command addressing '
+    'the mailbox "{mailbox}"'
+)
+def step_command_log_never_addresses(context: Context, account_id: str, mailbox: str) -> None:
+    records = _server_command_log(context, account_id)
+    hits = [r for r in records if r.mailbox == mailbox]
+    if hits:
+        raise AssertionError(
+            f"Unexpected command addressing {mailbox!r} in the command log:\n"
+            f"{_format_log(records)}"
+        )
+
+
+@then('the IMAP command log for "{account_id}" contains no STORE command')
+def step_command_log_has_no_store(context: Context, account_id: str) -> None:
+    records = _server_command_log(context, account_id)
+    hits = [r for r in records if r.command in ("STORE", "UID STORE")]
+    if hits:
+        raise AssertionError(f"Unexpected STORE in the command log:\n{_format_log(records)}")

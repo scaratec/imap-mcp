@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import (
+    FolderNotSelectable,
     LabelMutationFailed,
     TargetFolderMissing,
     UidNotFound,
@@ -139,15 +140,20 @@ async def _handle_move_gmail_label_swap(
     """Gmail intra-account branch: remove the source label and add the
     target label. Gmail folders are label projections over a single
     [Gmail]/All Mail store, so this is the correct primitive instead
-    of IMAP MOVE."""
+    of IMAP MOVE.
+
+    Both folders arrive canonical (ADR 0033); the labels derive from
+    the canonical paths, and the source folder is selected under its
+    wire path from the account's alias map."""
     from ..imap_core import _LABEL_TO_FOLDER
 
     account, password = await _password_for(context, src_account)
     folder_to_label: dict[str, str] = {v: k for k, v in _LABEL_TO_FOLDER.items()}
     src_label = folder_to_label.get(src_folder, src_folder)
     dst_label = folder_to_label.get(dst_folder, dst_folder)
+    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
     try:
-        await imap_gmail_label_swap(account, password, src_uid, src_label, dst_label)
+        await imap_gmail_label_swap(account, password, imap_src, src_uid, src_label, dst_label)
     except LabelMutationFailed as e:
         return _error_saga(
             error_type="provider_rejected",
@@ -158,6 +164,13 @@ async def _handle_move_gmail_label_swap(
             target_folder=dst_folder,
             uid=src_uid,
             imap_response=e.response_text or e.status,
+        )
+    except FolderNotSelectable:
+        return _error_saga(
+            error_type="folder_absent",
+            account=src_account,
+            folder=src_folder,
+            uid=src_uid,
         )
     except RuntimeError:
         return _error_saga(

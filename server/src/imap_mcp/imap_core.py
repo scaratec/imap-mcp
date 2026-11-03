@@ -208,38 +208,59 @@ class FolderInfo:
     flags: str = ""
 
 
+async def _list_selectable(imap: IMAP4) -> list[tuple[str, str]]:
+    """Issue LIST and return (UTF-8 path, flags) for every selectable mailbox."""
+    status, response = await imap.list('""', "*")
+    if status != "OK":
+        raise RuntimeError(f"IMAP LIST failed: {status} {response!r}")
+    entries: list[tuple[str, str]] = []
+    for raw in response:
+        if isinstance(raw, bytes) is False:
+            continue
+        line = raw.strip()
+        if not line or line.endswith(b"LIST completed") or line == b"Done":
+            continue
+        match = _LIST_LINE.search(line)
+        if not match:
+            continue
+        flags_raw = match.group("flags").decode("utf-8", errors="replace")
+        if "\\Noselect" in flags_raw:
+            continue
+        name_raw = match.group("name").strip()
+        if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
+            name_raw = name_raw[1:-1]
+        entries.append((decode_mutf7(name_raw.decode("utf-8")), flags_raw))
+    return entries
+
+
 async def list_folders(account: Account, password: str) -> list[FolderInfo]:
     """Connect, authenticate, LIST + STATUS per folder, logout."""
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
 
     try:
-        status, response = await imap.list('""', "*")
-        if status != "OK":
-            raise RuntimeError(f"IMAP LIST failed: {status} {response!r}")
-        entries: list[tuple[str, str]] = []
-        for raw in response:
-            if isinstance(raw, bytes) is False:
-                continue
-            line = raw.strip()
-            if not line or line.endswith(b"LIST completed") or line == b"Done":
-                continue
-            match = _LIST_LINE.search(line)
-            if not match:
-                continue
-            flags_raw = match.group("flags").decode("utf-8", errors="replace")
-            if "\\Noselect" in flags_raw:
-                continue
-            name_raw = match.group("name").strip()
-            if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
-                name_raw = name_raw[1:-1]
-            entries.append((decode_mutf7(name_raw.decode("utf-8")), flags_raw))
-
+        entries = await _list_selectable(imap)
         result: list[FolderInfo] = []
         for folder_path, flags in entries:
             count = await _folder_message_count(imap, folder_path)
             result.append(FolderInfo(path=folder_path, message_count=count, flags=flags))
         return result
+    finally:
+        await imap.logout()
+
+
+async def list_mailboxes(account: Account, password: str) -> list[FolderInfo]:
+    """Connect, authenticate, LIST only, logout.
+
+    The cheap variant of `list_folders` for callers that need paths and
+    special-use flags but no message counts (ADR 0033 alias map).
+    `message_count` is left at 0.
+    """
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        entries = await _list_selectable(imap)
+        return [FolderInfo(path=path, message_count=0, flags=flags) for path, flags in entries]
     finally:
         await imap.logout()
 
@@ -263,7 +284,8 @@ def build_folder_alias_map(folders: list[FolderInfo]) -> dict[str, str]:
     the canonical English name, a mapping entry is created so that
     policy paths can be resolved to the actual IMAP path.
 
-    Returns: {canonical_path: actual_imap_path}
+    Returns: {canonical_path: actual_imap_path}, both in UTF-8; the
+    mUTF-7 wire encoding is applied later by `_quote_mailbox`.
     """
     alias_map: dict[str, str] = {}
     for fi in folders:
@@ -814,8 +836,8 @@ async def folder_stats(account: Account, password: str, folder: str) -> FolderSt
     Per ADR 0025, three outcomes are reported separately so the handler
     can map each to its own reason / error.type:
 
-      - kind="ok"      → SELECT succeeded; (exists, uid_list) is set.
-      - kind="absent"  → IMAP LIST reports the folder does not exist.
+      - kind="ok"      → EXAMINE succeeded; `exists` is set.
+      - kind="absent"  → EXAMINE was refused: the folder does not exist.
       - kind="select_failed" → folder is present per LIST but SELECT
         returned BAD/NO. `imap_response` carries the raw status text.
     """
@@ -823,31 +845,30 @@ async def folder_stats(account: Account, password: str, folder: str) -> FolderSt
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
-        # STATUS distinguishes "no such folder" (server returns NO) from
-        # "exists, here's the count". STATUS gives us MESSAGES directly,
-        # so for the existence + count answer we don't need SELECT at
-        # all. SELECT is only needed when the caller will subsequently
-        # use the UIDs (e.g. for a bulk store), and that path uses
-        # `store_flags_batch` which selects internally.
-        status, data = await imap.status(quoted, "(MESSAGES)")
+        # EXAMINE opens the folder read-only and reports EXISTS, so it
+        # answers existence and count in one round trip without
+        # touching \Recent. A NO is the IMAP signal for "this mailbox
+        # is unknown to the server" (RFC 3501 §6.3.2). Opening the
+        # mailbox (rather than STATUS) keeps folder_stats on the same
+        # addressing path as every other folder-opening tool, which is
+        # what a localized Gmail account rejects for the English name
+        # (ADR 0033).
+        status, data = await imap.examine(quoted)
         if status != "OK":
-            # STATUS NO is the IMAP signal for "this mailbox is unknown
-            # to the server" (RFC 3501 §6.3.10).  We do not have a
-            # response text to distinguish select_failed here because
-            # STATUS does not surface BAD differently — that path
-            # remains testable through the SELECT-injection step until
-            # a richer wire-error helper exists.
             return FolderStatsResult(kind="absent")
         count = 0
         for part in data:
             if isinstance(part, bytes):
-                m = _STATUS_MESSAGES.search(part)
+                m = _EXISTS_LINE.search(part)
                 if m:
                     count = int(m.group(1))
                     break
         return FolderStatsResult(kind="ok", exists=count, uids=[])
     finally:
         await imap.logout()
+
+
+_EXISTS_LINE = re.compile(rb"^\s*(\d+)\s+EXISTS\b")
 
 
 @dataclass(frozen=True)
@@ -978,6 +999,21 @@ class UidStale(RuntimeError):
     """UIDVALIDITY changed between SELECT and the next mutating
     command. A new MOVE/COPY against the original UID would target a
     different message; the saga must re-resolve before retrying."""
+
+
+class FolderNotSelectable(RuntimeError):
+    """SELECT of a folder was refused (NO/BAD).
+
+    Raised where the caller must tell a wrong folder name apart from a
+    wrong UID: ADR 0025 reports it as ``folder_absent``, never as
+    ``uid_not_found`` (ADR 0033).
+    """
+
+    def __init__(self, folder: str, status: str, response_text: str) -> None:
+        super().__init__(f"SELECT {folder!r} failed: {status} {response_text}")
+        self.folder = folder
+        self.status = status
+        self.response_text = response_text
 
 
 class LabelMutationFailed(RuntimeError):
@@ -1426,11 +1462,15 @@ def _response_text(lines: list[bytes | bytearray] | None) -> str:
 async def gmail_label_swap(
     account: Account,
     password: str,
+    folder: str,
     uid: int,
     remove_label: str,
     add_label: str,
 ) -> None:
     """ADD the target label, then REMOVE the source label.
+
+    `folder` is the source folder's wire path (already resolved through
+    the account's alias map, ADR 0033); the UID is relative to it.
 
     Gmail folders are label projections: removing the source label
     first detaches the UID from the selected mailbox, so the next
@@ -1438,15 +1478,15 @@ async def gmail_label_swap(
     therefore run before REMOVE while the source label is still
     keeping the UID visible in the selected folder.
     """
-    folder = _quote_mailbox(_label_to_folder(remove_label))
+    quoted = _quote_mailbox(folder)
     wire_add = _encode_gmail_label(add_label)
     wire_remove = _encode_gmail_label(remove_label)
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
-        status, _ = await imap.select(folder)
+        status, lines = await imap.select(quoted)
         if status != "OK":
-            raise RuntimeError(f"cannot SELECT {folder!r}")
+            raise FolderNotSelectable(folder, status, _response_text(lines))
         status, lines = await imap.uid(
             "store", str(uid), "+X-GM-LABELS", f"({_quote_gmail_label(wire_add)})"
         )
@@ -1543,7 +1583,7 @@ def _encode_gmail_label(label: str) -> str:
     return encode_mutf7(label)
 
 
-# Maps Gmail system labels back to IMAP folder paths.
+# Maps Gmail system labels to their canonical folder paths.
 _LABEL_TO_FOLDER: dict[str, str] = {
     "\\Inbox": "INBOX",
     "\\Sent": "[Gmail]/Sent Mail",
@@ -1553,8 +1593,3 @@ _LABEL_TO_FOLDER: dict[str, str] = {
     "\\Starred": "[Gmail]/Starred",
     "\\Important": "[Gmail]/Important",
 }
-
-
-def _label_to_folder(label: str) -> str:
-    """Map a Gmail label to the corresponding IMAP folder name."""
-    return _LABEL_TO_FOLDER.get(label, label)

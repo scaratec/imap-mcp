@@ -28,7 +28,12 @@ from mcp.types import (
 )
 
 from .context import ServerContext, _package_version
-from .handlers._common import READ_TOOL_MIN_VIS, TOOL_SET_VERSION, WRITE_TOOL_CAP
+from .handlers._common import (
+    READ_TOOL_MIN_VIS,
+    TOOL_SET_VERSION,
+    WRITE_TOOL_CAP,
+    canonicalize_folder_arguments,
+)
 from .handlers.accounts import (
     handle_list_accounts,
     handle_list_folders,
@@ -162,6 +167,11 @@ def build_server(context: ServerContext) -> Server:
             },
         ) as span:
             start = _time.monotonic()
+            # ADR 0033: Gmail special-use folders are canonical from
+            # here on — for policy, IMAP resolution, response, audit.
+            arguments = await canonicalize_folder_arguments(context, arguments)
+            if "folder" in arguments:
+                span.set_attribute("mcp.folder", arguments["folder"])
             result = await _dispatch(context, name, arguments)
             elapsed_ms = int((_time.monotonic() - start) * 1000)
             span.set_attribute("mcp.decision", result.get("decision", ""))

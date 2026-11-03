@@ -96,6 +96,10 @@ class SagaResult:
 
 
 AccountResolver = Callable[[str], Awaitable[tuple[Account, str]]]
+# (account_id, canonical folder path) -> wire folder path (ADR 0033).
+FolderResolver = Callable[[str, str], Awaitable[str]]
+
+_GMAIL_ALL_MAIL = "[Gmail]/All Mail"
 
 
 class SagaManager:
@@ -108,11 +112,13 @@ class SagaManager:
         retry_limit: int = 3,
         account_resolver: AccountResolver | None = None,
         test_hooks: Any = None,
+        folder_resolver: FolderResolver | None = None,
     ) -> None:
         self.wal = wal
         self.audit = audit_emitter
         self.retry_limit = retry_limit
         self.account_resolver = account_resolver
+        self.folder_resolver = folder_resolver
         # test_hooks is accepted for DI symmetry with OAuthManager and
         # context._build_context, but the crash/pause helpers read the
         # process-global TestHooks singleton since they fire from deep
@@ -291,7 +297,9 @@ class SagaManager:
             # Gmail cross-account: resolve the canonical
             # [Gmail]/All Mail UID via X-GM-MSGID so the FETCH reads
             # the full message from All Mail (which always has the
-            # complete RFC822 payload regardless of label state).
+            # complete RFC822 payload regardless of label state). On a
+            # localized account All Mail has another wire name, so it
+            # is resolved through the account's alias map (ADR 0033).
             fetch_folder = src_folder
             fetch_uid = src_uid
             if _is_google_provider(src_account):
@@ -300,14 +308,17 @@ class SagaManager:
                         src_account, src_password, src_folder, src_uid
                     )
                     if gm_msgid is not None:
+                        all_mail = _GMAIL_ALL_MAIL
+                        if self.folder_resolver is not None:
+                            all_mail = await self.folder_resolver(src_account.id, all_mail)
                         all_mail_hits = await gmail_search_by_msgid(
                             src_account,
                             src_password,
-                            "[Gmail]/All Mail",
+                            all_mail,
                             gm_msgid,
                         )
                         if all_mail_hits:
-                            fetch_folder = "[Gmail]/All Mail"
+                            fetch_folder = all_mail
                             fetch_uid = all_mail_hits[0]
                 except Exception:  # noqa: BLE001, S110 - optional All Mail lookup
                     pass  # fall back to direct fetch from source folder

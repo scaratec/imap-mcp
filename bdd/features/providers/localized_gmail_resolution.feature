@@ -1,4 +1,3 @@
-@pending
 Feature: Gmail special-use folders resolve on every path, from the first call on
 
   ADR 0033.
@@ -152,7 +151,7 @@ Feature: Gmail special-use folders resolve on every path, from the first call on
   Scenario: A cross-account move from a localized account fetches from the localized All Mail folder
     Given the IMAP account "archive-srv" exists with provider "imap-standard" and folder "Archiv"
     And policy "de-policy" grants account "archive-srv"
-    And policy "de-policy" grants folder:
+    And policy "de-policy" grants folder on account "gupta-gmail-de":
       | folder | mode      | default | rules | move_out | accept_incoming |
       | INBOX  | blacklist | FULL    | []    | true     | false           |
     And policy "de-policy" grants folder on account "archive-srv":

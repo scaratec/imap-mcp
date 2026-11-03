@@ -95,10 +95,9 @@ async def handle_list_folders(
 
     alias_map: dict[str, str] = {}
     if _is_google_provider(account_model):
+        # Refresh the lazily built alias map (ADR 0033) from this LIST.
         alias_map = build_folder_alias_map(folder_infos)
-        if context._live.folder_aliases is None:
-            context._live.folder_aliases = {}
-        context._live.folder_aliases[account_id] = alias_map
+        context.pdp.set_folder_aliases(account_id, alias_map)
 
     reverse_map = {v: k for k, v in alias_map.items()}
     all_paths = [reverse_map.get(fi.path, fi.path) for fi in folder_infos]

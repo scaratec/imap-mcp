@@ -1393,6 +1393,27 @@ def step_caller_calls_search(
     _store_result(context, payload)
 
 
+_use_step_matcher("re")
+
+
+@when(
+    r'(?P<caller_id>\S+) calls search with account "(?P<account>[^"]+)", '
+    r'folder "(?P<folder>[^"]+)"'
+)
+def step_caller_calls_search_no_criteria(
+    context: Context, caller_id: str, account: str, folder: str
+) -> None:
+    """search without criteria, scope, limit or offset."""
+    context.last_call_account = account
+    context.last_call_folder = folder
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("search", {"account": account, "folder": folder})
+    _store_result(context, payload)
+
+
+_use_step_matcher("parse")
+
+
 @when(
     '{caller_id} calls list_messages with account "{account}", folder "{folder}", criteria {tail}'
 )

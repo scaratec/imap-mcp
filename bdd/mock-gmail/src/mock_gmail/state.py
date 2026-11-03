@@ -68,6 +68,22 @@ class Message:
     date: str = ""
 
 
+@dataclass(frozen=True)
+class CommandRecord:
+    """One IMAP command as the mock received it.
+
+    `mailbox` is the mailbox argument exactly as it travelled on the
+    wire (unquoted, still Modified UTF-7), or None for commands that do
+    not address a mailbox. `user` is the LOGIN name of the connection
+    that sent it, so a test can tell its own direct commands apart
+    from the server's.
+    """
+
+    user: str | None
+    command: str
+    mailbox: str | None
+
+
 SYSTEM_LABELS = frozenset({
     "\\Inbox", "\\Sent", "\\Drafts", "\\Trash",
     "\\Spam", "\\Starred", "\\Important",
@@ -107,6 +123,8 @@ class GmailState:
         # Test hook: (status, text) injected into the next STORE response
         # to simulate a backend rejection (e.g. OVERQUOTA).
         self.next_store_rejection: tuple[str, str] | None = None
+        # Every command received, in order, across all connections.
+        self.command_log: list[CommandRecord] = []
 
     def reset(self) -> None:
         self.messages.clear()
@@ -118,6 +136,7 @@ class GmailState:
         self.record_store_operations = False
         self.store_operations.clear()
         self.next_store_rejection = None
+        self.command_log.clear()
 
     def set_localized_folders(
         self, mapping: list[tuple[str, str, str]]
@@ -151,6 +170,27 @@ class GmailState:
             if folder == localized:
                 return canonical
         return folder
+
+    def mailbox_for_wire_name(self, wire: str) -> str | None:
+        """Resolve a mailbox name received on the wire to internal state.
+
+        Real Gmail knows a localized system folder only under its
+        localized name: on a German account `[Gmail]/Drafts` does not
+        exist. So a canonical name whose folder is localized resolves
+        to None (no such mailbox); the localized name resolves to the
+        canonical key the state uses internally; anything else passes
+        through.
+        """
+        if wire in self._localized_folders:
+            return None
+        return self._resolve_localized(wire)
+
+    def folder_exists(self, folder: str) -> bool:
+        """True when `folder` (internal name) is a mailbox Gmail would list."""
+        if folder.upper() == "INBOX":
+            return True
+        known = set(self.all_folders())
+        return folder in known or decode_mutf7(folder) in known
 
     def messages_in_folder(self, folder: str) -> list[tuple[int, Message]]:
         folder = self._resolve_localized(folder)

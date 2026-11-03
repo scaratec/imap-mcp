@@ -43,7 +43,6 @@ class _LiveState:
     pdp: PolicyDecisionPoint
     configuration: Configuration
     oauth_manager: OAuthManager | None = None
-    folder_aliases: dict[str, dict[str, str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -177,5 +176,11 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
 
             return await _password_for(context, account_id)
 
+        async def _folder_resolver(account_id: str, canonical_path: str) -> str:
+            from .handlers._common import _resolve_imap_folder
+
+            return await _resolve_imap_folder(context, account_id, canonical_path)
+
         saga_mgr.account_resolver = _resolver
+        saga_mgr.folder_resolver = _folder_resolver
     return context, configuration
