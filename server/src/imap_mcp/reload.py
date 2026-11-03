@@ -82,8 +82,22 @@ def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
                     }
                 )
 
-    # Pool-drain audit per removed account (no actual pool today;
-    # ADR 0013's pool will hook in here when its scenarios activate).
+    # ADR 0013: connections of a removed account, or of one whose server,
+    # user or authentication changed, must not be reused. Changed keys
+    # would also be caught at the next lease; draining closes the idle
+    # sockets now instead of when the account is next used.
+    from .imap_core import drain_connection_pool
+
+    new_accounts = {a.id: a for a in new_config.accounts_file.accounts}
+    for old_acct in old_config.accounts_file.accounts:
+        changed = new_accounts.get(old_acct.id)
+        if changed is None or (
+            (changed.host, changed.port, changed.user, changed.auth)
+            != (old_acct.host, old_acct.port, old_acct.user, old_acct.auth)
+        ):
+            drain_connection_pool(old_acct.id)
+
+    # Pool-drain audit per removed account.
     if audit is not None:
         old_ids = {a.id for a in old_config.accounts_file.accounts}
         new_ids = {a.id for a in new_config.accounts_file.accounts}

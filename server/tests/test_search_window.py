@@ -10,6 +10,8 @@ symmetrically and never replaced by a silent zero.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -343,7 +345,7 @@ class _FakeImap:
     def __init__(self, select: str, search: tuple[str, list[bytes]]) -> None:
         self._select = select
         self._search = search
-        self.logged_out = False
+        self.released = False
 
     async def select(self, folder: str) -> tuple[str, list[bytes]]:
         return self._select, []
@@ -351,26 +353,24 @@ class _FakeImap:
     async def uid_search(self, criteria: str) -> tuple[str, list[bytes]]:
         return self._search
 
-    async def logout(self) -> None:
-        self.logged_out = True
 
 
 def _patch_connection(monkeypatch: pytest.MonkeyPatch, fake: _FakeImap) -> None:
-    async def open_imap(account: Any) -> _FakeImap:
-        return fake
+    @asynccontextmanager
+    async def session(account: Any, password: str, **_: Any) -> AsyncIterator[_FakeImap]:
+        try:
+            yield fake
+        finally:
+            fake.released = True
 
-    async def authenticate(imap: Any, account: Any, password: str) -> None:
-        return None
-
-    monkeypatch.setattr(imap_core, "_open_imap", open_imap)
-    monkeypatch.setattr(imap_core, "_authenticate_imap", authenticate)
+    monkeypatch.setattr(imap_core, "_imap_session", session)
 
 
 async def test_count_uids_counts_the_search_result(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeImap("OK", ("OK", [b"2 3 4", b"SEARCH completed"]))
     _patch_connection(monkeypatch, fake)
     assert await imap_core.count_uids(Account(id=ACCOUNT), "pw", "INBOX", "BEFORE x") == 3
-    assert fake.logged_out
+    assert fake.released
 
 
 async def test_count_uids_of_nothing_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -389,4 +389,4 @@ async def test_a_refused_count_raises_instead_of_reading_zero(
     _patch_connection(monkeypatch, fake)
     with pytest.raises(RuntimeError):
         await imap_core.count_uids(Account(id=ACCOUNT), "pw", "INBOX", "BEFORE x")
-    assert fake.logged_out
+    assert fake.released

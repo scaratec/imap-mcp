@@ -748,6 +748,74 @@ def step_assert_max_connections(context: Context, n: int) -> None:
     )
 
 
+@given('the folder "{folder}" on "{account_id}" holds messages:')
+def step_folder_on_account_holds_messages(
+    context: Context, folder: str, account_id: str
+) -> None:
+    """Seed the table's messages into `folder` of `account_id`.
+
+    mock-gmail accounts are seeded straight into the mock's state with
+    the uid column as the UID, so seeding opens no IMAP connection that
+    a connection count would see. Other accounts go through the common
+    staged seeding (`the folder "..." of "..." holds messages:`).
+    Columns: uid, from, subject, date (ISO 8601); To and Message-ID
+    follow the common seeding's conventions.
+    """
+    instance, user = resolve_account(account_id)
+    if instance != "mock-gmail":
+        from features.steps.policy_steps import _seed_message
+
+        _seed_message(context, account_id, folder)
+        return
+    from datetime import datetime, timezone
+    from email.message import EmailMessage
+    from email.policy import SMTP
+    from email.utils import format_datetime
+
+    from mock_gmail.state import FOLDER_TO_LABEL, Message
+
+    expected = {"uid", "from", "subject", "date"}
+    if set(context.table.headings) != expected:
+        raise AssertionError(
+            f"Seeding table needs exactly the columns {sorted(expected)}; "
+            f"got {context.table.headings!r}"
+        )
+    state = _gmail_state(context)
+    label = FOLDER_TO_LABEL.get(folder, folder)
+    if label == "__ALL_MAIL__":
+        raise AssertionError("Seed a message into a labelled folder, not into All Mail.")
+    context.message_uids = getattr(context, "message_uids", {})
+    for row in context.table:
+        uid = int(row["uid"])
+        parsed = datetime.fromisoformat(row["date"].replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        date_header = format_datetime(parsed)
+        message_id = f"<scenario-{uid}@bdd.local>"
+        mime = EmailMessage()
+        mime["From"] = row["from"]
+        mime["To"] = f"{user}@bdd.local"
+        mime["Subject"] = row["subject"]
+        mime["Date"] = date_header
+        mime["Message-ID"] = message_id
+        mime.set_content(f"Body for {row['subject']}")
+        msg = Message(
+            gm_msgid=state.new_msgid(),
+            gm_thrid=state.new_msgid(),
+            rfc822=mime.as_bytes(policy=SMTP),
+            labels={label},
+            message_id=message_id,
+            from_addr=row["from"],
+            to_addr=f"{user}@bdd.local",
+            subject=row["subject"],
+            date=date_header,
+        )
+        state.add_message(msg)
+        state._uid_maps.setdefault(folder, {})[msg.gm_msgid] = uid
+        state._uid_counters[folder] = max(state._uid_counters.get(folder, 0), uid)
+        context.message_uids[(account_id, folder, uid)] = uid
+
+
 # ---------------------------------------- localized Gmail folders
 
 

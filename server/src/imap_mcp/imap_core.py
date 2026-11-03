@@ -1,22 +1,23 @@
-"""Minimal IMAP client — Walking-Skeleton slice (ADR 0012, 0013).
+"""Minimal IMAP client (ADR 0012, 0013).
 
-Built on `aioimaplib`. Opens a single async connection per call for
-now; the hybrid connection pool from ADR 0013 will wrap these calls
-when the scenarios that exercise pool semantics activate.
+Built on `aioimaplib`. Every operation leases an authenticated
+connection from the per-account pool (`pool.py`, ADR 0013) through
+`_imap_session`, selects the folder it works in, and hands the
+connection back; the pool decides whether it is reused or closed.
 
 Only the operations the current tool set needs are exposed:
 - `list_folders(account)` returns the full folder path list as the
   IMAP server reports it, unfiltered by policy.
 The PDP (in `policy.py`) is responsible for reducing that list.
-
-XOAUTH2 and Gmail extensions are deferred; only plain-auth password
-logins are supported at this stage.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from aioimaplib import IMAP4, IMAP4_SSL
 
 from .config import Account
+from .pool import ConnectionPools, PoolSettings
 
 if TYPE_CHECKING:
     from email.message import Message
@@ -205,6 +207,11 @@ class TracedIMAP:
     def __init__(self, client: IMAP4) -> None:
         self._client = client
 
+    @property
+    def client(self) -> IMAP4:
+        """The untraced aioimaplib client underneath."""
+        return self._client
+
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._client, name)
         if name in _AUTH_COMMANDS:
@@ -242,33 +249,49 @@ async def _run_traced(span_name: str, attributes: dict[str, str] | None, call: A
         return response
 
 
-async def _open_imap(account: Account, *, timeout: int = 10) -> TracedIMAP:
+_COMMAND_TIMEOUT = 10
+
+
+async def _open_imap(
+    account: Account,
+    *,
+    timeout: int = _COMMAND_TIMEOUT,
+    on_lost: Callable[[], None] | None = None,
+) -> TracedIMAP:
+    """Connect and wait for the greeting. `on_lost` runs when the
+    transport closes, whoever closed it."""
     from .tracing import tracer
 
     with tracer.start_as_current_span(
         "imap.connect",
         attributes={"imap.host": account.host, "imap.port": account.port},
     ):
+        imap: IMAP4
         if account.port == 993:
             imap = IMAP4_SSL(host=account.host, port=account.port, timeout=timeout)
         else:
-            try:
-                _r, _w = await asyncio.wait_for(
-                    asyncio.open_connection(account.host, account.port),
-                    timeout=timeout,
-                )
-                _w.close()
-                try:
-                    await _w.wait_closed()
-                except Exception:  # noqa: BLE001, S110 - best-effort close of probe
-                    pass
-            except ConnectionRefusedError:
-                raise
-            except OSError as exc:
-                raise ConnectionRefusedError(*exc.args) from exc
             imap = IMAP4(host=account.host, port=account.port, timeout=timeout)
-        await imap.wait_hello_from_server()
+        if on_lost is not None:
+            imap.protocol.conn_lost_cb = lambda _exc: on_lost()
+        try:
+            await imap.wait_hello_from_server()
+        except OSError as exc:
+            # A refused or unreachable plain-IMAP server surfaces as
+            # ConnectionRefusedError, whatever the OS reported; a server
+            # that accepted the connection but did not greet in time
+            # stays a timeout.
+            _abort_transport(imap)
+            connected = imap.protocol.transport is not None
+            if account.port == 993 or connected or isinstance(exc, ConnectionRefusedError):
+                raise
+            raise ConnectionRefusedError(*exc.args) from exc
         return TracedIMAP(imap)
+
+
+def _abort_transport(imap: IMAP4) -> None:
+    transport = getattr(imap.protocol, "transport", None)
+    if transport is not None and not transport.is_closing():
+        transport.abort()
 
 
 async def _authenticate_imap(imap: IMAP4, account: Account, password: str) -> None:
@@ -318,6 +341,157 @@ async def _refresh_capabilities(imap: IMAP4, auth_lines: list[Any] | None = None
         protocol.capabilities = known
 
 
+# ------------------------------------------------------- connection pool
+# ADR 0013. The pool (pool.py) is IMAP-agnostic; this is the IMAP side:
+# what a pooled connection is, how one is opened, and the lease every
+# operation below goes through.
+
+# A NOOP on a healthy session answers within milliseconds; a socket the
+# far end dropped without a FIN would otherwise hold the caller for the
+# full command timeout.
+_HEALTHCHECK_TIMEOUT = 5.0
+_LOGOUT_TIMEOUT = 2.0
+
+
+class _PooledIMAP:
+    """One authenticated IMAP connection as the pool holds it."""
+
+    def __init__(self, imap: TracedIMAP, lost: asyncio.Event) -> None:
+        self.imap = imap
+        self._lost = lost
+        self.broken = False
+
+    def set_timeout(self, seconds: int) -> None:
+        """Per-command timeout aioimaplib applies from now on."""
+        self.imap.client.timeout = seconds
+
+    def reusable(self) -> bool:
+        if self.broken or self._lost.is_set() or _connection_lost(self.imap):
+            return False
+        return bool(self.imap.get_state() in ("AUTH", "SELECTED"))
+
+    async def healthcheck(self) -> bool:
+        """NOOP before reuse (ADR 0013). A connection whose socket is
+        already known closed fails without a round trip; otherwise the
+        NOOP races the transport closing, so a server that drops the
+        connection instead of answering fails the check at once."""
+        if not self.reusable():
+            return False
+        noop = asyncio.ensure_future(self.imap.noop())
+        lost = asyncio.ensure_future(self._lost.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {noop, lost}, timeout=_HEALTHCHECK_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (noop, lost):
+                if not task.done():
+                    task.cancel()
+        healthy = (
+            noop in done
+            and not noop.cancelled()
+            and noop.exception() is None
+            and getattr(noop.result(), "result", None) == "OK"
+            and not self._lost.is_set()
+        )
+        if not healthy:
+            self.broken = True
+        return healthy
+
+    async def close(self) -> None:
+        """LOGOUT when the session can still take it, then drop the socket."""
+        try:
+            if not self.broken and not self._lost.is_set() and not _connection_lost(self.imap):
+                await asyncio.wait_for(self.imap.logout(), _LOGOUT_TIMEOUT)
+        except Exception:  # noqa: BLE001, S110 - best-effort logout
+            pass
+        finally:
+            self.broken = True
+            _abort_transport(self.imap.client)
+
+
+async def _connect(account: Account, password: str, timeout: int) -> _PooledIMAP:
+    lost = asyncio.Event()
+    imap = await _open_imap(account, timeout=timeout, on_lost=lost.set)
+    try:
+        await _authenticate_imap(imap, account, password)
+    except BaseException:
+        _abort_transport(imap.client)
+        raise
+    return _PooledIMAP(imap, lost)
+
+
+def _pool_key(account: Account, password: str) -> str:
+    """What a pooled connection was opened for: the account's
+    connection settings and a digest of the credential. A refreshed
+    token or a changed password or server yields another key, and the
+    idle connections opened under the old one are closed, not reused."""
+    auth_type = account.auth.type if account.auth else ""
+    material = "\0".join(
+        [account.host, str(account.port), _imap_user_for(account), auth_type, password]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+_POOLS: ConnectionPools[_PooledIMAP] | None = None
+
+
+def configure_connection_pools(settings: PoolSettings) -> None:
+    """Install the process-wide pools with `settings` (server startup)."""
+    global _POOLS
+    _POOLS = ConnectionPools(settings)
+
+
+def connection_pools() -> ConnectionPools[_PooledIMAP]:
+    global _POOLS
+    if _POOLS is None:
+        _POOLS = ConnectionPools(PoolSettings.from_environment())
+    return _POOLS
+
+
+def drain_connection_pool(account_id: str) -> None:
+    """Close the pooled connections of one account (token refresh,
+    configuration change); leased ones close when they come back."""
+    if _POOLS is not None:
+        _POOLS.drain(account_id)
+
+
+async def close_connection_pools() -> None:
+    """Server shutdown: LOGOUT every pooled connection."""
+    if _POOLS is not None:
+        await _POOLS.close_all()
+
+
+@asynccontextmanager
+async def _imap_session(
+    account: Account, password: str, *, timeout: int = _COMMAND_TIMEOUT
+) -> AsyncIterator[TracedIMAP]:
+    """Lease an authenticated connection to `account` for one operation.
+
+    The connection returns to the pool afterwards unless the operation
+    failed in a way that may have left the session in an unknown state:
+    any exception other than the domain errors raised after a complete
+    tagged response (`_KEEPS_CONNECTION`) closes it. Every operation
+    issues its own SELECT/EXAMINE, so the folder a previous lease left
+    selected never matters.
+    """
+
+    async def _open() -> _PooledIMAP:
+        return await _connect(account, password, timeout)
+
+    async with connection_pools().lease(account.id, _pool_key(account, password), _open) as conn:
+        conn.set_timeout(timeout)
+        try:
+            yield conn.imap
+        except _KEEPS_CONNECTION:
+            raise
+        except BaseException:
+            conn.broken = True
+            raise
+        finally:
+            conn.set_timeout(_COMMAND_TIMEOUT)
+
+
 @dataclass(frozen=True)
 class FolderInfo:
     """Folder path with message count from IMAP STATUS."""
@@ -354,18 +528,14 @@ async def _list_selectable(imap: IMAP4) -> list[tuple[str, str]]:
 
 async def list_folders(account: Account, password: str) -> list[FolderInfo]:
     """Connect, authenticate, LIST + STATUS per folder, logout."""
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
 
-    try:
+    async with _imap_session(account, password) as imap:
         entries = await _list_selectable(imap)
         result: list[FolderInfo] = []
         for folder_path, flags in entries:
             count = await _folder_message_count(imap, folder_path)
             result.append(FolderInfo(path=folder_path, message_count=count, flags=flags))
         return result
-    finally:
-        await imap.logout()
 
 
 async def list_mailboxes(account: Account, password: str) -> list[FolderInfo]:
@@ -375,13 +545,9 @@ async def list_mailboxes(account: Account, password: str) -> list[FolderInfo]:
     special-use flags but no message counts (ADR 0033 alias map).
     `message_count` is left at 0.
     """
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         entries = await _list_selectable(imap)
         return [FolderInfo(path=path, message_count=0, flags=flags) for path, flags in entries]
-    finally:
-        await imap.logout()
 
 
 _SPECIAL_USE_TO_CANONICAL: dict[str, str] = {
@@ -464,9 +630,7 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
     from email.utils import getaddresses, parsedate_to_datetime
 
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
@@ -504,8 +668,6 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
             has_attachment=has_attachment,
             flags=flags,
         )
-    finally:
-        await imap.logout()
 
 
 def _decode_header(raw: str) -> str:
@@ -529,10 +691,8 @@ async def fetch_envelopes_batch(
     folder = _quote_mailbox(folder)
     if not uids:
         return []
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
     results: list[Envelope] = []
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return []
@@ -578,8 +738,6 @@ async def fetch_envelopes_batch(
                 )
             )
             i += 2
-    finally:
-        await imap.logout()
     return results
 
 
@@ -687,9 +845,7 @@ async def fetch_full_message(
 ) -> bytes | None:
     """Return the raw RFC822 bytes for a UID."""
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
@@ -697,8 +853,6 @@ async def fetch_full_message(
         if status != "OK":
             return None
         return _extract_literal(response)
-    finally:
-        await imap.logout()
 
 
 def mime_add_attachment(rfc822: bytes, filename: str, mime_type: str, content: bytes) -> bytes:
@@ -858,9 +1012,7 @@ async def fetch_body(
     import email
 
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
@@ -906,8 +1058,6 @@ async def fetch_body(
             flags=flags,
         )
         return envelope, body_text, message
-    finally:
-        await imap.logout()
 
 
 async def fetch_message_for_reply(
@@ -925,9 +1075,7 @@ async def fetch_message_for_reply(
     import email
 
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
@@ -959,8 +1107,6 @@ async def fetch_message_for_reply(
                     body_text = decoded
         body_text = body_text.replace("\r\n", "\n").rstrip("\n")
         return message, body_text
-    finally:
-        await imap.logout()
 
 
 async def folder_stats(account: Account, password: str, folder: str) -> FolderStatsResult:
@@ -975,9 +1121,7 @@ async def folder_stats(account: Account, password: str, folder: str) -> FolderSt
         returned BAD/NO. `imap_response` carries the raw status text.
     """
     quoted = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         # EXAMINE opens the folder read-only and reports EXISTS, so it
         # answers existence and count in one round trip without
         # touching \Recent. A NO is the IMAP signal for "this mailbox
@@ -997,8 +1141,6 @@ async def folder_stats(account: Account, password: str, folder: str) -> FolderSt
                     count = int(m.group(1))
                     break
         return FolderStatsResult(kind="ok", exists=count, uids=[])
-    finally:
-        await imap.logout()
 
 
 _EXISTS_LINE = re.compile(rb"^\s*(\d+)\s+EXISTS\b")
@@ -1026,17 +1168,13 @@ async def store_flag(
     add: bool,
 ) -> bool:
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return False
         op = "+FLAGS" if add else "-FLAGS"
         status, _ = await imap.uid("store", str(uid), op, f"({flag})")
         return bool(status == "OK")
-    finally:
-        await imap.logout()
 
 
 async def store_flags_batch(
@@ -1052,9 +1190,7 @@ async def store_flags_batch(
     folder = _quote_mailbox(folder)
     if not uids:
         return 0
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return 0
@@ -1062,8 +1198,6 @@ async def store_flags_batch(
         uid_str = ",".join(str(u) for u in uids)
         status, _ = await imap.uid("store", uid_str, op, f"({flag})")
         return len(uids) if status == "OK" else 0
-    finally:
-        await imap.logout()
 
 
 async def store_keywords(
@@ -1076,9 +1210,7 @@ async def store_keywords(
     mode: str,
 ) -> bool:
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return False
@@ -1087,8 +1219,6 @@ async def store_keywords(
         joined = " ".join(keywords)
         status, _ = await imap.uid("store", str(uid), op, f"({joined})")
         return bool(status == "OK")
-    finally:
-        await imap.logout()
 
 
 async def store_keywords_batch(
@@ -1104,9 +1234,7 @@ async def store_keywords_batch(
     folder = _quote_mailbox(folder)
     if not uids:
         return 0
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return 0
@@ -1116,8 +1244,6 @@ async def store_keywords_batch(
         uid_str = ",".join(str(u) for u in uids)
         status, _ = await imap.uid("store", uid_str, op, f"({joined})")
         return len(uids) if status == "OK" else 0
-    finally:
-        await imap.logout()
 
 
 class TargetFolderMissing(RuntimeError):
@@ -1194,9 +1320,7 @@ async def move_message(
     """Intra-account move via RFC 6851 MOVE. Returns 'native_move' or 'copy_store_expunge'."""
     folder = _quote_mailbox(folder)
     target_folder = _quote_mailbox(target_folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         # Confirm target exists before attempting the move; otherwise
         # distinguishing uid_not_found from target_folder_missing after
         # the fact would require parsing IMAP NO-response text.
@@ -1248,8 +1372,6 @@ async def move_message(
         await imap.uid("store", str(uid), "+FLAGS", r"(\Deleted)")
         await imap.expunge()
         return "copy_store_expunge"
-    finally:
-        await imap.logout()
 
 
 async def copy_message(
@@ -1261,22 +1383,30 @@ async def copy_message(
 ) -> bool:
     folder = _quote_mailbox(folder)
     target_folder = _quote_mailbox(target_folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return False
         status, _ = await imap.uid("copy", str(uid), target_folder)
         return bool(status == "OK")
-    finally:
-        await imap.logout()
 
 
 class ExpungeScopeUnsafe(RuntimeError):
     """The server offers neither MOVE nor UIDPLUS and other messages in
     the source folder already carry `\\Deleted`: the plain EXPUNGE a
     COPY-based move would need would remove them too."""
+
+
+# Raised after a complete tagged response: the session is in a known
+# state and may return to the pool (see `_imap_session`).
+_KEEPS_CONNECTION: tuple[type[Exception], ...] = (
+    TargetFolderMissing,
+    UidNotFound,
+    UidStale,
+    FolderNotSelectable,
+    LabelMutationFailed,
+    ExpungeScopeUnsafe,
+)
 
 
 async def move_uids(
@@ -1301,9 +1431,7 @@ async def move_uids(
     quoted_src = _quote_mailbox(folder)
     quoted_dst = _quote_mailbox(target_folder)
     uid_set = ",".join(str(uid) for uid in uids)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, lines = await imap.select(quoted_src)
         if status != "OK":
             raise FolderNotSelectable(folder, status, _response_text(lines))
@@ -1334,11 +1462,6 @@ async def move_uids(
         if status != "OK":
             raise RuntimeError(f"EXPUNGE failed: {status} {_response_text(lines)}")
         return "copy_store_expunge"
-    finally:
-        try:
-            await imap.logout()
-        except Exception:  # noqa: BLE001, S110 - best-effort logout
-            pass
 
 
 @dataclass(frozen=True)
@@ -1380,9 +1503,7 @@ async def append_message(
 ) -> AppendResult:
     folder = _quote_mailbox(folder)
     timeout = _append_timeout()
-    imap = await _open_imap(account, timeout=timeout)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password, timeout=timeout) as imap:
         flags_str = " ".join(flags) if flags else None
         try:
             response = await asyncio.wait_for(
@@ -1409,11 +1530,6 @@ async def append_message(
                 reason = str(last)
             reason = reason.rstrip("\r\n")
         return AppendResult(outcome="rejected", imap_response=reason)
-    finally:
-        try:
-            await imap.logout()
-        except Exception:  # noqa: BLE001, S110 - best-effort logout
-            pass
 
 
 async def fetch_raw_with_flags(
@@ -1421,9 +1537,7 @@ async def fetch_raw_with_flags(
 ) -> tuple[bytes, tuple[str, ...]] | None:
     """Fetch RFC822 bytes and FLAGS for a UID. Returns None if absent."""
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
@@ -1435,8 +1549,6 @@ async def fetch_raw_with_flags(
             return None
         flags = _extract_flags(response)
         return raw, flags
-    finally:
-        await imap.logout()
 
 
 def _bytearray_literal_at(response: list[bytes | bytearray], start: int) -> bytes | None:
@@ -1467,10 +1579,8 @@ async def fetch_raw_headers_batch(
     folder = _quote_mailbox(folder)
     if not uids:
         return {}
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
     out: dict[int, bytes] = {}
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return {}
@@ -1488,8 +1598,6 @@ async def fetch_raw_headers_batch(
             if uid_val is not None:
                 out[uid_val] = raw_header
             i += 2
-    finally:
-        await imap.logout()
     return out
 
 
@@ -1498,9 +1606,7 @@ async def search_uids(
 ) -> list[int]:
     """Execute a SEARCH in `folder` and return the matching UIDs."""
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return []
@@ -1513,8 +1619,6 @@ async def search_uids(
         if not raw:
             return []
         return [int(token) for token in raw.split()]
-    finally:
-        await imap.logout()
 
 
 async def count_uids(account: Account, password: str, folder: str, criteria: str) -> int:
@@ -1525,9 +1629,7 @@ async def count_uids(account: Account, password: str, folder: str, criteria: str
     call rather than read as zero.
     """
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, lines = await imap.select(folder)
         if status != "OK":
             raise FolderNotSelectable(folder, status, _response_text(lines))
@@ -1536,8 +1638,6 @@ async def count_uids(account: Account, password: str, folder: str, criteria: str
             raise RuntimeError(f"count SEARCH failed: {status}")
         raw = response[0] if response and isinstance(response[0], bytes) else b""
         return len(raw.split())
-    finally:
-        await imap.logout()
 
 
 async def expunge_uids(account: Account, password: str, folder: str, uids: list[int]) -> int:
@@ -1551,9 +1651,7 @@ async def expunge_uids(account: Account, password: str, folder: str, uids: list[
     if not uids:
         return 0
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             raise RuntimeError(f"SELECT {folder!r} failed: {status}")
@@ -1565,11 +1663,6 @@ async def expunge_uids(account: Account, password: str, folder: str, uids: list[
         if status != "OK":
             raise RuntimeError(f"EXPUNGE failed: {status}")
         return len(uids)
-    finally:
-        try:
-            await imap.logout()
-        except Exception:  # noqa: BLE001, S110 - best-effort logout
-            pass
 
 
 def _extract_literal(response: list[bytes | bytearray]) -> bytes | None:
@@ -1603,9 +1696,7 @@ async def gmail_search_by_msgid(
 ) -> list[int]:
     """SEARCH X-GM-MSGID <id> in the given folder."""
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return []
@@ -1618,16 +1709,12 @@ async def gmail_search_by_msgid(
         if not raw:
             return []
         return [int(token) for token in raw.split()]
-    finally:
-        await imap.logout()
 
 
 async def gmail_fetch_labels(account: Account, password: str, folder: str, uid: int) -> list[str]:
     """FETCH (X-GM-LABELS) for a single UID."""
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return []
@@ -1643,16 +1730,12 @@ async def gmail_fetch_labels(account: Account, password: str, folder: str, uid: 
             if m:
                 return _parse_gmail_label_list(m.group(1))
         return []
-    finally:
-        await imap.logout()
 
 
 async def gmail_fetch_msgid(account: Account, password: str, folder: str, uid: int) -> int | None:
     """FETCH (X-GM-MSGID) for a single UID."""
     folder = _quote_mailbox(folder)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
@@ -1667,8 +1750,6 @@ async def gmail_fetch_msgid(account: Account, password: str, folder: str, uid: i
             if m:
                 return int(m.group(1))
         return None
-    finally:
-        await imap.logout()
 
 
 def _response_text(lines: list[bytes | bytearray] | None) -> str:
@@ -1713,9 +1794,7 @@ async def gmail_label_swap(
     quoted = _quote_mailbox(folder)
     wire_add = _encode_gmail_label(add_label)
     wire_remove = _encode_gmail_label(remove_label)
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, lines = await imap.select(quoted)
         if status != "OK":
             raise FolderNotSelectable(folder, status, _response_text(lines))
@@ -1738,8 +1817,6 @@ async def gmail_label_swap(
         )
         if status != "OK":
             raise LabelMutationFailed("remove", remove_label, status, _response_text(lines))
-    finally:
-        await imap.logout()
 
 
 # Gmail system labels whose mailbox, once the label is added, is the
@@ -1755,9 +1832,7 @@ async def gmail_list_labels(account: Account, password: str) -> list[dict[str, s
     Each dict contains: ``name`` (folder path), ``flags`` (raw IMAP
     flags string), ``separator`` (hierarchy delimiter).
     """
-    imap = await _open_imap(account)
-    await _authenticate_imap(imap, account, password)
-    try:
+    async with _imap_session(account, password) as imap:
         status, response = await imap.list('""', "*")
         if status != "OK":
             raise RuntimeError(f"IMAP LIST failed: {status} {response!r}")
@@ -1785,8 +1860,6 @@ async def gmail_list_labels(account: Account, password: str) -> list[dict[str, s
                 }
             )
         return labels
-    finally:
-        await imap.logout()
 
 
 def _parse_gmail_label_list(raw: str) -> list[str]:

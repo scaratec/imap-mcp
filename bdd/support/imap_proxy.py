@@ -40,6 +40,9 @@ the live Dovecot cannot produce on its own:
 Every client→upstream command line is also written, with a UTC
 timestamp, into a per-account command log file. The harness reads
 the file as a second verification channel (BDD Guidelines §13.2).
+Every accepted client connection likewise appends one timestamped line
+to `connection_log_path`, so a scenario can count the IMAP connections
+the server opened.
 
 The proxy parses only enough of the IMAP framing to honour
 synchronous literals (`{N}`-prefixed continuation lines). It does NOT
@@ -53,6 +56,7 @@ Configuration is loaded from the JSON file pointed at by
       "upstream_host": "127.0.0.1",
       "upstream_port": 11143,
       "command_log_path": "/tmp/.../proxy.log",
+      "connection_log_path": "/tmp/.../proxy-connections.log",
       "strip_capabilities": ["MOVE"],
       "uidvalidity_change_after": "UID SEARCH",
       "uidvalidity_new_value": "99999",
@@ -467,6 +471,18 @@ class ProxySession:
                 return
 
 
+def _log_connection(config: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+    path = config.get("connection_log_path")
+    if not path:
+        return
+    peer = writer.get_extra_info("peername")
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{_now_iso()}\tCONNECT {peer!r}\n")
+    except OSError:
+        pass
+
+
 async def _main(host: str, port: int, config_path: Path) -> None:
     # Load the config dict ONCE per proxy process and share it across
     # every session. Fault counters (`inject_failure_on[*].remaining`,
@@ -478,6 +494,7 @@ async def _main(host: str, port: int, config_path: Path) -> None:
     async def _on_client(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        _log_connection(shared_config, writer)
         session = ProxySession(reader, writer, shared_config)
         try:
             await session.run()

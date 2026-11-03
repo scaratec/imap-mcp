@@ -17,6 +17,7 @@ from mcp.server.stdio import stdio_server
 
 from ..context import ServerContext, _build_context
 from ..dispatch import build_server
+from ..imap_core import close_connection_pools
 from ..reload import _install_sighup_handler
 from ..tracing import install_sigterm_flush
 
@@ -55,6 +56,7 @@ async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
                 app.create_initialization_options(),
             )
     finally:
+        await close_connection_pools()
         await context.oauth_manager.aclose()
 
 

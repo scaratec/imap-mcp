@@ -2361,6 +2361,7 @@ def _start_imap_proxy(
     upstream_host, upstream_port = context.imap_instances[instance]
 
     log_path = context.scratch_dir / f"imap-proxy-{account_id}.log"
+    connection_log_path = context.scratch_dir / f"imap-proxy-{account_id}-connections.log"
     config_path = context.scratch_dir / f"imap-proxy-{account_id}.json"
 
     # Merge new keys into any existing config file for this account.
@@ -2374,6 +2375,7 @@ def _start_imap_proxy(
     config.setdefault("upstream_host", upstream_host)
     config.setdefault("upstream_port", upstream_port)
     config.setdefault("command_log_path", str(log_path))
+    config.setdefault("connection_log_path", str(connection_log_path))
     if strip_capabilities is not None:
         config["strip_capabilities"] = list(strip_capabilities)
     config.setdefault("strip_capabilities", [])
@@ -2405,6 +2407,9 @@ def _start_imap_proxy(
     if not hasattr(context, "imap_proxy_log_paths"):
         context.imap_proxy_log_paths = {}
     context.imap_proxy_log_paths[account_id] = log_path
+    if not hasattr(context, "imap_proxy_connection_log_paths"):
+        context.imap_proxy_connection_log_paths = {}
+    context.imap_proxy_connection_log_paths[account_id] = Path(config["connection_log_path"])
 
     # Refuse-mode: pick a port, don't bind anything to it, rewire the
     # account. `connect()` to a port nothing listens on returns
@@ -2472,12 +2477,15 @@ def _start_imap_proxy(
     return proxy_port
 
 
-_COMMAND_LOG_WITNESS = re.compile(r'the IMAP command log for "([^"]+)"')
+_COMMAND_LOG_WITNESS = re.compile(
+    r'the IMAP (?:command log for|connections opened for account) "([^"]+)"'
+)
 
 
 def capture_witnessed_command_logs(context: Context) -> None:
     """Put the pass-through proxy in front of every Dovecot-backed account
-    whose IMAP command log the current scenario witnesses.
+    whose IMAP command log or connection count the current scenario
+    witnesses.
 
     Called once, just before the server process starts: the proxy can
     only record what passes through it, so it must be wired into the

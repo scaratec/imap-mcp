@@ -404,6 +404,10 @@ See [ADR 0018](docs/adr/0018-non-goal-tool-surface.md).
 | `IMAP_MCP_HTTP_HOST` | no | Bind address for HTTP (default: `127.0.0.1`) |
 | `IMAP_MCP_HTTP_PORT` | no | Port for HTTP (default: `0` = ephemeral) |
 | `IMAP_MCP_APPEND_TIMEOUT` | no | Timeout in seconds for IMAP APPEND |
+| `IMAP_MCP_POOL_MAX_SIZE` | no | Pooled IMAP connections per account (default: `4`, ADR 0013). Gmail allows about 15 concurrent connections per account across all clients and server instances |
+| `IMAP_MCP_POOL_IDLE_TTL` | no | Seconds an unused pooled connection stays open (default: `600`) |
+| `IMAP_MCP_POOL_MAX_AGE` | no | Seconds after which a pooled connection is closed however busy it is (default: `3600`) |
+| `IMAP_MCP_POOL_ACQUIRE_TIMEOUT` | no | Seconds a call waits for a free connection when all are in use (default: `30`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | OTLP endpoint for tracing (e.g. `http://localhost:4317`) |
 | `OTEL_RESOURCE_ATTRIBUTES` | no | Extra resource attributes on every span, e.g. `run.id=…,harness=…` |
 | `IMAP_MCP_TRACE_PAYLOADS` | no | `off`, `redacted` (default) or `full`: what tool spans record of request and response (ADR 0037) |

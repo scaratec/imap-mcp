@@ -153,6 +153,54 @@ class MCPClient:
             {"name": name, "arguments": arguments},
         )
 
+    def call_tools_concurrently(
+        self, calls: list[tuple[str, dict[str, Any]]], timeout: float = 60.0
+    ) -> list[dict[str, Any]]:
+        """Send every `tools/call` request before reading any response, so
+        the server has all of them in flight at once; return the results
+        in request order. JSON-RPC errors raise MCPRPCError."""
+        request_ids = [str(uuid.uuid4()) for _ in calls]
+        for request_id, (name, arguments) in zip(request_ids, calls):
+            self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                }
+            )
+        if self._stdout is None:
+            raise MCPClientError("Server stdout not available")
+        pending = set(request_ids)
+        responses: dict[str, dict[str, Any]] = {}
+        deadline = time.monotonic() + timeout
+        while pending:
+            if time.monotonic() >= deadline:
+                raise MCPClientError(
+                    f"Timed out waiting for {len(pending)} of {len(calls)} responses"
+                )
+            line = self._stdout.readline()
+            if not line:
+                raise MCPClientError(
+                    f"Server closed stdout with {len(pending)} responses outstanding. "
+                    f"Stderr:\n{self.stderr_text}"
+                )
+            line = line.strip()
+            if not line:
+                continue
+            message = json.loads(line.decode("utf-8"))
+            if message.get("id") in pending:
+                pending.discard(message["id"])
+                responses[message["id"]] = message
+        results: list[dict[str, Any]] = []
+        for request_id in request_ids:
+            response = responses[request_id]
+            if "error" in response:
+                err = response["error"]
+                raise MCPRPCError(err["code"], err.get("message", ""), err.get("data"))
+            results.append(response.get("result", {}))
+        return results
+
     def raw_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Escape hatch for calling arbitrary JSON-RPC methods.
 

@@ -41,12 +41,12 @@ corresponding layer here.
 | L10| Secret store                            | 10    | 7       | 3        | 0   |
 | L11| Audit log                               | 11    | 8 (+3 covered_by_LIM-0009) | 0 | 0 |
 | L12| Configuration loading                   | 13    | 12      | 1        | 0   |
-| L13| Connection pool / IMAP session          | 12    | 0 (+7 specified @pending) | 5 | 0 |
+| L13| Connection pool / IMAP session          | 12    | 9       | 3        | 0   |
 | L14| Gmail-specific semantics                | 33    | 23 (+7 covered_by_LIM-0002) | 3 | 0 |
 | L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
 | L16| Agent-facing draft and search contract  | 29    | 29      | 0        | 0   |
 | L17| Observability (traces)                  | 23    | 23      | 0        | 0   |
-|    | **Total**                               | 278   | 169 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +31 specified @pending) | 60 | 0 |
+|    | **Total**                               | 278   | 178 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +24 specified @pending) | 58 | 0 |
 
 Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
 while the L9 section itself listed nineteen rows, four of them
@@ -422,18 +422,18 @@ by pydantic; one negative scenario will cover the class.
 
 | ID     | Error case                                      | Status  | Reference |
 |--------|-------------------------------------------------|---------|-----------|
-| L13.1  | Acquire from empty pool creates new connection  | specified @pending | connection_pool: five sequential calls |
-| L13.2  | Acquire reuses a healthy pooled connection      | specified @pending | connection_pool: five sequential calls |
-| L13.3  | Acquire skips a connection that fails NOOP      | specified @pending | connection_pool: stale connection replaced |
+| L13.1  | Acquire from empty pool creates new connection  | covered | connection_pool: five sequential calls |
+| L13.2  | Acquire reuses a healthy pooled connection      | covered | connection_pool: five sequential calls |
+| L13.3  | Acquire skips a connection that fails NOOP      | covered | connection_pool: stale connection replaced |
 | L13.4  | Acquire times out when pool is exhausted         | deferred B | — |
-| L13.5  | Max-age reached, connection force-closed         | deferred B | — |
-| L13.6  | Idle TTL reached, connection closed               | deferred B | — |
+| L13.5  | Max-age reached, connection force-closed         | covered | connection_pool_expiry: maximum age |
+| L13.6  | Idle TTL reached, connection closed               | covered | connection_pool_expiry: idle TTL |
 | L13.7  | Token refresh drains the pool                     | deferred B | — |
 | L13.8  | Long-lived IDLE session not recycled by pool      | deferred B | — |
-| L13.9  | Two accounts keep separate pools                  | specified @pending | connection_pool: two accounts |
-| L13.10 | Folder switch on a reused connection selects first | specified @pending | connection_pool: folder switch |
-| L13.11 | Concurrent calls bounded by max_size              | specified @pending | connection_pool: concurrent calls |
-| L13.12 | Pooled connections logged out on shutdown          | specified @pending | connection_pool: logout on shutdown |
+| L13.9  | Two accounts keep separate pools                  | covered | connection_pool: two accounts |
+| L13.10 | Folder switch on a reused connection selects first | covered | connection_pool: folder switch |
+| L13.11 | Concurrent calls bounded by max_size              | covered | connection_pool: concurrent calls |
+| L13.12 | Pooled connections logged out on shutdown          | covered | connection_pool: logout on shutdown |
 
 **Deferred reason B** — The connection pool has no separately
 observable behaviour at the MCP surface; it affects latency and log
@@ -451,6 +451,28 @@ implemented: every tool call still opens and closes its own connection.
 L13.4–8 stay deferred: idle TTL and max age need a controllable clock
 inside the pool, the token-refresh drain needs the OAuth mock to rotate
 a token mid-session.
+
+Update 2026-11-03: the pool is implemented (`server/src/imap_mcp/pool.py`,
+leases in `imap_core._imap_session`) and L13.1–3 and L13.9–12 are
+covered. The idle TTL and the maximum age turned out not to need a
+controllable clock: both are operator settings (`IMAP_MCP_POOL_IDLE_TTL`,
+`IMAP_MCP_POOL_MAX_AGE`), and `performance/connection_pool_expiry.feature`
+sets them to seconds and witnesses the LOGOUT and the replacement
+connection on the mock-gmail server, so L13.5 and L13.6 are covered too.
+Three cases stay deferred, unit-tested in `server/tests/test_connection_pool.py`:
+
+- L13.4 — what a caller sees when no connection becomes free within
+  `IMAP_MCP_POOL_ACQUIRE_TIMEOUT` is not part of the response contract
+  yet (the pool raises a `TimeoutError`, which tools report like any
+  other IMAP timeout). A scenario needs that contract first.
+- L13.7 — the drain on token refresh needs an IMAP server that accepts
+  XOAUTH2 and an OAuth account whose token rotates mid-session; the
+  mock-gmail server speaks LOGIN only and the Dovecot fixture has no
+  OAuth. Independently of the drain, a pooled connection is keyed by a
+  digest of the credential it authenticated with, so a connection opened
+  with an old token is never reused.
+- L13.8 — there is no long-lived IDLE consumer (push is out of scope,
+  ADR 0014), so nothing to observe.
 
 ---
 

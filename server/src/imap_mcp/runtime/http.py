@@ -7,6 +7,7 @@ from typing import Any
 
 from ..context import _CURRENT_CALLER_ID, _build_context
 from ..dispatch import build_server
+from ..imap_core import close_connection_pools
 from ..reload import _install_sighup_handler
 
 
@@ -189,4 +190,5 @@ async def run_http(config_dir: Path, host: str, port: int) -> None:
             config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
             await uvicorn.Server(config).serve()
     finally:
+        await close_connection_pools()
         await context.oauth_manager.aclose()

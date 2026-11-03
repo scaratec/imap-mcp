@@ -16,7 +16,9 @@ from typing import TYPE_CHECKING
 
 from .audit import AuditWriter
 from .config import Account, Configuration, load_configuration
+from .imap_core import configure_connection_pools
 from .policy import PolicyDecisionPoint
+from .pool import PoolSettings
 from .saga import SagaManager
 from .secrets import build_secret_store
 from .test_hooks import TestHooks, set_global_hooks
@@ -115,6 +117,11 @@ def _build_context(config_dir: Path, default_caller_id: str) -> tuple[ServerCont
     """
     test_hooks = TestHooks.from_environment()
     set_global_hooks(test_hooks)
+    try:
+        pool_settings = PoolSettings.from_environment()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    configure_connection_pools(pool_settings)
 
     configuration: Configuration = load_configuration(config_dir)
     pdp = PolicyDecisionPoint(configuration)

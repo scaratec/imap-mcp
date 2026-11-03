@@ -9,6 +9,8 @@ under its UTF-8 name instead of `[Gmail]/Entw&APw-rfe`.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -128,14 +130,11 @@ class _FakeIMAP:
 def fake_imap(monkeypatch: pytest.MonkeyPatch) -> _FakeIMAP:
     fake = _FakeIMAP(capabilities={"UIDPLUS"})
 
-    async def open_imap(account: Any, *, timeout: int = 10) -> _FakeIMAP:
-        return fake
+    @asynccontextmanager
+    async def session(account: Any, password: str, **_: Any) -> AsyncIterator[_FakeIMAP]:
+        yield fake
 
-    async def authenticate(imap: Any, account: Any, password: str) -> None:
-        return None
-
-    monkeypatch.setattr(imap_core, "_open_imap", open_imap)
-    monkeypatch.setattr(imap_core, "_authenticate_imap", authenticate)
+    monkeypatch.setattr(imap_core, "_imap_session", session)
     return fake
 
 

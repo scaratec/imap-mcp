@@ -87,6 +87,11 @@ class OAuthManager:
             "access_token": access_token,
             "expires_at": time.time() + expires_in,
         }
+        # ADR 0013: connections authenticated with the previous token
+        # are not reused; the next lease authenticates with this one.
+        from ..imap_core import drain_connection_pool
+
+        drain_connection_pool(account.id)
         self._persist_access_token_if_configured(account, access_token)
         self._log_audit(account.id, "ALLOW", "OK")
         return access_token

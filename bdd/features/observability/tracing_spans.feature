@@ -123,6 +123,9 @@ Feature: Traces carry what is needed to measure how efficiently a caller uses th
   # --- IMAP round trips ------------------------------------------------
 
   Scenario: The IMAP commands of a call appear as child spans of its tool span
+    # The connection stays in the account's pool after the call (ADR
+    # 0013), so no LOGOUT is sent for it; the count witness below pins
+    # the spans to the commands the call actually sent.
     When trace-agent calls search with account "gupta-scaratec", folder "INBOX", criteria {"from_domain": "nordlicht.example.org"}, scope "all"
     Then within 10 seconds the trace sink contains one connected trace rooted at span "tool.search" with child spans in order:
       | span               |
@@ -131,7 +134,6 @@ Feature: Traces carry what is needed to measure how efficiently a caller uses th
       | imap.select        |
       | imap.uid_search    |
       | imap.uid_fetch     |
-      | imap.logout        |
     And the number of "imap.*" child spans of "tool.search" equals the number of commands the IMAP command log for "gupta-scaratec" recorded for that call
 
   # --- Flush on shutdown -----------------------------------------------

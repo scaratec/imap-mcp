@@ -51,7 +51,12 @@ class GmailIMAPHandler:
         self._authed = False
         self._user: str | None = None
         self._selected_folder: str | None = None
-        state.total_connections += 1
+        self.epoch = state.epoch
+        state.connection_opened(self)
+
+    def close(self) -> None:
+        """Drop the connection from the server side."""
+        self._w.close()
 
     def _resolve_folder(self, folder: str) -> str | None:
         """Map a wire mailbox name to the mock's internal folder name.
@@ -86,6 +91,7 @@ class GmailIMAPHandler:
         except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
             pass
         finally:
+            self._state.connection_closed(self)
             self._w.close()
 
     async def _dispatch(self, tag: str, cmd: str, args: str) -> None:
@@ -592,6 +598,8 @@ class GmailIMAPHandler:
 
     def _record(self, cmd: str, args: str) -> None:
         """Append the command to the shared command log."""
+        if self.epoch != self._state.epoch:
+            return
         command = cmd
         mailbox: str | None = None
         if cmd in _MAILBOX_COMMANDS:
@@ -602,8 +610,14 @@ class GmailIMAPHandler:
                 command = f"UID {parts[0].upper()}"
             if command in ("UID COPY", "UID MOVE") and len(parts) > 2:
                 mailbox = _first_astring(parts[2])
+        recorded_args = "" if cmd in ("LOGIN", "AUTHENTICATE") else args
+        user = self._user
+        if cmd == "LOGIN" and user is None:
+            # LOGIN names the user it is about to authenticate.
+            first = args.split(None, 1)
+            user = _unquote(first[0]) if first else None
         self._state.command_log.append(
-            CommandRecord(user=self._user, command=command, mailbox=mailbox)
+            CommandRecord(user=user, command=command, mailbox=mailbox, args=recorded_args)
         )
 
     def _send(self, tag: str, status: str, text: str) -> None:
@@ -777,6 +791,7 @@ async def start_gmail_mock(
         handler = GmailIMAPHandler(reader, writer, state)
         await handler.run()
 
+    state.loop = asyncio.get_running_loop()
     server = await asyncio.start_server(_handle, host, port)
     actual_port = server.sockets[0].getsockname()[1]
     return server, actual_port

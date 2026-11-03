@@ -12,6 +12,7 @@ in Trash (or Spam) is shown in that mailbox only.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import itertools
 from dataclasses import dataclass, field
@@ -75,7 +76,7 @@ class CommandRecord:
 
     `mailbox` is the mailbox argument exactly as it travelled on the
     wire (unquoted, still Modified UTF-7), or None for commands that do
-    not address a mailbox. `user` is the LOGIN name of the connection
+    not address a mailbox; `args` keeps the rest of the line as sent. `user` is the LOGIN name of the connection
     that sent it, so a test can tell its own direct commands apart
     from the server's.
     """
@@ -83,6 +84,9 @@ class CommandRecord:
     user: str | None
     command: str
     mailbox: str | None
+    args: str = ""
+    """Everything after the command verb as received, except for LOGIN
+    and AUTHENTICATE, whose credentials are not recorded."""
 
 
 @dataclass(frozen=True)
@@ -142,6 +146,14 @@ class GmailState:
         self._created_folders: set[str] = set()
         self.password: str = "test"
         self.total_connections: int = 0
+        # Connection bookkeeping. `epoch` advances on every reset, so a
+        # connection of a previous scenario that is still closing counts
+        # neither as open nor in the high-water mark, and its last
+        # commands do not reach the new command log.
+        self.epoch: int = 0
+        self.max_concurrent_connections: int = 0
+        self._open_handlers: set[Any] = set()
+        self.loop: asyncio.AbstractEventLoop | None = None
         self._localized_folders: dict[str, tuple[str, str]] = {}
         # Test hooks: when record_store_operations is True the server
         # appends every X-GM-LABELS STORE op as (uid, '+'|'-', label)
@@ -164,10 +176,53 @@ class GmailState:
         self._created_folders.clear()
         self._localized_folders.clear()
         self.total_connections = 0
+        self.epoch += 1
+        self.max_concurrent_connections = 0
         self.record_store_operations = False
         self.store_operations.clear()
         self.next_store_rejection = None
         self.command_log.clear()
+
+    # ------------------------------------------------- connection bookkeeping
+
+    @property
+    def open_connections(self) -> int:
+        """Connections of the current epoch the server side still holds open."""
+        return sum(1 for handler in self._open_handlers if handler.epoch == self.epoch)
+
+    def connection_opened(self, handler: Any) -> None:
+        self.total_connections += 1
+        self._open_handlers.add(handler)
+        self.max_concurrent_connections = max(
+            self.max_concurrent_connections, self.open_connections
+        )
+
+    def connection_closed(self, handler: Any) -> None:
+        self._open_handlers.discard(handler)
+
+    def close_all_connections(self, timeout: float = 5.0) -> int:
+        """Close every open connection from the server side, the way
+        Gmail drops idle sessions, and wait until each one is gone.
+
+        Callable from any thread: the work runs on the mock's own event
+        loop. Returns how many connections were closed.
+        """
+        if self.loop is None:
+            raise RuntimeError("mock-gmail is not running")
+
+        async def _close_all() -> int:
+            handlers = list(self._open_handlers)
+            for handler in handlers:
+                handler.close()
+            deadline = self.loop.time() + timeout
+            while any(h in self._open_handlers for h in handlers):
+                if self.loop.time() >= deadline:
+                    raise TimeoutError("mock-gmail connections did not close in time")
+                await asyncio.sleep(0.01)
+            return len(handlers)
+
+        future = asyncio.run_coroutine_threadsafe(_close_all(), self.loop)
+        return future.result(timeout + 1)
 
     def set_localized_folders(
         self, mapping: list[tuple[str, str, str]]

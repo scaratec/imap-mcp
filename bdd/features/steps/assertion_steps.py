@@ -2383,14 +2383,24 @@ def step_imap_command_log_in_order(context: Context, account_id: str) -> None:
     client→upstream traffic. Substring match per cell — adjacent
     matches need not be contiguous in the log because aioimaplib
     emits its own bookkeeping (NOOP, LOGOUT, etc.) between the
-    business commands."""
+    business commands.
+
+    mock-gmail accounts have no proxy in front of them; their log is
+    the mock's own command log (`connection_steps.imap_command_lines`)."""
+    from support.imap_fixture import resolve_account
+
     log_path = (getattr(context, "imap_proxy_log_paths", None) or {}).get(account_id)
-    if log_path is None or not log_path.exists():
+    if log_path is not None and log_path.exists():
+        log = log_path.read_text(encoding="utf-8", errors="replace")
+    elif resolve_account(account_id)[0] == "mock-gmail":
+        from features.steps.connection_steps import imap_command_lines
+
+        log = "\n".join(imap_command_lines(context, account_id))
+    else:
         raise AssertionError(
             f"No IMAP proxy log captured for account {account_id!r}; "
             "did a prior step start the MITM proxy?"
         )
-    log = log_path.read_text(encoding="utf-8", errors="replace")
     expected_lines = [row["command"] for row in context.table]
     cursor = 0
     upper_log = log.upper()

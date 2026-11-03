@@ -1,4 +1,3 @@
-@pending
 Feature: Tool calls on one account share pooled IMAP connections
 
   ADR 0013 (Accepted) decides a per-account pool: a connection is leased
@@ -28,9 +27,10 @@ Feature: Tool calls on one account share pooled IMAP connections
   server's own counter, command order from the IMAP command log. Result
   correctness after a folder switch is checked against the seeded uids.
 
-  Not covered here (stay deferred, see L13): idle TTL and max age need a
-  controllable clock inside the pool; token-refresh drain needs the
-  OAuth mock to rotate a token mid-session.
+  Idle TTL and max age are covered in connection_pool_expiry.feature
+  through short IMAP_MCP_POOL_* settings. Still deferred (see L13): the
+  acquire timeout, because its response contract is undecided, and the
+  token-refresh drain, because the mock speaks LOGIN only.
 
   Covered error layers (per BDD Guidelines §4.5):
     - Sequential calls on one account reuse one connection       : 1
