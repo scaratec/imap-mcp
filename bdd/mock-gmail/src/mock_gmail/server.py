@@ -11,8 +11,11 @@ import asyncio
 import email
 import email.utils
 import re
+from datetime import UTC, datetime
 from typing import Any
 
+from .mime import bodystructure
+from .search import SearchSyntaxError, search
 from .state import (
     FOLDER_TO_LABEL,
     HIDDEN_LABELS,
@@ -109,6 +112,7 @@ class GmailIMAPHandler:
             "APPEND": self._cmd_append,
             "EXPUNGE": self._cmd_expunge,
             "CREATE": self._cmd_create,
+            "STATUS": self._cmd_status,
         }.get(cmd)
         if handler is None:
             self._send(tag, "BAD", f"Unknown command {cmd}")
@@ -166,6 +170,35 @@ class GmailIMAPHandler:
         self._send_untagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)")
         self._send(tag, "OK", "[READ-WRITE] SELECT completed")
 
+    async def _cmd_status(self, tag: str, args: str) -> None:
+        """RFC 3501 §6.3.10 STATUS, counted like SELECT counts EXISTS."""
+        m = re.match(r'\s*("(?:[^"\\]|\\.)*"|\S+)\s+\(([^)]*)\)\s*$', args)
+        if not m:
+            self._send(tag, "BAD", "Could not parse command")
+            return
+        wire = _first_astring(m.group(1)) or ""
+        folder = self._resolve_folder(wire)
+        if folder is None or not self._state.folder_exists(folder):
+            self._send(tag, "NO", f"[NONEXISTENT] Unknown Mailbox: {wire} (Failure)")
+            return
+        msgs = self._state.messages_in_folder(folder)
+        values = {
+            "MESSAGES": len(msgs),
+            "RECENT": 0,
+            "UIDNEXT": max((u for u, _ in msgs), default=0) + 1,
+            "UIDVALIDITY": self._state.uidvalidity(folder),
+            "UNSEEN": sum(1 for _, msg in msgs if "\\Seen" not in msg.flags),
+        }
+        items = m.group(2).upper().split()
+        unknown = [item for item in items if item not in values]
+        if unknown or not items:
+            self._send(tag, "BAD", "Could not parse command")
+            return
+        listed = " ".join(f"{item} {values[item]}" for item in items)
+        quoted = wire.replace("\\", "\\\\").replace('"', '\\"')
+        self._send_untagged(f'STATUS "{quoted}" ({listed})')
+        self._send(tag, "OK", "Success")
+
     async def _cmd_close(self, tag: str, args: str) -> None:
         self._selected_folder = None
         self._send(tag, "OK", "CLOSE completed")
@@ -196,7 +229,7 @@ class GmailIMAPHandler:
         self._send(tag, "OK", "EXPUNGE completed")
 
     async def _cmd_append(self, tag: str, args: str) -> None:
-        m = re.match(r'"?([^"]+)"?\s+(?:\(([^)]*)\)\s+)?(?:"[^"]*"\s+)?\{(\d+)\}', args)
+        m = re.match(r'"?([^"]+)"?\s+(?:\(([^)]*)\)\s+)?(?:"([^"]*)"\s+)?\{(\d+)\}', args)
         if not m:
             self._send(tag, "BAD", "APPEND parse error")
             return
@@ -204,7 +237,14 @@ class GmailIMAPHandler:
         if folder is None:
             self._send(tag, "NO", "[TRYCREATE] Folder doesn't exist. (Failure)")
             return
-        size = int(m.group(3))
+        internal_date = datetime.now(UTC)
+        if m.group(3) is not None:
+            try:
+                internal_date = datetime.strptime(m.group(3).strip(), "%d-%b-%Y %H:%M:%S %z")
+            except ValueError:
+                self._send(tag, "BAD", "Could not parse command")
+                return
+        size = int(m.group(4))
         self._send_untagged_raw("+ Ready for literal data\r\n")
         data = await self._r.readexactly(size)
         await self._r.readline()
@@ -223,6 +263,7 @@ class GmailIMAPHandler:
             to_addr=msg_obj.get("To") or "",
             subject=msg_obj.get("Subject") or "",
             date=msg_obj.get("Date") or "",
+            internal_date=internal_date,
         )
         self._state.add_message(message)
         uid = self._state.uid_for(folder, gm_msgid) or 0
@@ -253,72 +294,16 @@ class GmailIMAPHandler:
             self._send(tag, "BAD", f"Unknown UID sub-command {sub}")
 
     async def _uid_search(self, tag: str, args: str) -> None:
+        """RFC 3501 §6.4.4 UID SEARCH; a program that does not parse is
+        answered BAD, as Gmail does."""
         folder = self._selected_folder or "INBOX"
-        msgs = self._state.messages_in_folder(folder)
-
-        gm_msgid_match = re.search(r"X-GM-MSGID\s+(\d+)", args, re.IGNORECASE)
-        if gm_msgid_match:
-            target = int(gm_msgid_match.group(1))
-            uids = [str(u) for u, m in msgs if m.gm_msgid == target]
-            self._send_untagged(f"SEARCH {' '.join(uids)}" if uids else "SEARCH")
-            self._send(tag, "OK", "UID SEARCH completed")
+        try:
+            uids = search(args, self._state.messages_in_folder(folder))
+        except SearchSyntaxError:
+            self._send(tag, "BAD", "Could not parse command")
             return
-
-        header_match = re.search(
-            r'HEADER\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]*)"|(\S+))', args, re.IGNORECASE
-        )
-        if header_match:
-            hdr_name = header_match.group(1) or header_match.group(2)
-            hdr_value = header_match.group(3) if header_match.group(3) is not None else header_match.group(4)
-            # RFC 3501 §6.4.4: a message matches when the named header
-            # field contains the string, case-insensitively.
-            uids = []
-            for u, m in msgs:
-                values = email.message_from_bytes(m.rfc822).get_all(hdr_name) or []
-                if any(hdr_value.lower() in str(v).lower() for v in values):
-                    uids.append(str(u))
-            self._send_untagged(f"SEARCH {' '.join(uids)}" if uids else "SEARCH")
-            self._send(tag, "OK", "UID SEARCH completed")
-            return
-
-        subject_match = re.search(r'SUBJECT\s+"([^"]+)"', args, re.IGNORECASE)
-        from_match = re.search(r'FROM\s+"([^"]+)"', args, re.IGNORECASE)
-        uid_match = re.search(r"^UID\s+(\d+)", args.strip())
-        since_match = re.search(r"SINCE\s+(\d{1,2}-\w{3}-\d{4})", args, re.IGNORECASE)
-        since_date = None
-        if since_match:
-            from datetime import datetime
-
-            try:
-                since_date = datetime.strptime(since_match.group(1), "%d-%b-%Y")
-            except ValueError:
-                pass
-
-        uids = []
-        for u, m in msgs:
-            if uid_match:
-                if u == int(uid_match.group(1)):
-                    uids.append(str(u))
-                continue
-            match = True
-            if since_date and m.date:
-                from email.utils import parsedate_to_datetime
-
-                try:
-                    msg_date = parsedate_to_datetime(m.date).replace(tzinfo=None)
-                    if msg_date < since_date:
-                        match = False
-                except (TypeError, ValueError):
-                    pass
-            if subject_match and subject_match.group(1).lower() not in m.subject.lower():
-                match = False
-            if from_match and from_match.group(1).lower() not in m.from_addr.lower():
-                match = False
-            if match:
-                uids.append(str(u))
-
-        self._send_untagged(f"SEARCH {' '.join(uids)}" if uids else "SEARCH")
-        self._send(tag, "OK", "UID SEARCH completed")
+        self._send_untagged("SEARCH " + " ".join(str(u) for u in uids) if uids else "SEARCH")
+        self._send(tag, "OK", "SEARCH completed (Success)")
 
     async def _uid_fetch(self, tag: str, args: str) -> None:
         folder = self._selected_folder or "INBOX"
@@ -385,12 +370,10 @@ class GmailIMAPHandler:
             parts.append(f"ENVELOPE {_build_envelope(msg)}")
         if "RFC822.SIZE" in items:
             parts.append(f"RFC822.SIZE {len(msg.rfc822)}")
+        if "INTERNALDATE" in items and msg.internal_date is not None:
+            parts.append(f'INTERNALDATE "{msg.internal_date.strftime("%d-%b-%Y %H:%M:%S %z")}"')
         if "BODYSTRUCTURE" in items:
-            parts.append(
-                'BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" '
-                + str(len(msg.rfc822))
-                + " 1)"
-            )
+            parts.append(f"BODYSTRUCTURE {bodystructure(msg.rfc822)}")
         if not skip_body:
             if "RFC822" in items:
                 parts.append(

@@ -10,6 +10,7 @@ X-GM-MSGID, labels, and per-folder UIDs.
 from __future__ import annotations
 
 import email.utils
+import itertools
 import json
 import re
 
@@ -1044,9 +1045,12 @@ def step_command_log_has_no_store(context: Context, account_id: str) -> None:
 
 
 def _harness_conn(context: Context, account_id: str, mailbox: str):
-    """The harness's own IMAP connection, with `mailbox` (wire form) selected."""
+    """The harness's own IMAP connection, with `mailbox` (wire form) selected.
+    Messages the scenario staged are seeded first, as before a tool call."""
+    from features.steps.policy_steps import flush_staged_messages
     from support.imap_fixture import IMAPFixture
 
+    flush_staged_messages(context)
     instance, user = resolve_account(account_id)
     conn = context.imap.connect(instance, user)
     status, data = conn.select(IMAPFixture._q(mailbox))
@@ -1066,13 +1070,15 @@ def step_direct_imap_command(context: Context, mailbox: str, account_id: str) ->
     if len(words) < 3 or words[0].upper() != "UID":
         raise AssertionError(f"Expected 'UID <command> <arguments>', got {context.text!r}")
     conn = _harness_conn(context, account_id, mailbox)
+    data: list = []
     try:
-        status, _data = conn.uid(words[1].upper(), words[2])
+        status, data = conn.uid(words[1].upper(), words[2])
     except imaplib.IMAP4.error as exc:
         if "BAD" not in str(exc) and "command error" not in str(exc):
             raise
         status = "BAD"
     context.last_direct_imap_status = status
+    context.last_direct_imap_command = (account_id, mailbox, words[1].upper(), data)
 
 
 def _direct_fetch_items(context: Context, qualified: str, uid: int) -> str:
@@ -1232,4 +1238,177 @@ def step_label_store_received(context: Context, label: str, op: str, account_id:
     if not any(r.op == op and r.labels is not None and label in r.labels for r in records):
         raise AssertionError(
             f"No parsed X-GM-LABELS STORE {op}{label!r}:\n{_format_label_stores(records)}"
+        )
+
+
+# ---------------------------------------- Gmail search, structure and counts (mock fidelity)
+
+
+def _seeded_uid(context: Context, account_id: str, folder: str, hint: int) -> int:
+    """The UID the IMAP server assigned to the message seeded under `hint`.
+    A hint the scenario never seeded is a harness error, not a UID."""
+    uids = getattr(context, "message_uids", {})
+    if (account_id, folder, hint) not in uids:
+        raise AssertionError(
+            f"No message was seeded as {hint} in {account_id}:{folder}; seeded: "
+            f"{sorted(k[2] for k in uids if k[:2] == (account_id, folder))!r}"
+        )
+    return uids[(account_id, folder, hint)]
+
+
+@then("the direct IMAP SEARCH answer lists exactly the messages {hints_raw}")
+def step_direct_search_lists_messages(context: Context, hints_raw: str) -> None:
+    command = getattr(context, "last_direct_imap_command", None)
+    if command is None or command[2] != "SEARCH":
+        raise AssertionError("No direct IMAP UID SEARCH has been issued in this scenario.")
+    if context.last_direct_imap_status != "OK":
+        raise AssertionError(
+            f"The direct UID SEARCH was answered {context.last_direct_imap_status!r}."
+        )
+    account_id, mailbox, _verb, data = command
+    expected = sorted(
+        _seeded_uid(context, account_id, mailbox, hint) for hint in json.loads(hints_raw)
+    )
+    raw = b" ".join(item for item in data if isinstance(item, bytes))
+    actual = sorted(int(token) for token in raw.split())
+    if actual != expected:
+        raise AssertionError(
+            f"Direct UID SEARCH in {account_id}:{mailbox}: expected UIDs {expected!r} "
+            f"(messages {hints_raw}), got {actual!r}"
+        )
+
+
+def _parse_imap_list(text: str, start: int) -> tuple[list, int]:
+    """Parse one parenthesised IMAP list starting at `text[start] == "("`.
+    Atoms stay strings, NIL becomes None, quoted strings are unescaped."""
+    items: list = []
+    i = start + 1
+    while i < len(text):
+        ch = text[i]
+        if ch == " ":
+            i += 1
+        elif ch == "(":
+            inner, i = _parse_imap_list(text, i)
+            items.append(inner)
+        elif ch == ")":
+            return items, i + 1
+        elif ch == '"':
+            out = []
+            i += 1
+            while text[i] != '"':
+                if text[i] == "\\":
+                    i += 1
+                out.append(text[i])
+                i += 1
+            items.append("".join(out))
+            i += 1
+        else:
+            j = i
+            while j < len(text) and text[j] not in ' ()"':
+                j += 1
+            atom = text[i:j]
+            items.append(None if atom.upper() == "NIL" else atom)
+            i = j
+    raise AssertionError(f"Unbalanced IMAP list in {text!r}")
+
+
+def _leaf_parts(body: list, prefix: str = "") -> list[tuple[str, list]]:
+    """(section number, leaf body) for every non-multipart part (RFC 3501 §6.4.5)."""
+    if body and isinstance(body[0], list):
+        leaves: list[tuple[str, list]] = []
+        children = itertools.takewhile(lambda item: isinstance(item, list), body)
+        for index, item in enumerate(children, start=1):
+            leaves.extend(_leaf_parts(item, f"{prefix}{index}."))
+        return leaves
+    return [(prefix.rstrip(".") or "1", body)]
+
+
+def _leaf_disposition(leaf: list) -> tuple[str, str]:
+    """(disposition type, filename) of a leaf body; empty strings for none."""
+    maintype = str(leaf[0]).lower()
+    subtype = str(leaf[1]).lower()
+    index = 9
+    if maintype == "message" and subtype == "rfc822":
+        index = 11
+    elif maintype != "text":
+        index = 8
+    disposition = leaf[index] if len(leaf) > index else None
+    if not isinstance(disposition, list) or not disposition:
+        return "", ""
+    params = disposition[1] if len(disposition) > 1 and isinstance(disposition[1], list) else []
+    pairs = dict(zip(params[::2], params[1::2]))
+    filename = next((v for k, v in pairs.items() if str(k).lower() == "filename"), "")
+    return str(disposition[0]).lower(), filename or ""
+
+
+@then(
+    'a direct IMAP FETCH of the BODYSTRUCTURE of message {hint:d} in "{qualified}" '
+    'shows a {content_type} body with the parts:'
+)
+def step_direct_bodystructure_parts(
+    context: Context, hint: int, qualified: str, content_type: str
+) -> None:
+    account_id, sep, mailbox = qualified.partition(":")
+    if not sep:
+        raise AssertionError(f'Expected an "account:folder" qualified name, got {qualified!r}')
+    conn = _harness_conn(context, account_id, mailbox)
+    uid = _seeded_uid(context, account_id, mailbox, hint)
+    status, data = conn.uid("FETCH", str(uid), "(BODYSTRUCTURE)")
+    text = " ".join(item.decode("utf-8", "replace") for item in data or [] if isinstance(item, bytes))
+    marker = text.find("BODYSTRUCTURE (")
+    if status != "OK" or marker < 0:
+        raise AssertionError(f"Direct FETCH BODYSTRUCTURE of uid {uid} returned {data!r}")
+    body, _end = _parse_imap_list(text, marker + len("BODYSTRUCTURE "))
+    if body and isinstance(body[0], list):
+        subtype = next(item for item in body if not isinstance(item, list))
+        actual_type = f"multipart/{str(subtype).lower()}"
+    else:
+        actual_type = f"{str(body[0]).lower()}/{str(body[1]).lower()}"
+    if actual_type != content_type:
+        raise AssertionError(f"uid {uid}: BODYSTRUCTURE is {actual_type}, not {content_type}: {text}")
+    actual_parts = []
+    for section, leaf in _leaf_parts(body):
+        disposition, filename = _leaf_disposition(leaf)
+        actual_parts.append(
+            {
+                "part": section,
+                "type": f"{str(leaf[0]).lower()}/{str(leaf[1]).lower()}",
+                "disposition": disposition,
+                "filename": filename,
+            }
+        )
+    expected_parts = [
+        {key: row[key] for key in ("part", "type", "disposition", "filename")}
+        for row in context.table
+    ]
+    if actual_parts != expected_parts:
+        raise AssertionError(
+            f"uid {uid}: BODYSTRUCTURE parts {actual_parts!r}, expected {expected_parts!r}"
+        )
+
+
+@then('a direct IMAP STATUS of "{mailbox}" on "{account_id}" reports MESSAGES {count:d}')
+def step_direct_status_messages(
+    context: Context, mailbox: str, account_id: str, count: int
+) -> None:
+    import imaplib
+
+    from features.steps.policy_steps import flush_staged_messages
+    from support.imap_fixture import IMAPFixture
+
+    flush_staged_messages(context)
+    instance, user = resolve_account(account_id)
+    conn = context.imap.connect(instance, user)
+    try:
+        status, data = conn.status(IMAPFixture._q(mailbox), "(MESSAGES)")
+    except imaplib.IMAP4.error as exc:
+        raise AssertionError(f"Direct STATUS of {mailbox!r} was refused: {exc}") from exc
+    text = " ".join(item.decode("utf-8", "replace") for item in data or [] if isinstance(item, bytes))
+    match = re.search(r"\bMESSAGES (\d+)", text)
+    if status != "OK" or match is None:
+        raise AssertionError(f"Direct STATUS of {mailbox!r} returned {status} {data!r}")
+    if int(match.group(1)) != count:
+        raise AssertionError(
+            f"Direct STATUS of {mailbox!r} on {account_id!r} reports MESSAGES "
+            f"{match.group(1)}, expected {count}"
         )

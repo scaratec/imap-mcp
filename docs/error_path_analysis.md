@@ -29,7 +29,7 @@ corresponding layer here.
 
 | #  | Layer                                   | Total | Covered | Deferred | Gap |
 |----|-----------------------------------------|-------|---------|----------|-----|
-| L1 | MCP input validation                    | 22    | 8       | 14       | 0   |
+| L1 | MCP input validation                    | 22    | 6       | 16       | 0   |
 | L2 | MCP protocol                            | 8     | 4       | 4        | 0   |
 | L3 | Caller authentication                   | 8     | 7       | 1        | 0   |
 | L4 | Policy evaluation                       | 22    | 16      | 6        | 0   |
@@ -42,11 +42,11 @@ corresponding layer here.
 | L11| Audit log                               | 11    | 8 (+3 covered_by_LIM-0009) | 0 | 0 |
 | L12| Configuration loading                   | 13    | 12      | 1        | 0   |
 | L13| Connection pool / IMAP session          | 12    | 9       | 3        | 0   |
-| L14| Gmail-specific semantics                | 33    | 23 (+7 covered_by_LIM-0002) | 3 | 0 |
+| L14| Gmail-specific semantics                | 39    | 29 (+7 covered_by_LIM-0002) | 3 | 0 |
 | L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
 | L16| Agent-facing draft and search contract  | 29    | 29      | 0        | 0   |
 | L17| Observability (traces)                  | 23    | 23      | 0        | 0   |
-|    | **Total**                               | 278   | 178 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +24 specified @pending) | 58 | 0 |
+|    | **Total**                               | 284   | 182 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +24 specified @pending) | 60 | 0 |
 
 Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
 while the L9 section itself listed nineteen rows, four of them
@@ -58,6 +58,12 @@ LIM-0003, +3 LIM-0009, +76 specified @pending) / 45`, which the layer
 rows do not add up to: they give 113 covered, 60 deferred, and two
 `covered_by_LIM-0006` cases (L9) the row left out. The Total row is now
 the sum of the layer rows, after L16.20–L16.27 became covered.
+
+Correction, 2026-11-03 (second): the L1 row read `22 / 8 / 14` while
+the L1 section listed four covered rows (L1.9, L1.12, L1.14, L1.22) and
+eighteen deferred. With L1.1 and L1.3 now covered the section gives
+6 / 16, and the row says so. The Total row is again the sum of the layer
+rows, after L14.34–39 were added.
 
 Counts are best-effort enumerations. They are updated by the author of
 any change that adds or removes a failure mode, and reviewed as part of
@@ -89,9 +95,9 @@ any side-effects occur?
 
 | ID     | Error case                                              | Status     | Reference |
 |--------|---------------------------------------------------------|------------|-----------|
-| L1.1   | Missing required argument (`account`, `folder`, `uid`)  | deferred A | —         |
+| L1.1   | Missing required argument (`account`, `folder`, `uid`)  | covered    | required_arguments: missing-argument rows |
 | L1.2   | Extra unrecognised argument                             | deferred A | non_goal_rejection: last scenario |
-| L1.3   | Argument wrong type (string expected, int given, etc.)  | deferred A | —         |
+| L1.3   | Argument wrong type (string expected, int given, etc.)  | covered    | required_arguments: wrong-JSON-type rows |
 | L1.4   | UID ≤ 0                                                 | deferred A | —         |
 | L1.5   | UID > 2^32 (out of IMAP range)                          | deferred A | —         |
 | L1.6   | Folder path empty string                                | deferred A | —         |
@@ -112,13 +118,26 @@ any side-effects occur?
 | L1.21  | mark_tagged tags list empty                             | deferred A | —         |
 | L1.22  | fetch_attachment part_id unknown for this UID           | covered    | visibility_levels: FULL scenario |
 
-**Deferred reason A** — L1.1–L1.8, L1.10, L1.11, L1.13, L1.15–L1.21 are
+**Deferred reason A** — L1.2, L1.4–L1.8, L1.10, L1.11, L1.13, L1.15–L1.21 are
 pure schema-validation cases that the MCP tool-call layer rejects via
 pydantic before domain logic runs. The generic behaviour "malformed
 input → JSON-RPC error -32602 with a field-path message" is uniform
 across tools, so we do not specify each as its own scenario. A single
 negative-schema scenario (to be added in task #9 with the rest of the
 step implementations) will cover the category.
+
+Added 2026-11-03 (L1.1, L1.3 covered): the agent usability smoke test
+showed that the category was not uniform at all. `list_drafts` without
+`folder` and `list_folders` without `account` were answered with JSON-RPC
+error code 0 whose message was the bare key name (a `KeyError` leaking
+out of the handler), `fetch_body` with `uid` `"abc"` with code 0 and a
+Python `ValueError` text, and `uid` `true` even reached IMAP as UID 1.
+Every tool now checks the required arguments and JSON types of its
+inputSchema, nested objects included, before any handler runs, and
+answers -32602 naming the tool and the argument;
+`tool_surface/required_arguments.feature` specifies it with the logging
+IMAP proxy as the witness that no command reached the mailbox. Like the
+other -32602 rejections it writes no audit record.
 
 ---
 
@@ -513,6 +532,12 @@ Three cases stay deferred, unit-tested in `server/tests/test_connection_pool.py`
 | L14.31 | Move INBOX → [Gmail]/Trash: `\Trash` sent as an atom, message in the trash only | covered | gmail_draft_lifecycle: move to system label (Trash) |
 | L14.32 | Move INBOX → [Gmail]/Spam: `\Spam` sent as an atom, message in Spam only | covered | gmail_draft_lifecycle: move to system label (Spam) |
 | L14.33 | Move of a draft to a user label leaves the drafts folder (Drafts is not a label) | covered | gmail_draft_lifecycle: draft to user label |
+| L14.34 | Mock fidelity: UID SEARCH date keys compare the internal date (BEFORE, ON, SINCE) or the Date header (SENT*) by calendar day | covered | gmail_search_and_counts: UID SEARCH date keys |
+| L14.35 | Mock fidelity: BODYSTRUCTURE renders the stored MIME, parts with their Content-Disposition | covered | gmail_search_and_counts: BODYSTRUCTURE multipart/mixed |
+| L14.36 | Mock fidelity: STATUS reports the number of messages in a mailbox | covered | gmail_search_and_counts: STATUS |
+| L14.37 | search with a calendar window and the default window's outside_scope_total on a Gmail account | covered | gmail_search_and_counts: calendar window, default window |
+| L14.38 | has_attachment on a Gmail account (search criteria, list_messages) | covered | gmail_search_and_counts: has_attachment, list_messages |
+| L14.39 | list_folders and folder_stats report the message count on a Gmail account | covered | gmail_search_and_counts: list_folders, folder_stats |
 
 **Deferred reason A** — Edge cases for Gmail that require deep
 knowledge of Gmail's label model side effects. Will be covered by
@@ -541,6 +566,17 @@ included). The mock accepted both, modelled Drafts as a removable label
 and advertised MOVE before authentication. L14.25–28 pin the mock to the
 behaviour observed on real Gmail with raw IMAP; L14.29–33 specify the
 tools against it.
+
+Added 2026-11-03 (L14.34–39): found by the agent usability smoke test,
+not by the suite. On mock-gmail a search with `before` returned messages
+after the date, the default window counted every match as lying before
+it, no invoice had an attachment and list_folders reported 0 messages
+for every folder. The mock ignored the SEARCH keys BEFORE and ON (and
+LARGER, SMALLER, FLAGGED and the SENT* keys), answered BODYSTRUCTURE
+with a single text/plain part whatever MIME it stored, and had no
+STATUS. L14.34–36 pin the mock to RFC 3501; L14.37–39 specify the tools
+on a Gmail account against it. folder_stats (EXAMINE) and SINCE were
+already right; their rows guard against regressions.
 
 ---
 

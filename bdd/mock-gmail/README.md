@@ -46,6 +46,41 @@ test of 2.2.0, 2026-11-03) and modelled since:
 - MOVE and UIDPLUS are advertised only after authentication; UID
   EXPUNGE is implemented.
 
+Search, structure and counts follow RFC 3501 (since 2026-11-03, found
+by the agent usability smoke test; pinned by
+`../features/providers/gmail_search_and_counts.feature`):
+
+- Every message has an INTERNALDATE. APPEND takes it from its
+  date-time argument, or the time of the APPEND when there is none
+  (RFC 3501 §6.3.11). A message seeded straight into `GmailState`
+  without `internal_date` takes the instant of its Date header, the way
+  the harness's APPEND to Dovecot sets it. FETCH INTERNALDATE returns it.
+- UID SEARCH (`search.py`) evaluates the whole search program: ALL, the
+  flag keys (SEEN, UNSEEN, FLAGGED, UNFLAGGED, DELETED, UNDELETED, DRAFT,
+  UNDRAFT, ANSWERED, UNANSWERED, KEYWORD, UNKEYWORD; RECENT and NEW never
+  match, OLD always does), FROM, TO, CC, BCC, SUBJECT, HEADER (substring,
+  case-insensitive, decoded header values), BODY, TEXT, LARGER, SMALLER,
+  BEFORE, ON, SINCE (internal date), SENTBEFORE, SENTON, SENTSINCE (Date
+  header, falling back to the internal date), UID and sequence sets, NOT,
+  OR, parenthesised lists, a leading CHARSET, and the Gmail keys
+  X-GM-MSGID, X-GM-THRID, X-GM-LABELS. Dates compare calendar days,
+  disregarding time and timezone (§6.4.4). Any other key is answered
+  `BAD Could not parse command`. Results are in ascending UID order.
+- BODYSTRUCTURE (`mime.py`) renders the MIME the message really has:
+  multipart with its children, subtype and parameters; each part with
+  type, parameters, encoding, size, lines (text), and the
+  Content-Disposition with its parameters, e.g.
+  `("ATTACHMENT" ("FILENAME" "rechnung.pdf"))`. Gmail's upper-casing and
+  extension fields are followed (single part: md5, disposition,
+  language; multipart: parameters, disposition, language).
+- STATUS reports MESSAGES, RECENT (always 0), UIDNEXT, UIDVALIDITY and
+  UNSEEN, counted like SELECT counts EXISTS; an unknown mailbox is
+  answered `NO [NONEXISTENT]`.
+
+Not modelled: Gmail matches SEARCH strings by word, not by substring,
+and may evaluate date keys in the account's timezone; the mock follows
+RFC 3501 on both.
+
 ## What this mock is not
 
 - It is not a faithful re-implementation of Gmail. It implements

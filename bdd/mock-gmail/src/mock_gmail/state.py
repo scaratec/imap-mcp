@@ -16,6 +16,8 @@ import asyncio
 import base64
 import itertools
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 
@@ -68,6 +70,22 @@ class Message:
     to_addr: str = ""
     subject: str = ""
     date: str = ""
+    internal_date: datetime | None = None
+    """RFC 3501 INTERNALDATE. Set by APPEND from its date-time argument
+    (or the time of the APPEND); a message seeded straight into the
+    state without one takes the instant of its Date header, the way the
+    harness's APPEND to Dovecot sets it."""
+
+
+def date_header_instant(header: str) -> datetime | None:
+    """The Date header as a timezone-aware datetime, None if unparseable."""
+    if not header:
+        return None
+    try:
+        parsed = parsedate_to_datetime(header)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -242,6 +260,8 @@ class GmailState:
         self._created_folders.add(name)
 
     def add_message(self, msg: Message) -> None:
+        if msg.internal_date is None:
+            msg.internal_date = date_header_instant(msg.date) or datetime.now(UTC)
         # Real Gmail: every message in the drafts mailbox carries \Draft.
         if "\\Drafts" in msg.labels:
             msg.flags.add("\\Draft")

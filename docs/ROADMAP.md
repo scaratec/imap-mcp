@@ -125,7 +125,7 @@ dafür da, eine saubere Lösung zu ersetzen, die nur aufwendig ist:
 | #  | Titel | Verweis | Art |
 |----|---|---|---|
 | 20 | `get_transaction_status` prüft den Caller nicht gegen den im WAL hinterlegten `caller_id` | ADR-0029 §3, Security Implications, [Betriebsanleitung P13](ops/kubernetes-sidecar-deployment.md) | **Defekt** — Autorisierungslücke, im Code verifiziert; siehe Einschränkung unter der Tabelle |
-| 21 | Verbindungspool aus ADR-0013 ist Accepted, aber nicht implementiert (in Arbeit 2026-11-03, Ziel 2.3.0, `bdd/features/performance/connection_pool.feature`) | [ADR-0013](adr/0013-hybrid-connection-pool.md) | **Defekt** — Kapazitätsgrenze je Provider bei N Sidecars |
+| ~~21~~ | ~~Verbindungspool aus ADR-0013 ist Accepted, aber nicht implementiert~~ (**erledigt 2.3.0**, `server/src/imap_mcp/pool.py`, `bdd/features/performance/connection_pool*.feature`) | [ADR-0013](adr/0013-hybrid-connection-pool.md) | **Defekt** — Kapazitätsgrenze je Provider bei N Sidecars |
 | 22 | Saga-Recovery beim Start | ADR-0029 §8, `bdd/features/transactions/startup_saga_recovery.feature` | Feature — Neustarts sind im Cluster Routine |
 | 23 | `GET /healthz` | ADR-0029 §7, `bdd/features/deployment/health_probe.feature` | Feature |
 | 24 | Projizierte Config + SIGHUP | ADR-0029 §5, `bdd/features/deployment/projected_config_reload.feature` | Feature |
@@ -192,10 +192,11 @@ Löschen der alten Entwurfsfassung auf; beides deckte der Mock nicht ab
 | 49 | Strukturierte `create_draft`-Entwürfe haben keinen `From`-Header; Mail-Clients setzen ihn aus der gewählten Identität | ADR-0035 | Entscheidung offen: Konto-Identität wie bei `create_reply_draft` verwenden? |
 | 50 | Pilot der Usability-Matrix (120 Läufe) | `usability/matrix.yaml` | Owner startet bewusst (Kosten, Kontingente) |
 | 51 | Traces vom Desktop per OTLP an Grafana Tempo (talos-3l), Payload-Modus `full` | Trello „Meta Projects“ → ToDo | Eigenes Arbeitspaket, wartet auf Abschluss der laufenden Grafana-Umbauten |
+| 52 | Pool-Standardwerte aus ADR-0013 (max. 4 Verbindungen, 10 min Leerlauf je Instanz) gehen von einem Prozess aus; lokal läuft je Agent-Sitzung eine Instanz (ADR-0032), bei ~15 Sitzungen droht Gmails Grenze von etwa 15 gleichzeitigen Verbindungen je Konto | `server/src/imap_mcp/pool.py`, ADR-0013 | Entscheidung offen: Standardwerte senken oder Grenze instanzübergreifend durchsetzen. Lokal bis dahin `IMAP_MCP_POOL_MAX_SIZE=2`, `IMAP_MCP_POOL_IDLE_TTL=60` in den Agent-Konfigurationen |
 
 ## Querschnitt
 
-- **Error-Path-Analysis-Bilanz** ([error_path_analysis.md](error_path_analysis.md)) wird mit jedem Eintrag oben aktualisiert. Layer L13 (Connection pool) bleibt absichtlich `deferred B` (kein extern beobachtbares Verhalten).
+- **Error-Path-Analysis-Bilanz** ([error_path_analysis.md](error_path_analysis.md)) wird mit jedem Eintrag oben aktualisiert. Layer L13 (Connection pool) ist seit 2.3.0 überwiegend abgedeckt; Verbindungszahlen sind über den Mock und den IMAP-Proxy beobachtbar. Offen bleiben L13.4 (Acquire-Timeout, Antwortvertrag ungeklärt), L13.7 (Drain bei Token-Erneuerung, Mock kann kein XOAUTH2) und L13.8 (keine IDLE-Nutzer).
 - **Spec-Audit-Zyklen** sammeln sich unter `docs/spec-audit/<datum>-cycle-N.md`. Jeder Zyklus prüft die drei Prüfmuster aus BDD-Guidelines §13.2 gegen alle nicht-pending Szenarien.
 
 ## Prozess
