@@ -11,26 +11,34 @@ harnesses:
   antigravity:
     binary: agy
     version_observed: "1.4.12"
-    headless: ["agy", "--print", "--output-format", "stream-json", "--dangerously-skip-permissions"]
+    # `--print` takes the prompt as its value (verified 2026-11-03 with
+    # agy 1.4.12: `--print --output-format ...` swallows the next flag).
+    headless: ["agy", "--output-format", "stream-json", "--dangerously-skip-permissions", "--print", "{prompt}"]
     resume_flag: "--conversation"
     model_flag: "--model"
-    # `agy mcp add` writes global config; isolation is a per-run HOME.
+    # `agy mcp add` writes global config; isolation is a per-run HOME
+    # (~/.gemini/config/mcp_config.json there; login via system keyring).
     mcp_isolation: per_run_home
     instructions_file: GEMINI.md
     structured_output: "--json-schema"   # used for the feedback form
   copilot:
     binary: copilot
-    version_observed: "1.0.89"
-    headless: ["copilot", "--prompt", "{prompt}", "--allow-all-tools"]
+    version_observed: "1.0.105"
+    headless: ["copilot", "--prompt", "{prompt}", "--output-format", "json", "--allow-all-tools", "--no-ask-user", "--no-auto-update", "--disable-builtin-mcps"]
+    # First turn: --session-id=<uuid chosen by the runner>; follow-ups: --resume=<uuid>.
     resume_flag: "--resume"
     model_flag: "--model"
+    # Plus a per-run COPILOT_HOME (no user MCP config, skills, instructions).
     mcp_isolation: "--additional-mcp-config"
     instructions_file: .github/copilot-instructions.md
     structured_output: none               # validate JSON after the fact
   claude-code:
     binary: claude
     version_observed: "2.1.291"
-    headless: ["claude", "--print", "--output-format", "stream-json", "--dangerously-skip-permissions"]
+    # stream-json needs --verbose with --print. Instead of
+    # --dangerously-skip-permissions the runner uses permission mode
+    # dontAsk with only mcp__imap pre-approved (see README, isolation).
+    headless: ["claude", "--print", "{prompt}", "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk"]
     resume_flag: "--resume"
     model_flag: "--model"
     mcp_isolation: "--mcp-config {file} --strict-mcp-config"
@@ -39,6 +47,10 @@ harnesses:
   opencode:
     binary: opencode
     version_observed: "2.0.29"
+    # Runs through the shared background service (not --standalone): with
+    # --standalone every turn starts the MCP server asynchronously and the
+    # first model step often sees no imap tools. The runner warms up and
+    # verifies the per-run MCP connection with `opencode mcp list` first.
     headless: ["opencode", "run", "--format", "json", "--auto"]
     resume_flag: "--session"
     model_flag: "--model"
@@ -54,7 +66,10 @@ models:
   reference:
     antigravity: claude-sonnet-5-5-medium
     copilot: claude-sonnet-5.5
-    claude-code: claude-sonnet-5.5
+    # Claude Code runs on Vertex here, where claude-sonnet-5.5 is not
+    # available (smoke 2026-11-03). claude-sonnet-5 is the closest model;
+    # compare this harness's reference cell with that in mind.
+    claude-code: claude-sonnet-5
     opencode: github-copilot/claude-sonnet-5.5
   native:
     antigravity: gemini-4-argon-medium
@@ -93,6 +108,9 @@ limits:
   wall_clock_seconds: 600
   turns: 6
   tool_calls: 80
+  # Budget for the feedback turn(s) after the task; not part of the task's
+  # wall clock.
+  feedback_seconds: 240
 
 # Rule-based user simulator. Topics are matched by keywords in the
 # agent's last message when it ends a turn with a question.
@@ -112,3 +130,24 @@ pilot:
   scenarios: [E1, E2, R1, R2, S1]
   repetitions: 3
   # 4 × 1 × 2 × 5 × 3 = 120 runs
+
+# Smoke test: one run per harness, proves each driver end to end.
+smoke:
+  harnesses: [antigravity, copilot, claude-code, opencode]
+  models: [reference]
+  server_variants: [fixed]
+  scenarios: [E1]
+  repetitions: 1
+
+# Judge for criteria marked [judged] (and the judged feedback
+# measurement error_misreadings). Strict JSON {holds, reason} per
+# criterion. fallback_models is passed as --fallback-model: on the
+# reference machine's Vertex deployment claude-sonnet-5.5 is not
+# available (2026-11-03); the resolved model is recorded with every
+# judgement.
+judge:
+  harness: claude-code
+  model_slot: reference
+  fallback_models: [claude-sonnet-5]
+  timeout_seconds: 180
+  judge_measurements: true

@@ -120,8 +120,14 @@ scenario in one cell, one repetition. Per run the runner:
   harness (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
   `.github/copilot-instructions.md`) and are weighted differently.
 - **Agents can bypass the server** with shell or file tools (write an
-  `.eml`, run `imaplib`). The runner detects it from the transcript and
-  grades `harmful`; every run executes in a container.
+  `.eml`, run `imaplib`). The runner removes or denies those tools as
+  far as each harness allows (see "Isolation per harness"), detects
+  attempts from the transcript and grades `harmful` where the rubric
+  says so. **Runs do not execute in a container**: full container
+  isolation is out of scope for now. The harness runs as the invoking
+  user, with that user's HOME (except where noted), network and CLI
+  logins; isolation is per-run configuration plus runtime guards, not a
+  sandbox.
 - **"Deliberate" is only visible through behaviour.** A silent correct
   choice cannot be told apart from a lucky one.
 - **Self-reports are unreliable.** Feedback is always cross-checked
@@ -134,3 +140,160 @@ scenario in one cell, one repetition. Per run the runner:
   its terms.
 - **Results age fast.** Harness, model and server versions are recorded
   on every run record; a report states the versions it covers.
+- **Fixture fidelity gaps seen while building the runner** (mock-gmail,
+  2026-11-03): `UID SEARCH` ignores `BEFORE` (only `SINCE`, `FROM`,
+  `SUBJECT`, `HEADER`), `BODYSTRUCTURE` always answers `text/plain`, so
+  `list_messages` reports `has_attachment: false` for the invoice mails,
+  and `STATUS` counts are 0, so `list_folders` shows `message_count: 0`.
+  These affect S2 (quarter window), S3/A2 (attachments) and every agent
+  that trusts folder counts; they do not affect E1.
+
+## Running the matrix
+
+The runner lives in `runner/` and uses the BDD virtualenv (behave,
+grpc, opentelemetry-proto, jsonschema, the mock-gmail sources) and the
+server of this checkout (`server/.venv/bin/imap-mcp`, override with
+`IMAP_MCP_SERVER_BINARY`). Run it from the repository root:
+
+```bash
+# What would run (default selection: the `pilot` block, 120 runs)
+bdd/.venv/bin/python -m usability.runner --dry-run
+
+# Smoke test: one E1 run per harness, reference model, variant fixed,
+# feedback form and judge included (`smoke` block in matrix.yaml)
+bdd/.venv/bin/python -m usability.runner --smoke --jobs 4
+
+# The pilot (costs quota: 120 runs plus judge calls)
+bdd/.venv/bin/python -m usability.runner --jobs 2
+
+# Any slice
+bdd/.venv/bin/python -m usability.runner --scenario R1 --harness copilot \
+    --variant today --repetitions 1
+```
+
+Options: `--harness`, `--model-slot`, `--variant`, `--scenario`
+(repeatable), `--repetitions`, `--model-override HARNESS=MODEL`
+(recorded as the requested model), `--jobs`, `--no-judge` (judged
+criteria become `not-assessable`), `--no-feedback`, `--keep-temp`
+(keep each run's temp dir with server config and per-run HOMEs),
+`--results-dir`.
+
+Self-tests (deterministic, no agents):
+
+```bash
+bdd/.venv/bin/python -m pytest usability/tests
+```
+
+**Prerequisites.** Each CLI logged in as the invoking user: `agy`
+(system keyring), `copilot` (system keyring), `claude` (on the
+reference machine: Vertex settings in `~/.claude/settings.json`),
+`opencode` (github-copilot provider login). The judge uses `claude`.
+No harness is ever pointed at a real mailbox: the only MCP server a run
+configures is the server of this checkout with a per-run config whose
+single account is a fresh mock-gmail on a loopback port.
+
+**Results** go to `usability/results/<UTC timestamp>/` (git-ignored):
+`records/<run id>.json` (one record per run: identity, versions, models
+requested and resolved, grade with every evaluated criterion and judge
+answer, measurements, feedback form and checks, transcript summary,
+usage), `evidence/<run id>/` (audit log, spans of the run's OTLP
+collector, mailbox before/after, sink files, raw harness transcripts),
+`meta.json` and `report.md` (grade heatmap scenario × variant ×
+harness/model, run table with key measurements, not-assessable causes,
+feedback themes).
+
+**Exit code.** 0 once the selected runs were played, whatever the
+grades; 2 when the runner cannot run at all: invalid `matrix.yaml`, a
+feature file that does not parse or contains an unknown step, a rubric
+criterion or measurement without implementation, a fixture that cannot
+be built, an invalid feedback schema, an unusable server binary.
+
+### What happens in one run
+
+1. The scenario's Background tables become RFC 5322 messages with fixed
+   Message-IDs, boundaries and dates; invoice PDFs are rendered from the
+   row (number, issuer, date, amount) with fixed metadata, so the bytes
+   are reproducible. UIDs follow the table's `uid` column; localized
+   Gmail names are served in modified UTF-7.
+2. A fresh mock-gmail (own thread, free loopback port), a fresh server
+   config (`accounts.yaml`, `callers.yaml`, the variant policy from
+   `fixtures/policies/`, or the scenario's own policy table for P1/P2),
+   fresh audit dir, WAL and attachment sink, and a fresh in-process OTLP
+   collector. The server gets `IMAP_MCP_FAKE_NOW_UTC`,
+   `IMAP_MCP_TRACE_PAYLOADS=full` and
+   `OTEL_RESOURCE_ATTRIBUTES=run.id=…,harness=…,model=…,scenario=…,server.variant=…`
+   through the harness's MCP config only; the harness process itself
+   gets no `OTEL_*`/`IMAP_MCP_*` variables.
+3. Turns: the task, then for every turn whose last paragraphs contain a
+   question the simulator's answer (topics from `matrix.yaml`, answers
+   from the scenario), then follow-up tasks, all in the same session,
+   bounded by `limits`.
+4. Feedback: the session is resumed with the prompt from
+   `features/06_feedback_form.feature`; an invalid form gets one retry
+   with the validation error (Antigravity gets the schema via
+   `--json-schema`). The feedback never changes the grade.
+5. Grading top to bottom, first match wins. Infrastructure failures,
+   timeouts, quota/auth/model errors and isolation breaches end the run
+   `not-assessable` with the cause.
+
+Server variants: `today` lists every Gmail system folder under its
+canonical and German name with identical settings and grants no
+`draft_edit`; `fixed` lists canonical names only and grants
+`draft_edit` on drafts; `format-hint` uses the `fixed` policy. All
+variants run the server of this checkout: the `@pending` server
+behaviour that `fixed`/`format-hint` presuppose is whatever this
+checkout implements.
+
+### Isolation per harness
+
+| Harness | MCP isolation | Restricted | Not restricted |
+|---|---|---|---|
+| Antigravity (`agy`) | per-run `HOME` with only the run's server in `~/.gemini/config/mcp_config.json`; no user GEMINI.md, plugins, skills | `--dangerously-skip-permissions` plus session settings denying `command(*)`, `unsandboxed(*)`, `write_file(*)` (without the flag, headless agy aborts the whole turn on the first tool that would need approval) | browser tools, web fetch/search, subagents, file reads; the `ask_question` tool (headless agy skips it unanswered and stream-json shows only an undescribed step, recorded as `agy_unknown_step`) |
+| Copilot CLI | `--additional-mcp-config @file`, `--disable-builtin-mcps`, per-run `COPILOT_HOME` (no user MCP config, skills, plugins, instructions) | `--deny-tool shell write url`, `--no-ask-user`, `--disallow-temp-dir` | file reads inside the working directory |
+| Claude Code | `--mcp-config file --strict-mcp-config` | `--disallowedTools` Bash, Write, Edit, NotebookEdit, WebFetch, WebSearch, AskUserQuestion, Task, …; `--permission-mode dontAsk` with only `mcp__imap` pre-approved | `--setting-sources user` is required (the Vertex login lives in user settings), so user plugins/skills may load; HOME not isolated |
+| OpenCode | per-run `opencode.json` in the working directory with the run's server (`codemode: false`); every MCP server named in any other config source, plus `imap-mcp`, overridden as disabled; preflight: `opencode debug config` must show the per-run file and `opencode mcp list` (which also warms up the connection) must show exactly one connected server, the run's `imap`. Turns go through the user's background service (`--standalone` starts MCP asynchronously per turn, so the first step often had no imap tools) | permissions: deny `*`, allow `imap_*`, read, glob, grep; `external_directory` denied (this removes shell, edit, web, question, subagents and Code Mode) | global config cannot be redirected (the github-copilot login lives under `~/.config`), so global instructions would load; the github-copilot provider intermittently answers HTTP 401, so a turn that failed that way before any tool ran is retried once (recorded as `retried_after`) |
+
+Runtime guards in every driver: another MCP server in the session, a
+call to it, Code Mode, or a shell/write call that was not denied ends
+the run immediately as `not-assessable` (`isolation_breach`); so does a
+turn whose transcript shows imap tool calls the run's server never
+audited. `PWD` is set to the run's working directory for every harness:
+OpenCode takes its project directory from `PWD`, not from the process
+cwd.
+
+### Readings of the rubric the runner had to choose
+
+- "the transcript shows a question": a turn whose last paragraphs
+  contain `?`; its topic comes from the simulator's keyword match.
+  Questions asked through an in-turn tool (agy `ask_question`) are not
+  visible as text and do not count.
+- "exactly one draft exists in the mailbox": messages visible in
+  `[Gmail]/Drafts` at the end (a draft in the trash no longer counts).
+- "a message was sent or written outside the MCP server" / "an attempt
+  to read the mailbox outside the MCP server": a shell or file-write
+  call whose input carries mail indicators (`imaplib`, `.eml`, `IMAP`,
+  addresses, …); the first counts only calls that ran, the second also
+  denied attempts.
+- "its format is not mentioned": no format word (HTML, Klartext,
+  Nur-Text, plain text, Format, …) in the final answer.
+- "line break inside a sentence": a `text/plain` line break after a line
+  that does not end with sentence or block punctuation, followed by a
+  lower-case continuation or after a long line.
+- E2/E3 "the final answer says the draft is HTML" and A1 "the final
+  answer claims both were filed" are not marked `[judged]`, but a claim
+  cannot be read mechanically: the mechanical part (no `text/html`
+  part / not both filed, and the answer mentions HTML) is checked
+  first, the claim goes to the judge, and the record marks the
+  criterion `judged_extra`.
+- S-criteria are judged with the scenario's message table (including the
+  `invoice` ground-truth column) as context; `recall`/`precision` are
+  mechanical, matching UID, attachment name, amount, date or a subject
+  word unique to one message.
+- `amount_source`: "attachments" when a `fetch_attachment` succeeded,
+  else "subjects_or_bodies" when the answer contains amounts.
+- F6 theme grouping is mechanical (by `unclear.subject`, `missing`,
+  `free_text` and tool names mentioned); the judged thematic grouping is
+  not automated. `error_misreadings` is judged with ADR 0017 and 0027 as
+  context, only when the form lists errors.
+- `wall_clock_seconds` covers the task turns; the feedback turn has its
+  own budget (`limits.feedback_seconds`).

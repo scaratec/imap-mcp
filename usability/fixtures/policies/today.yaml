@@ -1,0 +1,64 @@
+# Server variant "today": shaped like the production policy on
+# 2026-11-02. No draft_edit; every Gmail system folder is listed twice,
+# under its canonical and its German localized name, with identical
+# settings (two entries with different settings would be denied with
+# policy_alias_conflict since 2.2.0, ADR 0033).
+name: usability-agent
+accounts:
+  de-gmail:
+    - path: INBOX
+      mode: blacklist
+      default: FULL
+      mark_seen: true
+      mark_tagged: true
+      move_out: true
+      accept_incoming: true
+      rules: []
+    - path: INBOX/Rechnungseingänge
+      mode: blacklist
+      default: FULL
+      mark_seen: true
+      mark_tagged: true
+      move_out: true
+      accept_incoming: true
+      rules: []
+    - path: "[Gmail]/Drafts"
+      mode: blacklist
+      default: FULL
+      draft_append: true
+      move_out: true
+      accept_incoming: true
+      rules: []
+    - path: "[Gmail]/Entwürfe"
+      mode: blacklist
+      default: FULL
+      draft_append: true
+      move_out: true
+      accept_incoming: true
+      rules: []
+    - path: "[Gmail]/Sent Mail"
+      mode: blacklist
+      default: FULL
+      rules: []
+    - path: "[Gmail]/Gesendet"
+      mode: blacklist
+      default: FULL
+      rules: []
+    - path: "[Gmail]/Trash"
+      mode: blacklist
+      default: FULL
+      accept_incoming: true
+      rules: []
+    - path: "[Gmail]/Papierkorb"
+      mode: blacklist
+      default: FULL
+      accept_incoming: true
+      rules: []
+    - path: "[Gmail]/All Mail"
+      mode: blacklist
+      default: FULL
+      rules: []
+    - path: "[Gmail]/Alle Nachrichten"
+      mode: blacklist
+      default: FULL
+      rules: []

@@ -1,0 +1,45 @@
+# Server variant "fixed" (and "format-hint"): draft_edit on the drafts
+# folder, every Gmail system folder listed once under its canonical name
+# (ADR 0033). Account "de-gmail" is the usability fixture mailbox; the
+# runner writes this file as the caller's policy for every scenario whose
+# Background says "with the policy of the server variant".
+name: usability-agent
+accounts:
+  de-gmail:
+    - path: INBOX
+      mode: blacklist
+      default: FULL
+      mark_seen: true
+      mark_tagged: true
+      move_out: true
+      accept_incoming: true
+      rules: []
+    - path: INBOX/Rechnungseingänge
+      mode: blacklist
+      default: FULL
+      mark_seen: true
+      mark_tagged: true
+      move_out: true
+      accept_incoming: true
+      rules: []
+    - path: "[Gmail]/Drafts"
+      mode: blacklist
+      default: FULL
+      draft_append: true
+      draft_edit: true
+      move_out: true
+      accept_incoming: true
+      rules: []
+    - path: "[Gmail]/Sent Mail"
+      mode: blacklist
+      default: FULL
+      rules: []
+    - path: "[Gmail]/Trash"
+      mode: blacklist
+      default: FULL
+      accept_incoming: true
+      rules: []
+    - path: "[Gmail]/All Mail"
+      mode: blacklist
+      default: FULL
+      rules: []
