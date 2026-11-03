@@ -11,6 +11,17 @@ on:
   workflow_run:
     workflows: ["BDD"]
     types: [completed]
+  # Re-publish an already tagged version: upload whatever PyPI and the
+  # GitHub release are missing (both steps skip what exists). Used to
+  # backfill the sdists of 2.1.0 and 2.1.1, which PyPI rejected because
+  # of a "../README.md" member, and their missing GitHub releases. The
+  # backfill job lives in this file because PyPI trusted publishing is
+  # bound to the workflow file name.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to re-publish, e.g. v2.1.1"
+        required: true
 
 permissions:
   contents: write
@@ -131,6 +142,7 @@ jobs:
         with:
           packages-dir: server/dist/
           skip-existing: true
+          verbose: true
 
       # GitHub release + asset upload is the previously-flaky step. We
       # use the gh CLI directly so we control the idempotency: if the
@@ -172,3 +184,99 @@ jobs:
                 --repo "${{ github.repository }}"
             fi
           done
+
+  backfill:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      # Tags up to v2.1.1 declare readme = "../README.md", which puts a
+      # member outside the sdist root. Rebuild them with the packaging
+      # of the default branch: the version and the code stay those of
+      # the tag; only how the README enters the sdist changes.
+      - name: Apply the fixed sdist packaging
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$DEFAULT_BRANCH"
+          if grep -q '^readme = "../README.md"' server/pyproject.toml; then
+            git checkout "origin/$DEFAULT_BRANCH" -- server/hatch_build.py
+            python - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("server/pyproject.toml")
+          s = p.read_text()
+          s = s.replace('readme = "../README.md"\n', 'dynamic = ["readme"]\n')
+          s = re.sub(r'requires = \["hatchling<[^"]*"\]', 'requires = ["hatchling"]', s)
+          s = s.replace(
+              "[tool.hatch.build.targets.wheel]",
+              "[tool.hatch.metadata.hooks.custom]\n\n"
+              "[tool.hatch.build.targets.sdist.force-include]\n"
+              '"../README.md" = "PYPI_README.md"\n\n'
+              "[tool.hatch.build.targets.wheel]",
+              1,
+          )
+          p.write_text(s)
+          PY
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        working-directory: server
+        run: |
+          set -euo pipefail
+          pip install build
+          python -m build
+          if tar tzf dist/*.tar.gz | grep -q '\.\./'; then
+            echo "sdist still contains a member outside its root" >&2
+            exit 1
+          fi
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          packages-dir: server/dist/
+          skip-existing: true
+          verbose: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        working-directory: server
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            # Release notes: the CHANGELOG section of this version.
+            awk -v v="$VERSION" '
+              $0 ~ "^## v" v "( |$)" {on=1; next}
+              on && /^## v[0-9]/ {exit}
+              on {print}
+            ' CHANGELOG.md > /tmp/notes.md
+            [ -s /tmp/notes.md ] || echo "Release $TAG" > /tmp/notes.md
+            gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "$TAG" --notes-file /tmp/notes.md --verify-tag
+          fi
+          EXISTING=$(gh release view "$TAG" --repo "${{ github.repository }}" \
+            --json assets --jq '.assets[].name')
+          for f in dist/*; do
+            name=$(basename "$f")
+            if echo "$EXISTING" | grep -Fxq "$name"; then
+              echo "asset $name already on release - skipping"
+            else
+              gh release upload "$TAG" "$f" --repo "${{ github.repository }}"
+            fi
+          done
+
