@@ -8,3 +8,14 @@ repos:
         files: ^server/src/
       - id: ruff-format
         files: ^server/src/
+  - repo: local
+    hooks:
+      # .gitattributes alone does not encrypt: without `git-crypt init`
+      # the filter is a no-op and the secret is committed in plain text
+      # (ROADMAP entry 40).
+      - id: git-crypt-status
+        name: git-crypt status
+        entry: git-crypt status -e
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -49,8 +49,8 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
 ### Nächster Block
 
-Einträge 31 bis 40 unter *Audit und Auslieferung*. Entschieden sind 31,
-32, 33 und 40; zuerst 31 und 32, weil jeder Release-Lauf bis dahin rot
+Einträge 31 bis 39 unter *Audit und Auslieferung* (40 ist erledigt).
+Entschieden sind 31, 32 und 33; zuerst 31 und 32, weil jeder Release-Lauf bis dahin rot
 endet. Offen und als Nächstes mit dem Owner zu klären: 34 bis 39, in
 dieser Reihenfolge.
 
@@ -166,7 +166,7 @@ Die Einträge unten sind dabei aufgefallen und nicht Teil des Fixes.
 | 37 | Kein Status-Signal, ob das Audit schreibbar ist; der Client sieht einen gesunden Server, bis ein Aufruf scheitert | Bugreport 2026-10-17, Punkt 4 | Feature — Entscheidung offen (Feld in `tool_surface_info` oder `describe_policy`, oder eigenes Tool) |
 | 38 | ADR-0032 steht auf *Proposed* | [ADR-0032](adr/0032-shared-audit-chain-across-local-instances.md) | Owner-Entscheidung offen |
 | 39 | Während des Ausfalls (2026-10-16 ca. 21:50 bis Neustart) können `create_draft`-Aufrufe Entwürfe angelegt und trotzdem einen Fehler gemeldet haben; Wiederholungen ergeben dann Duplikate | Folge von Eintrag 33 | Betrieb — offen: `[Gmail]/Drafts` der betroffenen Konten lesend auf Duplikate prüfen |
-| 40 | Das Gmail-App-Passwort des Mock-Testkontos lag bis cfcff4f unverschlüsselt im öffentlichen Repository und bleibt in der Historie lesbar | `bdd/mock-gmail/credentials/app-password.secret` | Sicherheit — **entschieden 2026-10-19:** beim Provider widerrufen, Historie nicht umschreiben. Widerruf durch den Kontoinhaber offen |
+| ~~40~~ | ~~Das Gmail-App-Passwort des Mock-Testkontos lag bis cfcff4f unverschlüsselt im öffentlichen Repository und bleibt in der Historie lesbar~~ | `bdd/mock-gmail/credentials/app-password.secret` | **Erledigt 2026-11-01** — App-Passwort „imap-traces“ beim Provider gelöscht; laut Google zuletzt am 2026-05-06 verwendet, also vor dem Klartext-Commit fb23b4e (2026-05-07). Datei entfernt, Historie nicht umgeschrieben. Pre-commit-Hook `git-crypt status -e` bricht Commits mit unverschlüsselten Dateien unter git-crypt-Filter ab |
 | 41 | Server läuft nicht mit dem MCP-SDK 2.x (u. a. `McpError` → `MCPError`); derzeit `mcp>=1.0.0,<2` | 6cfb6e5 | Wartung — Portierung auf mcp 2 als eigene Arbeit |
 | 42 | CI installiert Abhängigkeiten ohne Versionsstand; ein neues Release eines Pakets (hier mcp 2.0) ließ nahezu alle BDD-Szenarien mit Fehler enden, ohne dass sich Code geändert hatte | `.github/workflows/bdd.yml`, `ci.yml` | Wartung — Entscheidung offen (Constraints- oder Lock-Datei für CI, getrennt von den Bereichen im Paket) |
 | 43 | GitHub Actions: `actions/checkout@v4` und `actions/setup-python@v5` laufen auf Node 20 (veraltet); `ubuntu-latest` wechselt ab 2026-10-19 auf Ubuntu 26 | Annotationen der Läufe vom 2026-10-18 | Wartung — Aktionen anheben, Release-Workflow auf dem neuen Image prüfen |
