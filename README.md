@@ -325,46 +325,71 @@ Gmail), enabling rules like "grant full access to all starred messages":
 
 ## MCP tool surface
 
-Nineteen tools, each gated on exactly one visibility level or one
-capability.
+Thirty tools (tool set 2.2.0), each gated on exactly one visibility
+level or one capability. `tool_surface_info` reports the tool set
+version at runtime.
 
-### Read tools (10)
+### Read tools (13)
 
 | Tool | Min visibility | Description |
 |---|---|---|
 | `list_accounts` | — | List visible accounts + `hidden_accounts_count` |
-| `list_folders` | COUNT | List visible folders + `hidden_folders_count` |
+| `list_folders` | COUNT | List visible folders + `hidden_folders_count` (canonical names) |
 | `list_labels` | COUNT | Gmail only: list labels with flags |
-| `list_messages` | ENVELOPE | **Primary tool for reading mail.** Returns from, subject, date per message. Supports criteria and pagination. |
 | `folder_stats` | COUNT | Message counts per visibility level |
-| `search` | METADATA | Search for UIDs with `matched_total` / `matched_visible` / `filtered_out` |
+| `search` | METADATA | Search for UIDs with `matched_total` / `matched_visible` / `filtered_out`; `outside_scope_total` under the 7-day default; `since` / `before` calendar dates |
+| `list_messages` | METADATA | **Primary tool for reading mail.** From, subject, date per message; same criteria and window rules as `search`; pagination |
 | `fetch_envelope` | ENVELOPE | From, To, Subject, Date for a single message by UID |
 | `fetch_headers` | HEADERS | Full RFC 5322 headers |
 | `fetch_body` | BODY | Plain-text and HTML bodies |
-| `fetch_attachment` | FULL | MIME attachment bytes |
+| `list_attachments` | BODY | Attachment metadata of a message |
+| `fetch_attachment` | FULL | Save one MIME part to the attachment sink |
+| `list_drafts` | METADATA | Drafts in a folder with their handles |
+| `get_draft` | BODY | Read a draft by its handle |
 
-### Write tools (6)
+### Write tools (13)
 
 | Tool | Required capability | Description |
 |---|---|---|
 | `mark_seen` | `mark_seen` | Toggle `\Seen` flag on a single message |
 | `bulk_mark_seen` | `mark_seen` | Toggle `\Seen` on all messages matching criteria |
 | `mark_tagged` | `mark_tagged` | Add/remove keywords |
-| `move` | `move_out` + `accept_incoming` | Move message (intra-account: native MOVE; cross-account: saga) |
+| `bulk_mark_tagged` | `mark_tagged` | Add/remove keywords on all messages matching criteria |
+| `move` | `move_out` + `accept_incoming` | Move message (Gmail: label swap; other servers: native MOVE; cross-account: saga) |
 | `copy` | `accept_incoming` | Copy message to target folder |
-| `create_draft` | `draft_append` | Append a draft: plain text or HTML from fields, or a raw RFC 5322 message |
+| `create_draft` | `draft_append` | Append a draft: plain text or HTML from fields, or a raw RFC 5322 message; reports the stored `format` |
+| `create_reply_draft` | `draft_append` | Reply draft with recipients, subject and quote set by the server; `reply_text` and/or `reply_html` |
+| `update_draft` | `draft_edit` | Revise a draft field-wise under its handle |
+| `discard_draft` | `move_out` + `accept_incoming` | Move every revision of a draft to the `\Trash` folder by its handle; never hard-deletes |
+| `add_attachment` | `modify_message` | Add an attachment (message rewrite) |
+| `replace_attachment` | `modify_message` | Replace an attachment (message rewrite) |
+| `delete_attachment` | `modify_message` | Remove an attachment (message rewrite) |
 
-### Meta tools (3)
+### Meta tools (4)
 
 | Tool | Description |
 |---|---|
 | `describe_policy` | Caller's own policy profile (accounts, folders, capabilities, hidden counts). Never reveals rule patterns or other callers. |
 | `get_caller_identity` | Resolved `caller_id` for the current session |
-| `get_transaction_status` | WAL state of a cross-account move saga |
+| `get_transaction_status` | WAL state of a saga transaction |
+| `tool_surface_info` | Tool set version and package version |
+
+### Upgrading to 2.2.0
+
+- **Gmail folder names.** System folders such as `[Gmail]/Drafts` and
+  `[Gmail]/Entwürfe` now address the same folder, and responses always
+  name it canonically (`[Gmail]/Drafts`). A policy that lists both
+  names with **different** settings now denies that folder with
+  `policy_alias_conflict`; keep one entry per folder, preferably under
+  the canonical name ([ADR 0033](docs/adr/0033-gmail-special-use-folder-resolution.md)).
+- **Trace payloads** default to `redacted`. Set
+  `IMAP_MCP_TRACE_PAYLOADS=full` to keep complete request and response
+  payloads in a trace store only you can read
+  ([ADR 0037](docs/adr/0037-trace-payload-modes.md)).
 
 ### Deliberately absent
 
-`delete`, `expunge`, `raw_imap_command`, `fetch_raw_rfc822`, cross-account
+`delete` (drafts are discarded to the trash with `discard_draft`), `expunge`, `raw_imap_command`, `fetch_raw_rfc822`, cross-account
 search, MCP resource subscriptions, folder CRUD, policy reload via MCP.
 See [ADR 0018](docs/adr/0018-non-goal-tool-surface.md).
 

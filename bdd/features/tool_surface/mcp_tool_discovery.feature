@@ -1,13 +1,14 @@
 Feature: MCP tool discovery
 
   A connected client enumerates the server's tools via the standard
-  MCP list_tools handshake. The 2.1.0 surface exposes exactly 30
+  MCP list_tools handshake. The 2.2.0 surface exposes exactly 30
   tools partitioned into 13 read, 13 write, and 4 meta. The
   advertised shape matches ADR 0026 + ADR 0028 + ADR 0030 + ADR 0031
-  + ADR 0034; the minor bump to 2.1.0 is the purely additive draft
-  surface — get_draft and list_drafts (ADR 0030) and update_draft
-  (ADR 0031) — which breaks nothing that came before. discard_draft
-  (ADR 0034) is equally additive.
+  + ADR 0034 + ADR 0035 + ADR 0036. 2.1.0 added the draft surface
+  (get_draft, list_drafts, update_draft); 2.2.0 adds discard_draft
+  (ADR 0034), structured create_draft fields and reply_html
+  (ADR 0035), and since/before with outside_scope_total (ADR 0036).
+  Both bumps are additive and break nothing that came before.
 
   Covered error layers (per BDD Guidelines §4.5):
     - Tool presence           : 1 (exact set)
@@ -21,7 +22,7 @@ Feature: MCP tool discovery
     Given the server is started with a minimal caller configuration
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The 2.1 tool set consists of exactly these 30 tools
+  Scenario: The 2.2 tool set consists of exactly these 30 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
       | tool                      |
