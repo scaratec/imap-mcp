@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v2.2.1 (2026-11-03)
+
+### Bug Fixes
+
+- **gmail**: Quote system labels and encode mailboxes like Gmail needs
+  ([`b568f8d`](https://github.com/scaratec/imap-mcp/commit/b568f8dd07bbb1b336005b8865eacdb2253c5a8e))
+
+### Continuous Integration
+
+- **release**: Take release notes from the CHANGELOG
+  ([`5a07d00`](https://github.com/scaratec/imap-mcp/commit/5a07d001966f9dc81329221ae67edee45e51a4f1))
+
+### Documentation
+
+- **roadmap**: Record the agent usability work and its follow-ups
+  ([`e0dc93f`](https://github.com/scaratec/imap-mcp/commit/e0dc93f70a5ed5c37f6e984aad1733e13c1685a5))
+
+
 ## v2.2.0 (2026-11-03)
 
 ### Bug Fixes
