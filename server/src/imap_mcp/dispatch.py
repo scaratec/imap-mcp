@@ -47,6 +47,7 @@ from .handlers.attachments import (
 from .handlers.drafts import (
     handle_create_draft,
     handle_create_reply_draft,
+    handle_discard_draft,
     handle_get_draft,
     handle_list_drafts,
     handle_update_draft,
@@ -246,6 +247,8 @@ def build_server(context: ServerContext) -> Server:
             return await handle_create_reply_draft(context, arguments)
         if name == "update_draft":
             return await handle_update_draft(context, arguments)
+        if name == "discard_draft":
+            return await handle_discard_draft(context, arguments)
         if name == "add_attachment":
             return await handle_add_attachment(context, arguments)
         if name == "replace_attachment":
@@ -524,7 +527,7 @@ def _tool(
 
 
 def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
-    """Return the V2 tool surface (ADR 0026, ADR 0030, ADR 0031; 29 tools).
+    """Return the V2 tool surface (ADR 0026, 0030, 0031, 0034; 30 tools).
 
     `context` is consulted only to render the dynamic
     `fetch_attachment` description per ADR 0028 §3. When called
@@ -724,6 +727,18 @@ def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
                 "changes": _DRAFT_CHANGES_SCHEMA,
             },
             ["account", "folder", "draft_id", "base_revision", "changes"],
+        ),
+        _tool(
+            "discard_draft",
+            (
+                "Discard a draft by its handle: move every message carrying it "
+                "(all revisions) to the account's trash folder, the one with the "
+                "\\Trash special-use flag. Never deletes permanently. Needs "
+                "move_out on the drafts folder and accept_incoming on the trash "
+                "folder (ADR 0034)."
+            ),
+            {**account_field, **folder_field, "draft_id": {"type": "string"}},
+            ["account", "folder", "draft_id"],
         ),
         _tool(
             "add_attachment",

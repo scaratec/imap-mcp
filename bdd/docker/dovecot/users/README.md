@@ -5,7 +5,7 @@ Two passwd-files hold the test accounts for the two instances.
 | Instance | File       | Accounts                                       |
 |----------|------------|------------------------------------------------|
 | imap-a   | `a.passwd` | `gupta@a.local`, `osthues@a.local`             |
-| imap-b   | `b.passwd` | `personal@b.local`, `archive@b.local`          |
+| imap-b   | `b.passwd` | `personal@b.local`, `archive@b.local`, `info@b.local` |
 
 Password for **every** test account is `test123`.
 

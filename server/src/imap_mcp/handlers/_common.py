@@ -58,6 +58,7 @@ WRITE_TOOL_CAP = {
     "create_draft": "draft_append",
     "create_reply_draft": "draft_append",
     "update_draft": "draft_edit",
+    "discard_draft": "move_out",
     "add_attachment": "modify_message",
     "replace_attachment": "modify_message",
     "delete_attachment": "modify_message",
@@ -94,6 +95,8 @@ _KNOWN_ERROR_TYPES = frozenset(
         "draft_not_editable",
         "draft_ambiguous",
         "draft_revision_conflict",
+        # Discarding a draft (ADR 0034)
+        "trash_unavailable",
     }
 )
 

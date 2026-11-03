@@ -20,7 +20,9 @@ docker compose down -v    # tear down incl. mail volumes
 ```
 
 `bdd/environment.py` does the same thing via `docker compose` from
-behave hooks. Manual start is for interactive debugging.
+behave hooks, with `--build` so a changed Dovecot config or user file
+reaches the image. Manual start is for interactive debugging; after
+editing `./dovecot/`, run `docker compose up -d --build`.
 
 ## Ports (bound to 127.0.0.1 only)
 
@@ -41,7 +43,7 @@ wiped between test runs by `docker compose down -v`.
 
 ## Credentials
 
-All four test users share password `test123`. Users are defined in
+All five test users share password `test123`. Users are defined in
 `./dovecot/users/*.passwd`. See the README there.
 
 ## Production note

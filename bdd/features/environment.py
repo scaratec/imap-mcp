@@ -67,7 +67,9 @@ READINESS_TIMEOUT_SECONDS = 30
 def before_all(context: Context) -> None:
     """Start the shared dovecot fixture once per suite."""
     _compose("down", "-v", check=False)
-    _compose("up", "-d")
+    # --build: a changed Dovecot config or user file must reach the
+    # image; with an unchanged context the layer cache makes it a no-op.
+    _compose("up", "-d", "--build")
     _wait_for_imap_ready()
     _wait_for_oauth_ready()
 

@@ -1628,6 +1628,43 @@ def step_caller_calls_get_draft_literal_handle(
     _store_result(context, payload)
 
 
+@when(
+    '{caller_id} calls discard_draft with account "{account}", '
+    'folder "{folder}", the returned draft_id'
+)
+def step_caller_calls_discard_draft_returned_handle(
+    context: Context, caller_id: str, account: str, folder: str
+) -> None:
+    draft_id = getattr(context, "last_draft_id", None)
+    if not draft_id:
+        raise AssertionError(
+            "No draft_id has been returned in this scenario yet; "
+            "the step needs a preceding create_draft or create_reply_draft."
+        )
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool(
+        "discard_draft",
+        {"account": account, "folder": folder, "draft_id": draft_id},
+    )
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls discard_draft with account "{account}", '
+    'folder "{folder}", draft_id "{draft_id}"'
+)
+def step_caller_calls_discard_draft_literal_handle(
+    context: Context, caller_id: str, account: str, folder: str, draft_id: str
+) -> None:
+    """Handle named in the scenario, for drafts the harness seeded."""
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool(
+        "discard_draft",
+        {"account": account, "folder": folder, "draft_id": draft_id},
+    )
+    _store_result(context, payload)
+
+
 @when('{caller_id} calls list_drafts with account "{account}", folder "{folder}"')
 def step_caller_calls_list_drafts(
     context: Context, caller_id: str, account: str, folder: str

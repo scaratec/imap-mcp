@@ -1,5 +1,5 @@
 """Draft handlers: create_draft, create_reply_draft, get_draft,
-list_drafts, update_draft.
+list_drafts, update_draft, discard_draft.
 
 Draft identity follows ADR 0030: the server injects `X-SC-Draft-Id`
 and `X-SC-Draft-Rev` into every draft it appends and flags the append
@@ -20,6 +20,10 @@ import uuid
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, TypedDict
 
 from .. import reply as reply_builder
+from ..imap_core import (
+    ExpungeScopeUnsafe,
+    find_trash_folder,
+)
 from ..imap_core import (
     append_message as imap_append_message,
 )
@@ -42,11 +46,22 @@ from ..imap_core import (
     folder_stats as imap_folder_stats,
 )
 from ..imap_core import (
+    gmail_label_swap as imap_gmail_label_swap,
+)
+from ..imap_core import (
+    list_mailboxes as imap_list_mailboxes,
+)
+from ..imap_core import (
+    move_uids as imap_move_uids,
+)
+from ..imap_core import (
     search_uids as imap_search_uids,
 )
 from ..policy import MessageFacts, evaluate_message_against_folder, level_rank
 from ._common import (
+    _ensure_folder_aliases,
     _facts_from_envelope,
+    _is_google_provider,
     _password_for,
     _require_saga,
     _resolve_imap_folder,
@@ -1338,4 +1353,219 @@ async def handle_update_draft(
         "revision": new_revision,
         "mechanism": saga_result.mechanism,
         "tx_id": saga_result.tx_id,
+    }
+
+
+# --------------------------------------------------------------------- ADR 0034
+
+
+class DiscardDraftResponse(TypedDict, total=False):
+    decision: Literal["ALLOW", "DENY"]
+    result: NotRequired[Literal["OK", "ERROR"]]
+    reason: NotRequired[str]
+    error: NotRequired[dict[str, str]]
+    account: str
+    folder: str
+    draft_id: str
+    missing_capability: NotRequired[str]
+    target_folder: NotRequired[str]
+    discarded_count: NotRequired[int]
+    moved_to: NotRequired[str]
+    mechanism: NotRequired[str]
+
+
+async def _uids_carrying_handle(
+    account: Any, password: str, imap_folder: str, draft_id: str
+) -> list[int]:
+    """Every UID in one folder whose `X-SC-Draft-Id` equals `draft_id`.
+
+    Unlike `_resolve_draft_id` this keeps every revision, residue and
+    messages without a usable revision included: ADR 0034 discards
+    whatever carries the handle. SEARCH HEADER matches substrings
+    (RFC 3501 §6.4.4), so each hit is re-checked for equality.
+    """
+    criteria = f'HEADER "{DRAFT_ID_HEADER}" "{draft_id}"'
+    uids = await imap_search_uids(account, password, imap_folder, criteria)
+    if not uids:
+        return []
+    raw_headers = await imap_fetch_raw_headers_batch(account, password, imap_folder, uids)
+    return [
+        uid
+        for uid, raw in sorted(raw_headers.items())
+        if _parse_draft_headers(uid, raw).draft_id == draft_id
+    ]
+
+
+class _PartialDiscard(RuntimeError):
+    """A label swap failed after `moved` messages had been moved."""
+
+    def __init__(self, moved: int) -> None:
+        super().__init__(f"discard stopped after {moved} message(s)")
+        self.moved = moved
+
+
+async def _discard_by_label_swap(
+    account: Any,
+    password: str,
+    imap_folder: str,
+    uids: list[int],
+    *,
+    folder: str,
+    trash_folder: str,
+) -> None:
+    """Move each UID with the Gmail label swap of ADR 0019.
+
+    Labels derive from the canonical paths (ADR 0033); the source is
+    selected under its wire path. The first failure stops the loop and
+    surfaces as `_PartialDiscard` carrying how many were moved before.
+    """
+    from ..imap_core import _LABEL_TO_FOLDER
+
+    folder_to_label = {path: label for label, path in _LABEL_TO_FOLDER.items()}
+    src_label = folder_to_label.get(folder, folder)
+    dst_label = folder_to_label.get(trash_folder, trash_folder)
+    for moved, uid in enumerate(uids):
+        try:
+            await imap_gmail_label_swap(account, password, imap_folder, uid, src_label, dst_label)
+        except Exception as exc:
+            raise _PartialDiscard(moved) from exc
+
+
+async def handle_discard_draft(
+    context: ServerContext, arguments: dict[str, Any]
+) -> DiscardDraftResponse:
+    """Move every message carrying a draft handle to the account's trash.
+
+    ADR 0034. Authorization is that of `move`: `move_out` on the drafts
+    folder, then `accept_incoming` on the folder flagged `\\Trash`. The
+    trash folder is located by its RFC 6154 flag in one LIST. All
+    authorization and existence checks run before the first mutating
+    command, so nothing is moved on any error that has a type.
+    """
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+    draft_id = str(arguments["draft_id"])
+    identity: dict[str, Any] = {
+        "account": account_id,
+        "folder": folder_path,
+        "draft_id": draft_id,
+    }
+
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return _deny_draft_read(  # type: ignore[return-value]
+            reason=folder_decision.reason,
+            account=account_id,
+            folder=folder_path,
+            draft_id=draft_id,
+        )
+    assert folder_decision.folder_policy is not None
+    if not folder_decision.folder_policy.move_out:
+        return {
+            "decision": "DENY",
+            "reason": "capability_missing",
+            "account": account_id,
+            "folder": folder_path,
+            "draft_id": draft_id,
+            "missing_capability": "move_out",
+        }
+
+    account, password = await _password_for(context, account_id)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    mailboxes = await imap_list_mailboxes(account, password)
+    trash_wire = find_trash_folder(mailboxes)
+    if trash_wire is None:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="trash_unavailable",
+            detail="no folder on this account carries the \\Trash special-use flag",
+            reason=folder_decision.reason,
+            extra=identity,
+        )
+    await _ensure_folder_aliases(context, account_id)
+    trash_folder = context.pdp.canonical_folder(account_id, trash_wire)
+
+    trash_decision = context.pdp.decide_folder_access(context.caller_id, account_id, trash_folder)
+    if not trash_decision.allowed:
+        # The trash folder is not visible to the caller, so its name is
+        # not disclosed either.
+        return _deny_draft_read(  # type: ignore[return-value]
+            reason=trash_decision.reason,
+            account=account_id,
+            folder=folder_path,
+            draft_id=draft_id,
+        )
+    assert trash_decision.folder_policy is not None
+    if not trash_decision.folder_policy.accept_incoming:
+        return {
+            "decision": "DENY",
+            "reason": "capability_missing",
+            "account": account_id,
+            "folder": folder_path,
+            "draft_id": draft_id,
+            "target_folder": trash_folder,
+            "missing_capability": "accept_incoming",
+        }
+
+    listed = {fi.path for fi in mailboxes}
+    if imap_folder not in listed and imap_folder.upper() != "INBOX":
+        return error_envelope(  # type: ignore[return-value]
+            error_type="folder_absent", reason=folder_decision.reason, extra=identity
+        )
+
+    uids = await _uids_carrying_handle(account, password, imap_folder, draft_id)
+    if not uids:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="draft_not_found", reason=folder_decision.reason, extra=identity
+        )
+
+    account_model = context.account_by_id(account_id)
+    try:
+        if account_model is not None and _is_google_provider(account_model):
+            await _discard_by_label_swap(
+                account,
+                password,
+                imap_folder,
+                uids,
+                folder=folder_path,
+                trash_folder=trash_folder,
+            )
+            mechanism = "gmail_label_swap"
+        else:
+            mechanism = await imap_move_uids(account, password, imap_folder, uids, trash_wire)
+    except _PartialDiscard as exc:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="transient_imap_failure",
+            detail=f"label swap failed after {exc.moved} of {len(uids)} message(s)",
+            reason=folder_decision.reason,
+            extra={**identity, "discarded_count": exc.moved, "moved_to": trash_folder},
+        )
+    except ExpungeScopeUnsafe:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="transient_imap_failure",
+            detail=(
+                "server offers neither MOVE nor UIDPLUS and other messages "
+                "in the folder are marked \\Deleted; nothing was moved"
+            ),
+            reason=folder_decision.reason,
+            extra={**identity, "discarded_count": 0, "moved_to": trash_folder},
+        )
+    except Exception:  # noqa: BLE001 - any IMAP failure is reported
+        # How much of a failed MOVE took effect is unknown, so no count
+        # is claimed; a repeated call moves whatever is left (ADR 0034).
+        return error_envelope(  # type: ignore[return-value]
+            error_type="transient_imap_failure",
+            detail="moving the draft to the trash folder failed",
+            reason=folder_decision.reason,
+            extra={**identity, "moved_to": trash_folder},
+        )
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": folder_decision.reason,
+        "account": account_id,
+        "folder": folder_path,
+        "draft_id": draft_id,
+        "discarded_count": len(uids),
+        "moved_to": trash_folder,
+        "mechanism": mechanism,
     }

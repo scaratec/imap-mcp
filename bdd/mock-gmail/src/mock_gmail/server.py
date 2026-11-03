@@ -237,13 +237,18 @@ class GmailIMAPHandler:
             self._send(tag, "OK", "UID SEARCH completed")
             return
 
-        header_match = re.search(r'HEADER\s+"([^"]+)"\s+"([^"]+)"', args, re.IGNORECASE)
+        header_match = re.search(
+            r'HEADER\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]*)"|(\S+))', args, re.IGNORECASE
+        )
         if header_match:
-            hdr_name = header_match.group(1)
-            hdr_value = header_match.group(2)
+            hdr_name = header_match.group(1) or header_match.group(2)
+            hdr_value = header_match.group(3) if header_match.group(3) is not None else header_match.group(4)
+            # RFC 3501 §6.4.4: a message matches when the named header
+            # field contains the string, case-insensitively.
             uids = []
             for u, m in msgs:
-                if hdr_name.lower() == "message-id" and m.message_id and hdr_value in m.message_id:
+                values = email.message_from_bytes(m.rfc822).get_all(hdr_name) or []
+                if any(hdr_value.lower() in str(v).lower() for v in values):
                     uids.append(str(u))
             self._send_untagged(f"SEARCH {' '.join(uids)}" if uids else "SEARCH")
             self._send(tag, "OK", "UID SEARCH completed")

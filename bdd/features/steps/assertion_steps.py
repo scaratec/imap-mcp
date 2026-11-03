@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from behave import given, then, when
+from behave import given, then, use_step_matcher, when
 from behave.runner import Context
 
 
@@ -381,11 +381,94 @@ def step_wal_has_entry(context: Context) -> None:
         )
 
 
-@then('the IMAP folder "{folder}" still contains uid {uid:d}')
+# Regex, not parse: a parse `{folder}` would also swallow
+# `INBOX/Drafts" on "info-bg` and bind the account-qualified form below
+# to the wrong folder name.
+use_step_matcher("re")
+
+
+@then(r'the IMAP folder "(?P<folder>[^"]+)" still contains uid (?P<uid>\d+)')
 def step_imap_folder_still_contains_uid(
-    context: Context, folder: str, uid: int
+    context: Context, folder: str, uid: str
 ) -> None:
-    _assert_uid_presence(context, folder, uid, should_exist=True)
+    _assert_uid_presence(context, folder, int(uid), should_exist=True)
+
+
+@then(
+    r'the IMAP folder "(?P<folder>[^"]+)" on "(?P<account_id>[^"]+)" '
+    r"still contains uid (?P<uid>\d+)"
+)
+def step_imap_folder_on_account_still_contains_uid(
+    context: Context, folder: str, account_id: str, uid: str
+) -> None:
+    _assert_uid_presence(
+        context, folder, int(uid), should_exist=True, account_id=account_id
+    )
+
+
+@then(
+    r'a direct IMAP SEARCH on "(?P<qualified>[^"]+)" for header (?P<header>[A-Za-z0-9-]+) '
+    r"equal to the returned draft_id returns (?P<count>.+?) results?"
+)
+def step_direct_header_search_returned_draft_id(
+    context: Context, qualified: str, header: str, count: str
+) -> None:
+    draft_id = getattr(context, "last_draft_id", None)
+    if not draft_id:
+        raise AssertionError(
+            "No draft_id has been returned in this scenario yet; "
+            "the step needs a preceding create_draft or create_reply_draft."
+        )
+    _assert_direct_header_search(context, qualified, header, draft_id, count)
+
+
+@then(
+    r'a direct IMAP SEARCH on "(?P<qualified>[^"]+)" for header (?P<header>[A-Za-z0-9-]+) '
+    r'"(?P<value>[^"]+)" returns (?P<count>.+?) results?'
+)
+def step_direct_header_search_literal(
+    context: Context, qualified: str, header: str, value: str, count: str
+) -> None:
+    _assert_direct_header_search(context, qualified, header, value, count)
+
+
+use_step_matcher("parse")
+
+
+def _count_phrase(phrase: str) -> int:
+    """`zero`, `exactly one`, `exactly 2` and the like, as written."""
+    words = {"zero": 0, "no": 0, "one": 1, "two": 2}
+    text = phrase.strip()
+    if text.startswith("exactly "):
+        text = text[len("exactly "):]
+    if text in words:
+        return words[text]
+    if text.isdigit():
+        return int(text)
+    raise AssertionError(f"Cannot interpret count phrase {phrase!r}")
+
+
+def _assert_direct_header_search(
+    context: Context, qualified: str, header: str, value: str, count: str
+) -> None:
+    """Second channel (BDD Guidelines §13.2): SEARCH the IMAP server
+    itself, under the folder name that server uses, for messages whose
+    `header` equals `value`."""
+    from support.imap_fixture import resolve_account
+
+    account_id, sep, folder = qualified.partition(":")
+    if not sep:
+        raise AssertionError(
+            f"Expected an \"account:folder\" qualified name, got {qualified!r}"
+        )
+    expected = _count_phrase(count)
+    instance, user = resolve_account(account_id)
+    hits = context.imap.search_header(instance, user, folder, header, value)
+    if len(hits) != expected:
+        raise AssertionError(
+            f"SEARCH HEADER {header} {value!r} on {qualified!r}: expected "
+            f"{expected} message(s), found {len(hits)} (UIDs {hits!r})"
+        )
 
 
 @then('the folder "{folder}" still contains uid {uid:d}')
@@ -470,9 +553,15 @@ def _assert_subject_presence(
 
 
 def _assert_uid_presence(
-    context: Context, folder: str, uid: int, *, should_exist: bool
+    context: Context,
+    folder: str,
+    uid: int,
+    *,
+    should_exist: bool,
+    account_id: str | None = None,
 ) -> None:
-    account_id = _account_for_folder(context, folder)
+    if account_id is None:
+        account_id = _account_for_folder(context, folder)
     from support.imap_fixture import resolve_account
 
     instance, user = resolve_account(account_id)

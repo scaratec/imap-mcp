@@ -69,8 +69,38 @@ def step_imap_account_exists_with_folders(context: Context, account_id: str) -> 
     for row in context.table:
         folder = row["folder path"]
         context.imap.create_folder(instance, user, folder)
+    if "special use" in context.table.headings:
+        _assert_special_use_as_declared(context, instance, user)
 
     builder.write()
+
+
+def _assert_special_use_as_declared(context: Context, instance: str, user: str) -> None:
+    """Check that IMAP LIST reports each folder's special-use flags as
+    the table declares them, an empty cell meaning none.
+
+    Dovecot takes special-use flags from its configuration
+    (docker/dovecot/conf/dovecot.conf), not from the client that
+    creates the folder, so the harness cannot set them. A row the
+    fixture does not reproduce is a harness gap and fails here, before
+    the scenario runs against a mailbox other than the one specified.
+    """
+    reported = context.imap.folder_special_use(instance, user)
+    for row in context.table:
+        folder = row["folder path"]
+        declared = sorted(flag.lower() for flag in row["special use"].split())
+        if folder not in reported:
+            raise AssertionError(
+                f"Folder {folder!r} is not listed by the IMAP fixture; "
+                f"listed: {sorted(reported)!r}"
+            )
+        actual = sorted(flag.lower() for flag in reported[folder])
+        if actual != declared:
+            raise AssertionError(
+                f"Harness gap: IMAP LIST reports special use {reported[folder]!r} "
+                f"for {folder!r}, the scenario declares {row['special use']!r}. "
+                "Special-use flags come from docker/dovecot/conf/dovecot.conf."
+            )
 
 
 @given('the IMAP account "{account_id}" exists with folder "{folder}"')
@@ -522,7 +552,76 @@ def step_folder_holds_messages_plural_explicit(
     _seed_message(context, account_id, folder)
 
 
+@given(r'the IMAP folder "(?P<folder>[^"]+)" holds messages:')
+def step_imap_folder_holds_messages(context: Context, folder: str) -> None:
+    """Same seeding as `the folder "..." holds messages:`."""
+    step_folder_holds_messages_plural(context, folder)
+
+
+@given(
+    r'the IMAP folder "(?P<folder>[^"]+)" holds drafts carrying the handle '
+    r'"(?P<draft_id>[^"]+)":'
+)
+def step_imap_folder_holds_handle_drafts(
+    context: Context, folder: str, draft_id: str
+) -> None:
+    _stage_handle_drafts(context, _find_account_for_folder(context, folder), folder, draft_id)
+
+
+@given(
+    r'the IMAP folder "(?P<folder>[^"]+)" on "(?P<account_id>[^"]+)" holds drafts '
+    r'carrying the handle "(?P<draft_id>[^"]+)":'
+)
+def step_imap_folder_on_account_holds_handle_drafts(
+    context: Context, folder: str, account_id: str, draft_id: str
+) -> None:
+    _stage_handle_drafts(context, account_id, folder, draft_id)
+
+
 use_step_matcher("parse")
+
+
+def _stage_handle_drafts(
+    context: Context, account_id: str, folder: str, draft_id: str
+) -> None:
+    """Stage one message per row that carries the draft handle headers
+    of ADR 0030 (`X-SC-Draft-Id`, `X-SC-Draft-Rev`) as a server-written
+    draft would, without going through the server.
+
+    Table columns: uid (the scenario's UID hint), revision, subject.
+    Everything else follows the defaults of `_seed_message`.
+    """
+    expected = {"uid", "revision", "subject"}
+    if set(context.table.headings) != expected:
+        raise AssertionError(
+            f"Draft seeding table needs exactly the columns {sorted(expected)}; "
+            f"got {context.table.headings!r}"
+        )
+    context.staged_messages = getattr(context, "staged_messages", [])
+    for row in context.table:
+        context.staged_messages.append(
+            {
+                "_account_id": account_id,
+                "_folder": folder,
+                "uid_hint": int(row["uid"]),
+                "from": None,
+                "to": None,
+                "subject": row["subject"],
+                "message_id_override": None,
+                "has_attachment": False,
+                "size_hint": 0,
+                "date": None,
+                "flags": [],
+                "extra_attachments": [],
+                "extra_headers": [
+                    ("X-SC-Draft-Id", draft_id),
+                    ("X-SC-Draft-Rev", row["revision"]),
+                ],
+                "body_override": None,
+                "html_body": None,
+                "html_only": False,
+            }
+        )
 
 
 @given('the folder "{folder}" holds a verbatim message:')

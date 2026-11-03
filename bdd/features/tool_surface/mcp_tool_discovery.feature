@@ -1,12 +1,13 @@
 Feature: MCP tool discovery
 
   A connected client enumerates the server's tools via the standard
-  MCP list_tools handshake. The 2.1.0 surface exposes exactly 29
-  tools partitioned into 13 read, 12 write, and 4 meta. The
-  advertised shape matches ADR 0026 + ADR 0028 + ADR 0030 + ADR 0031;
-  the minor bump to 2.1.0 is the purely additive draft surface —
-  get_draft and list_drafts (ADR 0030) and update_draft (ADR 0031) —
-  which breaks nothing that came before.
+  MCP list_tools handshake. The 2.1.0 surface exposes exactly 30
+  tools partitioned into 13 read, 13 write, and 4 meta. The
+  advertised shape matches ADR 0026 + ADR 0028 + ADR 0030 + ADR 0031
+  + ADR 0034; the minor bump to 2.1.0 is the purely additive draft
+  surface — get_draft and list_drafts (ADR 0030) and update_draft
+  (ADR 0031) — which breaks nothing that came before. discard_draft
+  (ADR 0034) is equally additive.
 
   Covered error layers (per BDD Guidelines §4.5):
     - Tool presence           : 1 (exact set)
@@ -20,7 +21,7 @@ Feature: MCP tool discovery
     Given the server is started with a minimal caller configuration
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The 2.1 tool set consists of exactly these 29 tools
+  Scenario: The 2.1 tool set consists of exactly these 30 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
       | tool                      |
@@ -46,6 +47,7 @@ Feature: MCP tool discovery
       | create_draft              |
       | create_reply_draft        |
       | update_draft              |
+      | discard_draft             |
       | add_attachment            |
       | replace_attachment        |
       | delete_attachment         |
@@ -104,6 +106,7 @@ Feature: MCP tool discovery
       | create_draft       | draft_append        |
       | create_reply_draft | draft_append        |
       | update_draft       | draft_edit          |
+      | discard_draft      | move_out            |
       | add_attachment     | modify_message      |
       | replace_attachment | modify_message      |
       | delete_attachment  | modify_message      |

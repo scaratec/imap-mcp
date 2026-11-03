@@ -1,4 +1,3 @@
-@pending
 Feature: discard_draft moves every revision of a draft to the account's trash by its handle
 
   ADR 0030 hides UIDs: create_draft, get_draft, list_drafts and

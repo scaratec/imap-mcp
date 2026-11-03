@@ -44,9 +44,9 @@ corresponding layer here.
 | L13| Connection pool / IMAP session          | 12    | 0 (+7 specified @pending) | 5 | 0 |
 | L14| Gmail-specific semantics                | 24    | 0 (+7 covered_by_LIM-0002, +14 specified @pending) | 3 | 0 |
 | L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
-| L16| Agent-facing draft and search contract  | 27    | 0 (+27 specified @pending) | 0 | 0 |
+| L16| Agent-facing draft and search contract  | 27    | 8 (+19 specified @pending) | 0 | 0 |
 | L17| Observability (traces)                  | 23    | 0 (+23 specified @pending) | 0 | 0 |
-|    | **Total**                               | 267   | 110 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009, +95 specified @pending) | 45 | 0 |
+|    | **Total**                               | 267   | 118 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009, +87 specified @pending) | 45 | 0 |
 
 Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
 while the L9 section itself listed nineteen rows, four of them
@@ -557,14 +557,14 @@ Decided in ADR 0033 to ADR 0036 (2026-11-03).
 
 | ID     | Error case                                                  | Status | Reference |
 |--------|-------------------------------------------------------------|--------|-----------|
-| L16.1  | discard_draft, standard IMAP with \Trash                    | specified @pending | discard_draft: standard IMAP |
-| L16.2  | discard_draft, Gmail with localized names                   | specified @pending | discard_draft: Gmail localized |
-| L16.3  | discard_draft takes residue revisions along                 | specified @pending | discard_draft: residue |
-| L16.4  | discard_draft without move_out on drafts                    | specified @pending | discard_draft: capability (row 1) |
-| L16.5  | discard_draft without accept_incoming on trash              | specified @pending | discard_draft: capability (row 2) |
-| L16.6  | discard_draft on an account without \Trash                  | specified @pending | discard_draft: trash_unavailable |
-| L16.7  | discard_draft with an unknown handle                        | specified @pending | discard_draft: draft_not_found |
-| L16.8  | discard_draft leaves handle-less drafts alone               | specified @pending | discard_draft: owner's draft untouched |
+| L16.1  | discard_draft, standard IMAP with \Trash                    | covered            | discard_draft: standard IMAP |
+| L16.2  | discard_draft, Gmail with localized names                   | covered            | discard_draft: Gmail localized |
+| L16.3  | discard_draft takes residue revisions along                 | covered            | discard_draft: residue |
+| L16.4  | discard_draft without move_out on drafts                    | covered            | discard_draft: capability (row 1) |
+| L16.5  | discard_draft without accept_incoming on trash              | covered            | discard_draft: capability (row 2) |
+| L16.6  | discard_draft on an account without \Trash                  | covered            | discard_draft: trash_unavailable |
+| L16.7  | discard_draft with an unknown handle                        | covered            | discard_draft: draft_not_found |
+| L16.8  | discard_draft leaves handle-less drafts alone               | covered            | discard_draft: owner's draft untouched |
 | L16.9  | create_draft description presents the format as a choice    | specified @pending | create_draft_format: description |
 | L16.10 | create_draft reports format text/plain                      | specified @pending | create_draft_format: reports text/plain |
 | L16.11 | create_draft reports format text/html                       | specified @pending | create_draft_format: reports text/html |

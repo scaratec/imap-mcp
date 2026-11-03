@@ -65,7 +65,7 @@ def _encode_mutf7(utf8: str) -> str:
 # reset_user skips it (see guard below).
 _USERS_BY_INSTANCE: dict[str, list[str]] = {
     "imap-a": ["gupta", "osthues"],
-    "imap-b": ["personal", "archive"],
+    "imap-b": ["personal", "archive", "info"],
     "mock-gmail": ["test"],
 }
 
@@ -85,6 +85,7 @@ _ACCOUNT_ID_TO_INSTANCE_USER: dict[str, tuple[str, str]] = {
     "gupta-gmail-de": ("mock-gmail", "test"),
     "archive-srv": ("imap-b", "archive"),
     "ext-user": ("imap-a", "gupta"),
+    "info-bg": ("imap-b", "info"),
 }
 
 
@@ -105,6 +106,11 @@ def resolve_account(account_id: str) -> tuple[str, str]:
 # be cleared out at reset_user time so they do not leak into the
 # next scenario's hidden_folders_count.
 _SYSTEM_FOLDERS = frozenset({"INBOX"})
+
+# RFC 6154 §2 special-use attributes, lower-cased for comparison.
+_SPECIAL_USE_FLAGS = frozenset(
+    {"\\all", "\\archive", "\\drafts", "\\flagged", "\\junk", "\\sent", "\\trash"}
+)
 
 
 @dataclass
@@ -569,6 +575,58 @@ class IMAPFixture:
             return ()
         end = raw.find(")", start)
         return tuple(raw[start + len("FLAGS (") : end].split())
+
+    def search_header(
+        self, instance: str, user: str, folder: str, header: str, value: str
+    ) -> list[int]:
+        """Independent IMAP UID SEARCH HEADER, for Then-step use.
+
+        Returns the UIDs whose `header` field holds exactly `value`.
+        SEARCH HEADER matches a substring (RFC 3501 §6.4.4); each hit
+        is fetched and compared so a step asking for equality gets it.
+        A folder that cannot be selected fails loudly instead of
+        reading as "zero results".
+        """
+        wire = self.to_wire(instance, user, folder)
+        conn = self.connect(instance, user)
+        status, data = conn.select(self._q(wire), readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"SELECT {folder!r} failed: {data!r}")
+        status, data = conn.uid("SEARCH", None, "HEADER", f'"{header}"', f'"{value}"')
+        if status != "OK":
+            raise RuntimeError(f"SEARCH HEADER {header} on {folder!r} failed: {data!r}")
+        hits = [int(token) for token in (data[0] or b"").split()] if data else []
+        exact: list[int] = []
+        for uid in hits:
+            status, fetched = conn.uid("FETCH", str(uid), "(BODY.PEEK[HEADER])")
+            if status != "OK":
+                raise RuntimeError(f"FETCH header of uid {uid} failed: {fetched!r}")
+            raw = b"".join(
+                item[1] for item in fetched or [] if isinstance(item, tuple) and len(item) >= 2
+            )
+            values = email.message_from_bytes(raw).get_all(header) or []
+            if any(str(v).strip() == value for v in values):
+                exact.append(uid)
+        return exact
+
+    def folder_special_use(self, instance: str, user: str) -> dict[str, tuple[str, ...]]:
+        """Map every listed folder to the RFC 6154 special-use flags
+        its LIST line carries (as the server reports them)."""
+        conn = self.connect(instance, user)
+        _, folder_lines = conn.list()
+        reverse = {
+            v: k for k, v in self._folder_wire_map.get((instance, user), {}).items()
+        }
+        result: dict[str, tuple[str, ...]] = {}
+        for line in folder_lines or []:
+            text = line.decode() if isinstance(line, bytes) else str(line)
+            flags_part = text[text.find("(") + 1 : text.find(")")]
+            special = tuple(
+                flag for flag in flags_part.split() if flag.lower() in _SPECIAL_USE_FLAGS
+            )
+            name = self._parse_folder_name(line)
+            result[reverse.get(name, name)] = special
+        return result
 
     def list_folders(self, instance: str, user: str) -> list[str]:
         conn = self.connect(instance, user)

@@ -296,6 +296,20 @@ def build_folder_alias_map(folders: list[FolderInfo]) -> dict[str, str]:
     return alias_map
 
 
+def find_trash_folder(folders: list[FolderInfo]) -> str | None:
+    """Return the path of the folder carrying the RFC 6154 `\\Trash` flag.
+
+    ADR 0034: the trash folder is found by its special-use flag, never
+    by name or configuration. Flags compare case-insensitively (RFC
+    3501 §9). The first flagged folder in LIST order wins; None when no
+    folder carries the flag.
+    """
+    for fi in folders:
+        if any(token.lower() == "\\trash" for token in fi.flags.split()):
+            return fi.path
+    return None
+
+
 _STATUS_MESSAGES = re.compile(rb"MESSAGES\s+(\d+)")
 
 
@@ -1138,6 +1152,74 @@ async def copy_message(
         return bool(status == "OK")
     finally:
         await imap.logout()
+
+
+class ExpungeScopeUnsafe(RuntimeError):
+    """The server offers neither MOVE nor UIDPLUS and other messages in
+    the source folder already carry `\\Deleted`: the plain EXPUNGE a
+    COPY-based move would need would remove them too."""
+
+
+async def move_uids(
+    account: Account,
+    password: str,
+    folder: str,
+    uids: list[int],
+    target_folder: str,
+) -> str:
+    """Move exactly `uids` from `folder` to `target_folder` in one session.
+
+    RFC 6851 MOVE when the server advertises it. Otherwise UID COPY,
+    STORE `\\Deleted` and an EXPUNGE limited to the moved UIDs: UID
+    EXPUNGE (RFC 4315) under UIDPLUS, a plain EXPUNGE only when no
+    other message of the folder is marked `\\Deleted`
+    (`ExpungeScopeUnsafe`, raised before anything is copied). A failed
+    MOVE is not retried as COPY, which could duplicate the messages
+    MOVE already took. Returns the mechanism used.
+    """
+    if not uids:
+        raise ValueError("move_uids needs at least one UID")
+    quoted_src = _quote_mailbox(folder)
+    quoted_dst = _quote_mailbox(target_folder)
+    uid_set = ",".join(str(uid) for uid in uids)
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, lines = await imap.select(quoted_src)
+        if status != "OK":
+            raise FolderNotSelectable(folder, status, _response_text(lines))
+        if imap.has_capability("MOVE"):
+            status, lines = await imap.uid("move", uid_set, quoted_dst)
+            if status != "OK":
+                raise RuntimeError(f"UID MOVE failed: {status} {_response_text(lines)}")
+            return "native_move"
+        has_uidplus = bool(imap.has_capability("UIDPLUS"))
+        if not has_uidplus:
+            status, response = await imap.uid_search("DELETED")
+            if status != "OK":
+                raise RuntimeError(f"SEARCH DELETED failed: {status}")
+            raw = response[0] if response and isinstance(response[0], (bytes, bytearray)) else b""
+            already_deleted = {int(token) for token in bytes(raw).split() if token.isdigit()}
+            if already_deleted - set(uids):
+                raise ExpungeScopeUnsafe(folder)
+        status, lines = await imap.uid("copy", uid_set, quoted_dst)
+        if status != "OK":
+            raise RuntimeError(f"UID COPY failed: {status} {_response_text(lines)}")
+        status, lines = await imap.uid("store", uid_set, "+FLAGS", r"(\Deleted)")
+        if status != "OK":
+            raise RuntimeError(f"STORE \\Deleted failed: {status} {_response_text(lines)}")
+        if has_uidplus:
+            status, lines = await imap.uid("expunge", uid_set)
+        else:
+            status, lines = await imap.expunge()
+        if status != "OK":
+            raise RuntimeError(f"EXPUNGE failed: {status} {_response_text(lines)}")
+        return "copy_store_expunge"
+    finally:
+        try:
+            await imap.logout()
+        except Exception:  # noqa: BLE001, S110 - best-effort logout
+            pass
 
 
 @dataclass(frozen=True)
