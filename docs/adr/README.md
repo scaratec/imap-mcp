@@ -93,3 +93,10 @@ edit its Status line and link the replacement. Do not delete the file.
 | 0030 | [Draft Identity via In-Message Handle and Revision Counter](0030-draft-identity-and-revisions.md) | Proposed |
 | 0031 | [Draft Revision via the Message-Rewrite Saga](0031-draft-revision-via-rewrite-saga.md) | Proposed |
 | 0032 | [One Audit Chain Shared by Local Server Instances](0032-shared-audit-chain-across-local-instances.md) | Proposed |
+| 0033 | [Gmail Special-Use Folders Resolve on Every Path](0033-gmail-special-use-folder-resolution.md) | Accepted |
+| 0034 | [Discard a Draft by Its Handle](0034-discard-draft-by-handle.md) | Accepted |
+| 0035 | [Draft Body Format Is a Deliberate, Equally Easy Choice](0035-draft-body-format-choice.md) | Accepted |
+| 0036 | [Search Reports What Its Window Hid and Accepts Calendar Dates](0036-search-window-transparency-and-calendar-dates.md) | Accepted |
+| 0037 | [Trace Payload Modes](0037-trace-payload-modes.md) | Accepted |
+| 0038 | [Traces Carry What Usage Efficiency Needs](0038-traces-for-usage-efficiency.md) | Accepted |
+| 0039 | [A Usability Matrix for Agent Behaviour, Apart from BDD](0039-usability-matrix-for-agent-behaviour.md) | Accepted |
