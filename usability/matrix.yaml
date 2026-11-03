@@ -1,0 +1,114 @@
+# Usability matrix definition. Read by the usability runner; see README.md.
+#
+# Model ids were taken from each harness's own model list on 2026-11-02
+# (agy models, opencode models). Copilot CLI ids follow the
+# github-copilot provider names and must be confirmed with a dry run
+# before the pilot. Every run record stores the ids actually resolved.
+
+schema_version: 1
+
+harnesses:
+  antigravity:
+    binary: agy
+    version_observed: "1.4.12"
+    headless: ["agy", "--print", "--output-format", "stream-json", "--dangerously-skip-permissions"]
+    resume_flag: "--conversation"
+    model_flag: "--model"
+    # `agy mcp add` writes global config; isolation is a per-run HOME.
+    mcp_isolation: per_run_home
+    instructions_file: GEMINI.md
+    structured_output: "--json-schema"   # used for the feedback form
+  copilot:
+    binary: copilot
+    version_observed: "1.0.89"
+    headless: ["copilot", "--prompt", "{prompt}", "--allow-all-tools"]
+    resume_flag: "--resume"
+    model_flag: "--model"
+    mcp_isolation: "--additional-mcp-config"
+    instructions_file: .github/copilot-instructions.md
+    structured_output: none               # validate JSON after the fact
+  claude-code:
+    binary: claude
+    version_observed: "2.1.291"
+    headless: ["claude", "--print", "--output-format", "stream-json", "--dangerously-skip-permissions"]
+    resume_flag: "--resume"
+    model_flag: "--model"
+    mcp_isolation: "--mcp-config {file} --strict-mcp-config"
+    instructions_file: CLAUDE.md
+    structured_output: none
+  opencode:
+    binary: opencode
+    version_observed: "2.0.29"
+    headless: ["opencode", "run", "--format", "json", "--auto"]
+    resume_flag: "--session"
+    model_flag: "--model"
+    mcp_isolation: per_run_project_config
+    instructions_file: AGENTS.md
+    structured_output: none
+
+# Three model slots. "reference" is the same model in every harness and
+# isolates the harness effect; "native" is what the harness is used with
+# in practice; "small" probes whether tool descriptions carry a weaker
+# model.
+models:
+  reference:
+    antigravity: claude-sonnet-5-5-medium
+    copilot: claude-sonnet-5.5
+    claude-code: claude-sonnet-5.5
+    opencode: github-copilot/claude-sonnet-5.5
+  native:
+    antigravity: gemini-4-argon-medium
+    copilot: gpt-6.1-sol
+    claude-code: claude-opus-5.5
+    opencode: google/gemini-4-argon
+  small:
+    antigravity: gemini-3.8-flash-medium
+    copilot: claude-haiku-5.5
+    claude-code: claude-haiku-5.5
+    opencode: github-copilot/claude-haiku-5.5
+
+# What the server looks like during a run.
+server_variants:
+  today:
+    description: Policy shaped like production on 2026-11-02 (no draft_edit, every Gmail system folder listed under both names), current tool descriptions.
+    policy: fixtures/policies/today.yaml
+  fixed:
+    description: draft_edit granted on drafts folders, canonical folder names only, server with the bdd/@pending behaviour implemented.
+    policy: fixtures/policies/fixed.yaml
+  format-hint:
+    description: As "fixed", plus the create_draft description from bdd/features/tool_surface/create_draft_format.feature.
+    policy: fixtures/policies/fixed.yaml
+
+repetitions: 3
+
+# Environment for the MCP server process in every run.
+server_environment:
+  IMAP_MCP_TRACE_PAYLOADS: full          # fixtures hold no personal data
+  IMAP_MCP_FAKE_NOW_UTC: "2026-11-02T09:00:00Z"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:4317"
+  # OTEL_RESOURCE_ATTRIBUTES is set per run by the runner.
+
+# Per-run limits; exceeding one ends the run as not-assessable.
+limits:
+  wall_clock_seconds: 600
+  turns: 6
+  tool_calls: 80
+
+# Rule-based user simulator. Topics are matched by keywords in the
+# agent's last message when it ends a turn with a question.
+user_simulator:
+  default_answer: "Entscheide bitte selbst."
+  topics:
+    body format: ["HTML", "Klartext", "Textformat", "Nur-Text", "plain text", "Format"]
+    recipient: ["Empfänger", "an wen", "E-Mail-Adresse"]
+    folder: ["Ordner", "ablegen", "verschieben nach"]
+    time range: ["Zeitraum", "seit wann", "welches Jahr"]
+
+# Pilot: the smallest matrix that answers the open questions.
+pilot:
+  harnesses: [antigravity, copilot, claude-code, opencode]
+  models: [reference]
+  server_variants: [today, fixed]
+  scenarios: [E1, E2, R1, R2, S1]
+  repetitions: 3
+  # 4 × 1 × 2 × 5 × 3 = 120 runs

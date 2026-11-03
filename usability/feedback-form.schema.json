@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://imapmcp.dev/usability/feedback-form.schema.json",
+  "title": "imap-mcp usability feedback form",
+  "description": "Filled in by the agent in the same session, right after its final answer. Every factual field is cross-checked against the audit log and traces (features/06_feedback_form.feature); free text is read by humans.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_understanding",
+    "task_completed",
+    "confidence_complete",
+    "tools_used",
+    "errors_encountered",
+    "unclear",
+    "missing",
+    "deviations",
+    "considered_asking",
+    "ratings",
+    "free_text"
+  ],
+  "properties": {
+    "task_understanding": {
+      "type": "string",
+      "maxLength": 600,
+      "description": "In your own words: what did the user want?"
+    },
+    "task_completed": {
+      "enum": ["yes", "partly", "no"],
+      "description": "Did you complete the task?"
+    },
+    "confidence_complete": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "How sure are you that your result is complete and correct (e.g. that a search found everything)? 0-100."
+    },
+    "tools_used": {
+      "type": "array",
+      "description": "Every MCP tool call you made, in order.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool", "purpose"],
+        "properties": {
+          "tool": { "type": "string" },
+          "purpose": { "type": "string", "maxLength": 200 }
+        }
+      }
+    },
+    "errors_encountered": {
+      "type": "array",
+      "description": "Every error or denial the server returned, quoted verbatim, and how you understood it.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool", "verbatim", "your_interpretation", "what_you_did_next"],
+        "properties": {
+          "tool": { "type": "string" },
+          "verbatim": { "type": "string", "maxLength": 500 },
+          "your_interpretation": { "type": "string", "maxLength": 300 },
+          "what_you_did_next": { "type": "string", "maxLength": 300 }
+        }
+      }
+    },
+    "unclear": {
+      "type": "array",
+      "description": "What was unclear: tool names, descriptions, parameters, folder names, responses.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["subject", "what"],
+        "properties": {
+          "subject": { "enum": ["tool_name", "tool_description", "parameter", "folder_name", "response", "error_message", "other"] },
+          "what": { "type": "string", "maxLength": 300 }
+        }
+      }
+    },
+    "missing": {
+      "type": "array",
+      "description": "A tool, parameter or piece of information you needed and did not have.",
+      "items": { "type": "string", "maxLength": 300 }
+    },
+    "deviations": {
+      "type": "array",
+      "description": "Where you deviated from the task or from a stated preference, and why.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["what", "why"],
+        "properties": {
+          "what": { "type": "string", "maxLength": 300 },
+          "why": { "type": "string", "maxLength": 300 }
+        }
+      }
+    },
+    "format_decision": {
+      "type": "object",
+      "description": "Only for tasks that create or change an email draft.",
+      "additionalProperties": false,
+      "required": ["chosen", "reason", "asked_user"],
+      "properties": {
+        "chosen": { "enum": ["plain_text", "html", "multipart_alternative", "none"] },
+        "reason": { "type": "string", "maxLength": 300 },
+        "asked_user": { "type": "boolean" },
+        "why_not_asked": { "type": "string", "maxLength": 300 }
+      }
+    },
+    "considered_asking": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asked", "considered"],
+      "properties": {
+        "asked": { "type": "boolean", "description": "Did you ask the user anything?" },
+        "considered": { "type": "boolean", "description": "Did you consider asking and decide against it?" },
+        "about": { "type": "string", "maxLength": 300 }
+      }
+    },
+    "leftovers": {
+      "type": "array",
+      "description": "Anything you left behind for the user to clean up (e.g. an outdated draft).",
+      "items": { "type": "string", "maxLength": 300 }
+    },
+    "ratings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_discoverability", "error_clarity", "response_clarity"],
+      "properties": {
+        "tool_discoverability": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "error_clarity": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "response_clarity": { "type": "integer", "minimum": 1, "maximum": 5 }
+      }
+    },
+    "free_text": {
+      "type": "string",
+      "maxLength": 1500,
+      "description": "Anything else the server's developers should know."
+    }
+  }
+}
