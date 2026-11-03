@@ -2,6 +2,62 @@
 
 <!-- version list -->
 
+## v2.2.0 (2026-11-03)
+
+### Bug Fixes
+
+- **gmail**: Resolve localized special-use folders on every path
+  ([`9dc335b`](https://github.com/scaratec/imap-mcp/commit/9dc335b01e435facae3957834949d7087f2a69cd))
+
+### Build System
+
+- **server**: Ship the README inside the sdist
+  ([`37941fe`](https://github.com/scaratec/imap-mcp/commit/37941fe29deb742cc82c8b7ffcb0d81f106ed2ad))
+
+### Chores
+
+- **secrets**: Remove the revoked mock Gmail app password
+  ([`9fb90e6`](https://github.com/scaratec/imap-mcp/commit/9fb90e633a661264f69c1f7e5f69f658292a594b))
+
+- **tools**: Advertise tool set 2.2.0 and document the surface
+  ([`f7ca943`](https://github.com/scaratec/imap-mcp/commit/f7ca9437fe3043f01e8e22a4df523f1ec03dd581))
+
+### Continuous Integration
+
+- **release**: Publish verbosely and backfill tagged versions
+  ([`97394bd`](https://github.com/scaratec/imap-mcp/commit/97394bd0883d299fe8b475b3506bc01bb842c140))
+
+- **release**: Publish with gh-action-pypi-publish v1.14.3
+  ([`f9abfd4`](https://github.com/scaratec/imap-mcp/commit/f9abfd45dde788233ef73c8e9a44c41098690e27))
+
+### Documentation
+
+- **adr**: Decide drafts, folder names, search, tracing and usability
+  ([`20a68a3`](https://github.com/scaratec/imap-mcp/commit/20a68a3698390bdbe256efed6b44843491ca8a3c))
+
+### Features
+
+- **drafts**: Compose drafts from fields and report their format
+  ([`9ae9134`](https://github.com/scaratec/imap-mcp/commit/9ae9134054fc8439c33e4498300ba58219d5ca89))
+
+- **drafts**: Discard a draft by its handle
+  ([`6d77021`](https://github.com/scaratec/imap-mcp/commit/6d77021c5b807bb1e556986cadfe505c66babf1a))
+
+- **search**: Report what the window hid and accept calendar dates
+  ([`199ce07`](https://github.com/scaratec/imap-mcp/commit/199ce0716e1e89ad0620006840c2880bc6dceda2))
+
+- **tracing**: Choose payload modes and record usage efficiency
+  ([`e343202`](https://github.com/scaratec/imap-mcp/commit/e3432021a7c099b72d75da0539dc22e8f904e8c0))
+
+### Testing
+
+- **bdd**: Specify ADRs 0033 to 0038 and the connection pool
+  ([`97b3569`](https://github.com/scaratec/imap-mcp/commit/97b3569ccef11c8093bfd345761af5ecd401e58c))
+
+- **usability**: Specify the agent usability matrix
+  ([`5efd170`](https://github.com/scaratec/imap-mcp/commit/5efd17020c6b2b5c6f10f0b80c7c3232cd7854a9))
+
+
 ## v2.1.1 (2026-10-31)
 
 ### Bug Fixes
