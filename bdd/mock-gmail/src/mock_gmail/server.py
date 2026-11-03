@@ -13,13 +13,30 @@ import email.utils
 import re
 from typing import Any
 
-from .state import FOLDER_TO_LABEL, CommandRecord, GmailState, Message, decode_mutf7
+from .state import (
+    FOLDER_TO_LABEL,
+    HIDDEN_LABELS,
+    CommandRecord,
+    GmailState,
+    LabelStoreRecord,
+    Message,
+    decode_mutf7,
+)
 
 # Commands whose first argument is a mailbox name (RFC 3501 §6.3).
 _MAILBOX_COMMANDS = frozenset({
     "SELECT", "EXAMINE", "STATUS", "APPEND", "CREATE", "DELETE",
     "RENAME", "SUBSCRIBE", "UNSUBSCRIBE",
 })
+
+# CAPABILITY before and after authentication, as Gmail answers them
+# (trimmed to what the mock implements).
+_CAPS_NOT_AUTHENTICATED = "IMAP4rev1 UNSELECT IDLE NAMESPACE X-GM-EXT-1 SASL-IR AUTH=PLAIN"
+_CAPS_AUTHENTICATED = "IMAP4rev1 UNSELECT IDLE NAMESPACE X-GM-EXT-1 UIDPLUS MOVE"
+
+# RFC 3501 §9 atom-specials, minus resp-specials (`]` is allowed in an
+# astring) and minus `\` (handled separately for flags).
+_ATOM_SPECIALS = frozenset('(){ %*"')
 
 
 class GmailIMAPHandler:
@@ -95,9 +112,10 @@ class GmailIMAPHandler:
     # ---------------------------------------------------------- commands
 
     async def _cmd_capability(self, tag: str, args: str) -> None:
-        self._send_untagged(
-            "CAPABILITY IMAP4rev1 UNSELECT IDLE NAMESPACE X-GM-EXT-1 SASL-IR AUTH=PLAIN UID MOVE"
-        )
+        # Real Gmail advertises MOVE and UIDPLUS only after
+        # authentication; the greeting-time list lacks them.
+        caps = _CAPS_AUTHENTICATED if self._authed else _CAPS_NOT_AUTHENTICATED
+        self._send_untagged(f"CAPABILITY {caps}")
         self._send(tag, "OK", "CAPABILITY completed")
 
     async def _cmd_login(self, tag: str, args: str) -> None:
@@ -172,7 +190,7 @@ class GmailIMAPHandler:
         self._send(tag, "OK", "EXPUNGE completed")
 
     async def _cmd_append(self, tag: str, args: str) -> None:
-        m = re.match(r'"?([^"]+)"?\s+(?:\([^)]*\)\s+)?(?:"[^"]*"\s+)?\{(\d+)\}', args)
+        m = re.match(r'"?([^"]+)"?\s+(?:\(([^)]*)\)\s+)?(?:"[^"]*"\s+)?\{(\d+)\}', args)
         if not m:
             self._send(tag, "BAD", "APPEND parse error")
             return
@@ -180,7 +198,7 @@ class GmailIMAPHandler:
         if folder is None:
             self._send(tag, "NO", "[TRYCREATE] Folder doesn't exist. (Failure)")
             return
-        size = int(m.group(2))
+        size = int(m.group(3))
         self._send_untagged_raw("+ Ready for literal data\r\n")
         data = await self._r.readexactly(size)
         await self._r.readline()
@@ -193,6 +211,7 @@ class GmailIMAPHandler:
             gm_thrid=gm_msgid,
             rfc822=data,
             labels=labels,
+            flags=set((m.group(2) or "").split()),
             message_id=msg_obj.get("Message-ID") or "",
             from_addr=msg_obj.get("From") or "",
             to_addr=msg_obj.get("To") or "",
@@ -222,6 +241,8 @@ class GmailIMAPHandler:
             await self._uid_copy(tag, sub_args)
         elif sub == "MOVE":
             await self._uid_move(tag, sub_args)
+        elif sub == "EXPUNGE":
+            await self._uid_expunge(tag, sub_args)
         else:
             self._send(tag, "BAD", f"Unknown UID sub-command {sub}")
 
@@ -378,17 +399,18 @@ class GmailIMAPHandler:
     async def _uid_store(self, tag: str, args: str) -> None:
         folder = self._selected_folder or "INBOX"
         m = re.match(
-            r"([\d,:]+)\s+([+-]?)(FLAGS|X-GM-LABELS)(?:\.SILENT)?\s+\(([^)]*)\)",
+            r"([\d,:]+)\s+([+-]?)(FLAGS|X-GM-LABELS)(\.SILENT)?\s+(.*)$",
             args,
             re.IGNORECASE,
         )
         if not m:
-            self._send(tag, "BAD", "STORE parse error")
+            self._send(tag, "BAD", "Could not parse command")
             return
         uid_spec = m.group(1)
         op = m.group(2)
         field = m.group(3).upper()
-        values_raw = m.group(4)
+        silent = m.group(4) is not None
+        values_raw = m.group(5).strip()
         uids_to_store: list[int] = []
         for part in uid_spec.split(","):
             if ":" in part:
@@ -396,11 +418,22 @@ class GmailIMAPHandler:
                 uids_to_store.extend(range(int(lo), int(hi) + 1))
             else:
                 uids_to_store.append(int(part))
+        labels: list[str] = []
+        if field == "X-GM-LABELS":
+            parsed = _parse_label_list(values_raw)
+            if parsed is None:
+                # Real Gmail: a malformed list, e.g. a quoted string
+                # holding a bare backslash ("\Trash"), is a syntax error.
+                self._log_label_store(op, values_raw, None, "BAD")
+                self._send(tag, "BAD", "Could not parse command")
+                return
+            labels = parsed
         # Check injected rejection BEFORE mutating state, so the test
         # observes "STORE never ran" rather than "half-applied".
         if field == "X-GM-LABELS" and self._state.next_store_rejection is not None:
             status, text = self._state.next_store_rejection
             self._state.next_store_rejection = None
+            self._log_label_store(op, values_raw, tuple(labels), status)
             self._send(tag, status, text)
             return
         any_resolved = False
@@ -410,11 +443,14 @@ class GmailIMAPHandler:
                 continue
             any_resolved = True
             if field == "X-GM-LABELS":
-                labels = _parse_label_list(values_raw)
-                for label in labels:
-                    wire = label.replace("\\\\", "\\")
+                uids_before = [u for u, _ in self._state.messages_in_folder(folder)]
+                for wire in labels:
                     if self._state.record_store_operations and op in ("+", "-"):
                         self._state.store_operations.append((uid, op, wire))
+                    # Drafts is not an X-GM-LABELS label on Gmail: STORE
+                    # of it is accepted and changes nothing.
+                    if wire in HIDDEN_LABELS:
+                        continue
                     # Real Gmail: user labels arrive Modified-UTF-7
                     # encoded; system labels (\Inbox etc.) are flags
                     # and travel literally. Decoding here lets the
@@ -425,23 +461,89 @@ class GmailIMAPHandler:
                         self._state.add_label(msg, applied)
                     elif op == "-":
                         self._state.remove_label(msg, applied)
-                visible = self._state.labels_visible_from(folder, msg)
-                label_str = " ".join(_quote_label(l) for l in visible)
-                self._send_untagged(f"{uid} FETCH (X-GM-LABELS ({label_str}) UID {uid})")
+                if self._state.message_by_uid(folder, uid) is None:
+                    # The label change took the message out of the
+                    # selected mailbox (e.g. +\Trash): Gmail expunges it.
+                    self._send_untagged(f"{uids_before.index(uid) + 1} EXPUNGE")
+                elif not silent:
+                    visible = self._state.labels_visible_from(folder, msg)
+                    label_str = " ".join(_quote_label(l) for l in visible)
+                    self._send_untagged(f"{uid} FETCH (X-GM-LABELS ({label_str}) UID {uid})")
             elif field == "FLAGS":
-                flags = set(values_raw.split())
+                flags = set(values_raw.strip("()").split())
                 if op == "+":
                     msg.flags.update(flags)
                 elif op == "-":
                     msg.flags -= flags
                 else:
                     msg.flags = flags
-                flags_str = " ".join(sorted(msg.flags))
-                self._send_untagged(f"{uid} FETCH (FLAGS ({flags_str}) UID {uid})")
+                if not silent:
+                    flags_str = " ".join(sorted(msg.flags))
+                    self._send_untagged(f"{uid} FETCH (FLAGS ({flags_str}) UID {uid})")
+                if "\\Deleted" in msg.flags:
+                    self._auto_expunge(folder, uid, msg)
         if not any_resolved and uids_to_store:
-            self._send(tag, "NO", "STORE failed: no matching UIDs")
-            return
+            # A UID that has left the mailbox during the session (moved
+            # to the trash, expunged) is ignored, as Gmail does
+            # (RFC 3501 §6.4.8); one never handed out is refused.
+            if not any(self._state.uid_was_assigned(folder, uid) for uid in uids_to_store):
+                if field == "X-GM-LABELS":
+                    self._log_label_store(op, values_raw, tuple(labels), "NO")
+                self._send(tag, "NO", "STORE failed: no matching UIDs")
+                return
+        if field == "X-GM-LABELS":
+            self._log_label_store(op, values_raw, tuple(labels), "OK")
         self._send(tag, "OK", "STORE completed")
+
+    def _auto_expunge(self, folder: str, uid: int, msg: Message) -> None:
+        """Gmail's default auto-expunge: a message marked `\\Deleted`
+        leaves the selected label mailbox at once, without EXPUNGE.
+
+        In Trash or Spam that deletes it for good; in any other label
+        mailbox (drafts included) only that mailbox loses it. All Mail
+        is not a label mailbox and keeps the flag until EXPUNGE.
+        """
+        label = FOLDER_TO_LABEL.get(folder, folder)
+        if label == "__ALL_MAIL__":
+            return
+        uids = [u for u, _ in self._state.messages_in_folder(folder)]
+        seq = uids.index(uid) + 1 if uid in uids else None
+        msg.flags.discard("\\Deleted")
+        if label in ("\\Trash", "\\Spam"):
+            self._state.delete_message(msg)
+        else:
+            self._state.leave_mailbox(msg, folder)
+        if seq is not None:
+            self._send_untagged(f"{seq} EXPUNGE")
+
+    def _log_label_store(
+        self, op: str, raw: str, labels: tuple[str, ...] | None, status: str
+    ) -> None:
+        self._state.label_store_log.append(
+            LabelStoreRecord(user=self._user, op=op, raw=raw, labels=labels, status=status)
+        )
+
+    async def _uid_expunge(self, tag: str, args: str) -> None:
+        """RFC 4315 UID EXPUNGE: expunge only the named `\\Deleted` UIDs."""
+        folder = self._selected_folder or "INBOX"
+        label = FOLDER_TO_LABEL.get(folder, folder)
+        wanted: set[int] = set()
+        for part in args.strip().split(","):
+            if not part:
+                continue
+            if ":" in part:
+                lo, hi = part.split(":", 1)
+                wanted.update(range(int(lo), int(hi) + 1))
+            else:
+                wanted.add(int(part))
+        for uid, msg in self._state.messages_in_folder(folder):
+            if uid not in wanted or "\\Deleted" not in msg.flags:
+                continue
+            msg.flags.discard("\\Deleted")
+            if label != "__ALL_MAIL__":
+                self._state.remove_label(msg, label)
+            self._send_untagged(f"{uid} EXPUNGE")
+        self._send(tag, "OK", "UID EXPUNGE completed")
 
     async def _uid_copy(self, tag: str, args: str) -> None:
         folder = self._selected_folder or "INBOX"
@@ -559,29 +661,81 @@ def _first_astring(args: str) -> str | None:
 
 
 def _quote_label(label: str) -> str:
-    if label.startswith("\\"):
-        return f'"{label}"'
-    if " " in label or '"' in label:
-        return f'"{label}"'
-    return label
+    """Render a label in an X-GM-LABELS response the way Gmail does:
+    system labels as flag atoms, other labels as an atom when they are
+    one, otherwise as an RFC 3501 quoted string."""
+    if _is_flag_atom(label) or _is_atom(label):
+        return label
+    escaped = label.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
-def _parse_label_list(raw: str) -> list[str]:
-    labels = []
+def _is_atom(token: str) -> bool:
+    return bool(token) and all(
+        0x20 < ord(ch) < 0x7F and ch not in _ATOM_SPECIALS and ch != "\\" for ch in token
+    )
+
+
+def _is_flag_atom(token: str) -> bool:
+    return token.startswith("\\") and _is_atom(token[1:])
+
+
+def _parse_label_list(raw: str) -> list[str] | None:
+    """Parse the label list of an X-GM-LABELS STORE per RFC 3501.
+
+    Accepts a parenthesised list or a single label. Each label is an
+    atom, a flag (`\\` atom) or a quoted string in which `\\` may only
+    escape `\\` or `"` (RFC 3501 §4.3, §9 `quoted`). Anything else,
+    such as `"\\Trash"` with a single backslash, returns None: Gmail
+    answers it with `BAD Could not parse command`.
+    """
+    s = raw.strip()
+    if s.startswith("("):
+        if not s.endswith(")"):
+            return None
+        s = s[1:-1]
+        if not s:
+            return []
+    elif not s:
+        return None
+    labels: list[str] = []
     i = 0
-    while i < len(raw):
-        if raw[i] == '"':
-            j = raw.index('"', i + 1)
-            labels.append(raw[i + 1 : j])
-            i = j + 1
-        elif raw[i] == " ":
+    n = len(s)
+    while i < n:
+        if s[i] == '"':
+            out: list[str] = []
             i += 1
+            while True:
+                if i >= n:
+                    return None
+                ch = s[i]
+                if ch == '"':
+                    i += 1
+                    break
+                if ch == "\\":
+                    if i + 1 >= n or s[i + 1] not in ('"', "\\"):
+                        return None
+                    out.append(s[i + 1])
+                    i += 2
+                    continue
+                if ch in "\r\n":
+                    return None
+                out.append(ch)
+                i += 1
+            labels.append("".join(out))
         else:
-            j = raw.find(" ", i)
+            j = s.find(" ", i)
             if j == -1:
-                j = len(raw)
-            labels.append(raw[i:j])
+                j = n
+            token = s[i:j]
+            if not (_is_atom(token) or _is_flag_atom(token)):
+                return None
+            labels.append(token)
             i = j
+        if i < n:
+            if s[i] != " " or i + 1 >= n:
+                return None
+            i += 1
     return labels
 
 

@@ -42,11 +42,11 @@ corresponding layer here.
 | L11| Audit log                               | 11    | 8 (+3 covered_by_LIM-0009) | 0 | 0 |
 | L12| Configuration loading                   | 13    | 12      | 1        | 0   |
 | L13| Connection pool / IMAP session          | 12    | 0 (+7 specified @pending) | 5 | 0 |
-| L14| Gmail-specific semantics                | 24    | 14 (+7 covered_by_LIM-0002) | 3 | 0 |
+| L14| Gmail-specific semantics                | 33    | 23 (+7 covered_by_LIM-0002) | 3 | 0 |
 | L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
 | L16| Agent-facing draft and search contract  | 29    | 29      | 0        | 0   |
 | L17| Observability (traces)                  | 23    | 23      | 0        | 0   |
-|    | **Total**                               | 269   | 160 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +31 specified @pending) | 60 | 0 |
+|    | **Total**                               | 278   | 169 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +31 specified @pending) | 60 | 0 |
 
 Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
 while the L9 section itself listed nineteen rows, four of them
@@ -482,6 +482,15 @@ a token mid-session.
 | L14.22 | Localized-only policy entry governs the canonical name | covered            | localized_gmail_resolution: localized-only policy |
 | L14.23 | Conflicting entries for one special-use folder         | covered            | localized_gmail_resolution: fail closed |
 | L14.24 | Responses echo the canonical folder name               | covered            | localized_gmail_resolution: canonical echo |
+| L14.25 | Mock fidelity: system label quoted with a bare backslash refused (BAD), atom accepted | covered | gmail_draft_lifecycle: mock refuses quoted system label |
+| L14.26 | Mock fidelity: a draft carries `\Draft`, no Drafts label; STORE of `\Drafts` changes nothing | covered | gmail_draft_lifecycle: draft flag and labels |
+| L14.27 | Mock fidelity: `\Deleted` leaves a label mailbox at once (auto-expunge) | covered | gmail_draft_lifecycle: auto-expunge |
+| L14.28 | Mock fidelity: MOVE and UIDPLUS advertised only after authentication | covered | gmail_draft_lifecycle: capabilities after LOGIN |
+| L14.29 | update_draft on localized Drafts: delete step selects the mUTF-7 name, one message remains | covered | gmail_draft_lifecycle: update_draft keeps one message |
+| L14.30 | discard_draft on localized Drafts moves every revision to the trash | covered | gmail_draft_lifecycle: discard_draft every revision |
+| L14.31 | Move INBOX → [Gmail]/Trash: `\Trash` sent as an atom, message in the trash only | covered | gmail_draft_lifecycle: move to system label (Trash) |
+| L14.32 | Move INBOX → [Gmail]/Spam: `\Spam` sent as an atom, message in Spam only | covered | gmail_draft_lifecycle: move to system label (Spam) |
+| L14.33 | Move of a draft to a user label leaves the drafts folder (Drafts is not a label) | covered | gmail_draft_lifecycle: draft to user label |
 
 **Deferred reason A** — Edge cases for Gmail that require deep
 knowledge of Gmail's label model side effects. Will be covered by
@@ -496,6 +505,20 @@ calls on a German account. The existing localized scenarios all called
 `list_folders` first and ran against a mock that also accepted the
 English names, so none of them could see it. L14.11 pins the mock
 itself (Guideline §7.2).
+
+Added 2026-11-03 (L14.25–33): found by the acceptance test of 2.2.0
+against a real German-locale Gmail account, not by the suite, which was
+green. `update_draft` on `[Gmail]/Drafts` failed with
+`source_delete_failed` and left two revisions (the saga's delete step
+selected `[Gmail]/Entwürfe` unencoded instead of `[Gmail]/Entw&APw-rfe`);
+`discard_draft` failed with "label swap failed after 0 of 2" (the label
+STORE sent `("\Trash")`, a quoted string with a bare backslash, which
+Gmail answers `BAD Could not parse command`; the same quoting broke every
+label swap that names a system label, the `-\Inbox` of a plain move
+included). The mock accepted both, modelled Drafts as a removable label
+and advertised MOVE before authentication. L14.25–28 pin the mock to the
+behaviour observed on real Gmail with raw IMAP; L14.29–33 specify the
+tools against it.
 
 ---
 

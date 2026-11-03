@@ -6,7 +6,8 @@ A "folder" is a label projection: selecting folder F shows all
 messages whose label set contains F.  UIDs are per-folder and stable
 within a session (mapping: (label, gm_msgid) -> uid).
 
-[Gmail]/All Mail shows every non-Trash message.
+[Gmail]/All Mail shows every message not in Trash or Spam; a message
+in Trash (or Spam) is shown in that mailbox only.
 """
 
 from __future__ import annotations
@@ -84,10 +85,37 @@ class CommandRecord:
     mailbox: str | None
 
 
+@dataclass(frozen=True)
+class LabelStoreRecord:
+    """One `UID STORE ... X-GM-LABELS` as the mock parsed it.
+
+    `labels` is the label list after RFC 3501 parsing (quoted strings
+    unescaped, atoms verbatim), or None when the list did not parse and
+    the command was answered BAD, as real Gmail does. `status` is the
+    tagged response the mock sent.
+    """
+
+    user: str | None
+    op: str
+    raw: str
+    labels: tuple[str, ...] | None
+    status: str
+
+
 SYSTEM_LABELS = frozenset({
     "\\Inbox", "\\Sent", "\\Drafts", "\\Trash",
     "\\Spam", "\\Starred", "\\Important",
 })
+
+# Real Gmail does not expose the drafts mailbox as an X-GM-LABELS
+# label: a draft shows `X-GM-LABELS ()`, and STORE of `\Drafts` is
+# answered OK without effect. Internally the mock still marks drafts
+# with this label to know which messages the drafts mailbox shows.
+HIDDEN_LABELS = frozenset({"\\Drafts"})
+
+# A message carrying one of these labels is shown in that mailbox only;
+# Gmail removes it from every other view at once. Trash wins over Spam.
+EXCLUSIVE_LABELS = ("\\Trash", "\\Spam")
 
 FOLDER_TO_LABEL: dict[str, str] = {
     "INBOX": "\\Inbox",
@@ -125,8 +153,11 @@ class GmailState:
         self.next_store_rejection: tuple[str, str] | None = None
         # Every command received, in order, across all connections.
         self.command_log: list[CommandRecord] = []
+        # Every X-GM-LABELS STORE with its parse result and status.
+        self.label_store_log: list[LabelStoreRecord] = []
 
     def reset(self) -> None:
+        self.label_store_log.clear()
         self.messages.clear()
         self._uid_maps.clear()
         self._uid_counters.clear()
@@ -156,10 +187,26 @@ class GmailState:
         self._created_folders.add(name)
 
     def add_message(self, msg: Message) -> None:
+        # Real Gmail: every message in the drafts mailbox carries \Draft.
+        if "\\Drafts" in msg.labels:
+            msg.flags.add("\\Draft")
         self.messages.append(msg)
         for label in msg.labels:
-            self._assign_uid(self._label_to_folder(label), msg.gm_msgid)
-        self._assign_uid("[Gmail]/All Mail", msg.gm_msgid)
+            folder = self._label_to_folder(label)
+            if self._visible_in(folder, msg):
+                self._assign_uid(folder, msg.gm_msgid)
+        if self._visible_in("[Gmail]/All Mail", msg):
+            self._assign_uid("[Gmail]/All Mail", msg.gm_msgid)
+
+    def delete_message(self, msg: Message) -> None:
+        """Remove a message for good (expunged from Trash or Spam)."""
+        self.messages = [m for m in self.messages if m.gm_msgid != msg.gm_msgid]
+        for uid_map in self._uid_maps.values():
+            uid_map.pop(msg.gm_msgid, None)
+
+    def uid_was_assigned(self, folder: str, uid: int) -> bool:
+        """True when `uid` was handed out in `folder` at some point."""
+        return 0 < uid <= self._uid_counters.get(folder, 0)
 
     def new_msgid(self) -> int:
         return next(_msgid_counter)
@@ -192,20 +239,26 @@ class GmailState:
         known = set(self.all_folders())
         return folder in known or decode_mutf7(folder) in known
 
+    def _visible_in(self, folder: str, msg: Message) -> bool:
+        """True when Gmail shows `msg` in the mailbox `folder` (internal name).
+
+        A message in Trash (or Spam) is shown there only; All Mail
+        shows everything else; any other mailbox shows the messages
+        carrying its label.
+        """
+        label = FOLDER_TO_LABEL.get(folder, folder)
+        for exclusive in EXCLUSIVE_LABELS:
+            if exclusive in msg.labels:
+                return label == exclusive
+        if label == "__ALL_MAIL__":
+            return True
+        return label in msg.labels or folder in msg.labels
+
     def messages_in_folder(self, folder: str) -> list[tuple[int, Message]]:
         folder = self._resolve_localized(folder)
-        label = FOLDER_TO_LABEL.get(folder, folder)
-        if label == "__ALL_MAIL__":
-            result = []
-            for msg in self.messages:
-                if "\\Trash" not in msg.labels:
-                    uid = self._get_uid(folder, msg.gm_msgid)
-                    if uid is not None:
-                        result.append((uid, msg))
-            return result
         result = []
         for msg in self.messages:
-            if label in msg.labels or folder in msg.labels:
+            if self._visible_in(folder, msg):
                 uid = self._get_uid(folder, msg.gm_msgid)
                 if uid is not None:
                     result.append((uid, msg))
@@ -216,7 +269,7 @@ class GmailState:
         for gm_msgid, mapped_uid in uid_map.items():
             if mapped_uid == uid:
                 for msg in self.messages:
-                    if msg.gm_msgid == gm_msgid:
+                    if msg.gm_msgid == gm_msgid and self._visible_in(folder, msg):
                         return msg
         return None
 
@@ -227,6 +280,7 @@ class GmailState:
         msg.labels.add(label)
         folder = self._label_to_folder(label)
         self._assign_uid(folder, msg.gm_msgid)
+        self._sync_uids(msg)
 
     def remove_label(self, msg: Message, label: str) -> None:
         # Drop the per-folder UID mapping too, mirroring real Gmail:
@@ -237,13 +291,45 @@ class GmailState:
         uid_map = self._uid_maps.get(folder)
         if uid_map is not None:
             uid_map.pop(msg.gm_msgid, None)
+        self._sync_uids(msg)
+
+    def leave_mailbox(self, msg: Message, folder: str) -> None:
+        """Take `msg` out of mailbox `folder` (internal name).
+
+        Unlike `remove_label` this also works for the drafts mailbox,
+        whose label Gmail does not expose to STORE: it is how a
+        `\\Deleted` message leaves a mailbox under auto-expunge.
+        """
+        label = FOLDER_TO_LABEL.get(folder, folder)
+        msg.labels.discard(label)
+        msg.labels.discard(folder)
+        uid_map = self._uid_maps.get(folder)
+        if uid_map is not None:
+            uid_map.pop(msg.gm_msgid, None)
+        self._sync_uids(msg)
+
+    def _sync_uids(self, msg: Message) -> None:
+        """Align the per-mailbox UID maps with where `msg` is now shown.
+
+        A mailbox the message left loses its UID; a mailbox it
+        (re)appears in hands out a fresh UID, never the old one.
+        """
+        for folder, uid_map in self._uid_maps.items():
+            if msg.gm_msgid in uid_map and not self._visible_in(folder, msg):
+                uid_map.pop(msg.gm_msgid)
+        folders = {self._label_to_folder(label) for label in msg.labels}
+        folders.add("[Gmail]/All Mail")
+        for folder in folders:
+            if self._visible_in(folder, msg) and self._get_uid(folder, msg.gm_msgid) is None:
+                self._assign_uid(folder, msg.gm_msgid)
 
     def labels_visible_from(self, folder: str, msg: Message) -> list[str]:
         """Labels as Gmail shows them from a given folder's perspective."""
         current_label = FOLDER_TO_LABEL.get(folder, folder)
+        shown = [label for label in msg.labels if label not in HIDDEN_LABELS]
         if current_label == "__ALL_MAIL__":
-            return sorted(msg.labels)
-        return sorted(l for l in msg.labels if l != current_label)
+            return sorted(shown)
+        return sorted(label for label in shown if label != current_label)
 
     def all_folders(self) -> list[str]:
         system = [

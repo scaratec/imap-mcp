@@ -157,7 +157,8 @@ def _append_timeout() -> int:
 # becomes a child span `imap.<method>` of the current span (ADR 0038).
 # `uid(<cmd>, ...)` becomes `imap.uid_<cmd>`, `login` and `xoauth2`
 # become `imap.authenticate`. The CAPABILITY the library sends after
-# the greeting belongs to `imap.connect`.
+# the greeting belongs to `imap.connect`; one sent after authentication
+# (`_refresh_capabilities`) is `imap.capability`.
 _TRACED_COMMANDS = frozenset(
     {
         "append",
@@ -275,11 +276,46 @@ async def _authenticate_imap(imap: IMAP4, account: Account, password: str) -> No
     user = _imap_user_for(account)
     if account.auth and account.auth.type == "xoauth2":
         try:
-            await imap.xoauth2(user, password)
+            response = await imap.xoauth2(user, password)
         except Exception as e:
             raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}") from e
     else:
-        await imap.login(user, password)
+        response = await imap.login(user, password)
+    if getattr(response, "result", None) == "OK":
+        await _refresh_capabilities(imap, getattr(response, "lines", None))
+
+
+_CAPABILITY_IN_RESPONSE = re.compile(rb"(?:^|\[)CAPABILITY\s+([^\]\r\n]+)", re.IGNORECASE)
+
+
+async def _refresh_capabilities(imap: IMAP4, auth_lines: list[Any] | None = None) -> None:
+    """Learn the capabilities of the authenticated session.
+
+    aioimaplib keeps the list the server sent with its greeting. A
+    server may advertise more after authentication (RFC 3501 §6.2);
+    Gmail lists MOVE and UIDPLUS only then, so without this the
+    MOVE/UID EXPUNGE paths would never be taken on Gmail. A list the
+    server already sent with the authentication response (untagged or
+    as a `[CAPABILITY …]` response code) is taken as is; otherwise one
+    CAPABILITY command asks for it. Best effort: if that command fails,
+    the list known before stays in force.
+    """
+    protocol = imap.protocol
+    announced: set[str] = set()
+    for line in auth_lines or []:
+        if isinstance(line, (bytes, bytearray)):
+            for match in _CAPABILITY_IN_RESPONSE.finditer(bytes(line)):
+                announced.update(match.group(1).decode("ascii", errors="replace").split())
+    if announced:
+        protocol.capabilities = announced
+        return
+    known = set(protocol.capabilities)
+    try:
+        await asyncio.wait_for(
+            _run_traced("imap.capability", None, protocol.capability()), timeout=imap.timeout
+        )
+    except Exception:  # noqa: BLE001 - keep the greeting-time capabilities
+        protocol.capabilities = known
 
 
 @dataclass(frozen=True)
@@ -1665,6 +1701,14 @@ async def gmail_label_swap(
     STORE on the same UID is rejected as "no matching UIDs". ADD must
     therefore run before REMOVE while the source label is still
     keeping the UID visible in the selected folder.
+
+    Two Gmail rules shorten the second step. Adding `\\Trash` or
+    `\\Spam` takes the message out of every other mailbox at once, so
+    there is nothing left to remove. The drafts mailbox is not an
+    X-GM-LABELS label (a STORE of `\\Drafts` is accepted and changes
+    nothing), so a draft leaves it the way Gmail's auto-expunge
+    provides: `\\Deleted`, followed by UID EXPUNGE where UIDPLUS is
+    offered.
     """
     quoted = _quote_mailbox(folder)
     wire_add = _encode_gmail_label(add_label)
@@ -1680,6 +1724,15 @@ async def gmail_label_swap(
         )
         if status != "OK":
             raise LabelMutationFailed("add", add_label, status, _response_text(lines))
+        if add_label in _GMAIL_EXCLUSIVE_LABELS:
+            return
+        if remove_label in _GMAIL_UNEXPOSED_LABELS:
+            status, lines = await imap.uid("store", str(uid), "+FLAGS", r"(\Deleted)")
+            if status == "OK" and imap.has_capability("UIDPLUS"):
+                status, lines = await imap.uid("expunge", str(uid))
+            if status != "OK":
+                raise LabelMutationFailed("remove", remove_label, status, _response_text(lines))
+            return
         status, lines = await imap.uid(
             "store", str(uid), "-X-GM-LABELS", f"({_quote_gmail_label(wire_remove)})"
         )
@@ -1687,6 +1740,13 @@ async def gmail_label_swap(
             raise LabelMutationFailed("remove", remove_label, status, _response_text(lines))
     finally:
         await imap.logout()
+
+
+# Gmail system labels whose mailbox, once the label is added, is the
+# only one that still shows the message.
+_GMAIL_EXCLUSIVE_LABELS = frozenset({"\\Trash", "\\Spam"})
+# Gmail mailboxes that are not exposed as an X-GM-LABELS label.
+_GMAIL_UNEXPOSED_LABELS = frozenset({"\\Drafts"})
 
 
 async def gmail_list_labels(account: Account, password: str) -> list[dict[str, str]]:
@@ -1730,14 +1790,24 @@ async def gmail_list_labels(account: Account, password: str) -> list[dict[str, s
 
 
 def _parse_gmail_label_list(raw: str) -> list[str]:
-    """Parse a parenthesised X-GM-LABELS value into a Python list."""
+    """Parse a parenthesised X-GM-LABELS value into a Python list.
+
+    Quoted strings are unescaped as RFC 3501 §4.3 defines (`\\\\` and
+    `\\"`); atoms, system-label flags included, pass through.
+    """
     labels: list[str] = []
     i = 0
     while i < len(raw):
         if raw[i] == '"':
-            j = raw.index('"', i + 1)
-            labels.append(raw[i + 1 : j])
-            i = j + 1
+            out: list[str] = []
+            i += 1
+            while i < len(raw) and raw[i] != '"':
+                if raw[i] == "\\" and i + 1 < len(raw):
+                    i += 1
+                out.append(raw[i])
+                i += 1
+            labels.append("".join(out))
+            i += 1
         elif raw[i] == " ":
             i += 1
         else:
@@ -1749,13 +1819,31 @@ def _parse_gmail_label_list(raw: str) -> list[str]:
     return labels
 
 
+# RFC 3501 §9: characters that end an atom (atom-specials, plus the
+# resp-special `]` and the quoted-special `\`). CTL and 8-bit bytes are
+# excluded separately.
+_ATOM_SPECIALS = frozenset('(){ %*"\\]')
+
+
+def _is_imap_atom(token: str) -> bool:
+    return bool(token) and all(0x20 < ord(ch) < 0x7F and ch not in _ATOM_SPECIALS for ch in token)
+
+
 def _quote_gmail_label(label: str) -> str:
-    """Quote a label for use in an IMAP STORE X-GM-LABELS command."""
-    if label.startswith("\\"):
-        return f'"{label}"'
-    if " " in label or '"' in label:
-        return f'"{label}"'
-    return label
+    """Render one label for the list of an X-GM-LABELS STORE.
+
+    A system label (`\\Trash`, `\\Inbox`, …) travels as a flag atom:
+    inside a quoted string a backslash escapes the next character
+    (RFC 3501 §4.3), and Gmail answers `("\\Trash")` with `BAD Could not
+    parse command`. Any other label is sent as an atom when it is one,
+    otherwise as a quoted string with `\\` and `"` escaped.
+    """
+    if label.startswith("\\") and _is_imap_atom(label[1:]):
+        return label
+    if _is_imap_atom(label):
+        return label
+    escaped = label.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _encode_gmail_label(label: str) -> str:

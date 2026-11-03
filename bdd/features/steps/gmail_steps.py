@@ -970,3 +970,198 @@ def step_command_log_has_no_store(context: Context, account_id: str) -> None:
     hits = [r for r in records if r.command in ("STORE", "UID STORE")]
     if hits:
         raise AssertionError(f"Unexpected STORE in the command log:\n{_format_log(records)}")
+
+
+# ---------------------------------------- Gmail draft lifecycle (real-Gmail fidelity)
+
+
+def _harness_conn(context: Context, account_id: str, mailbox: str):
+    """The harness's own IMAP connection, with `mailbox` (wire form) selected."""
+    from support.imap_fixture import IMAPFixture
+
+    instance, user = resolve_account(account_id)
+    conn = context.imap.connect(instance, user)
+    status, data = conn.select(IMAPFixture._q(mailbox))
+    if status != "OK":
+        raise AssertionError(f"Direct SELECT of {mailbox!r} failed: {status} {data!r}")
+    return conn
+
+
+@when('a direct IMAP command is issued in "{mailbox}" on "{account_id}":')
+def step_direct_imap_command(context: Context, mailbox: str, account_id: str) -> None:
+    """Send the DocString as one UID command, byte for byte, from the
+    harness's own connection. A BAD answer is recorded as status "BAD"
+    (imaplib raises on it) so the Then can assert it."""
+    import imaplib
+
+    words = (context.text or "").strip().split(None, 2)
+    if len(words) < 3 or words[0].upper() != "UID":
+        raise AssertionError(f"Expected 'UID <command> <arguments>', got {context.text!r}")
+    conn = _harness_conn(context, account_id, mailbox)
+    try:
+        status, _data = conn.uid(words[1].upper(), words[2])
+    except imaplib.IMAP4.error as exc:
+        if "BAD" not in str(exc) and "command error" not in str(exc):
+            raise
+        status = "BAD"
+    context.last_direct_imap_status = status
+
+
+def _direct_fetch_items(context: Context, qualified: str, uid: int) -> str:
+    account_id, sep, mailbox = qualified.partition(":")
+    if not sep:
+        raise AssertionError(f'Expected an "account:folder" qualified name, got {qualified!r}')
+    conn = _harness_conn(context, account_id, mailbox)
+    status, data = conn.uid("FETCH", str(uid), "(FLAGS X-GM-LABELS)")
+    frames = [
+        (item if isinstance(item, bytes) else b"").decode("utf-8", errors="replace")
+        for item in (data or [])
+    ]
+    text = " ".join(frame for frame in frames if frame)
+    if status != "OK" or f"UID {uid}" not in text:
+        raise AssertionError(f"Direct FETCH of uid {uid} in {qualified!r} returned {data!r}")
+    return text
+
+
+@then('a direct IMAP FETCH of uid {uid:d} in "{qualified}" shows the flag "{flag}"')
+def step_direct_fetch_shows_flag(context: Context, uid: int, qualified: str, flag: str) -> None:
+    text = _direct_fetch_items(context, qualified, uid)
+    match = re.search(r"FLAGS \(([^)]*)\)", text)
+    flags = match.group(1).split() if match else []
+    if flag not in flags:
+        raise AssertionError(f"uid {uid} in {qualified!r}: flag {flag!r} not in {flags!r}")
+
+
+@then('a direct IMAP FETCH of uid {uid:d} in "{qualified}" shows X-GM-LABELS "{labels}"')
+def step_direct_fetch_shows_labels(
+    context: Context, uid: int, qualified: str, labels: str
+) -> None:
+    text = _direct_fetch_items(context, qualified, uid)
+    match = re.search(r"X-GM-LABELS (\([^)]*\))", text)
+    actual = match.group(1) if match else None
+    if actual != labels:
+        raise AssertionError(
+            f"uid {uid} in {qualified!r}: expected X-GM-LABELS {labels}, got {actual!r}"
+        )
+
+
+@when(
+    'a fresh direct IMAP connection to "{account_id}" asks for CAPABILITY '
+    "before and after LOGIN"
+)
+def step_capability_before_after_login(context: Context, account_id: str) -> None:
+    import imaplib
+
+    from support.imap_fixture import TEST_PASSWORD
+
+    instance, user = resolve_account(account_id)
+    host, port = context.imap_instances[instance]
+    conn = imaplib.IMAP4(host, port)
+    try:
+        context.capability_before_login = {c.upper() for c in conn.capabilities}
+        conn.login(user, TEST_PASSWORD)
+        status, data = conn.capability()
+        if status != "OK" or not data:
+            raise AssertionError(f"CAPABILITY after LOGIN failed: {status} {data!r}")
+        context.capability_after_login = {
+            c.upper() for c in data[0].decode("ascii", errors="replace").split()
+        }
+    finally:
+        try:
+            conn.logout()
+        except (imaplib.IMAP4.error, OSError):
+            pass
+
+
+@then('the CAPABILITY before LOGIN lists neither "{first}" nor "{second}"')
+def step_capability_before_lacks(context: Context, first: str, second: str) -> None:
+    present = {first, second} & context.capability_before_login
+    if present:
+        raise AssertionError(
+            f"Pre-authentication CAPABILITY lists {sorted(present)!r}: "
+            f"{sorted(context.capability_before_login)!r}"
+        )
+
+
+@then('the CAPABILITY after LOGIN lists both "{first}" and "{second}"')
+def step_capability_after_has(context: Context, first: str, second: str) -> None:
+    missing = {first, second} - context.capability_after_login
+    if missing:
+        raise AssertionError(
+            f"Post-authentication CAPABILITY lacks {sorted(missing)!r}: "
+            f"{sorted(context.capability_after_login)!r}"
+        )
+
+
+@then('the message carrying the returned draft_id in "{qualified}" has the headers:')
+def step_message_with_handle_has_headers(context: Context, qualified: str) -> None:
+    """Second channel: SEARCH the mock for the handle, FETCH the one hit
+    and compare decoded header values."""
+    from email.header import decode_header, make_header
+
+    draft_id = getattr(context, "last_draft_id", None)
+    if not draft_id:
+        raise AssertionError("No draft_id has been returned in this scenario yet.")
+    account_id, _, folder = qualified.partition(":")
+    instance, user = resolve_account(account_id)
+    hits = context.imap.search_header(instance, user, folder, "X-SC-Draft-Id", draft_id)
+    if len(hits) != 1:
+        raise AssertionError(
+            f"Expected exactly one message carrying {draft_id!r} in {qualified!r}, "
+            f"found UIDs {hits!r}"
+        )
+    message = context.imap.fetch_message(instance, user, folder, hits[0])
+    for row in context.table:
+        raw = message.get(row["header"])
+        actual = None if raw is None else str(make_header(decode_header(raw))).strip()
+        if actual != row["value"]:
+            raise AssertionError(
+                f"{qualified!r} uid {hits[0]}: header {row['header']!r} is {actual!r}, "
+                f"expected {row['value']!r}"
+            )
+
+
+def _server_label_stores(context: Context, account_id: str) -> list:
+    """X-GM-LABELS STOREs the mock received from the server under test
+    (anyone but the harness's own login), with the mock's parse result."""
+    instance, harness_user = resolve_account(account_id)
+    if instance != "mock-gmail":
+        raise AssertionError(f"Account {account_id!r} is not backed by the mock-gmail server.")
+    records = [r for r in _gmail_state(context).label_store_log if r.user != harness_user]
+    if not records:
+        raise AssertionError(
+            f"The mock-gmail server received no X-GM-LABELS STORE from the server "
+            f"for {account_id!r}."
+        )
+    return records
+
+
+def _format_label_stores(records: list) -> str:
+    return "\n".join(
+        f"  {r.op}X-GM-LABELS {r.raw} -> {r.status} parsed={r.labels!r}" for r in records
+    )
+
+
+@then(
+    "the mock-gmail server answered every X-GM-LABELS STORE from the server "
+    'for "{account_id}" with status "{status}"'
+)
+def step_label_stores_all_status(context: Context, account_id: str, status: str) -> None:
+    records = _server_label_stores(context, account_id)
+    bad = [r for r in records if r.status != status]
+    if bad:
+        raise AssertionError(
+            f"X-GM-LABELS STOREs not answered {status}:\n{_format_label_stores(records)}"
+        )
+
+
+@then(
+    'the mock-gmail server received the label "{label}" in an X-GM-LABELS STORE '
+    '"{op}" from the server for "{account_id}"'
+)
+def step_label_store_received(context: Context, label: str, op: str, account_id: str) -> None:
+    records = _server_label_stores(context, account_id)
+    if not any(r.op == op and r.labels is not None and label in r.labels for r in records):
+        raise AssertionError(
+            f"No parsed X-GM-LABELS STORE {op}{label!r}:\n{_format_label_stores(records)}"
+        )

@@ -767,12 +767,12 @@ async def _delete_source(account: Account, password: str, folder: str, uid: int)
     Uses MOVE-to-trash-folder-emulation via STORE \\Deleted + EXPUNGE,
     which is the DELETE component of the saga.
     """
-    from .imap_core import _authenticate_imap, _open_imap
+    from .imap_core import _authenticate_imap, _open_imap, _quote_mailbox
 
     imap = await _open_imap(account)
     await _authenticate_imap(imap, account, password)
     try:
-        status, _ = await imap.select(folder)
+        status, _ = await imap.select(_quote_mailbox(folder))
         if status != "OK":
             raise RuntimeError(f"SELECT {folder!r} failed: {status}")
         status, _ = await imap.uid("store", str(uid), "+FLAGS", r"(\Deleted)")

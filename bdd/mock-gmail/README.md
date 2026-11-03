@@ -30,6 +30,22 @@ in [LIM-0002](../../docs/limitations/0002-gmail-scenarios-not-runnable.md).
   - the `[Gmail]/*` special-use folders (`All Mail`, `Drafts`, `Sent
     Mail`, `Spam`, `Starred`, `Trash`) with their respective semantics.
 
+Behaviour observed on a real Gmail account with raw IMAP (acceptance
+test of 2.2.0, 2026-11-03) and modelled since:
+
+- `X-GM-LABELS` lists in STORE are parsed per RFC 3501; a quoted string
+  holding a bare backslash (`("\Trash")`) is answered
+  `BAD Could not parse command`, the atom `(\Trash)` is accepted.
+- A draft carries `\Draft` and shows `X-GM-LABELS ()`: Drafts is not a
+  label, and STORE of `\Drafts` is answered OK without effect.
+- Adding `\Trash` (or `\Spam`) takes a message out of every other
+  mailbox at once; All Mail shows neither Trash nor Spam.
+- Auto-expunge: `\Deleted` in a label mailbox removes the message from
+  that mailbox immediately (from Trash or Spam: for good). A STORE on a
+  UID that has left the mailbox is answered OK.
+- MOVE and UIDPLUS are advertised only after authentication; UID
+  EXPUNGE is implemented.
+
 ## What this mock is not
 
 - It is not a faithful re-implementation of Gmail. It implements
