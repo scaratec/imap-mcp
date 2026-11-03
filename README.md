@@ -380,6 +380,9 @@ See [ADR 0018](docs/adr/0018-non-goal-tool-surface.md).
 | `IMAP_MCP_HTTP_PORT` | no | Port for HTTP (default: `0` = ephemeral) |
 | `IMAP_MCP_APPEND_TIMEOUT` | no | Timeout in seconds for IMAP APPEND |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | OTLP endpoint for tracing (e.g. `http://localhost:4317`) |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | Extra resource attributes on every span, e.g. `run.id=…,harness=…` |
+| `IMAP_MCP_TRACE_PAYLOADS` | no | `off`, `redacted` (default) or `full`: what tool spans record of request and response (ADR 0037) |
+| `IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS` | no | Cut for each payload in mode `full` (default: `16384`) |
 
 ## OAuth2 bootstrap
 
@@ -418,7 +421,20 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 ```
 
 Open http://localhost:16686 for the Jaeger UI. Every MCP tool call
-creates a trace with nested IMAP connection and authentication spans.
+creates a span `tool.<name>` with one child span per IMAP command
+(`imap.connect`, `imap.authenticate`, `imap.select`, `imap.uid_fetch`,
+…), the MCP client name and version, the response size and, for
+listing tools, result counts (ADR 0038). Batched spans are flushed
+when stdin closes or on `SIGTERM`.
+
+`IMAP_MCP_TRACE_PAYLOADS` controls the `mcp.request` and `mcp.response`
+attributes (ADR 0037): `redacted` (default) records the arguments as
+the audit log does and the response without message content,
+addresses, subjects, headers, bodies or attachment data; `off` records
+neither; `full` records both complete, each cut at
+`IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS` characters. Use `full` only with a
+trace store that is protected like the mailbox itself. An unknown
+value stops the server at startup.
 
 ## Policy reload
 

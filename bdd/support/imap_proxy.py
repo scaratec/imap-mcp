@@ -30,6 +30,13 @@ the live Dovecot cannot produce on its own:
   Used by the APPEND-timeout scenario in conjunction with the server's
   `IMAP_MCP_APPEND_TIMEOUT` to make the server-side `wait_for` fire.
 
+- **`login_credentials`** — `{scenario_password: fixture_password}`.
+  A LOGIN whose quoted password is a scenario password reaches Dovecot
+  with the fixture password instead. Lets a scenario store its own
+  password in the server's secret store (the secret-absence witnesses
+  of tracing_payload_mode.feature) while the fixture keeps one
+  password per user.
+
 Every client→upstream command line is also written, with a UTC
 timestamp, into a per-account command log file. The harness reads
 the file as a second verification channel (BDD Guidelines §13.2).
@@ -182,6 +189,19 @@ def _rewrite_capability(line: bytes, tokens: list[str]) -> bytes:
     return CAPABILITY_BRACKET_RE.sub(_bracket_sub, line)
 
 
+def _translate_login(line: bytes, credentials: dict[str, str]) -> bytes:
+    """Swap a scenario password in a LOGIN command for the one Dovecot
+    knows, so a scenario can put its own password into the secret store
+    and the fixture still accepts it. Only the quoted password argument
+    is matched; nothing else on the line changes."""
+    for scenario_password, fixture_password in credentials.items():
+        quoted = b'"' + scenario_password.encode("utf-8") + b'"'
+        if line.rstrip(b"\r\n").endswith(quoted):
+            replacement = b'"' + fixture_password.encode("utf-8") + b'"'
+            return line.replace(quoted, replacement)
+    return line
+
+
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -304,6 +324,8 @@ class ProxySession:
             command_line = line.rstrip(b"\r\n")
             await self._log_command(command_line)
             tag, verb = _parse_tag_and_verb(command_line)
+            if verb == "LOGIN":
+                line = _translate_login(line, self.config.get("login_credentials") or {})
 
             matched_spec = (
                 _consume_command_match(inject_specs, verb) if verb else None

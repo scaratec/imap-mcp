@@ -18,6 +18,7 @@ from mcp.server.stdio import stdio_server
 from ..context import ServerContext, _build_context
 from ..dispatch import build_server
 from ..reload import _install_sighup_handler
+from ..tracing import install_sigterm_flush
 
 
 async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
@@ -44,6 +45,7 @@ async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
         return
 
     _install_sighup_handler(context, config_dir)
+    install_sigterm_flush()
     app = build_server(context)
     try:
         async with stdio_server() as (read_stream, write_stream):

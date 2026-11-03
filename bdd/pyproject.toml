@@ -18,6 +18,10 @@ dependencies = [
     "pytest>=8.0",
     "aioimaplib>=1.1.0",
     "docker>=7.0.0",
+    # Test trace collector (support/trace_collector.py): an in-process
+    # OTLP/gRPC receiver the server exports to (ADR 0037, ADR 0038).
+    "opentelemetry-proto>=1.20",
+    "grpcio>=1.60",
 ]
 
 [project.optional-dependencies]

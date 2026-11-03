@@ -45,8 +45,8 @@ corresponding layer here.
 | L14| Gmail-specific semantics                | 24    | 14 (+7 covered_by_LIM-0002) | 3 | 0 |
 | L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
 | L16| Agent-facing draft and search contract  | 29    | 29      | 0        | 0   |
-| L17| Observability (traces)                  | 23    | 0 (+23 specified @pending) | 0 | 0 |
-|    | **Total**                               | 269   | 137 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +54 specified @pending) | 60 | 0 |
+| L17| Observability (traces)                  | 23    | 23      | 0        | 0   |
+|    | **Total**                               | 269   | 160 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +31 specified @pending) | 60 | 0 |
 
 Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
 while the L9 section itself listed nineteen rows, four of them
@@ -607,33 +607,33 @@ a test collector's sink, never through server internals.
 
 | ID     | Error case                                                  | Status | Reference |
 |--------|-------------------------------------------------------------|--------|-----------|
-| L17.1  | Default payload mode is redacted                            | specified @pending | tracing_payload_mode: default |
-| L17.2  | redacted: no content in the request (write tool)            | specified @pending | tracing_payload_mode: redacted request |
-| L17.3  | redacted: no content in the response (read tool)            | specified @pending | tracing_payload_mode: redacted response |
-| L17.4  | full: request and response complete                         | specified @pending | tracing_payload_mode: full |
-| L17.5  | full: oversized payload cut and marked                      | specified @pending | tracing_payload_mode: truncation |
-| L17.6  | off: no payload attributes, span still present              | specified @pending | tracing_payload_mode: off |
-| L17.7  | Active mode on the span (off)                               | specified @pending | tracing_payload_mode: invariants (row 1) |
-| L17.8  | Active mode on the span (redacted)                          | specified @pending | tracing_payload_mode: invariants (row 2) |
-| L17.9  | Active mode on the span (full)                              | specified @pending | tracing_payload_mode: invariants (row 3) |
-| L17.10 | Secrets absent (off)                                        | specified @pending | tracing_payload_mode: invariants (row 1) |
-| L17.11 | Secrets absent (redacted)                                   | specified @pending | tracing_payload_mode: invariants (row 2) |
-| L17.12 | Secrets absent (full)                                       | specified @pending | tracing_payload_mode: invariants (row 3) |
-| L17.13 | Unknown payload mode refused at startup                     | specified @pending | tracing_payload_mode: unknown mode |
-| L17.14 | OTEL_RESOURCE_ATTRIBUTES on every span                      | specified @pending | tracing_spans: run attributes |
-| L17.15 | Mandatory resource attributes of the standard               | specified @pending | tracing_spans: standard resource attributes |
-| L17.16 | MCP client name and version on tool spans                   | specified @pending | tracing_spans: client identity |
-| L17.17 | Response size equals what the client received               | specified @pending | tracing_spans: response size |
-| L17.18 | Result counts on listing tools                              | specified @pending | tracing_spans: result counts |
-| L17.19 | Policy denial is a rejected outcome, not an error           | specified @pending | tracing_spans: denial |
-| L17.20 | Error envelope sets error.type and status ERROR             | specified @pending | tracing_spans: error envelope |
-| L17.21 | IMAP commands as child spans of the tool span               | specified @pending | tracing_spans: IMAP child spans |
-| L17.22 | Last span survives stdin closed                             | specified @pending | tracing_spans: flush (row 1) |
-| L17.23 | Last span survives SIGTERM                                  | specified @pending | tracing_spans: flush (row 2) |
+| L17.1  | Default payload mode is redacted                            | covered            | tracing_payload_mode: default |
+| L17.2  | redacted: no content in the request (write tool)            | covered            | tracing_payload_mode: redacted request |
+| L17.3  | redacted: no content in the response (read tool)            | covered            | tracing_payload_mode: redacted response |
+| L17.4  | full: request and response complete                         | covered            | tracing_payload_mode: full |
+| L17.5  | full: oversized payload cut and marked                      | covered            | tracing_payload_mode: truncation |
+| L17.6  | off: no payload attributes, span still present              | covered            | tracing_payload_mode: off |
+| L17.7  | Active mode on the span (off)                               | covered            | tracing_payload_mode: invariants (row 1) |
+| L17.8  | Active mode on the span (redacted)                          | covered            | tracing_payload_mode: invariants (row 2) |
+| L17.9  | Active mode on the span (full)                              | covered            | tracing_payload_mode: invariants (row 3) |
+| L17.10 | Secrets absent (off)                                        | covered            | tracing_payload_mode: invariants (row 1) |
+| L17.11 | Secrets absent (redacted)                                   | covered            | tracing_payload_mode: invariants (row 2) |
+| L17.12 | Secrets absent (full)                                       | covered            | tracing_payload_mode: invariants (row 3) |
+| L17.13 | Unknown payload mode refused at startup                     | covered            | tracing_payload_mode: unknown mode |
+| L17.14 | OTEL_RESOURCE_ATTRIBUTES on every span                      | covered            | tracing_spans: run attributes |
+| L17.15 | Mandatory resource attributes of the standard               | covered            | tracing_spans: standard resource attributes |
+| L17.16 | MCP client name and version on tool spans                   | covered            | tracing_spans: client identity |
+| L17.17 | Response size equals what the client received               | covered            | tracing_spans: response size |
+| L17.18 | Result counts on listing tools                              | covered            | tracing_spans: result counts |
+| L17.19 | Policy denial is a rejected outcome, not an error           | covered            | tracing_spans: denial |
+| L17.20 | Error envelope sets error.type and status ERROR             | covered            | tracing_spans: error envelope |
+| L17.21 | IMAP commands as child spans of the tool span               | covered            | tracing_spans: IMAP child spans |
+| L17.22 | Last span survives stdin closed                             | covered            | tracing_spans: flush (row 1) |
+| L17.23 | Last span survives SIGTERM                                  | covered            | tracing_spans: flush (row 2) |
 
 Mode `full` deviates from the observability standard's ban on personal
 data in telemetry (§7). It is an explicit operator opt-in, visible on
-every span, and must be recorded in an ADR together with the default.
+every span, and recorded together with the default in ADR 0037.
 
 ---
 

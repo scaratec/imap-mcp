@@ -1,4 +1,3 @@
-@pending
 Feature: Trace payloads follow an operator-chosen mode: off, redacted or full
 
   Each tool call produces a span tool.<name> (tracing.py, dispatch.py).

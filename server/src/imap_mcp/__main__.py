@@ -39,11 +39,23 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    from .tracing import init_tracer
-
-    init_tracer()
+    from .trace_payloads import payload_settings
+    from .tracing import init_tracer, shutdown_tracer
 
     args = _parse_args()
+    # ADR 0037: an unknown payload mode stops the server here, whether
+    # or not an OTLP endpoint is configured.
+    payload_settings()
+    init_tracer()
+    try:
+        _serve(args)
+    finally:
+        # ADR 0038: the batch is exported before the process exits,
+        # also when a harness ends a stdio server by closing stdin.
+        shutdown_tracer()
+
+
+def _serve(args: argparse.Namespace) -> None:
     config_dir = _config_dir_from_env_or_exit()
     if args.transport == "stdio":
         # ADR-0015: caller_id is the orchestrator-supplied identity.

@@ -78,6 +78,8 @@ from .handlers.test_only import (
     handle_test_run_audit_rotation,
     handle_test_run_recovery,
 )
+from .trace_payloads import PayloadSettings, payload_attributes, payload_settings
+from .tracing import mark_span_error
 
 
 def build_server(context: ServerContext) -> Server:
@@ -158,6 +160,7 @@ def build_server(context: ServerContext) -> Server:
                     }
                 )
             raise McpError(ErrorData(code=-32601, message=f"Unknown tool: {name!r}"))
+        payloads = payload_settings()
         with tracer.start_as_current_span(
             f"tool.{name}",
             attributes={
@@ -165,6 +168,8 @@ def build_server(context: ServerContext) -> Server:
                 "mcp.caller_id": context.caller_id,
                 "mcp.account": arguments.get("account", ""),
                 "mcp.folder": arguments.get("folder", ""),
+                "imap_mcp.trace.payloads": payloads.mode,
+                **_client_attributes(app),
             },
         ) as span:
             start = _time.monotonic()
@@ -178,25 +183,10 @@ def build_server(context: ServerContext) -> Server:
             span.set_attribute("mcp.decision", result.get("decision", ""))
             span.set_attribute("mcp.reason", result.get("reason", ""))
             span.set_attribute("mcp.latency_ms", elapsed_ms)
-            import json as _json
-
-            _safe = {
-                k: v
-                for k, v in result.items()
-                if k
-                not in (
-                    "messages",
-                    "body",
-                    "headers",
-                    "attachment",
-                    "rfc822",
-                )
-                and not k.startswith("_")
-            }
-            span.set_attribute("mcp.response", _json.dumps(_safe, default=str))
-            span.set_attribute("mcp.request", _json.dumps(arguments, default=str))
+            content = _emit(result)
+            _record_span_outcome(span, name, arguments, result, content, payloads)
             _audit_tool_call(context, name, arguments, result, latency_ms=elapsed_ms)
-            return ServerResult(CallToolResult(content=_emit(result), isError=False))
+            return ServerResult(CallToolResult(content=content, isError=False))
 
     app.request_handlers[CallToolRequest] = _raw_call_tool_handler
 
@@ -300,6 +290,82 @@ def _emit(payload: Mapping[str, Any]) -> list[ContentBlock]:
 
     public = {k: v for k, v in payload.items() if not k.startswith("_")}
     return [TextContent(type="text", text=json.dumps(public))]
+
+
+# ADR 0038: the list member whose length is `mcp.result.returned`.
+_LISTING_FIELDS: dict[str, str] = {
+    "list_messages": "messages",
+    "search": "uids",
+    "list_drafts": "drafts",
+    "list_folders": "folders",
+    "list_accounts": "accounts",
+    "list_labels": "labels",
+    "list_attachments": "attachments",
+}
+_RESULT_COUNT_ATTRIBUTES = (
+    ("matched_total", "mcp.result.matched"),
+    ("matched_visible", "mcp.result.visible"),
+    ("has_more", "mcp.result.has_more"),
+)
+
+
+def _client_attributes(app: Server) -> dict[str, str]:
+    """ADR 0038: the MCP client as its Initialize `clientInfo` names it."""
+    try:
+        params = app.request_context.session.client_params
+    except LookupError:
+        return {}
+    if params is None:
+        return {}
+    return {
+        "mcp.client.name": params.clientInfo.name,
+        "mcp.client.version": params.clientInfo.version,
+    }
+
+
+def _record_span_outcome(
+    span: Any,
+    tool: str,
+    arguments: dict[str, Any],
+    result: Mapping[str, Any],
+    content: list[ContentBlock],
+    payloads: PayloadSettings,
+) -> None:
+    """Size, result counts, outcome and payloads of one tool call
+    (ADR 0037, ADR 0038)."""
+    public = {k: v for k, v in result.items() if not k.startswith("_")}
+    span.set_attribute(
+        "mcp.response.size_bytes",
+        sum(len(block.text.encode("utf-8")) for block in content if isinstance(block, TextContent)),
+    )
+    listed = public.get(_LISTING_FIELDS.get(tool, ""))
+    if isinstance(listed, list):
+        span.set_attribute("mcp.result.returned", len(listed))
+        for key, attribute in _RESULT_COUNT_ATTRIBUTES:
+            if key in public:
+                span.set_attribute(attribute, public[key])
+    # Observability standard §2: a policy denial is a rejected outcome,
+    # not a span error; only the error envelope is a technical failure.
+    if public.get("decision") == "DENY":
+        span.set_attribute("domain.outcome", "rejected")
+        span.set_attribute("domain.rejection.reason", str(public.get("reason", "")))
+    elif public.get("decision") == "ALLOW":
+        span.set_attribute("domain.outcome", "accepted")
+    if public.get("result") == "ERROR":
+        error = public.get("error")
+        error_type = str(error.get("type") or "") if isinstance(error, dict) else ""
+        # move/copy carry the type at the top level (ADR 0006).
+        error_type = error_type or str(public.get("error_type") or "")
+        span.set_attribute("error.type", error_type or "unknown")
+        mark_span_error(span, error_type or "error envelope")
+    span.set_attributes(
+        payload_attributes(
+            payloads,
+            request=arguments,
+            audited_request=_sanitise_args(arguments),
+            response=public,
+        )
+    )
 
 
 def _audit_tool_call(

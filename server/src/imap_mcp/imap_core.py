@@ -19,7 +19,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from aioimaplib import IMAP4, IMAP4_SSL
 
@@ -153,7 +153,95 @@ def _append_timeout() -> int:
     return override if override is not None else 60
 
 
-async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
+# aioimaplib client methods that send one IMAP command each; every call
+# becomes a child span `imap.<method>` of the current span (ADR 0038).
+# `uid(<cmd>, ...)` becomes `imap.uid_<cmd>`, `login` and `xoauth2`
+# become `imap.authenticate`. The CAPABILITY the library sends after
+# the greeting belongs to `imap.connect`.
+_TRACED_COMMANDS = frozenset(
+    {
+        "append",
+        "check",
+        "close",
+        "copy",
+        "create",
+        "delete",
+        "enable",
+        "examine",
+        "expunge",
+        "fetch",
+        "getquotaroot",
+        "id",
+        "idle",
+        "list",
+        "logout",
+        "lsub",
+        "move",
+        "namespace",
+        "noop",
+        "rename",
+        "search",
+        "select",
+        "status",
+        "store",
+        "subscribe",
+        "uid_search",
+        "unsubscribe",
+    }
+)
+_AUTH_COMMANDS = {"login": "password", "xoauth2": "xoauth2"}
+
+
+class TracedIMAP:
+    """An aioimaplib client whose IMAP commands are child spans.
+
+    Everything else (`has_capability`, `protocol`, …) passes through
+    unchanged. Spans carry the command name and the tagged status only,
+    never arguments: those hold mailbox names, search terms and
+    credentials.
+    """
+
+    def __init__(self, client: IMAP4) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._client, name)
+        if name in _AUTH_COMMANDS:
+            return self._traced(attr, "imap.authenticate", {"imap.auth_type": _AUTH_COMMANDS[name]})
+        if name == "uid":
+            return self._traced_uid(attr)
+        if name in _TRACED_COMMANDS:
+            return self._traced(attr, f"imap.{name}", None)
+        return attr
+
+    @staticmethod
+    def _traced(method: Any, span_name: str, attributes: dict[str, str] | None) -> Any:
+        async def call(*args: Any, **kwargs: Any) -> Any:
+            return await _run_traced(span_name, attributes, method(*args, **kwargs))
+
+        return call
+
+    @staticmethod
+    def _traced_uid(method: Any) -> Any:
+        async def call(command: str, *args: Any, **kwargs: Any) -> Any:
+            span_name = f"imap.uid_{command.lower()}"
+            return await _run_traced(span_name, None, method(command, *args, **kwargs))
+
+        return call
+
+
+async def _run_traced(span_name: str, attributes: dict[str, str] | None, call: Any) -> Any:
+    from .tracing import tracer
+
+    with tracer.start_as_current_span(span_name, attributes=attributes) as span:
+        response = await call
+        status = getattr(response, "result", None)
+        if isinstance(status, str):
+            span.set_attribute("imap.status", status)
+        return response
+
+
+async def _open_imap(account: Account, *, timeout: int = 10) -> TracedIMAP:
     from .tracing import tracer
 
     with tracer.start_as_current_span(
@@ -179,24 +267,19 @@ async def _open_imap(account: Account, *, timeout: int = 10) -> IMAP4:
                 raise ConnectionRefusedError(*exc.args) from exc
             imap = IMAP4(host=account.host, port=account.port, timeout=timeout)
         await imap.wait_hello_from_server()
-        return imap
+        return TracedIMAP(imap)
 
 
 async def _authenticate_imap(imap: IMAP4, account: Account, password: str) -> None:
-    from .tracing import tracer
-
-    auth_type = account.auth.type if account.auth else "password"
-    with tracer.start_as_current_span(
-        "imap.authenticate", attributes={"imap.auth_type": auth_type}
-    ):
-        user = _imap_user_for(account)
-        if account.auth and account.auth.type == "xoauth2":
-            try:
-                await imap.xoauth2(user, password)
-            except Exception as e:
-                raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}") from e
-        else:
-            await imap.login(user, password)
+    # The `imap.authenticate` span comes from TracedIMAP.
+    user = _imap_user_for(account)
+    if account.auth and account.auth.type == "xoauth2":
+        try:
+            await imap.xoauth2(user, password)
+        except Exception as e:
+            raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}") from e
+    else:
+        await imap.login(user, password)
 
 
 @dataclass(frozen=True)

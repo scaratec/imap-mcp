@@ -26,6 +26,9 @@ class BootstrapResult:
     exit_code: int
     stderr: str
     stdout: str
+    timed_out: bool = False
+    """The server neither refused nor finished within the timeout and
+    was killed; `exit_code` then says nothing about a refusal."""
 
 
 def try_bootstrap_server(
@@ -33,6 +36,8 @@ def try_bootstrap_server(
     config_dir: Path,
     caller_id: str,
     timeout: float = 5.0,
+    extra_env: dict[str, str] | None = None,
+    unset_env: tuple[str, ...] = (),
 ) -> BootstrapResult:
     """Attempt to run the server once; return the observed outcome.
 
@@ -46,6 +51,10 @@ def try_bootstrap_server(
     env = dict(os.environ)
     env["IMAP_MCP_CONFIG_DIR"] = str(config_dir)
     env["IMAP_MCP_CALLER_ID"] = caller_id
+    for name in unset_env:
+        env.pop(name, None)
+    if extra_env:
+        env.update(extra_env)
 
     proc = subprocess.Popen(
         [str(server_binary), "--transport", "stdio"],
@@ -74,11 +83,14 @@ def try_bootstrap_server(
             + b"\n"
         )
         stdout, stderr = proc.communicate(input=request, timeout=timeout)
+        timed_out = False
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout, stderr = proc.communicate()
+        timed_out = True
     return BootstrapResult(
         exit_code=proc.returncode if proc.returncode is not None else -1,
         stderr=stderr.decode("utf-8", errors="replace"),
         stdout=stdout.decode("utf-8", errors="replace"),
+        timed_out=timed_out,
     )

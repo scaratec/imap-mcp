@@ -44,6 +44,10 @@ def _ensure_builder(context: Context) -> PolicyBuilder:
     return builder
 
 
+# Every Dovecot test user's password (bdd/docker/dovecot/users/README.md).
+FIXTURE_PASSWORD = "test123"
+
+
 def _ensure_account_registered(
     context: Context, builder: PolicyBuilder, account_id: str
 ) -> None:
@@ -57,7 +61,28 @@ def _ensure_account_registered(
         port=port,
         auth_type="password",
         secret_ref=f"secret://accounts/{account_id}/password",
-        password_literal="test123",
+        password_literal=FIXTURE_PASSWORD,
+    )
+
+
+@given('the secret store holds the password "{password}" for account "{account_id}"')
+def step_secret_store_holds_password(
+    context: Context, password: str, account_id: str
+) -> None:
+    """Put the scenario's password into the server's secret store.
+
+    Dovecot knows one fixed password per test user, so the MITM proxy
+    in front of the account translates the scenario password in LOGIN
+    to the fixture's. The server itself only ever holds and sends the
+    scenario password.
+    """
+    builder = _ensure_builder(context)
+    _ensure_account_registered(context, builder, account_id)
+    account = next(a for a in builder.accounts if a.id == account_id)
+    account.password_literal = password
+    builder.write()
+    _start_imap_proxy(
+        context, account_id, login_credentials={password: FIXTURE_PASSWORD}
     )
 
 
@@ -407,6 +432,8 @@ def _parse_inline_rules(
     text = raw.strip()
     if text in ("", "[]"):
         return []
+    if text.startswith('[{"'):
+        return _parse_json_rules(raw)
     if not (text.startswith("[") and text.endswith("]")):
         raise AssertionError(f"Inline rules must be wrapped in []: {raw!r}")
     inner = text[1:-1].strip()
@@ -433,6 +460,35 @@ def _parse_inline_rules(
             results.append((match_dict, None, rhs_part[4:].strip()))
         else:
             results.append((match_dict, rhs_part, None))
+    return results
+
+
+def _parse_json_rules(
+    raw: str,
+) -> list[tuple[dict[str, object], str | None, str | None]]:
+    """Parse the rules column written as the policy file writes rules:
+    `[{"match": {"from_domain": "x.org"}, "grant": "ENVELOPE"}]`, each
+    rule with `match` and one of `grant` / `cap`."""
+    import json as _json
+
+    try:
+        parsed = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        raise AssertionError(f"Rules column is not valid JSON: {raw!r} ({exc})") from exc
+    if not isinstance(parsed, list):
+        raise AssertionError(f"Rules column must be a JSON list: {raw!r}")
+    results: list[tuple[dict[str, object], str | None, str | None]] = []
+    for rule in parsed:
+        if (
+            not isinstance(rule, dict)
+            or not isinstance(rule.get("match"), dict)
+            or set(rule) - {"match", "grant", "cap"}
+            or ("grant" in rule) == ("cap" in rule)
+        ):
+            raise AssertionError(
+                f"Rule must be an object with `match` and either `grant` or `cap`: {rule!r}"
+            )
+        results.append((dict(rule["match"]), rule.get("grant"), rule.get("cap")))
     return results
 
 
@@ -890,6 +946,20 @@ def step_folder_holds_message_bare_uid(
             "body_override": None,
         }
     )
+
+
+@given(
+    'the folder "{folder}" holds a message with uid {uid:d} whose plain-text body '
+    'is the letter "{letter}" repeated {count:d} times'
+)
+def step_folder_holds_message_repeated_letter_body(
+    context: Context, folder: str, uid: int, letter: str, count: int
+) -> None:
+    """Seed one default message whose text/plain body is exactly `letter * count`."""
+    if len(letter) != 1:
+        raise AssertionError(f"Expected a single letter, got {letter!r}")
+    step_folder_holds_message_bare_uid(context, folder, uid)
+    context.staged_messages[-1]["body_override"] = letter * count
 
 
 @given('policy grants mark_tagged=true on "{folder}"')
@@ -2261,6 +2331,7 @@ def _start_imap_proxy(
     uidvalidity_new_value: str | None = None,
     inject_failure_on: list[dict] | None = None,
     delay_command_seconds: dict | None = None,
+    login_credentials: dict[str, str] | None = None,
     refuse_connections: bool = False,
 ) -> int:
     """Spawn the BDD MITM proxy in front of the Dovecot instance for
@@ -2319,6 +2390,8 @@ def _start_imap_proxy(
     config.setdefault("inject_failure_on", [])
     if delay_command_seconds is not None:
         config["delay_command_seconds"] = delay_command_seconds
+    if login_credentials is not None:
+        config.setdefault("login_credentials", {}).update(login_credentials)
     config_path.write_text(_json.dumps(config), encoding="utf-8")
 
     procs = getattr(context, "imap_proxy_procs", None)

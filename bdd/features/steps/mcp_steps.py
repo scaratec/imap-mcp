@@ -120,6 +120,8 @@ def _ensure_mcp_client(context: Context, caller_id: str) -> MCPClient:
         config_dir=context.config_dir,
         caller_id=caller_id,
         extra_env=extra_env,
+        unset_env=tuple(getattr(context, "mcp_unset_env", ())),
+        **_client_info_kwargs(context),
     )
     client.start()
     context.mcp = client
@@ -128,6 +130,16 @@ def _ensure_mcp_client(context: Context, caller_id: str) -> MCPClient:
     # back rather than inventing one.
     context.mcp_caller_id = caller_id
     return client
+
+
+def _client_info_kwargs(context: Context) -> dict[str, str]:
+    """The Initialize `clientInfo` a scenario set for the MCP test client,
+    or nothing, which keeps the client's own default."""
+    info = getattr(context, "mcp_client_info", None)
+    if info is None:
+        return {}
+    name, version = info
+    return {"client_name": name, "client_version": version}
 
 
 def _store_result(context: Context, payload: dict[str, object]) -> None:
@@ -146,6 +158,13 @@ def _store_result(context: Context, payload: dict[str, object]) -> None:
         raise AssertionError(
             f"MCP tool response content is not a text block: {first!r}"
         )
+    # The text exactly as received, for witnesses that measure what the
+    # client had to read (ADR 0038 response size).
+    context.last_response_texts = [
+        block["text"]
+        for block in content
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
     if is_error:
         stderr = context.mcp.stderr_text if context.mcp else ""
         raise AssertionError(
@@ -1913,3 +1932,121 @@ given(
     '{caller_id} calls create_draft with account "{account}", folder "{folder}", '
     "rfc822 payload:"
 )(step_caller_calls_create_draft)
+
+
+# --------------------------------------------------- server environment
+
+
+def _server_not_started_yet(context: Context, what: str) -> None:
+    if getattr(context, "mcp", None) is not None:
+        raise AssertionError(
+            f"{what} must precede the server start; the server process already runs "
+            "and would not see it."
+        )
+
+
+@given('the environment variable "{name}" is set to "{value}"')
+def step_environment_variable_set(context: Context, name: str, value: str) -> None:
+    """The variable reaches the server process the scenario starts."""
+    _server_not_started_yet(context, f"Setting {name}")
+    env = getattr(context, "mcp_extra_env", None) or {}
+    env[name] = value
+    context.mcp_extra_env = env
+    context.mcp_unset_env = [n for n in getattr(context, "mcp_unset_env", []) if n != name]
+
+
+@given('the environment variable "{name}" is not set')
+def step_environment_variable_not_set(context: Context, name: str) -> None:
+    """Absent from the server's environment, including when the shell
+    running the suite exports it."""
+    _server_not_started_yet(context, f"Unsetting {name}")
+    env = getattr(context, "mcp_extra_env", None) or {}
+    env.pop(name, None)
+    context.mcp_extra_env = env
+    unset = list(getattr(context, "mcp_unset_env", []))
+    if name not in unset:
+        unset.append(name)
+    context.mcp_unset_env = unset
+
+
+@given('the MCP test client identifies itself as "{name}" version "{version}"')
+def step_mcp_client_identifies_itself(context: Context, name: str, version: str) -> None:
+    """`clientInfo` of the Initialize request the test client sends."""
+    _server_not_started_yet(context, "The client identity")
+    context.mcp_client_info = (name, version)
+
+
+@when('the server process is started with transport "stdio"')
+def step_server_process_started_stdio(context: Context) -> None:
+    """Start the server with the scenario's configuration and environment,
+    send it an Initialize, close stdin and record how it ended in
+    `context.startup_proc` for `the server refuses to start`."""
+    from types import SimpleNamespace
+
+    from support.server_bootstrap import try_bootstrap_server
+
+    builder = getattr(context, "policy_builder", None)
+    if builder is not None:
+        builder.write()
+    caller = next(iter(builder.callers), None) if builder is not None else None
+    extra_env = dict(getattr(context, "mcp_extra_env", None) or {})
+    extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
+    result = try_bootstrap_server(
+        _server_binary(context),
+        context.config_dir,
+        caller.id if caller is not None else "bootstrap-probe",
+        extra_env=extra_env,
+        unset_env=tuple(getattr(context, "mcp_unset_env", ())),
+    )
+    if result.timed_out:
+        raise AssertionError(
+            "The server neither refused to start nor ended after stdin closed; "
+            f"it was killed. Stderr:\n{result.stderr}"
+        )
+    context.startup_proc = SimpleNamespace(
+        returncode=result.exit_code, stdout=result.stdout, stderr=result.stderr
+    )
+
+
+@_behave_then('the startup error names "{variable}" and the allowed values "{allowed}"')
+def step_startup_error_names_variable_and_values(
+    context: Context, variable: str, allowed: str
+) -> None:
+    error = getattr(context, "startup_error", "")
+    missing = [part for part in (variable, allowed) if part not in error]
+    if missing:
+        raise AssertionError(f"Startup error lacks {missing!r}. Full message:\n{error}")
+
+
+# ------------------------------------------------- ending the server
+
+
+def _running_client(context: Context) -> MCPClient:
+    client = getattr(context, "mcp", None)
+    if client is None:
+        raise AssertionError("No stdio server runs in this scenario.")
+    return client
+
+
+@when("the MCP test client closes the server's stdin immediately after the response")
+def step_client_closes_stdin(context: Context) -> None:
+    _running_client(context).close_stdin()
+
+
+@when("the MCP test client sends SIGTERM to the server immediately after the response")
+def step_client_sends_sigterm(context: Context) -> None:
+    import signal
+
+    _running_client(context).send_signal(signal.SIGTERM)
+
+
+@_behave_then("within {seconds:d} seconds the server process has exited")
+def step_server_process_exited(context: Context, seconds: int) -> None:
+    import time
+
+    client = _running_client(context)
+    deadline = time.monotonic() + seconds
+    while client.poll_exit() is None:
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"The server process still runs after {seconds} s")
+        time.sleep(0.05)

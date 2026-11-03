@@ -1,4 +1,3 @@
-@pending
 Feature: Traces carry what is needed to measure how efficiently a caller uses the server
 
   The usability matrix (usability/README.md) measures, per agent run,

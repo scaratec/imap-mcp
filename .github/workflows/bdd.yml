@@ -30,13 +30,15 @@ jobs:
         run: |
           cd server
           python -m venv .venv
-          .venv/bin/pip install -e .
+          # The [tracing] extra: the observability scenarios witness
+          # the spans the server exports (ADR 0037, ADR 0038).
+          .venv/bin/pip install -e ".[tracing]"
 
       - name: Install BDD harness
         run: |
           cd bdd
           python -m venv .venv
-          .venv/bin/pip install behave httpx PyYAML
+          .venv/bin/pip install behave httpx PyYAML opentelemetry-proto grpcio
 
       - name: Start fixtures
         run: |

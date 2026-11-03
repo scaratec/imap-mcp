@@ -56,6 +56,11 @@ class MCPClient:
     config_dir: Path
     caller_id: str
     extra_env: dict[str, str] | None = None
+    unset_env: tuple[str, ...] = ()
+    """Variables removed from the inherited environment before start."""
+    client_name: str = "imap-mcp-bdd"
+    client_version: str = "0.1.0"
+    """`clientInfo` sent in the Initialize request."""
 
     def __post_init__(self) -> None:
         self._proc: subprocess.Popen[bytes] | None = None
@@ -74,6 +79,8 @@ class MCPClient:
         env = dict(os.environ)
         env["IMAP_MCP_CONFIG_DIR"] = str(self.config_dir)
         env["IMAP_MCP_CALLER_ID"] = self.caller_id
+        for name in self.unset_env:
+            env.pop(name, None)
         if self.extra_env:
             env.update(self.extra_env)
 
@@ -111,6 +118,24 @@ class MCPClient:
             self._stdin = None
             self._stdout = None
 
+    def close_stdin(self) -> None:
+        """End the session the way a harness does: EOF on the server's stdin."""
+        if self._stdin is None:
+            raise MCPClientError("Server stdin not available")
+        self._stdin.close()
+        self._stdin = None
+
+    def send_signal(self, sig: int) -> None:
+        if self._proc is None:
+            raise MCPClientError("Server process not started")
+        self._proc.send_signal(sig)
+
+    def poll_exit(self) -> int | None:
+        """The server's exit code, or None while it still runs."""
+        if self._proc is None:
+            raise MCPClientError("Server process not started")
+        return self._proc.poll()
+
     # --------------------------------------------------------- MCP API
 
     def list_tools(self) -> list[dict[str, Any]]:
@@ -144,7 +169,7 @@ class MCPClient:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "imap-mcp-bdd", "version": "0.1.0"},
+                "clientInfo": {"name": self.client_name, "version": self.client_version},
             },
         )
         self.server_info = dict(result.get("serverInfo", {}))

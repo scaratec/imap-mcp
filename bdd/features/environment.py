@@ -173,6 +173,10 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
         context.imap_proxy_ports = {}
     for instance in list((getattr(context, "server_instances", None) or {}).values()):
         instance.close()
+    collector = getattr(context, "trace_collector", None)
+    if collector is not None:
+        collector.stop()
+        context.trace_collector = None
     scratch = getattr(context, "scratch_dir", None)
     if scratch is not None and scratch.exists():
         # A scenario may have stripped write permission from parts of
