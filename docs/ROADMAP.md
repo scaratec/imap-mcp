@@ -49,25 +49,26 @@ Reihenfolge ist nach Bearbeitungspriorität sortiert.
 
 ### Nächster Block
 
-Einträge 31 bis 39 unter *Audit und Auslieferung* (40 ist erledigt).
-Entschieden sind 31, 32 und 33; zuerst 31 und 32, weil jeder Release-Lauf bis dahin rot
-endet. Offen und als Nächstes mit dem Owner zu klären: 34 bis 39, in
-dieser Reihenfolge.
+Offen mit dem Owner zu entscheiden: Eintrag 31 (abweichende Umsetzung bestätigen), 49 (`From` bei strukturierten Entwürfen) und 52 (Pool-Standardwerte bei vielen lokalen Instanzen). Danach die Defekte 44 bis 47 und die Einträge 33 bis 39 unter *Audit und Auslieferung*. Der Pilot der Usability-Matrix (50) liegt beim Owner.
 
 ### Smoke-Test beim Wieder-Einstieg
 
 ```sh
 cd /home/randy/Projekte/scaratec/imap-mcp/bdd
 .venv/bin/behave --no-color --format=progress features/
-# erwartet: 419 passed, 0 failed, 34 skipped
+# erwartet: 525 passed, 0 failed, 34 skipped
 # Hat semantic-release die Version angehoben, vorher die Metadaten der
 # Entwicklungsumgebung auffrischen, sonst schlägt in
 # mcp_tool_discovery.feature der Versionsvergleich fehl:
 #   cd ../server && .venv/bin/pip install --no-deps -e .
 
 cd /home/randy/Projekte/scaratec/imap-mcp/server
-.venv/bin/pytest tests/policy/ -q
-# erwartet: 8 passed
+.venv/bin/pytest -q
+# erwartet: 410 passed
+
+cd /home/randy/Projekte/scaratec/imap-mcp
+bdd/.venv/bin/python -m pytest -q usability/tests
+# erwartet: 62 passed (Selbsttests des Usability-Runners, ohne Agenten)
 ```
 
 ## Sofort (foundation)
