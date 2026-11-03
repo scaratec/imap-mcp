@@ -522,6 +522,26 @@ class IMAPFixture:
                 return msg
         raise RuntimeError(f"No RFC822 payload returned for uid {uid}")
 
+    def fetch_header_block(self, instance: str, user: str, folder: str, uid: int) -> bytes:
+        """Return the raw header block of <folder>/<uid> as stored.
+
+        `BODY.PEEK[HEADER]` hands back the bytes the server keeps, before
+        any parser decodes them, so a Then-step can inspect the wire form
+        itself (e.g. that it is pure ASCII). Raises if the UID is absent.
+        """
+        wire = self.to_wire(instance, user, folder)
+        conn = self.connect(instance, user)
+        status, data = conn.select(self._q(wire), readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"SELECT {folder!r} failed: {data!r}")
+        status, data = conn.uid("FETCH", str(uid), "(BODY.PEEK[HEADER])")
+        if status != "OK" or not data:
+            raise RuntimeError(f"FETCH header of uid {uid} in {folder!r} failed: {data!r}")
+        for item in data:
+            if isinstance(item, tuple) and len(item) >= 2 and item[1]:
+                return bytes(item[1])
+        raise RuntimeError(f"No header block returned for uid {uid} in {folder!r}")
+
     def find_uid_by_decoded_subject(
         self, instance: str, user: str, folder: str, subject: str
     ) -> int | None:

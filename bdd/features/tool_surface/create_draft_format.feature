@@ -1,4 +1,3 @@
-@pending
 Feature: A draft's body format is a visible, deliberate choice, equally easy either way
 
   Whether a draft is plain text or HTML is the mailbox owner's
@@ -181,6 +180,7 @@ Feature: A draft's body format is a visible, deliberate choice, equally easy eit
     # ADR 0035: reply_html is optional; the quoted original is rendered
     # as a blockquote in the HTML part.
     Given the IMAP account "gupta-scaratec" also has folder "INBOX"
+    And the account "gupta-scaratec" has identity "draft-agent@example.org"
     And policy "draft-policy" grants folder:
       | folder | mode      | default | rules |
       | INBOX  | blacklist | FULL    | []    |

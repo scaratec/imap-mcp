@@ -352,7 +352,7 @@ capability.
 | `mark_tagged` | `mark_tagged` | Add/remove keywords |
 | `move` | `move_out` + `accept_incoming` | Move message (intra-account: native MOVE; cross-account: saga) |
 | `copy` | `accept_incoming` | Copy message to target folder |
-| `create_draft` | `draft_append` | Append RFC 5322 draft |
+| `create_draft` | `draft_append` | Append a draft: plain text or HTML from fields, or a raw RFC 5322 message |
 
 ### Meta tools (3)
 

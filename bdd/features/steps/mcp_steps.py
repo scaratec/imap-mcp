@@ -175,6 +175,7 @@ def _store_result(context: Context, payload: dict[str, object]) -> None:
 
 
 @when("{caller_id} calls the MCP list_tools method")
+@when("{caller_id} lists the available tools")
 def step_caller_calls_list_tools(context: Context, caller_id: str) -> None:
     client = _ensure_mcp_client(context, caller_id)
     tools = client.list_tools()
@@ -1069,6 +1070,68 @@ def step_caller_calls_create_draft(
     _store_result(context, payload)
 
 
+def _call_create_draft_keeping_rpc_error(
+    context: Context, caller_id: str, arguments: dict[str, object]
+) -> None:
+    """Issue one create_draft call, keeping either the payload or the
+    JSON-RPC error: ADR 0035 rejects malformed input at the protocol
+    layer, so the error must survive as `context.last_rpc_error`."""
+    client = _ensure_mcp_client(context, caller_id)
+    context.last_response = None
+    context.last_rpc_error = None
+    try:
+        payload = client.call_tool("create_draft", arguments)
+    except MCPRPCError as exc:
+        context.last_rpc_error = {
+            "code": exc.code,
+            "message": exc.message,
+            "data": exc.data,
+        }
+        return
+    _store_result(context, payload)
+
+
+@when('{caller_id} calls create_draft with account "{account}", folder "{folder}", fields:')
+def step_caller_calls_create_draft_fields(
+    context: Context, caller_id: str, account: str, folder: str
+) -> None:
+    """The DocString is a JSON object whose members are passed as
+    create_draft arguments beside account and folder, unchanged."""
+    fields = json.loads(context.text or "{}")
+    if not isinstance(fields, dict):
+        raise AssertionError(f"fields DocString must be a JSON object, got {fields!r}")
+    _call_create_draft_keeping_rpc_error(
+        context, caller_id, {"account": account, "folder": folder, **fields}
+    )
+
+
+@when(
+    '{caller_id} calls create_draft with account "{account}", folder "{folder}", '
+    'rfc822 "{rfc822}" and fields {fields_raw}'
+)
+def step_caller_calls_create_draft_rfc822_and_fields(
+    context: Context,
+    caller_id: str,
+    account: str,
+    folder: str,
+    rfc822: str,
+    fields_raw: str,
+) -> None:
+    """Both input modes in one call. The quoted rfc822 value is read as
+    a JSON string literal, so the `\\r\\n` written in the step are the
+    line breaks they denote; `fields_raw` is a JSON object."""
+    fields = json.loads(fields_raw)
+    if not isinstance(fields, dict):
+        raise AssertionError(f"fields must be a JSON object, got {fields!r}")
+    arguments: dict[str, object] = {
+        "account": account,
+        "folder": folder,
+        "rfc822": json.loads(f'"{rfc822}"'),
+        **fields,
+    }
+    _call_create_draft_keeping_rpc_error(context, caller_id, arguments)
+
+
 @when(
     '{caller_id} calls fetch_headers with account "{account}", '
     'folder "{folder}", uid {uid:d}'
@@ -1585,6 +1648,37 @@ def step_caller_calls_create_reply_draft_inline(
             "uid": actual_uid,
             "drafts_folder": drafts_folder,
             "reply_text": reply_text,
+        },
+    )
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls create_reply_draft with account "{account}", '
+    'source folder "{src_folder}", uid {uid:d}, '
+    'drafts folder "{drafts_folder}", reply_html "{reply_html}"'
+)
+def step_caller_calls_create_reply_draft_html(
+    context: Context,
+    caller_id: str,
+    account: str,
+    src_folder: str,
+    uid: int,
+    drafts_folder: str,
+    reply_html: str,
+) -> None:
+    """HTML-only reply (ADR 0035): reply_html is passed, reply_text is not."""
+    client = _ensure_mcp_client(context, caller_id)
+    lookup = getattr(context, "message_uids", {})
+    actual_uid = lookup.get((account, src_folder, uid), uid)
+    payload = client.call_tool(
+        "create_reply_draft",
+        {
+            "account": account,
+            "source_folder": src_folder,
+            "uid": actual_uid,
+            "drafts_folder": drafts_folder,
+            "reply_html": reply_html,
         },
     )
     _store_result(context, payload)

@@ -12,6 +12,11 @@ message-rewrite saga under an optimistic check on `base_revision`. The
 request itself is hashed into `X-SC-Draft-Change-Hash` so that a retry
 of a call whose response was lost can be told apart from a genuine
 second edit.
+
+`create_draft` takes either a complete message or the field set a
+revision uses (ADR 0035); structured input shares its composition step
+with `update_draft`, and the response names the body format of what
+was appended.
 """
 
 from __future__ import annotations
@@ -82,6 +87,8 @@ FIRST_REVISION = 1
 # ADR 0030: a draft the server writes is a draft the owner has already
 # seen — it was composed through this server, not delivered to it.
 DRAFT_APPEND_FLAGS = ("\\Draft", "\\Seen")
+# ADR 0035: the body formats `create_draft` reports back.
+DraftFormat = Literal["text/plain", "text/html", "multipart/alternative"]
 
 
 def _split_header_block(rfc822: bytes) -> tuple[bytes, bytes]:
@@ -262,6 +269,7 @@ class CreateDraftResponse(TypedDict, total=False):
     missing_capability: NotRequired[str]
     draft_id: NotRequired[str]
     revision: NotRequired[int]
+    format: NotRequired[DraftFormat]
 
 
 class CreateReplyDraftResponse(TypedDict, total=False):
@@ -279,7 +287,9 @@ class CreateReplyDraftResponse(TypedDict, total=False):
     revision: NotRequired[int]
 
 
-def _ok_draft(*, account: str, folder: str, draft_id: str, revision: int) -> CreateDraftResponse:
+def _ok_draft(
+    *, account: str, folder: str, draft_id: str, revision: int, body_format: DraftFormat
+) -> CreateDraftResponse:
     return {
         "decision": "ALLOW",
         "result": "OK",
@@ -287,6 +297,7 @@ def _ok_draft(*, account: str, folder: str, draft_id: str, revision: int) -> Cre
         "folder": folder,
         "draft_id": draft_id,
         "revision": revision,
+        "format": body_format,
     }
 
 
@@ -393,7 +404,6 @@ async def handle_create_draft(
 ) -> CreateDraftResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
-    rfc822_text = str(arguments["rfc822"])
 
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
@@ -409,9 +419,13 @@ async def handle_create_draft(
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     draft_id = _new_draft_id()
-    rfc822_bytes = _inject_draft_headers(
-        rfc822_text.encode("utf-8"), draft_id=draft_id, revision=FIRST_REVISION
-    )
+    # ADR 0035: a complete message in `rfc822`, or structured fields the
+    # server composes; the dispatcher has already refused both and neither.
+    if "rfc822" in arguments:
+        message_bytes = str(arguments["rfc822"]).encode("utf-8")
+    else:
+        message_bytes = compose_draft(arguments)
+    rfc822_bytes = _inject_draft_headers(message_bytes, draft_id=draft_id, revision=FIRST_REVISION)
     try:
         append_result = await imap_append_message(
             account, password, imap_folder, rfc822_bytes, flags=DRAFT_APPEND_FLAGS
@@ -426,6 +440,7 @@ async def handle_create_draft(
             folder=folder_path,
             draft_id=draft_id,
             revision=FIRST_REVISION,
+            body_format=stored_format(rfc822_bytes),
         )
     return _error_draft(
         error_type="append_rejected",
@@ -496,11 +511,13 @@ def _assemble_reply_rfc822(
     source_body: str,
     reply_text: str,
     identity: Any,
+    reply_html: str | None = None,
 ) -> bytes:
     """Take the validated source message + agent-supplied reply_text
-    and produce the RFC822 bytes for the draft APPEND. Handles
-    subject/recipient derivation, attribution, body quoting, and
-    threading headers via ``reply_builder``.
+    (and optional reply_html, ADR 0035) and produce the RFC822 bytes
+    for the draft APPEND. Handles subject/recipient derivation,
+    attribution, body quoting, and threading headers via
+    ``reply_builder``.
     """
     from email.header import decode_header as _dh
     from email.header import make_header as _mh
@@ -520,6 +537,11 @@ def _assemble_reply_rfc822(
     attribution = reply_builder.build_attribution(src_date, src_from)
     quoted = reply_builder.quote_body(source_body)
     body = reply_builder.build_reply_body(reply_text, attribution, quoted)
+    html_body = (
+        reply_builder.build_reply_html(reply_html, attribution, source_body)
+        if reply_html is not None
+        else None
+    )
     in_reply_to, references = reply_builder.build_threading_headers(src_mid, src_references)
 
     return reply_builder.build_reply_message(
@@ -530,7 +552,27 @@ def _assemble_reply_rfc822(
         in_reply_to=in_reply_to,
         references=references,
         body=body,
+        html_body=html_body,
     )
+
+
+def _reply_bodies(arguments: dict[str, Any]) -> tuple[str, str | None]:
+    """Resolve `reply_text` and `reply_html` (ADR 0035).
+
+    A blank `reply_html` counts as absent. A missing or blank
+    `reply_text` is derived from `reply_html` by the tag stripping
+    `fetch_body` uses. With neither, the text is empty and the call
+    ends in `empty_reply_text`, as it always has.
+    """
+    from ..imap_core import _strip_html
+
+    raw_text = arguments.get("reply_text")
+    raw_html = arguments.get("reply_html")
+    reply_html = str(raw_html) if raw_html is not None and str(raw_html).strip() else None
+    reply_text = "" if raw_text is None else str(raw_text)
+    if not reply_text.strip() and reply_html is not None:
+        reply_text = _strip_html(reply_html)
+    return reply_text, reply_html
 
 
 async def handle_create_reply_draft(
@@ -540,7 +582,7 @@ async def handle_create_reply_draft(
     source_folder = str(arguments["source_folder"])
     uid = int(arguments["uid"])
     drafts_folder = str(arguments["drafts_folder"])
-    reply_text = str(arguments["reply_text"])
+    reply_text, reply_html = _reply_bodies(arguments)
 
     deny, src_decision, _drafts_decision = _validate_reply_preconditions(
         context,
@@ -611,6 +653,7 @@ async def handle_create_reply_draft(
         source_body=source_body,
         reply_text=reply_text,
         identity=account.identity,
+        reply_html=reply_html,
     )
 
     draft_id = _new_draft_id()
@@ -978,40 +1021,88 @@ def validate_changes(changes: Any) -> str | None:
             f"update_draft `changes` carries unknown member(s) {unknown}; "
             f"allowed: {sorted(CHANGE_FIELDS)} (ADR 0031)"
         )
+    return _field_values_error(changes, label="update_draft `changes.", allow_null=True)
+
+
+def _field_values_error(
+    values: dict[str, Any], *, label: str, allow_null: bool, ascii_addresses: bool = False
+) -> str | None:
+    """Check the draft fields present in `values` (ADR 0031, ADR 0035).
+
+    `label` prefixes every field name in a message. `allow_null` admits
+    `null` as "remove this field", which only a revision can mean.
+    `ascii_addresses` additionally refuses an addr-spec outside ASCII,
+    which cannot be RFC 2047 encoded into a pure-ASCII header block.
+    """
+    or_null = " or null" if allow_null else ""
     for field in _TEXT_CHANGE_FIELDS + _BODY_CHANGE_FIELDS:
-        if field not in changes:
+        if field not in values:
             continue
-        value = changes[field]
-        if value is None:
+        value = values[field]
+        if value is None and allow_null:
             continue
         if not isinstance(value, str):
-            return f"update_draft `changes.{field}` must be a string or null"
+            return f"{label}{field}` must be a string{or_null}"
     for field in _ADDRESS_CHANGE_FIELDS:
-        if field not in changes:
+        if field not in values:
             continue
-        value = changes[field]
-        if value is None:
+        value = values[field]
+        if value is None and allow_null:
             continue
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-            return f"update_draft `changes.{field}` must be an array of strings or null"
+            return f"{label}{field}` must be an array of strings{or_null}"
         for item in value:
             if not _is_rfc5322_address(item):
-                return f"update_draft `changes.{field}` holds a malformed address"
+                return f"{label}{field}` holds a malformed address"
+            if ascii_addresses and not _addr_spec_is_ascii(item):
+                return f"{label}{field}` holds an address outside ASCII"
     # ADR 0031: a header value carrying CR or LF is rejected, never
     # sanitised — silently stripping it would let a caller smuggle a
     # second header past the schema.
     for field in _TEXT_CHANGE_FIELDS + _ADDRESS_CHANGE_FIELDS:
-        value = changes.get(field)
+        value = values.get(field)
         candidates = (
             [value] if isinstance(value, str) else (value if isinstance(value, list) else [])
         )
         for candidate in candidates:
             if isinstance(candidate, str) and ("\r" in candidate or "\n" in candidate):
                 return (
-                    f"update_draft `changes.{field}` contains a line break; "
+                    f"{label}{field}` contains a line break; "
                     "header values must be a single line (ADR 0031)"
                 )
     return None
+
+
+def _addr_spec_is_ascii(value: str) -> bool:
+    from email.utils import getaddresses
+
+    return all(address.isascii() for _, address in getaddresses([value]))
+
+
+def validate_create_draft_arguments(arguments: dict[str, Any]) -> str | None:
+    """Validate the two input modes of `create_draft` (ADR 0035).
+
+    Either a complete message in `rfc822` or structured fields with at
+    least one body field — never both, never neither. Like
+    `validate_changes`, a rejection here is a malformed call: the
+    dispatcher answers it with invalid-arguments before any IMAP
+    command.
+    """
+    structured = [field for field in CHANGE_FIELDS if field in arguments]
+    if "rfc822" in arguments:
+        if structured:
+            return (
+                "create_draft takes either `rfc822` or structured fields, "
+                f"not both; got rfc822 and {structured} (ADR 0035)"
+            )
+        if not isinstance(arguments["rfc822"], str):
+            return "create_draft `rfc822` must be a string"
+        return None
+    if not any(field in arguments for field in _BODY_CHANGE_FIELDS):
+        return "create_draft requires `rfc822` or a `body_text` or `body_html` field (ADR 0035)"
+    return _field_values_error(
+        arguments, label="create_draft `", allow_null=False, ascii_addresses=True
+    )
 
 
 def change_hash(changes: dict[str, Any]) -> str:
@@ -1079,30 +1170,10 @@ def apply_draft_changes(
     `Message-ID`, `Date` and `X-SC-Draft-Change-Hash`.
     """
     import email
-    import io
-    from email.generator import BytesGenerator
     from email.utils import formatdate, make_msgid
 
     message = email.message_from_bytes(rfc822)
-
-    for field in _TEXT_CHANGE_FIELDS + _ADDRESS_CHANGE_FIELDS:
-        if field not in changes:
-            continue
-        header = _HEADER_FOR_CHANGE_FIELD[field]
-        value = changes[field]
-        del message[header]
-        if field in _ADDRESS_CHANGE_FIELDS:
-            addresses = value or []
-            if addresses:
-                message[header] = ", ".join(addresses)
-            continue
-        if value is not None:
-            message[header] = value
-
-    if "body_text" in changes:
-        _set_body_part(message, "text/plain", changes["body_text"])
-    if "body_html" in changes:
-        _set_body_part(message, "text/html", changes["body_html"])
+    _apply_field_values(message, changes)
 
     for header, value in (
         ("Date", formatdate(localtime=True)),
@@ -1113,9 +1184,113 @@ def apply_draft_changes(
         del message[header]
         message[header] = value
 
+    return _flatten(message, maxheaderlen=0)
+
+
+def _format_address_list(addresses: list[str]) -> str:
+    """Render recipients so that only a display name is RFC 2047
+    encoded; an encoded word must never swallow the addr-spec."""
+    from email.utils import formataddr, getaddresses
+
+    rendered = [formataddr(pair, charset="utf-8") for pair in getaddresses(addresses)]
+    return ", ".join(rendered)
+
+
+def _apply_field_values(message: Any, values: dict[str, Any]) -> None:
+    """Write the draft fields present in `values` onto `message`.
+
+    The one composition step shared by `update_draft` (ADR 0031) and
+    structured `create_draft` (ADR 0035): a member absent leaves the
+    field alone, a value sets it, `null` (or `[]`) removes it. Header
+    values are assigned as whole values, so the generator RFC 2047
+    encodes anything outside ASCII; nothing is concatenated into the
+    header block raw.
+    """
+    for field in _TEXT_CHANGE_FIELDS + _ADDRESS_CHANGE_FIELDS:
+        if field not in values:
+            continue
+        header = _HEADER_FOR_CHANGE_FIELD[field]
+        value = values[field]
+        del message[header]
+        if field in _ADDRESS_CHANGE_FIELDS:
+            addresses = value or []
+            if addresses:
+                message[header] = _format_address_list(addresses)
+            continue
+        if value is not None:
+            message[header] = value
+
+    if "body_text" in values:
+        _set_body_part(message, "text/plain", values["body_text"])
+    if "body_html" in values:
+        _set_body_part(message, "text/html", values["body_html"])
+
+
+def _flatten(message: Any, *, maxheaderlen: int) -> bytes:
+    import io
+    from email.generator import BytesGenerator
+
     buffer = io.BytesIO()
-    BytesGenerator(buffer, mangle_from_=False, maxheaderlen=0).flatten(message)
+    BytesGenerator(buffer, mangle_from_=False, maxheaderlen=maxheaderlen).flatten(message)
     return buffer.getvalue()
+
+
+# The empty message structured composition starts from: one empty UTF-8
+# text/plain part, which the body fields then fill or extend.
+_COMPOSE_SKELETON = b'MIME-Version: 1.0\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\n'
+# RFC 5322 §2.1.1 line limit; keeps every RFC 2047 encoded word short.
+_COMPOSE_MAX_HEADER_LEN = 78
+
+
+def compose_draft(fields: dict[str, Any]) -> bytes:
+    """Build a new draft from structured fields (ADR 0035).
+
+    `body_text` alone gives `text/plain; charset=utf-8`. `body_html`,
+    with or without `body_text`, gives `multipart/alternative` with a
+    text/plain and a text/html part; a missing `body_text` is derived
+    from the HTML by the tag stripping `fetch_body` uses. The draft
+    handle headers are not set here; the caller injects them as for an
+    `rfc822` draft.
+    """
+    import email
+    from email.utils import formatdate, make_msgid
+
+    from ..imap_core import _strip_html
+
+    values = {field: fields[field] for field in CHANGE_FIELDS if field in fields}
+    if values.get("body_html") is not None and values.get("body_text") is None:
+        values["body_text"] = _strip_html(str(values["body_html"]))
+
+    message = email.message_from_bytes(_COMPOSE_SKELETON)
+    _apply_field_values(message, values)
+    message["Date"] = formatdate(localtime=True)
+    message["Message-ID"] = make_msgid()
+    return _flatten(message, maxheaderlen=_COMPOSE_MAX_HEADER_LEN)
+
+
+def stored_format(rfc822: bytes) -> DraftFormat:
+    """Name the body format of a message about to be appended (ADR 0035).
+
+    A multipart/alternative is reported as such wherever it carries the
+    body; a mixed or related container is followed into its first part,
+    which is the body by convention. A single HTML leaf is `text/html`;
+    every other body is reported as `text/plain`.
+    """
+    import email
+    from email.message import Message
+
+    part = email.message_from_bytes(rfc822)
+    while part.is_multipart():
+        if part.get_content_type() == "multipart/alternative":
+            return "multipart/alternative"
+        children = part.get_payload()
+        if not isinstance(children, list) or not children:
+            return "text/plain"
+        first = children[0]
+        if not isinstance(first, Message):
+            return "text/plain"
+        part = first
+    return "text/html" if part.get_content_type() == "text/html" else "text/plain"
 
 
 async def _sweep_draft_residue(

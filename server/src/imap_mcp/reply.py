@@ -13,6 +13,7 @@ contract these helpers implement.
 
 from __future__ import annotations
 
+import re
 from email.message import EmailMessage
 from email.utils import (
     formataddr,
@@ -20,6 +21,7 @@ from email.utils import (
     parseaddr,
     parsedate_to_datetime,
 )
+from html import escape
 
 
 def build_reply_subject(source_subject: str) -> str:
@@ -150,6 +152,25 @@ def build_threading_headers(
     return in_reply_to, references
 
 
+def build_reply_html(
+    reply_html: str,
+    attribution: str,
+    source_body: str,
+) -> str:
+    """Assemble the HTML alternative of a top-posted reply (ADR 0035):
+    the caller's HTML, then the attribution, then the original in a
+    `<blockquote>`. The original and the attribution are plain text and
+    are escaped, line breaks kept as `<br>`. A reply that is a full
+    document gets the quote inside its `<body>`."""
+    lines = source_body.rstrip("\n").split("\n")
+    quoted = "<br>\n".join(escape(line) for line in lines)
+    tail = f'<p>{escape(attribution)}</p>\n<blockquote type="cite">\n{quoted}\n</blockquote>\n'
+    closing = re.search(r"</body\s*>", reply_html, flags=re.IGNORECASE)
+    if closing is not None:
+        return reply_html[: closing.start()] + tail + reply_html[closing.start() :]
+    return f"{reply_html.rstrip()}\n{tail}"
+
+
 def build_reply_message(
     *,
     self_identity: str,
@@ -159,13 +180,15 @@ def build_reply_message(
     in_reply_to: str,
     references: str,
     body: str,
+    html_body: str | None = None,
 ) -> bytes:
     """Construct the RFC822 bytes for the draft using stdlib EmailMessage.
 
     EmailMessage handles RFC 2047 encoding for non-ASCII subject and
     recipient display names automatically, and marks the body as
     UTF-8 — Cyrillic and other non-Latin scripts survive the round-trip
-    through IMAP unchanged.
+    through IMAP unchanged. With `html_body` the draft becomes
+    multipart/alternative, text/plain first.
     """
     msg = EmailMessage()
     msg["From"] = self_identity
@@ -176,4 +199,6 @@ def build_reply_message(
     msg["In-Reply-To"] = in_reply_to
     msg["References"] = references
     msg.set_content(body, subtype="plain", charset="utf-8")
+    if html_body is not None:
+        msg.add_alternative(html_body, subtype="html", charset="utf-8")
     return msg.as_bytes()

@@ -395,11 +395,39 @@ def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) ->
         changes_error = validate_changes(arguments.get("changes"))
         if changes_error is not None:
             return changes_error
+    if name == "create_draft":
+        from .handlers.drafts import validate_create_draft_arguments
+
+        return validate_create_draft_arguments(arguments)
+    if name == "create_reply_draft":
+        for key in ("reply_text", "reply_html"):
+            if key in arguments and not isinstance(arguments[key], str):
+                return f"create_reply_draft `{key}` must be a string (ADR 0035)"
     return None
+
+
+# ADR 0021 / ADR 0035: draft content arguments are never audited; only
+# the names of those present are, as `update_draft` records its changes.
+_DRAFT_CONTENT_ARGS = frozenset(
+    {
+        "to",
+        "cc",
+        "bcc",
+        "subject",
+        "body_text",
+        "body_html",
+        "in_reply_to",
+        "reply_text",
+        "reply_html",
+    }
+)
 
 
 def _sanitise_args(arguments: dict[str, Any]) -> dict[str, Any]:
     safe: dict[str, Any] = {}
+    content_fields = sorted(key for key in arguments if key in _DRAFT_CONTENT_ARGS)
+    if content_fields:
+        safe["changed_fields"] = content_fields
     for key, value in arguments.items():
         if key in ("rfc822", "tags"):
             safe[key] = "<redacted>" if key == "rfc822" else value
@@ -481,6 +509,9 @@ _ADDRESS_LIST_SCHEMA: dict[str, Any] = {
     "items": {"type": "string"},
 }
 _NULLABLE_STRING_SCHEMA: dict[str, Any] = {"type": ["string", "null"]}
+# ADR 0035: create_draft takes the same field set without the removal
+# form; a new draft has nothing to remove.
+_STRING_LIST_SCHEMA: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
 _DRAFT_CHANGES_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -700,21 +731,48 @@ def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
         ),
         _tool(
             "create_draft",
-            "Append an RFC 5322 message as a draft (ADR 0026, 0027).",
-            {**account_field, **folder_field, "rfc822": {"type": "string"}},
-            ["account", "folder", "rfc822"],
+            (
+                "Append a new draft (ADR 0026, 0027, 0035). Choose the body format "
+                "deliberately: plain text or HTML. If the user's preference is "
+                "unknown, ask. Pass either structured fields (to, cc, bcc, subject, "
+                "body_text and/or body_html, in_reply_to) or a complete RFC 5322 "
+                "message in rfc822, never both. body_text alone is stored as "
+                "text/plain; body_html as multipart/alternative, its plain-text "
+                "part derived from the HTML unless body_text is given too. The "
+                "response field format names the format that was stored."
+            ),
+            {
+                **account_field,
+                **folder_field,
+                "rfc822": {"type": "string"},
+                "to": _STRING_LIST_SCHEMA,
+                "cc": _STRING_LIST_SCHEMA,
+                "bcc": _STRING_LIST_SCHEMA,
+                "subject": {"type": "string"},
+                "body_text": {"type": "string"},
+                "body_html": {"type": "string"},
+                "in_reply_to": {"type": "string"},
+            },
+            ["account", "folder"],
         ),
         _tool(
             "create_reply_draft",
-            "Build and APPEND a top-posted reply draft (ADR 0026, 0027).",
+            (
+                "Build and APPEND a top-posted reply draft (ADR 0026, 0027, 0035). "
+                "Give reply_text, reply_html, or both. With reply_html the draft is "
+                "multipart/alternative: the HTML part quotes the original in a "
+                "<blockquote>, the text part with '>'; a missing reply_text is "
+                "derived from reply_html."
+            ),
             {
                 **account_field,
                 "source_folder": {"type": "string"},
                 **uid_field,
                 "drafts_folder": {"type": "string"},
                 "reply_text": {"type": "string"},
+                "reply_html": {"type": "string"},
             },
-            ["account", "source_folder", "uid", "drafts_folder", "reply_text"],
+            ["account", "source_folder", "uid", "drafts_folder"],
         ),
         _tool(
             "update_draft",

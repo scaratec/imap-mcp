@@ -44,9 +44,9 @@ corresponding layer here.
 | L13| Connection pool / IMAP session          | 12    | 0 (+7 specified @pending) | 5 | 0 |
 | L14| Gmail-specific semantics                | 24    | 0 (+7 covered_by_LIM-0002, +14 specified @pending) | 3 | 0 |
 | L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
-| L16| Agent-facing draft and search contract  | 27    | 8 (+19 specified @pending) | 0 | 0 |
+| L16| Agent-facing draft and search contract  | 27    | 19 (+8 specified @pending) | 0 | 0 |
 | L17| Observability (traces)                  | 23    | 0 (+23 specified @pending) | 0 | 0 |
-|    | **Total**                               | 267   | 118 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009, +87 specified @pending) | 45 | 0 |
+|    | **Total**                               | 267   | 129 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009, +76 specified @pending) | 45 | 0 |
 
 Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
 while the L9 section itself listed nineteen rows, four of them
@@ -565,17 +565,17 @@ Decided in ADR 0033 to ADR 0036 (2026-11-03).
 | L16.6  | discard_draft on an account without \Trash                  | covered            | discard_draft: trash_unavailable |
 | L16.7  | discard_draft with an unknown handle                        | covered            | discard_draft: draft_not_found |
 | L16.8  | discard_draft leaves handle-less drafts alone               | covered            | discard_draft: owner's draft untouched |
-| L16.9  | create_draft description presents the format as a choice    | specified @pending | create_draft_format: description |
-| L16.10 | create_draft reports format text/plain                      | specified @pending | create_draft_format: reports text/plain |
-| L16.11 | create_draft reports format text/html                       | specified @pending | create_draft_format: reports text/html |
-| L16.12 | create_draft reports format multipart/alternative           | specified @pending | create_draft_format: reports multipart/alternative |
-| L16.13 | Structured create_draft, body_text only                     | specified @pending | create_draft_format: structured (row 1) |
-| L16.14 | Structured create_draft, body_html only                     | specified @pending | create_draft_format: structured (row 2) |
-| L16.15 | Structured create_draft, both bodies                        | specified @pending | create_draft_format: structured (row 3) |
-| L16.16 | Non-ASCII subject and body in structured composition        | specified @pending | create_draft_format: non-ASCII |
-| L16.17 | rfc822 and structured fields together                       | specified @pending | create_draft_format: mutually exclusive |
-| L16.18 | Neither rfc822 nor a body field                             | specified @pending | create_draft_format: no body |
-| L16.19 | create_reply_draft with reply_html                          | specified @pending | create_draft_format: HTML reply |
+| L16.9  | create_draft description presents the format as a choice    | covered            | create_draft_format: description |
+| L16.10 | create_draft reports format text/plain                      | covered            | create_draft_format: reports text/plain |
+| L16.11 | create_draft reports format text/html                       | covered            | create_draft_format: reports text/html |
+| L16.12 | create_draft reports format multipart/alternative           | covered            | create_draft_format: reports multipart/alternative |
+| L16.13 | Structured create_draft, body_text only                     | covered            | create_draft_format: structured (row 1) |
+| L16.14 | Structured create_draft, body_html only                     | covered            | create_draft_format: structured (row 2) |
+| L16.15 | Structured create_draft, both bodies                        | covered            | create_draft_format: structured (row 3) |
+| L16.16 | Non-ASCII subject and body in structured composition        | covered            | create_draft_format: non-ASCII |
+| L16.17 | rfc822 and structured fields together                       | covered            | create_draft_format: mutually exclusive |
+| L16.18 | Neither rfc822 nor a body field                             | covered            | create_draft_format: no body |
+| L16.19 | create_reply_draft with reply_html                          | covered            | create_draft_format: HTML reply |
 | L16.20 | Default window hides matches, count reported (from_domain)  | specified @pending | search_completeness: outside count (row 1) |
 | L16.21 | Default window hides matches, count reported (subject)      | specified @pending | search_completeness: outside count (row 2) |
 | L16.22 | scope all reports no outside count                          | specified @pending | search_completeness: scope all |
