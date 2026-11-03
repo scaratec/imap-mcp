@@ -357,9 +357,10 @@ _DURATION_KEYS = ("newer_than", "older_than")
 
 
 def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) -> str | None:
-    """Reject the two argument shapes the in-handler code cannot
+    """Reject the argument shapes the in-handler code cannot
     distinguish from runtime errors: malformed duration strings and
-    a missing `part_id` on fetch_attachment.
+    calendar bounds (ADR 0024, 0036), a missing `part_id` on
+    fetch_attachment, and malformed draft arguments.
 
     Returns the JSON-RPC error message string when invalid, None when
     the call may proceed.
@@ -382,6 +383,11 @@ def _validate_arguments_against_surface(name: str, arguments: dict[str, Any]) ->
                         f"Invalid criteria.{key} {value!r}: must match "
                         f"the duration pattern {_DURATION_PATTERN}"
                     )
+            from .handlers.search import validate_calendar_bounds
+
+            calendar_error = validate_calendar_bounds(criteria)
+            if calendar_error is not None:
+                return calendar_error
     if name == "fetch_attachment" and "part_id" not in arguments:
         return "fetch_attachment requires part_id (ADR 0026 §1)"
     if name == "update_draft":
@@ -468,6 +474,12 @@ def _sanitise_args(arguments: dict[str, Any]) -> dict[str, Any]:
 # Single source for the V2 search-criteria grammar (ADR 0024, ADR 0026).
 # Reused by search, list_messages, bulk_mark_seen, bulk_mark_tagged.
 _DURATION_PATTERN = r"^[0-9]+[smhdwy]$"
+# ADR 0036: `since` inclusive, `before` exclusive, IMAP SEARCH semantics.
+_CALENDAR_DATE_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "format": "date",
+    "pattern": r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+}
 _CRITERIA_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -480,6 +492,8 @@ _CRITERIA_SCHEMA: dict[str, Any] = {
         "flagged": {"type": "boolean"},
         "newer_than": {"type": "string", "pattern": _DURATION_PATTERN},
         "older_than": {"type": "string", "pattern": _DURATION_PATTERN},
+        "since": _CALENDAR_DATE_SCHEMA,
+        "before": _CALENDAR_DATE_SCHEMA,
         "size_gt": {"type": "integer", "minimum": 1},
         "size_lt": {"type": "integer", "minimum": 1},
     },
@@ -603,7 +617,14 @@ def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
         ),
         _tool(
             "search",
-            "Search a folder for matching UIDs (ADR 0024, 0026).",
+            (
+                "Search a folder for matching UIDs (ADR 0024, 0026, 0036). Without "
+                "a time bound only the last 7 days are searched (applied_scope "
+                "recent_7d) and outside_scope_total counts the matches before that "
+                'window; pass scope "all" to search all time. criteria.since '
+                "(inclusive) and criteria.before (exclusive) take calendar dates "
+                "YYYY-MM-DD and cannot be combined with newer_than/older_than."
+            ),
             {
                 **account_field,
                 **folder_field,
@@ -616,7 +637,14 @@ def _build_tool_list(context: ServerContext | None = None) -> list[Tool]:
         ),
         _tool(
             "list_messages",
-            "List messages with envelope data (ADR 0024, 0026).",
+            (
+                "List messages with envelope data (ADR 0024, 0026, 0036). Without "
+                "a time bound only the last 7 days are listed (applied_scope "
+                "recent_7d) and outside_scope_total counts the matches before that "
+                'window; pass scope "all" to list all time. criteria.since '
+                "(inclusive) and criteria.before (exclusive) take calendar dates "
+                "YYYY-MM-DD and cannot be combined with newer_than/older_than."
+            ),
             {
                 **account_field,
                 **folder_field,

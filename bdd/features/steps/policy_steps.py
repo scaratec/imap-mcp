@@ -19,6 +19,7 @@ even that is a lookup in a fixed table, not a heuristic.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import yaml
@@ -2396,6 +2397,35 @@ def _start_imap_proxy(
             break
     builder.write()
     return proxy_port
+
+
+_COMMAND_LOG_WITNESS = re.compile(r'the IMAP command log for "([^"]+)"')
+
+
+def capture_witnessed_command_logs(context: Context) -> None:
+    """Put the pass-through proxy in front of every Dovecot-backed account
+    whose IMAP command log the current scenario witnesses.
+
+    Called once, just before the server process starts: the proxy can
+    only record what passes through it, so it must be wired into the
+    account before the server's first connection. Accounts already
+    behind a proxy keep it; mock-gmail accounts are skipped, the mock
+    records its own command log.
+    """
+    scenario = getattr(context, "scenario", None)
+    if scenario is None:
+        return
+    for step in scenario.steps:
+        match = _COMMAND_LOG_WITNESS.search(step.name)
+        if match is None:
+            continue
+        account_id = match.group(1)
+        if account_id in (getattr(context, "imap_proxy_ports", None) or {}):
+            continue
+        instance, _user = resolve_account(account_id)
+        if instance == "mock-gmail":
+            continue
+        _start_imap_proxy(context, account_id)
 
 
 @given('the IMAP server for "{account_id}" does not advertise the MOVE capability')

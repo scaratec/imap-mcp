@@ -87,13 +87,18 @@ def _ensure_mcp_client(context: Context, caller_id: str) -> MCPClient:
     # Flush any staged message seeding before every tool call. Messages
     # staged *after* the server first started must still reach Dovecot
     # before the server issues its next IMAP read.
-    from features.steps.policy_steps import flush_staged_messages
+    from features.steps.policy_steps import (
+        capture_witnessed_command_logs,
+        flush_staged_messages,
+    )
 
     flush_staged_messages(context)
 
     client = getattr(context, "mcp", None)
     if client is not None:
         return client
+
+    capture_witnessed_command_logs(context)
 
     builder = getattr(context, "policy_builder", None)
     if builder is not None:
@@ -1452,8 +1457,17 @@ def step_caller_calls_search(
         if key in extras:
             args[key] = extras[key]
     client = _ensure_mcp_client(context, caller_id)
-    payload = client.call_tool("search", args)
-    _store_result(context, payload)
+    context.last_response = None
+    context.last_rpc_error = None
+    try:
+        payload = client.call_tool("search", args)
+        _store_result(context, payload)
+    except MCPRPCError as exc:
+        context.last_rpc_error = {
+            "code": exc.code,
+            "message": exc.message,
+            "data": exc.data,
+        }
 
 
 _use_step_matcher("re")

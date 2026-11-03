@@ -1,4 +1,3 @@
-@pending
 Feature: A search tells the caller when matches lie outside the applied window, and accepts calendar dates
 
   ADR 0026 §5 makes a 7-day window the default for search and
@@ -43,7 +42,8 @@ Feature: A search tells the caller when matches lie outside the applied window, 
     - Malformed calendar date                                     : 1
     - since not before before                                     : 1
     - Calendar and duration bounds mixed                          : 1
-    Total enumerated                                              : 8   covered by this feature: 8
+    - Default window on an authorized folder that does not exist   : 2 (search, list_messages)
+    Total enumerated                                              : 10  covered by this feature: 10
 
   Background:
     Given the server date is pinned to "2026-11-02"
@@ -109,3 +109,23 @@ Feature: A search tells the caller when matches lie outside the applied window, 
       | {"since": "01.07.2026"}                                    | not an ISO calendar date    |
       | {"since": "2026-10-01", "before": "2026-07-01"}            | since is not before before  |
       | {"since": "2026-07-01", "newer_than": "30d"}               | calendar and duration mixed |
+
+  # --- Error path: the folder does not exist ---------------------------
+
+  Scenario Outline: The default window on an authorized folder that does not exist reports folder_absent
+    # The count search of ADR 0036 must open the folder; a folder the
+    # policy grants but the server lacks is folder_absent (ADR 0025),
+    # never an empty result and never an internal error.
+    Given policy "search-policy" folder defaults for "INBOX/Rechnungen-Tippfehler" are:
+      | mode      | default  |
+      | blacklist | ENVELOPE |
+    When search-agent calls <tool> with account "gupta-scaratec", folder "INBOX/Rechnungen-Tippfehler", criteria {"from_domain": "nordlicht.example.org"}
+    Then the response decision is ALLOW
+    And the response field result equals "ERROR"
+    And the response field error.type equals "folder_absent"
+
+    Examples:
+      | tool          |
+      | search        |
+      | list_messages |
+

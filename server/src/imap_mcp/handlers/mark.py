@@ -164,17 +164,12 @@ async def _bulk_search_uids(
     Returns (account_model, password, imap_folder, uids).  Honours the
     explicit `scope` argument (ADR 0026 §5).
     """
-    from .search import _criteria_to_imap_search, _resolve_scope
+    from .search import _scoped_search
 
-    criteria_raw = arguments.get("criteria") or {}
-    scope_arg = arguments.get("scope")
-    imap_criteria = _criteria_to_imap_search(criteria_raw)
-    _applied_scope, since_term = _resolve_scope(criteria_raw, scope_arg)
-    if since_term is not None:
-        imap_criteria = since_term if imap_criteria == "ALL" else f"{imap_criteria} {since_term}"
+    scoped = _scoped_search(arguments.get("criteria") or {}, arguments.get("scope"))
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    uids = await imap_search_uids(account, password, imap_folder, imap_criteria)
+    uids = await imap_search_uids(account, password, imap_folder, scoped.imap_criteria)
     return account, password, imap_folder, uids
 
 

@@ -1398,6 +1398,29 @@ async def search_uids(
         await imap.logout()
 
 
+async def count_uids(account: Account, password: str, folder: str, criteria: str) -> int:
+    """Count the messages a UID SEARCH matches in `folder`; fetch nothing.
+
+    Unlike `search_uids`, a refused SELECT or SEARCH raises: the count
+    is reported to the caller (ADR 0036), and a failure must fail the
+    call rather than read as zero.
+    """
+    folder = _quote_mailbox(folder)
+    imap = await _open_imap(account)
+    await _authenticate_imap(imap, account, password)
+    try:
+        status, lines = await imap.select(folder)
+        if status != "OK":
+            raise FolderNotSelectable(folder, status, _response_text(lines))
+        status, response = await imap.uid_search(criteria)
+        if status != "OK":
+            raise RuntimeError(f"count SEARCH failed: {status}")
+        raw = response[0] if response and isinstance(response[0], bytes) else b""
+        return len(raw.split())
+    finally:
+        await imap.logout()
+
+
 async def expunge_uids(account: Account, password: str, folder: str, uids: list[int]) -> int:
     """Remove the named UIDs from `folder` and return how many were removed.
 

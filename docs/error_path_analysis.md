@@ -42,16 +42,22 @@ corresponding layer here.
 | L11| Audit log                               | 11    | 8 (+3 covered_by_LIM-0009) | 0 | 0 |
 | L12| Configuration loading                   | 13    | 12      | 1        | 0   |
 | L13| Connection pool / IMAP session          | 12    | 0 (+7 specified @pending) | 5 | 0 |
-| L14| Gmail-specific semantics                | 24    | 0 (+7 covered_by_LIM-0002, +14 specified @pending) | 3 | 0 |
+| L14| Gmail-specific semantics                | 24    | 14 (+7 covered_by_LIM-0002) | 3 | 0 |
 | L15| Deployment / process lifecycle          | 16    | 0 (+16 specified @pending) | 0 | 0 |
-| L16| Agent-facing draft and search contract  | 27    | 19 (+8 specified @pending) | 0 | 0 |
+| L16| Agent-facing draft and search contract  | 29    | 29      | 0        | 0   |
 | L17| Observability (traces)                  | 23    | 0 (+23 specified @pending) | 0 | 0 |
-|    | **Total**                               | 267   | 129 (+7 LIM-0002, +6 LIM-0003, +3 LIM-0009, +76 specified @pending) | 45 | 0 |
+|    | **Total**                               | 269   | 137 (+7 LIM-0002, +6 LIM-0003, +2 LIM-0006, +3 LIM-0009, +54 specified @pending) | 60 | 0 |
 
 Correction, 2026-08-25: the L9 row previously read `15 / 13 / 0 / 0`
 while the L9 section itself listed nineteen rows, four of them
 `deferred A` (L9.16–L9.19). The summary was stale, not the section. The
 row above now counts them.
+
+Correction, 2026-11-03: the Total row read `129 (+7 LIM-0002, +6
+LIM-0003, +3 LIM-0009, +76 specified @pending) / 45`, which the layer
+rows do not add up to: they give 113 covered, 60 deferred, and two
+`covered_by_LIM-0006` cases (L9) the row left out. The Total row is now
+the sum of the layer rows, after L16.20–L16.27 became covered.
 
 Counts are best-effort enumerations. They are updated by the author of
 any change that adds or removes a failure mode, and reviewed as part of
@@ -462,20 +468,20 @@ a token mid-session.
 | L14.8  | Move target is a Gmail label currently empty           | deferred A | — |
 | L14.9  | Move target includes the label `All Mail` directly    | deferred A | — |
 | L14.10 | Concurrent label rewrite from outside imap-mcp        | deferred A | — |
-| L14.11 | Localized mock refuses the English name (fidelity)   | specified @pending | localized_gmail_resolution: mock refuses English name |
-| L14.12 | search on canonical Sent as first call of a session  | specified @pending | localized_gmail_resolution: read tool, first call (search) |
-| L14.13 | list_messages on canonical Trash as first call        | specified @pending | localized_gmail_resolution: read tool, first call (list_messages) |
-| L14.14 | folder_stats on canonical All Mail as first call      | specified @pending | localized_gmail_resolution: read tool, first call (folder_stats) |
-| L14.15 | create_draft on canonical Drafts as first call        | specified @pending | localized_gmail_resolution: create_draft first call |
-| L14.16 | Label-swap move canonical → canonical, localized acct | specified @pending | localized_gmail_resolution: draft to trash (row 1) |
-| L14.17 | Label-swap move localized → localized                 | specified @pending | localized_gmail_resolution: draft to trash (row 2) |
-| L14.18 | Label-swap move canonical → localized                 | specified @pending | localized_gmail_resolution: draft to trash (row 3) |
-| L14.19 | Unselectable source in label swap → folder_absent      | specified @pending | localized_gmail_resolution: folder_absent, never uid_not_found |
-| L14.20 | Cross-account saga resolves localized All Mail         | specified @pending | localized_gmail_resolution: cross-account All Mail |
-| L14.21 | Canonical-only policy governs the localized name       | specified @pending | localized_gmail_resolution: canonical-only policy |
-| L14.22 | Localized-only policy entry governs the canonical name | specified @pending | localized_gmail_resolution: localized-only policy |
-| L14.23 | Conflicting entries for one special-use folder         | specified @pending | localized_gmail_resolution: fail closed |
-| L14.24 | Responses echo the canonical folder name               | specified @pending | localized_gmail_resolution: canonical echo |
+| L14.11 | Localized mock refuses the English name (fidelity)   | covered            | localized_gmail_resolution: mock refuses English name |
+| L14.12 | search on canonical Sent as first call of a session  | covered            | localized_gmail_resolution: read tool, first call (search) |
+| L14.13 | list_messages on canonical Trash as first call        | covered            | localized_gmail_resolution: read tool, first call (list_messages) |
+| L14.14 | folder_stats on canonical All Mail as first call      | covered            | localized_gmail_resolution: read tool, first call (folder_stats) |
+| L14.15 | create_draft on canonical Drafts as first call        | covered            | localized_gmail_resolution: create_draft first call |
+| L14.16 | Label-swap move canonical → canonical, localized acct | covered            | localized_gmail_resolution: draft to trash (row 1) |
+| L14.17 | Label-swap move localized → localized                 | covered            | localized_gmail_resolution: draft to trash (row 2) |
+| L14.18 | Label-swap move canonical → localized                 | covered            | localized_gmail_resolution: draft to trash (row 3) |
+| L14.19 | Unselectable source in label swap → folder_absent      | covered            | localized_gmail_resolution: folder_absent, never uid_not_found |
+| L14.20 | Cross-account saga resolves localized All Mail         | covered            | localized_gmail_resolution: cross-account All Mail |
+| L14.21 | Canonical-only policy governs the localized name       | covered            | localized_gmail_resolution: canonical-only policy |
+| L14.22 | Localized-only policy entry governs the canonical name | covered            | localized_gmail_resolution: localized-only policy |
+| L14.23 | Conflicting entries for one special-use folder         | covered            | localized_gmail_resolution: fail closed |
+| L14.24 | Responses echo the canonical folder name               | covered            | localized_gmail_resolution: canonical echo |
 
 **Deferred reason A** — Edge cases for Gmail that require deep
 knowledge of Gmail's label model side effects. Will be covered by
@@ -576,14 +582,16 @@ Decided in ADR 0033 to ADR 0036 (2026-11-03).
 | L16.17 | rfc822 and structured fields together                       | covered            | create_draft_format: mutually exclusive |
 | L16.18 | Neither rfc822 nor a body field                             | covered            | create_draft_format: no body |
 | L16.19 | create_reply_draft with reply_html                          | covered            | create_draft_format: HTML reply |
-| L16.20 | Default window hides matches, count reported (from_domain)  | specified @pending | search_completeness: outside count (row 1) |
-| L16.21 | Default window hides matches, count reported (subject)      | specified @pending | search_completeness: outside count (row 2) |
-| L16.22 | scope all reports no outside count                          | specified @pending | search_completeness: scope all |
-| L16.23 | Calendar window since + before                              | specified @pending | search_completeness: calendar window (row 1) |
-| L16.24 | Calendar window since only                                  | specified @pending | search_completeness: calendar window (row 2) |
-| L16.25 | Malformed calendar date                                     | specified @pending | search_completeness: invalid (row 1) |
-| L16.26 | since not before before                                     | specified @pending | search_completeness: invalid (row 2) |
-| L16.27 | Calendar and duration bounds mixed                          | specified @pending | search_completeness: invalid (row 3) |
+| L16.20 | Default window hides matches, count reported (from_domain)  | covered            | search_completeness: outside count (row 1) |
+| L16.21 | Default window hides matches, count reported (subject)      | covered            | search_completeness: outside count (row 2) |
+| L16.22 | scope all reports no outside count                          | covered            | search_completeness: scope all |
+| L16.23 | Calendar window since + before                              | covered            | search_completeness: calendar window (row 1) |
+| L16.24 | Calendar window since only                                  | covered            | search_completeness: calendar window (row 2) |
+| L16.25 | Malformed calendar date                                     | covered            | search_completeness: invalid (row 1) |
+| L16.26 | since not before before                                     | covered            | search_completeness: invalid (row 2) |
+| L16.27 | Calendar and duration bounds mixed                          | covered            | search_completeness: invalid (row 3) |
+| L16.28 | Default window, folder absent (search)                      | covered            | search_completeness: folder_absent (row 1) |
+| L16.29 | Default window, folder absent (list_messages)               | covered            | search_completeness: folder_absent (row 2) |
 
 Whether agents actually use this contract well is not a server error
 path and is not counted here. It is measured, never asserted, in

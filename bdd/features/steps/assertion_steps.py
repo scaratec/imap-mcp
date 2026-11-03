@@ -2415,6 +2415,49 @@ def step_imap_command_log_in_order(context: Context, account_id: str) -> None:
         cursor = sub_cursor
 
 
+@then('the IMAP command log for "{account_id}" contains no SEARCH command')
+def step_imap_command_log_has_no_search(context: Context, account_id: str) -> None:
+    """Absence witness on the proxy in front of a Dovecot-backed account.
+
+    The server may legitimately never connect, so an empty or missing
+    log is acceptable only while the proxy that would have recorded the
+    SEARCH is still running and wired into the account; anything else
+    is a harness error, not a pass.
+    """
+    log_path = (getattr(context, "imap_proxy_log_paths", None) or {}).get(account_id)
+    proxy_proc = (getattr(context, "imap_proxy_procs", None) or {}).get(account_id)
+    if log_path is None or proxy_proc is None or proxy_proc.poll() is not None:
+        raise AssertionError(
+            f"No running IMAP proxy captures the traffic of {account_id!r}; "
+            "the absence of SEARCH cannot be witnessed."
+        )
+    builder = getattr(context, "policy_builder", None)
+    proxy_port = (getattr(context, "imap_proxy_ports", None) or {}).get(account_id)
+    wired = builder is not None and any(
+        account.id == account_id and account.port == proxy_port
+        for account in builder.accounts
+    )
+    if not wired:
+        raise AssertionError(
+            f"Account {account_id!r} is not configured to reach IMAP through "
+            f"the proxy on port {proxy_port!r}."
+        )
+    log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    searches = []
+    for entry in log.splitlines():
+        # `<timestamp>\t<tag> [UID] <command> ...`
+        tokens = entry.partition("\t")[2].split()
+        if len(tokens) > 1 and tokens[1].upper() == "UID":
+            tokens = tokens[1:]
+        if len(tokens) > 1 and tokens[1].upper() == "SEARCH":
+            searches.append(entry)
+    if searches:
+        raise AssertionError(
+            f"Unexpected SEARCH in the IMAP command log of {account_id!r}:\n"
+            + "\n".join(searches)
+        )
+
+
 @then('the IMAP server has no folder named "{folder_path}" that now holds uid {uid:d}')
 def step_imap_server_no_folder_holding_uid(
     context: Context, folder_path: str, uid: int

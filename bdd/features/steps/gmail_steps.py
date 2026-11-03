@@ -682,9 +682,16 @@ def step_response_hidden_folders_count_at_least(
 
 @then("the response uids equals {expected_raw}")
 def step_response_uids_equals(context: Context, expected_raw: str) -> None:
-    """Check the response uids field matches the expected list."""
+    """Check the response uids field matches the expected list.
+
+    The expected list holds the scenario's UID hints; they resolve to
+    the UIDs the IMAP server assigned at seeding (identity on the
+    mock-gmail server, which takes the hint as the UID).
+    """
+    from features.steps.assertion_steps import _resolve_uid_hints
+
     response = _last_response(context)
-    expected = json.loads(expected_raw)
+    expected = _resolve_uid_hints(context, json.loads(expected_raw))
     actual = response.get("uids")
     if actual is None:
         # Try extracting UIDs from a results/messages list.
