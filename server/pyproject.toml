@@ -4,7 +4,10 @@ version = "2.1.1"
 description = "Security-focused Model Context Protocol server mediating LLM access to IMAP mailboxes under strict, auditable policy."
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-or-later" }
-readme = "../README.md"
+# The long description is the repository README, supplied by
+# hatch_build.py: from ../README.md in the repository, from the copy
+# force-included as PYPI_README.md inside the sdist.
+dynamic = ["readme"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -51,11 +54,15 @@ imap-mcp = "imap_mcp.__main__:main"
 imap-mcp-oauth-bootstrap = "imap_mcp.auth.oauth_bootstrap:main"
 
 [build-system]
-# hatchling 1.32 rejects a readme outside the project directory, and the
-# PyPI page is rendered from the repository README one level up. Lift the
-# cap once that README is shipped from within server/.
-requires = ["hatchling<1.32"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata.hooks.custom]
+
+# A readme path outside the project made hatchling put a "../README.md"
+# member into the sdist, which PyPI rejects with 400 Bad Request.
+[tool.hatch.build.targets.sdist.force-include]
+"../README.md" = "PYPI_README.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/imap_mcp"]
