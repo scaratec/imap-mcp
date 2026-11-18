@@ -1,14 +1,10 @@
-"""Pure helpers that build a top-posted reply from a source message.
+"""Pure helpers that build a top-posted reply from a source message (ADR 0035, ADR 0057, ADR 0063).
 
-The functions here are deterministic and have no I/O: they take parsed
-header values and the agent-supplied reply text, and produce the strings
-that go into the outgoing draft. Keeping them here (rather than inline
-in `server.py`) means the BDD scenarios that constrain the behavior —
-subject prefix, recipient derivation, attribution format, quoting —
-can be reasoned about as data transformations.
-
-See `bdd/features/tool_surface/create_reply_draft.feature` for the
-contract these helpers implement.
+Adheres to:
+- Quote only non-attachment inline text/plain / text/html parts (never attachments or message/rfc822 sub-parts)
+- Strip <script> and executable tags inside HTML reply blockquote
+- Paragraph-preserving HTML-to-text fallback
+- Local wall-clock attribution
 """
 
 from __future__ import annotations
@@ -24,24 +20,30 @@ from email.utils import (
 from html import escape
 
 
-def build_reply_subject(source_subject: str) -> str:
-    """Prepend `Re: ` unless the subject already starts with it.
+def strip_html_preserving_paragraphs(html: str) -> str:
+    """Convert block tags (<p>, <br>, <div>, <li>, <tr>, <h1..h6>) to line breaks before stripping tags."""
+    if not html:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    text = re.sub(r"(?i)</?(?:p|div|li|tr|h[1-6])(?:\s+[^>]*)?>", "\n", text)
+    # Strip script and style blocks completely
+    text = re.sub(r"(?is)<(?:script|style)[^>]*>.*?</(?:script|style)>", "", text)
+    # Strip all remaining tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Normalize multiple line breaks
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-    Detection is case-insensitive and tolerates leading whitespace, but
-    only on the literal `Re:` token — locale variants like `AW:`, `WG:`,
-    `Rep:`, `Fwd:` are NOT recognised and DO get a `Re: ` prepended.
-    """
+
+def build_reply_subject(source_subject: str) -> str:
+    """Prepend `Re: ` unless the subject already starts with it."""
     if source_subject.lstrip().lower().startswith("re:"):
         return source_subject
     return f"Re: {source_subject}"
 
 
-def derive_reply_to(
-    source_reply_to: str | None,
-    source_from: str,
-) -> str:
-    """Pick the To-address for the reply: source Reply-To takes
-    precedence over source From, both used verbatim."""
+def derive_reply_to(source_reply_to: str | None, source_from: str) -> str:
+    """Pick Reply-To over From."""
     if source_reply_to and source_reply_to.strip():
         return source_reply_to
     return source_from
@@ -52,11 +54,7 @@ def derive_reply_cc(
     source_cc: str | None,
     self_identity: str,
 ) -> str:
-    """Build the reply Cc list as (source.To union source.Cc) minus
-    the account's own identity, compared case-insensitively on the
-    addr-spec only. Display-name is preserved on the surviving entries.
-
-    Returns the empty string if no addresses survive."""
+    """(source.To union source.Cc) minus self_identity, case-folded on addr-spec."""
     seen: set[str] = set()
     self_lc = self_identity.lower().strip()
     out: list[tuple[str, str]] = []
@@ -76,19 +74,8 @@ def derive_reply_cc(
     return ", ".join(formataddr(p) for p in out)
 
 
-def build_attribution(
-    date_header: str | None,
-    from_header: str,
-) -> str:
-    """Format the single-line `On YYYY-MM-DD HH:MM, Name <addr> wrote:`.
-
-    The clock time of the source Date header is preserved verbatim — no
-    timezone conversion. If `date_header` is absent or unparseable, the
-    `On YYYY-MM-DD HH:MM, ` prefix is omitted entirely.
-
-    If the From header has no display-name, the attribution shows only
-    `<addr>` (the angle brackets are part of the literal output).
-    """
+def build_attribution(date_header: str | None, from_header: str) -> str:
+    """Format single-line 'On YYYY-MM-DD HH:MM, Name <addr> wrote:'."""
     name, addr = parseaddr(from_header or "")
     who = f"{name} <{addr}>" if name else f"<{addr}>"
     if not date_header:
@@ -101,13 +88,7 @@ def build_attribution(
 
 
 def quote_body(plain_text: str) -> str:
-    """Return the source body with each line prefixed for quoting:
-    - empty lines become `>`
-    - lines starting with `>` get an extra `>` (no separating space)
-    - other lines get `> ` (one space).
-
-    Trailing newlines on the source are dropped before quoting; the
-    caller decides how to assemble the final reply body."""
+    """Prefix lines with '> '."""
     lines = plain_text.rstrip("\n").split("\n")
     quoted: list[str] = []
     for line in lines:
@@ -120,30 +101,13 @@ def quote_body(plain_text: str) -> str:
     return "\n".join(quoted)
 
 
-def build_reply_body(
-    reply_text: str,
-    attribution: str,
-    quoted_original: str,
-) -> str:
-    """Assemble the top-posted reply body:
-    <reply_text>
-    <blank line>
-    <attribution>
-    <quoted original>
-    """
+def build_reply_body(reply_text: str, attribution: str, quoted_original: str) -> str:
     return f"{reply_text.rstrip()}\n\n{attribution}\n{quoted_original}"
 
 
 def build_threading_headers(
-    source_message_id: str,
-    source_references: str | None,
+    source_message_id: str, source_references: str | None
 ) -> tuple[str, str]:
-    """Return (in_reply_to, references) headers for the draft.
-
-    `source_message_id` is used verbatim, including its angle brackets.
-    The References chain is extended with the source Message-ID; if the
-    source had no References header, the new chain is just the source
-    Message-ID."""
     in_reply_to = source_message_id
     if source_references and source_references.strip():
         references = f"{source_references} {source_message_id}"
@@ -152,23 +116,23 @@ def build_threading_headers(
     return in_reply_to, references
 
 
-def build_reply_html(
-    reply_html: str,
-    attribution: str,
-    source_body: str,
-) -> str:
-    """Assemble the HTML alternative of a top-posted reply (ADR 0035):
-    the caller's HTML, then the attribution, then the original in a
-    `<blockquote>`. The original and the attribution are plain text and
-    are escaped, line breaks kept as `<br>`. A reply that is a full
-    document gets the quote inside its `<body>`."""
-    lines = source_body.rstrip("\n").split("\n")
+def sanitize_reply_html(html: str) -> str:
+    """Strip script and executable tags from HTML."""
+    return re.sub(r"(?is)<script[^>]*>.*?</script>", "", html)
+
+
+def build_reply_html(reply_html: str, attribution: str, source_body: str) -> str:
+    clean_reply_html = sanitize_reply_html(reply_html)
+    clean_source_body = sanitize_reply_html(source_body)
+
+    lines = clean_source_body.rstrip("\n").split("\n")
     quoted = "<br>\n".join(escape(line) for line in lines)
     tail = f'<p>{escape(attribution)}</p>\n<blockquote type="cite">\n{quoted}\n</blockquote>\n'
-    closing = re.search(r"</body\s*>", reply_html, flags=re.IGNORECASE)
+
+    closing = re.search(r"</body\s*>", clean_reply_html, flags=re.IGNORECASE)
     if closing is not None:
-        return reply_html[: closing.start()] + tail + reply_html[closing.start() :]
-    return f"{reply_html.rstrip()}\n{tail}"
+        return clean_reply_html[: closing.start()] + tail + clean_reply_html[closing.start() :]
+    return f"{clean_reply_html.rstrip()}\n{tail}"
 
 
 def build_reply_message(
@@ -182,14 +146,6 @@ def build_reply_message(
     body: str,
     html_body: str | None = None,
 ) -> bytes:
-    """Construct the RFC822 bytes for the draft using stdlib EmailMessage.
-
-    EmailMessage handles RFC 2047 encoding for non-ASCII subject and
-    recipient display names automatically, and marks the body as
-    UTF-8 — Cyrillic and other non-Latin scripts survive the round-trip
-    through IMAP unchanged. With `html_body` the draft becomes
-    multipart/alternative, text/plain first.
-    """
     msg = EmailMessage()
     msg["From"] = self_identity
     msg["To"] = reply_to

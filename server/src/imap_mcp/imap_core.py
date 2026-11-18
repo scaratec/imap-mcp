@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -34,6 +34,20 @@ if TYPE_CHECKING:
 # RFC 3501 §5.1.3 — Modified UTF-7 codec for IMAP mailbox names.
 # The MCP surface uses UTF-8 throughout; encoding/decoding happens
 # only at the IMAP wire boundary inside this module.
+
+
+_MUTF7_AUDIT_CALLBACK: Callable[[], None] | None = None
+_OAUTH_TOKEN_REFRESHER: Callable[[Account], Awaitable[str]] | None = None
+
+
+def set_mutf7_audit_callback(cb: Callable[[], None] | None) -> None:
+    global _MUTF7_AUDIT_CALLBACK
+    _MUTF7_AUDIT_CALLBACK = cb
+
+
+def set_oauth_token_refresher(refresher: Callable[[Account], Awaitable[str]] | None) -> None:
+    global _OAUTH_TOKEN_REFRESHER
+    _OAUTH_TOKEN_REFRESHER = refresher
 
 
 def decode_mutf7(wire: str) -> str:
@@ -58,6 +72,11 @@ def decode_mutf7(wire: str) -> str:
             continue
         end = wire.find("-", i + 1)
         if end < 0:
+            if _MUTF7_AUDIT_CALLBACK is not None:
+                try:
+                    _MUTF7_AUDIT_CALLBACK()
+                except Exception:  # noqa: BLE001, S110
+                    pass
             return wire
         if end == i + 1:
             out.append("&")
@@ -68,7 +87,12 @@ def decode_mutf7(wire: str) -> str:
         try:
             raw = base64.b64decode(b64 + "=" * pad)
             out.append(raw.decode("utf-16-be"))
-        except ValueError:  # binascii.Error and UnicodeDecodeError
+        except (ValueError, Exception):  # binascii.Error and UnicodeDecodeError  # noqa: BLE001
+            if _MUTF7_AUDIT_CALLBACK is not None:
+                try:
+                    _MUTF7_AUDIT_CALLBACK()
+                except Exception:  # noqa: BLE001, S110
+                    pass
             return wire
         i = end + 1
     return "".join(out)
@@ -134,6 +158,9 @@ class Envelope:
     size_bytes: int = 0
     has_attachment: bool = False
     flags: tuple[str, ...] = ()
+    cc_addresses: list[str] = field(default_factory=list)
+    labels: tuple[str, ...] = ()
+    x_gm_msgid: int | None = None
 
 
 # RFC 3501 LIST response format:  * LIST (flags) "sep" "name"
@@ -203,6 +230,8 @@ class TracedIMAP:
     never arguments: those hold mailbox names, search terms and
     credentials.
     """
+
+    _lost: Any = None
 
     def __init__(self, client: IMAP4) -> None:
         self._client = client
@@ -275,16 +304,11 @@ async def _open_imap(
             imap.protocol.conn_lost_cb = lambda _exc: on_lost()
         try:
             await imap.wait_hello_from_server()
-        except OSError as exc:
-            # A refused or unreachable plain-IMAP server surfaces as
-            # ConnectionRefusedError, whatever the OS reported; a server
-            # that accepted the connection but did not greet in time
-            # stays a timeout.
+        except (OSError, TimeoutError) as exc:
             _abort_transport(imap)
-            connected = imap.protocol.transport is not None
-            if account.port == 993 or connected or isinstance(exc, ConnectionRefusedError):
-                raise
-            raise ConnectionRefusedError(*exc.args) from exc
+            raise TransientIMAPFailure(
+                f"Failed to connect to IMAP server {account.host}:{account.port}"
+            ) from exc
         return TracedIMAP(imap)
 
 
@@ -301,11 +325,14 @@ async def _authenticate_imap(imap: IMAP4, account: Account, password: str) -> No
         try:
             response = await imap.xoauth2(user, password)
         except Exception as e:
-            raise RuntimeError(f"IMAP AUTHENTICATE failed: {e}") from e
+            raise TransientIMAPFailure(f"IMAP AUTHENTICATE failed: {e}") from e
+        if getattr(response, "result", None) != "OK":
+            raise TransientIMAPFailure("IMAP AUTHENTICATE failed")
     else:
         response = await imap.login(user, password)
-    if getattr(response, "result", None) == "OK":
-        await _refresh_capabilities(imap, getattr(response, "lines", None))
+        if getattr(response, "result", None) != "OK":
+            raise TransientIMAPFailure(f"IMAP LOGIN failed for user {user!r}")
+    await _refresh_capabilities(imap, getattr(response, "lines", None))
 
 
 _CAPABILITY_IN_RESPONSE = re.compile(rb"(?:^|\[)CAPABILITY\s+([^\]\r\n]+)", re.IGNORECASE)
@@ -415,6 +442,21 @@ async def _connect(account: Account, password: str, timeout: int) -> _PooledIMAP
     imap = await _open_imap(account, timeout=timeout, on_lost=lost.set)
     try:
         await _authenticate_imap(imap, account, password)
+    except TransientIMAPFailure:
+        _abort_transport(imap.client)
+        if account.auth and account.auth.type == "xoauth2" and _OAUTH_TOKEN_REFRESHER is not None:
+            # Single reactive XOAUTH2 retry (ADR 0064 §2)
+            fresh_token = await _OAUTH_TOKEN_REFRESHER(account)
+            drain_connection_pool(account.id)
+            lost2 = asyncio.Event()
+            imap2 = await _open_imap(account, timeout=timeout, on_lost=lost2.set)
+            try:
+                await _authenticate_imap(imap2, account, fresh_token)
+            except BaseException:
+                _abort_transport(imap2.client)
+                raise
+            return _PooledIMAP(imap2, lost2)
+        raise
     except BaseException:
         _abort_transport(imap.client)
         raise
@@ -481,6 +523,7 @@ async def _imap_session(
 
     async with connection_pools().lease(account.id, _pool_key(account, password), _open) as conn:
         conn.set_timeout(timeout)
+        conn.imap._lost = conn._lost
         try:
             yield conn.imap
         except _KEEPS_CONNECTION:
@@ -612,16 +655,12 @@ async def _folder_message_count(imap: IMAP4, folder: str) -> int:
 
 
 def _imap_user_for(account: Account) -> str:
-    """Derive the IMAP username from an Account.
-
-    If the account has an explicit ``user`` field, use it directly.
-    Otherwise fall back to the walking-skeleton convention: the id
-    is ``<imap-user>-<tenant>`` and the user is the segment before
-    the first dash, or the whole id if no dash is present.
-    """
+    """Derive the IMAP username from an Account (ADR 0050)."""
     if account.user is not None:
         return account.user
-    return account.id.split("-", 1)[0]
+    if "-" in account.id and "@" not in account.id:
+        return account.id.split("-", 1)[0]
+    return account.id
 
 
 async def fetch_envelope(account: Account, password: str, folder: str, uid: int) -> Envelope | None:
@@ -634,9 +673,11 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
         status, _ = await imap.select(folder)
         if status != "OK":
             return None
-        status, response = await imap.uid(
-            "fetch", str(uid), "(FLAGS BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)"
-        )
+        fetch_cmd = "(FLAGS INTERNALDATE BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE"
+        if account.provider == "google":
+            fetch_cmd += " X-GM-LABELS X-GM-MSGID"
+        fetch_cmd += ")"
+        status, response = await imap.uid("fetch", str(uid), fetch_cmd)
         if status != "OK":
             return None
         raw_header = _extract_literal(response)
@@ -644,29 +685,38 @@ async def fetch_envelope(account: Account, password: str, folder: str, uid: int)
             return None
         size_bytes, has_attachment = _extract_meta(response)
         flags = _extract_flags(response)
+        date_iso = _extract_internaldate(response)
+        gm_labels: tuple[str, ...] = ()
+        x_gm_msgid: int | None = None
+        if account.provider == "google":
+            gm_labels, x_gm_msgid = _extract_gm_meta(response)
         message = email.message_from_bytes(raw_header)
         from_addrs = getaddresses(message.get_all("From", []))
-        to_addrs = getaddresses(message.get_all("To", []) + message.get_all("Cc", []))
-        date_iso: str | None = None
-        date_header = message.get("Date")
-        if date_header:
-            try:
-                parsed = parsedate_to_datetime(date_header)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=UTC)
-                date_iso = parsed.isoformat().replace("+00:00", "Z")
-            except (TypeError, ValueError):
-                date_iso = None
+        to_addrs = getaddresses(message.get_all("To", []))
+        cc_addrs = getaddresses(message.get_all("Cc", []))
+        if date_iso is None:
+            date_header = message.get("Date")
+            if date_header:
+                try:
+                    parsed = parsedate_to_datetime(date_header)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                    date_iso = parsed.isoformat().replace("+00:00", "Z")
+                except (TypeError, ValueError):
+                    date_iso = None
         return Envelope(
             uid=uid,
             from_address=from_addrs[0][1] if from_addrs else "",
             to_addresses=[addr for _, addr in to_addrs if addr],
+            cc_addresses=[addr for _, addr in cc_addrs if addr],
             subject=_decode_header(message.get("Subject", "") or ""),
             message_id=message.get("Message-ID"),
             date=date_iso,
             size_bytes=size_bytes,
             has_attachment=has_attachment,
             flags=flags,
+            labels=gm_labels,
+            x_gm_msgid=x_gm_msgid,
         )
 
 
@@ -697,9 +747,11 @@ async def fetch_envelopes_batch(
         if status != "OK":
             return []
         uid_set = ",".join(str(u) for u in uids)
-        status, response = await imap.uid(
-            "fetch", uid_set, "(FLAGS BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)"
-        )
+        fetch_cmd = "(FLAGS INTERNALDATE BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE"
+        if account.provider == "google":
+            fetch_cmd += " X-GM-LABELS X-GM-MSGID"
+        fetch_cmd += ")"
+        status, response = await imap.uid("fetch", uid_set, fetch_cmd)
         if status != "OK":
             return []
         i = 0
@@ -711,30 +763,39 @@ async def fetch_envelopes_batch(
             uid_val = _extract_uid(response, i)
             size_bytes, has_attachment = _extract_meta_at(response, i)
             flags = _extract_flags_at(response, i)
+            date_iso = _extract_internaldate_at(response, i)
+            gm_labels: tuple[str, ...] = ()
+            x_gm_msgid: int | None = None
+            if account.provider == "google":
+                gm_labels, x_gm_msgid = _extract_gm_meta_at(response, i)
             message = email.message_from_bytes(raw_header)
             from_addrs = getaddresses(message.get_all("From", []))
-            to_addrs = getaddresses(message.get_all("To", []) + message.get_all("Cc", []))
-            date_iso: str | None = None
-            date_header = message.get("Date")
-            if date_header:
-                try:
-                    parsed = parsedate_to_datetime(date_header)
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=UTC)
-                    date_iso = parsed.isoformat().replace("+00:00", "Z")
-                except (TypeError, ValueError):
-                    pass
+            to_addrs = getaddresses(message.get_all("To", []))
+            cc_addrs = getaddresses(message.get_all("Cc", []))
+            if date_iso is None:
+                date_header = message.get("Date")
+                if date_header:
+                    try:
+                        parsed = parsedate_to_datetime(date_header)
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=UTC)
+                        date_iso = parsed.isoformat().replace("+00:00", "Z")
+                    except (TypeError, ValueError):
+                        pass
             results.append(
                 Envelope(
                     uid=uid_val or 0,
                     from_address=from_addrs[0][1] if from_addrs else "",
                     to_addresses=[addr for _, addr in to_addrs if addr],
+                    cc_addresses=[addr for _, addr in cc_addrs if addr],
                     subject=_decode_header(message.get("Subject", "") or ""),
                     message_id=message.get("Message-ID"),
                     date=date_iso,
                     size_bytes=size_bytes,
                     has_attachment=has_attachment,
                     flags=flags,
+                    labels=gm_labels,
+                    x_gm_msgid=x_gm_msgid,
                 )
             )
             i += 2
@@ -838,6 +899,89 @@ def _extract_flags_at(response: list[bytes | bytearray], start: int) -> tuple[st
                 return ()
             return tuple(raw.split())
     return ()
+
+
+_INTERNALDATE_RE = re.compile(rb'INTERNALDATE\s+"([^"]+)"')
+
+
+def _extract_internaldate(response: list[bytes | bytearray]) -> str | None:
+    from email.utils import parsedate_to_datetime
+
+    for item in response:
+        if not isinstance(item, (bytes, bytearray)):
+            continue
+        m = _INTERNALDATE_RE.search(bytes(item))
+        if m:
+            try:
+                dt = parsedate_to_datetime(m.group(1).decode("ascii"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+                return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+            except Exception:  # noqa: BLE001, S110
+                pass
+    return None
+
+
+def _extract_internaldate_at(response: list[bytes | bytearray], start: int) -> str | None:
+    from email.utils import parsedate_to_datetime
+
+    for j in range(start, min(start + 3, len(response))):
+        part = response[j]
+        if not isinstance(part, (bytes, bytearray)):
+            continue
+        m = _INTERNALDATE_RE.search(bytes(part))
+        if m:
+            try:
+                dt = parsedate_to_datetime(m.group(1).decode("ascii"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+                return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+            except Exception:  # noqa: BLE001, S110
+                pass
+    return None
+
+
+_GM_SYSTEM_LABEL_MAP: dict[str, str] = {
+    r"\inbox": "INBOX",
+    "inbox": "INBOX",
+    r"\sent": "[Gmail]/Sent Mail",
+    r"\drafts": "[Gmail]/Drafts",
+    r"\trash": "[Gmail]/Trash",
+    r"\spam": "[Gmail]/Spam",
+    r"\starred": "[Gmail]/Starred",
+    r"\important": "[Gmail]/Important",
+}
+
+
+def _extract_gm_meta_at(
+    response: list[bytes | bytearray], start: int
+) -> tuple[tuple[str, ...], int | None]:
+    import re
+
+    labels: list[str] = []
+    gm_msgid: int | None = None
+    for j in range(start, min(start + 3, len(response))):
+        part = response[j]
+        if not isinstance(part, (bytes, bytearray)):
+            continue
+        m_msg = re.search(rb"X-GM-MSGID\s+(\d+)", bytes(part))
+        if m_msg:
+            gm_msgid = int(m_msg.group(1))
+        m_lbl = re.search(rb"X-GM-LABELS\s+\(([^)]*)\)", bytes(part))
+        if m_lbl:
+            raw = m_lbl.group(1).decode("utf-8", "replace")
+            for token in re.findall(r'"([^"]*)"|(\S+)', raw):
+                lbl = token[0] if token[0] else token[1]
+                if lbl:
+                    norm = _GM_SYSTEM_LABEL_MAP.get(lbl.lower(), lbl)
+                    labels.append(norm)
+    return tuple(labels), gm_msgid
+
+
+def _extract_gm_meta(
+    response: list[bytes | bytearray],
+) -> tuple[tuple[str, ...], int | None]:
+    return _extract_gm_meta_at(response, 0)
 
 
 async def fetch_full_message(
@@ -981,6 +1125,14 @@ def _strip_html(html: str) -> str:
             super().__init__()
             self._parts: list[str] = []
 
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag.lower() in ("p", "div", "li", "br", "tr", "h1", "h2", "h3", "h4", "h5", "h6"):
+                self._parts.append("\n")
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag.lower() in ("p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"):
+                self._parts.append("\n")
+
         def handle_data(self, data: str) -> None:
             self._parts.append(data)
 
@@ -988,7 +1140,7 @@ def _strip_html(html: str) -> str:
     stripper.feed(unescape(html))
     text = "".join(stripper._parts)
     lines = [line.strip() for line in text.splitlines()]
-    return "\n".join(line for line in lines if line)
+    return "\n\n".join(line for line in lines if line)
 
 
 def _decode_text_part(part: Message) -> str:
@@ -1109,6 +1261,40 @@ async def fetch_message_for_reply(
         return message, body_text
 
 
+def _contains_folder(response: list[Any], folder: str) -> bool:
+    for raw in response:
+        if not isinstance(raw, (bytes, bytearray)):
+            continue
+        line = bytes(raw).strip()
+        if not line or line.endswith(b"LIST completed") or line == b"Done":
+            continue
+        match = _LIST_LINE.search(line)
+        if not match:
+            continue
+        flags_raw = match.group("flags").decode("utf-8", errors="replace")
+        if "\\Noselect" in flags_raw:
+            continue
+        name_raw = match.group("name").strip()
+        if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
+            name_raw = name_raw[1:-1]
+        decoded = decode_mutf7(name_raw.decode("utf-8", errors="replace"))
+        raw_str = name_raw.decode("utf-8", errors="replace")
+        if decoded == folder or raw_str == folder:
+            return True
+        if folder.upper() == "INBOX" and (decoded.upper() == "INBOX" or raw_str.upper() == "INBOX"):
+            return True
+    return False
+
+
+async def _folder_exists_on_wire(imap: IMAP4, folder: str) -> bool:
+    quoted = _quote_mailbox(folder)
+    status, response = await imap.list('""', quoted)
+    if status == "OK" and _contains_folder(response, folder):
+        return True
+    status, response = await imap.list('""', "*")
+    return bool(status == "OK" and _contains_folder(response, folder))
+
+
 async def folder_stats(account: Account, password: str, folder: str) -> FolderStatsResult:
     """Return folder existence + uid list, distinguishing failure modes.
 
@@ -1122,17 +1308,11 @@ async def folder_stats(account: Account, password: str, folder: str) -> FolderSt
     """
     quoted = _quote_mailbox(folder)
     async with _imap_session(account, password) as imap:
-        # EXAMINE opens the folder read-only and reports EXISTS, so it
-        # answers existence and count in one round trip without
-        # touching \Recent. A NO is the IMAP signal for "this mailbox
-        # is unknown to the server" (RFC 3501 §6.3.2). Opening the
-        # mailbox (rather than STATUS) keeps folder_stats on the same
-        # addressing path as every other folder-opening tool, which is
-        # what a localized Gmail account rejects for the English name
-        # (ADR 0033).
+        if not await _folder_exists_on_wire(imap, folder):
+            return FolderStatsResult(kind="absent")
         status, data = await imap.examine(quoted)
         if status != "OK":
-            return FolderStatsResult(kind="absent")
+            return FolderStatsResult(kind="select_failed", imap_response=_response_text(data))
         count = 0
         for part in data:
             if isinstance(part, bytes):
@@ -1140,7 +1320,8 @@ async def folder_stats(account: Account, password: str, folder: str) -> FolderSt
                 if m:
                     count = int(m.group(1))
                     break
-        return FolderStatsResult(kind="ok", exists=count, uids=[])
+        validity = _extract_uidvalidity(data)
+        return FolderStatsResult(kind="ok", exists=count, uids=[], uidvalidity=validity)
 
 
 _EXISTS_LINE = re.compile(rb"^\s*(\d+)\s+EXISTS\b")
@@ -1156,6 +1337,7 @@ class FolderStatsResult:
     exists: int = 0
     uids: list[int] = field(default_factory=list)
     imap_response: str = ""
+    uidvalidity: int | None = None
 
 
 async def store_flag(
@@ -1214,7 +1396,15 @@ async def store_keywords(
         status, _ = await imap.select(folder)
         if status != "OK":
             return False
-        op_map = {"add": "+FLAGS", "remove": "-FLAGS", "replace": "FLAGS"}
+        if mode == "replace":
+            st, resp = await imap.uid("fetch", str(uid), "(FLAGS)")
+            existing = _extract_flags(resp) if st == "OK" else ()
+            system_flags = [f for f in existing if f.startswith("\\")]
+            all_flags = system_flags + keywords
+            joined = " ".join(all_flags)
+            status, _ = await imap.uid("store", str(uid), "FLAGS", f"({joined})")
+            return bool(status == "OK")
+        op_map = {"add": "+FLAGS", "remove": "-FLAGS"}
         op = op_map[mode]
         joined = " ".join(keywords)
         status, _ = await imap.uid("store", str(uid), op, f"({joined})")
@@ -1238,12 +1428,28 @@ async def store_keywords_batch(
         status, _ = await imap.select(folder)
         if status != "OK":
             return 0
-        op_map = {"add": "+FLAGS", "remove": "-FLAGS", "replace": "FLAGS"}
+        if mode == "replace":
+            success_count = 0
+            for u in uids:
+                st_u, resp_u = await imap.uid("fetch", str(u), "(FLAGS)")
+                existing = _extract_flags(resp_u) if st_u == "OK" else ()
+                system_flags = [f for f in existing if f.startswith("\\")]
+                all_flags = system_flags + keywords
+                joined = " ".join(all_flags)
+                st_s, _ = await imap.uid("store", str(u), "FLAGS", f"({joined})")
+                if st_s == "OK":
+                    success_count += 1
+            return success_count
+        op_map = {"add": "+FLAGS", "remove": "-FLAGS"}
         op = op_map[mode]
         joined = " ".join(keywords)
         uid_str = ",".join(str(u) for u in uids)
         status, _ = await imap.uid("store", uid_str, op, f"({joined})")
         return len(uids) if status == "OK" else 0
+
+
+class TransientIMAPFailure(RuntimeError):
+    """Raised when an IMAP connection, greeting, or authentication fails."""
 
 
 class TargetFolderMissing(RuntimeError):
@@ -1354,11 +1560,13 @@ async def move_message(
             and uidvalidity_before != uidvalidity_after
         ):
             raise UidStale(uid)
-        # Honour the IMAP CAPABILITY advertisement: only try native
-        # MOVE when the server announced it. Otherwise go straight to
-        # COPY + STORE + EXPUNGE so the wire-level command sequence
-        # matches the server's stated abilities (RFC 6851 §3).
         has_move = bool(imap.has_capability("MOVE"))
+        has_uidplus = bool(imap.has_capability("UIDPLUS"))
+        if not has_move and not has_uidplus:
+            raise RuntimeError(
+                "unsupported_imap_capability: server supports neither MOVE nor UIDPLUS"
+            )
+
         if has_move:
             try:
                 status, _ = await imap.uid("move", str(uid), target_folder)
@@ -1366,12 +1574,29 @@ async def move_message(
                     return "native_move"
             except Exception:  # noqa: BLE001, S110 - fall back to COPY
                 pass
+
+        if not has_uidplus:
+            raise RuntimeError(
+                "unsupported_imap_capability: server supports neither MOVE nor UIDPLUS"
+            )
+
         status, _ = await imap.uid("copy", str(uid), target_folder)
         if status != "OK":
             raise RuntimeError(f"COPY failed: {status}")
-        await imap.uid("store", str(uid), "+FLAGS", r"(\Deleted)")
-        await imap.expunge()
-        return "copy_store_expunge"
+        await imap.uid("store", str(uid), "+FLAGS.SILENT", r"(\Deleted)")
+        await imap.uid("expunge", str(uid))
+        return "copy_store_uid_expunge"
+
+
+async def move_message_with_fallback(
+    account: Account,
+    password: str,
+    folder: str,
+    uid: int,
+    target_folder: str,
+) -> str:
+    """Intra-account move adhering to ADR 0046 §3."""
+    return await move_message(account, password, folder, uid, target_folder)
 
 
 async def copy_message(
@@ -1505,20 +1730,35 @@ async def append_message(
     timeout = _append_timeout()
     async with _imap_session(account, password, timeout=timeout) as imap:
         flags_str = " ".join(flags) if flags else None
-        try:
-            response = await asyncio.wait_for(
-                imap.append(
-                    rfc822,
-                    mailbox=folder,
-                    flags=flags_str,
-                    date=datetime.now(tz=UTC),
-                ),
-                timeout=timeout,
+        append_future = asyncio.ensure_future(
+            imap.append(
+                rfc822,
+                mailbox=folder,
+                flags=flags_str,
+                date=datetime.now(tz=UTC),
             )
-        except TimeoutError:
+        )
+        lost_event: asyncio.Event | None = getattr(imap, "_lost", None)
+        lost_future = asyncio.ensure_future(lost_event.wait()) if lost_event is not None else None
+        wait_set: set[asyncio.Future[Any]] = {append_future}
+        if lost_future is not None:
+            wait_set.add(lost_future)
+
+        done, pending = await asyncio.wait(
+            wait_set, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+        for p in pending:
+            p.cancel()
+
+        if append_future in done:
+            response = append_future.result()
+        elif lost_event is not None and lost_event.is_set():
+            raise ConnectionResetError("IMAP connection lost while waiting for APPEND response")
+        else:
             if _connection_lost(imap):
                 raise ConnectionResetError("IMAP connection lost while waiting for APPEND response")
-            raise
+            raise TimeoutError("APPEND timed out")
+
         if response.result == "OK":
             return AppendResult(outcome="ok", imap_response=None)
         reason: str | None = None
@@ -1601,15 +1841,34 @@ async def fetch_raw_headers_batch(
     return out
 
 
+async def search_uids_with_validity(
+    account: Account, password: str, folder: str, criteria: str = "ALL"
+) -> tuple[list[int], int | None]:
+    """Execute a SEARCH in `folder` and return (matching UIDs, uidvalidity)."""
+    folder = _quote_mailbox(folder)
+    async with _imap_session(account, password) as imap:
+        status, lines = await imap.select(folder)
+        if status != "OK":
+            raise FolderNotSelectable(folder, status, _response_text(lines))
+        validity = _extract_uidvalidity(lines)
+        status, response = await imap.uid_search(criteria)
+        if status != "OK" or not response or not response[0]:
+            return [], validity
+        raw = response[0] if isinstance(response[0], bytes) else b""
+        if not raw:
+            return [], validity
+        return [int(token) for token in raw.split()], validity
+
+
 async def search_uids(
     account: Account, password: str, folder: str, criteria: str = "ALL"
 ) -> list[int]:
     """Execute a SEARCH in `folder` and return the matching UIDs."""
     folder = _quote_mailbox(folder)
     async with _imap_session(account, password) as imap:
-        status, _ = await imap.select(folder)
+        status, lines = await imap.select(folder)
         if status != "OK":
-            return []
+            raise FolderNotSelectable(folder, status, _response_text(lines))
         status, response = await imap.uid_search(criteria)
         if status != "OK":
             return []
@@ -1656,12 +1915,18 @@ async def expunge_uids(account: Account, password: str, folder: str, uids: list[
         if status != "OK":
             raise RuntimeError(f"SELECT {folder!r} failed: {status}")
         uid_set = ",".join(str(uid) for uid in uids)
+        has_uidplus = bool(imap.has_capability("UIDPLUS"))
         status, _ = await imap.uid("store", uid_set, "+FLAGS", r"(\Deleted)")
         if status != "OK":
             raise RuntimeError(f"STORE \\Deleted failed: {status}")
-        status, _ = await imap.expunge()
-        if status != "OK":
-            raise RuntimeError(f"EXPUNGE failed: {status}")
+        if has_uidplus:
+            status, lines = await imap.uid("expunge", uid_set)
+            if status != "OK":
+                raise RuntimeError(f"UID EXPUNGE failed: {_response_text(lines) or status}")
+        else:
+            status, lines = await imap.expunge()
+            if status != "OK":
+                raise RuntimeError(f"EXPUNGE failed: {_response_text(lines) or status}")
         return len(uids)
 
 

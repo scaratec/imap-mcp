@@ -1,4 +1,4 @@
-"""SIGHUP-driven configuration reload (ADR 0014).
+"""SIGHUP-driven configuration reload (ADR 0014, ADR 0049, ADR 0055, ADR 0059).
 
 Splits two concerns: `_reload_configuration` re-parses YAML and
 atomically swaps the live PDP + Configuration; `_install_sighup_handler`
@@ -16,16 +16,6 @@ from .policy import PolicyDecisionPoint
 
 
 def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
-    """SIGHUP-driven atomic reload (ADR 0014).
-
-    Re-parses every YAML file in `config_dir` into a temporary
-    Configuration. If parsing or validation fails, the previous
-    state is preserved and an `ERROR` audit record explains why. On
-    success, the new PDP + Configuration replace the live state in a
-    single attribute write — handlers reading `context.pdp` /
-    `context.configuration` see either the old or the new state, never
-    a half-applied one.
-    """
     from .config import Configuration
 
     audit = context.audit
@@ -34,17 +24,13 @@ def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
         new_config: Configuration = load_configuration(config_dir)
     except Exception as exc:  # noqa: BLE001 - keep old config on any error
         if audit is not None:
-            reason = (
-                "parse_error"
-                if "yaml" in type(exc).__module__.lower() or "yaml" in str(exc).lower()
-                else "validation_error"
-            )
             audit.write(
                 {
+                    "phase": "single",
                     "caller_id": context.caller_id,
                     "tool": "policy_reload",
                     "decision": "DENY",
-                    "reason": reason,
+                    "reason": "policy_reload_rejected",
                     "result": "ERROR",
                     "detail": str(exc),
                 }
@@ -52,16 +38,12 @@ def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
         return
 
     new_pdp = PolicyDecisionPoint(new_config)
-    # Atomic swap. `_LiveState` is a mutable dataclass — assigning
-    # both fields back-to-back is not atomic at the language level,
-    # but every handler reads either `pdp` or `configuration` (never
-    # both in one expression), so the worst case is a request that
-    # uses a fresh PDP against a stale Configuration for the duration
-    # of one method call. ADR 0014 declares that acceptable.
     context._live.pdp = new_pdp
     context._live.configuration = new_config
+    if hasattr(context, "oauth_manager") and context.oauth_manager is not None:
+        context.oauth_manager.config = new_config
 
-    # Detect oauth_scope changes → needs_rebootstrap (ADR 0014).
+    # Detect oauth_scope changes -> needs_rebootstrap (ADR 0049 §3, ADR 0059)
     old_scopes = {
         a.id: (a.auth.oauth_scope if a.auth else None) for a in old_config.accounts_file.accounts
     }
@@ -69,23 +51,9 @@ def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
         new_scope = new_acct.auth.oauth_scope if new_acct.auth else None
         old_scope = old_scopes.get(new_acct.id)
         if old_scope is not None and new_scope != old_scope:
-            context.oauth_manager._mark_rebootstrap_needed(new_acct.id)
-            if audit is not None:
-                audit.write(
-                    {
-                        "caller_id": context.caller_id,
-                        "tool": "policy_reload",
-                        "decision": "ALLOW",
-                        "reason": "reload_applied",
-                        "result": "OK",
-                        "detail": f"oauth_scope changed; rebootstrap required for {new_acct.id}",
-                    }
-                )
+            context.oauth_manager.mark_rebootstrap_needed(new_acct.id)
 
-    # ADR 0013: connections of a removed account, or of one whose server,
-    # user or authentication changed, must not be reused. Changed keys
-    # would also be caught at the next lease; draining closes the idle
-    # sockets now instead of when the account is next used.
+    # Drain pools for removed or changed accounts (ADR 0055)
     from .imap_core import drain_connection_pool
 
     new_accounts = {a.id: a for a in new_config.accounts_file.accounts}
@@ -97,51 +65,38 @@ def _reload_configuration(context: ServerContext, config_dir: Path) -> None:
         ):
             drain_connection_pool(old_acct.id)
 
-    # Pool-drain audit per removed account.
     if audit is not None:
         old_ids = {a.id for a in old_config.accounts_file.accounts}
         new_ids = {a.id for a in new_config.accounts_file.accounts}
         for removed in sorted(old_ids - new_ids):
             audit.write(
                 {
+                    "phase": "single",
                     "caller_id": context.caller_id,
                     "tool": "pool_drain",
                     "decision": "ALLOW",
-                    "reason": "account_removed",
+                    "reason": "pool_drain",
                     "account": removed,
                     "result": "OK",
                 }
             )
         audit.write(
             {
+                "phase": "single",
                 "caller_id": context.caller_id,
                 "tool": "policy_reload",
                 "decision": "ALLOW",
-                "reason": "reload_applied",
+                "reason": "policy_reload_ok",
                 "result": "OK",
-                "detail": (
-                    f"old_callers={len(old_config.callers_file.callers)}, "
-                    f"new_callers={len(new_config.callers_file.callers)}, "
-                    f"removed_accounts={sorted(old_ids - new_ids)}"
-                ),
             }
         )
 
 
 def _install_sighup_handler(context: ServerContext, config_dir: Path) -> None:
-    """Wire SIGHUP to `_reload_configuration` on the running event loop.
-
-    The handler is idempotent — repeated SIGHUPs each trigger a fresh
-    reload. Windows lacks SIGHUP; on those platforms the registration
-    is a no-op (the BDD suite runs on Linux only).
-    """
     import signal
 
-    if not hasattr(signal, "SIGHUP"):
-        return
     loop = asyncio.get_running_loop()
-
-    def _on_sighup() -> None:
-        _reload_configuration(context, config_dir)
-
-    loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+    try:
+        loop.add_signal_handler(signal.SIGHUP, lambda: _reload_configuration(context, config_dir))
+    except (NotImplementedError, RuntimeError):
+        pass

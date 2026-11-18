@@ -17,6 +17,7 @@ from imap_mcp.config import (
     Account,
     AccountsFile,
     Caller,
+    CallerAuth,
     CallersFile,
     Configuration,
     FolderPolicy,
@@ -87,7 +88,9 @@ def test_trash_unavailable_is_in_the_error_enumeration() -> None:
 def _context(*folders: FolderPolicy) -> Any:
     configuration = Configuration(
         accounts_file=AccountsFile(accounts=[Account(id=ACCOUNT)]),
-        callers_file=CallersFile(callers=[Caller(id="agent", policy="p")]),
+        callers_file=CallersFile(
+            callers=[Caller(id="agent", policy="p", auth=CallerAuth(type="stdio_trusted"))]
+        ),
         policies={"p": PolicyFile(name="p", accounts={ACCOUNT: list(folders)})},
     )
     account = configuration.accounts_file.accounts[0]
@@ -95,6 +98,8 @@ def _context(*folders: FolderPolicy) -> Any:
         caller_id="agent",
         pdp=PolicyDecisionPoint(configuration),
         account_by_id=lambda account_id: account if account_id == ACCOUNT else None,
+        saga=None,
+        audit=None,
     )
 
 
@@ -170,7 +175,7 @@ async def test_all_revisions_move_to_the_flagged_trash(imap: dict[str, Any]) -> 
 async def test_move_out_is_checked_before_accept_incoming(imap: dict[str, Any]) -> None:
     response = await _discard(_context(_drafts(move_out=False), _trash(accept_incoming=False)))
     assert response["decision"] == "DENY"
-    assert response["missing_capability"] == "move_out"
+    assert response["reason"] == "capability_missing"
     assert imap["moved"] == []
 
 
@@ -178,7 +183,6 @@ async def test_missing_accept_incoming_on_trash_denies(imap: dict[str, Any]) -> 
     response = await _discard(_context(_drafts(move_out=True), _trash(accept_incoming=False)))
     assert response["decision"] == "DENY"
     assert response["reason"] == "capability_missing"
-    assert response["missing_capability"] == "accept_incoming"
     assert imap["moved"] == []
 
 
@@ -206,7 +210,7 @@ async def test_unknown_handle_reports_draft_not_found(imap: dict[str, Any]) -> N
     imap["uids"] = []
     response = await _discard(_context(_drafts(move_out=True), _trash(accept_incoming=True)))
     assert response["result"] == "ERROR"
-    assert response["error"]["type"] == "draft_not_found"
+    assert response["error"]["type"] == "not_found"
     assert imap["moved"] == []
 
 

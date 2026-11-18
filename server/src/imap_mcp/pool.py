@@ -76,11 +76,11 @@ _ENV_SETTINGS = {
 
 @dataclass(frozen=True)
 class PoolSettings:
-    """Pool limits. Durations are seconds."""
+    """Pool limits. Durations are seconds (ADR 0055)."""
 
-    max_size: int = 4
-    idle_ttl: float = 600.0
-    max_age: float = 3600.0
+    max_size: int = 2
+    idle_ttl: float = 120.0
+    max_age: float = 1800.0
     acquire_timeout: float = 30.0
 
     def __post_init__(self) -> None:

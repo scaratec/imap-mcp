@@ -59,6 +59,7 @@ CONTENT_KEYS = frozenset(
         "filename",
         "new_filename",
         "saved_to",
+        "saved_path",
         "message_id",
         "in_reply_to",
         "references",

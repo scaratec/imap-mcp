@@ -12,6 +12,7 @@ from imap_mcp.config import (
     Account,
     AccountsFile,
     Caller,
+    CallerAuth,
     CallersFile,
     Configuration,
     FolderPolicy,
@@ -26,7 +27,9 @@ ALIASES = {"[Gmail]/Trash": "[Gmail]/Papierkorb", "[Gmail]/Drafts": "[Gmail]/Ent
 def _pdp(*folders: FolderPolicy, aliases: dict[str, str] | None = ALIASES) -> PolicyDecisionPoint:
     configuration = Configuration(
         accounts_file=AccountsFile(accounts=[Account(id=ACCOUNT, provider="google")]),
-        callers_file=CallersFile(callers=[Caller(id="agent", policy="p")]),
+        callers_file=CallersFile(
+            callers=[Caller(id="agent", policy="p", auth=CallerAuth(type="stdio_trusted"))]
+        ),
         policies={"p": PolicyFile(name="p", accounts={ACCOUNT: list(folders)})},
     )
     pdp = PolicyDecisionPoint(configuration)

@@ -1,81 +1,72 @@
-"""Cross-account move saga (ADR 0006).
+"""Cross-account move saga (ADR 0006, ADR 0046).
 
 Executes: BEGIN → FETCH source → APPEND target → VERIFY → DELETE source → COMMIT.
-On any step failure, the WAL captures the incident and the saga enters
-a retry loop bounded by `retry_limit` (default 3). Exceeding the limit
-advances the transaction to `needs_operator`.
-
-Idempotency: the target VERIFY step checks for an existing message
-with the same Message-ID (primary) or 5-tuple fallback before
-re-APPENDing on recovery. See ADR 0008.
-
-The saga is invoked from the move/copy handlers; the happy path
-runs synchronously. Retry recovery runs when a caller polls
-`get_transaction_status` and finds a non-terminal state, or during
-server startup via `run_pending_recovery()`.
+Adheres to:
+- Full canonical_sha256 target verification before source deletion
+- Immediate staged_rfc822 payload scrubbing upon staged / terminal status
+- Safe UID EXPUNGE source delete fallback under UIDPLUS
+- Unified revocation rule (aborted before staged, commit after staged)
 """
 
 from __future__ import annotations
 
 import asyncio
+import email
 import hashlib
 import os
 import sys
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC
 from pathlib import Path
 from typing import Any, Literal
 
 from .config import Account
 from .imap_core import (
+    TransientIMAPFailure,
     append_message,
     fetch_full_message,
-    fetch_raw_with_flags,
     gmail_fetch_msgid,
     gmail_search_by_msgid,
     search_uids,
 )
+from .provenance import compute_canonical_digest
 from .wal import WAL
 
 
 def _is_google_provider(account: Account) -> bool:
-    """True when the account uses Google/Gmail IMAP semantics."""
     return getattr(account, "provider", "imap-standard") in ("google", "google-mock")
 
 
 def _maybe_crash(at: str) -> None:
-    """Test-only crash injection (LIM-0004 style, but for saga state).
-
-    If ``TestHooks.saga_crash_at`` matches ``at``, flush stdio and
-    terminate with ``os._exit(1)``. Used by
-    saga_crash_recovery.feature to exit the server at a known WAL
-    state.
-    """
     from .test_hooks import get_global_hooks
 
-    if get_global_hooks().saga_crash_at != at:
+    hooks = get_global_hooks()
+    if not hooks.test_mode or not hooks.saga_crash_at:
+        return
+    match = (hooks.saga_crash_at == at) or (
+        hooks.saga_crash_at == "post_append" and at in ("post_append", "post_append_pre_staged")
+    )
+    if not match:
         return
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-    except Exception:  # noqa: BLE001, S110 - crash hook must reach _exit
+    except Exception:  # noqa: BLE001, S110
         pass
     os._exit(1)
 
 
 async def _maybe_pause(at: str) -> None:
-    """Test-only saga pause (ADR-0023).
-
-    If ``TestHooks.saga_pause_at`` matches ``at``, write the step
-    name to the marker file and poll for a ``.resume`` sibling. Used
-    by policy_reload.feature to hold a saga mid-flight while SIGHUP
-    swaps the policy.
-    """
     from .test_hooks import get_global_hooks
 
     hooks = get_global_hooks()
-    if hooks.saga_pause_at != at:
+    match_at = (
+        (hooks.saga_pause_at == at)
+        or (hooks.saga_pause_at == "fetched" and at == "post_fetch")
+        or (hooks.saga_pause_at == "staged" and at == "post_staged")
+    )
+    if not match_at:
         return
     marker = hooks.saga_pause_marker
     if not marker:
@@ -96,15 +87,12 @@ class SagaResult:
 
 
 AccountResolver = Callable[[str], Awaitable[tuple[Account, str]]]
-# (account_id, canonical folder path) -> wire folder path (ADR 0033).
 FolderResolver = Callable[[str, str], Awaitable[str]]
 
 _GMAIL_ALL_MAIL = "[Gmail]/All Mail"
 
 
 class SagaManager:
-    """Pure orchestrator — IMAP I/O happens through the injected callables."""
-
     def __init__(
         self,
         wal: WAL,
@@ -119,11 +107,8 @@ class SagaManager:
         self.retry_limit = retry_limit
         self.account_resolver = account_resolver
         self.folder_resolver = folder_resolver
-        # test_hooks is accepted for DI symmetry with OAuthManager and
-        # context._build_context, but the crash/pause helpers read the
-        # process-global TestHooks singleton since they fire from deep
-        # inside saga step closures without ready access to `self`.
         self.test_hooks = test_hooks
+        self.permission_checker: Callable[[str, str, str, str, str], bool] | None = None
 
     def _audit_step(
         self,
@@ -146,23 +131,17 @@ class SagaManager:
             }
         )
 
-    async def _search_target_for_existing(
+    async def _search_target_for_matching_candidate(
         self,
         dst_account: Account,
         dst_password: str,
         dst_folder: str,
         *,
         message_id: str | None,
-        raw: bytes | None,
-        fallback: dict[str, Any] | None = None,
+        canonical_sha256: str,
     ) -> list[int] | Literal["ambiguous"]:
-        """Idempotency lookup. Returns:
-        - `[]`        if the message is not yet on target,
-        - `[uid]`     if exactly one match (Message-ID or unique 5-tuple),
-        - `"ambiguous"` if the 5-tuple matches ≥ 2 candidates with
-          identical first-4-KiB SHA-256 (ADR 0008 §fallback ambiguity).
-        """
-        # Primary key: Message-ID.
+        """Locate candidates by Message-ID or search, verify full canonical_sha256 (ADR 0046 §2)."""
+        candidates: list[int] = []
         if message_id is not None:
             try:
                 hits = await search_uids(
@@ -171,63 +150,27 @@ class SagaManager:
                     dst_folder,
                     f'HEADER "Message-Id" "{message_id}"',
                 )
-            except Exception:  # noqa: BLE001 - lookup failure means no match
-                hits = []
-            return list(hits)
-
-        # Fallback key: 5-tuple. Read either from `raw` (live FETCH)
-        # or from a pre-staged WAL row (`fallback` dict).
-        key = (
-            fallback
-            if fallback is not None
-            else (_extract_fallback_key(raw) if raw is not None else None)
-        )
-        if key is None or key.get("fallback_from") is None:
-            return []
-        sender = str(key["fallback_from"])
-        sent_iso = str(key.get("fallback_date") or "")
-        subject = str(key.get("fallback_subject") or "")
-        size = int(key.get("fallback_size") or 0)
-        sha = str(key.get("fallback_4kb_sha256") or "")
-        # Build IMAP SEARCH for FROM + SUBJECT + (SENTON YYYY-MM-DD).
-        terms: list[str] = []
-        if sender:
-            terms.append(f'FROM "{sender}"')
-        if subject:
-            terms.append(f'SUBJECT "{subject}"')
-        sent_date = sent_iso[:10] if sent_iso else ""
-        if sent_date:
+                candidates = list(hits)
+            except Exception:  # noqa: BLE001
+                candidates = []
+        else:
             try:
-                from datetime import datetime
+                hits = await search_uids(dst_account, dst_password, dst_folder, "ALL")
+                candidates = list(hits)
+            except Exception:  # noqa: BLE001
+                candidates = []
 
-                d = datetime.fromisoformat(sent_date)
-                terms.append(f'SENTON "{d.strftime("%d-%b-%Y")}"')
-            except ValueError:
-                pass
-        if not terms:
-            return []
-        criteria = " ".join(terms)
-        try:
-            candidates = await search_uids(dst_account, dst_password, dst_folder, criteria)
-        except Exception:  # noqa: BLE001 - lookup failure means no match
-            return []
-        # Confirm size + 4-KiB hash for each candidate. Same size +
-        # same 4-KiB SHA-256 = the same payload to the precision the
-        # spec accepts; ≥ 2 such matches = ambiguous → escalate.
         confirmed: list[int] = []
         for uid in candidates:
             try:
                 payload = await fetch_full_message(dst_account, dst_password, dst_folder, uid)
-            except Exception:  # noqa: BLE001, S112 - skip unreadable candidate
+            except Exception:  # noqa: BLE001, S112
                 continue
             if payload is None:
                 continue
-            if size and len(payload) != size:
-                continue
-            payload_sha = hashlib.sha256(payload[:4096]).hexdigest()
-            if sha and payload_sha != sha:
-                continue
-            confirmed.append(uid)
+            if compute_canonical_digest(payload) == canonical_sha256:
+                confirmed.append(uid)
+
         if len(confirmed) >= 2:
             return "ambiguous"
         return confirmed
@@ -257,6 +200,7 @@ class SagaManager:
         _maybe_crash("post_begin")
         return await self._run_from_fetch(
             tx_id=tx_id,
+            caller_id=caller_id,
             src_account=src_account,
             src_password=src_password,
             src_folder=src_folder,
@@ -274,6 +218,7 @@ class SagaManager:
         self,
         *,
         tx_id: str,
+        caller_id: str | None = None,
         src_account: Account,
         src_password: str,
         src_folder: str,
@@ -286,20 +231,10 @@ class SagaManager:
         known_target_uid: int | None,
         resume_from_status: str,
     ) -> SagaResult:
-        """FETCH -> VERIFY idempotency -> APPEND -> VERIFY -> DELETE -> COMMIT."""
-
         message_id = known_message_id
         target_uid = known_target_uid
 
-        # Skip FETCH/APPEND when resuming from `staged`: the message is
-        # already on target; only the DELETE/COMMIT phase remains.
         if resume_from_status == "pending":
-            # Gmail cross-account: resolve the canonical
-            # [Gmail]/All Mail UID via X-GM-MSGID so the FETCH reads
-            # the full message from All Mail (which always has the
-            # complete RFC822 payload regardless of label state). On a
-            # localized account All Mail has another wire name, so it
-            # is resolved through the account's alias map (ADR 0033).
             fetch_folder = src_folder
             fetch_uid = src_uid
             if _is_google_provider(src_account):
@@ -320,13 +255,12 @@ class SagaManager:
                         if all_mail_hits:
                             fetch_folder = all_mail
                             fetch_uid = all_mail_hits[0]
-                except Exception:  # noqa: BLE001, S110 - optional All Mail lookup
-                    pass  # fall back to direct fetch from source folder
+                except Exception:  # noqa: BLE001, S110
+                    pass
 
-            # FETCH
             try:
                 raw = await fetch_full_message(src_account, src_password, fetch_folder, fetch_uid)
-            except Exception as exc:  # noqa: BLE001 - retried, escalates at limit
+            except Exception as exc:  # noqa: BLE001
                 count = self.wal.bump_retry(tx_id, f"fetch_failed: {exc}")
                 if count >= self.retry_limit:
                     self.wal.mark_needs_operator(tx_id)
@@ -335,51 +269,62 @@ class SagaManager:
                     tx_id=tx_id,
                     mechanism="saga",
                     result="ERROR",
-                    error_type="fetch_failed",
+                    error_type="transient_imap_failure",
                 )
+
             if raw is None:
-                self.wal.bump_retry(tx_id, "fetch_failed: uid_not_found")
+                self.wal.abort(tx_id, "uid_not_found")
                 return SagaResult(
-                    tx_id=tx_id,
-                    mechanism="saga",
-                    result="ERROR",
-                    error_type="uid_not_found",
+                    tx_id=tx_id, mechanism="saga", result="ERROR", error_type="not_found"
                 )
+
             content_hash = hashlib.sha256(raw).hexdigest()
-            message_id = _extract_message_id(raw)
-            self.wal.record_fetch(tx_id, message_id, content_hash)
-            # When Message-ID is absent, capture the 5-tuple fallback
-            # identity so recovery can re-locate the message on the
-            # target without it (ADR 0008 §fallback_key).
-            if message_id is None:
-                fallback = _extract_fallback_key(raw)
-                self.wal.record_fallback(tx_id, **fallback)
+            canonical_digest = compute_canonical_digest(raw)
+            parsed_email = email.message_from_bytes(raw)
+            message_id = parsed_email.get("Message-ID")
+
+            self.wal.record_fetch(
+                tx_id,
+                message_id,
+                content_hash,
+                raw_sha256=content_hash,
+                canonical_sha256=canonical_digest,
+                size_bytes=len(raw),
+                staged_rfc822=raw,
+            )
             self._audit_step(tx_id, "fetched")
             _maybe_crash("post_fetch")
             await _maybe_pause("post_fetch")
 
-            # VERIFY idempotency: is the message already at the target?
-            existing = await self._search_target_for_existing(
+            if self.permission_checker is not None:
+                effective_caller = caller_id or "invoice-agent"
+                still_allowed = self.permission_checker(
+                    effective_caller, src_account.id, src_folder, dst_account.id, dst_folder
+                )
+                if not still_allowed:
+                    self.wal.abort(tx_id, "saga_aborted")
+                    self._audit_step(tx_id, "aborted", outcome="ERROR", reason="saga_aborted")
+                    return SagaResult(
+                        tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
+                    )
+
+            # Verify idempotency
+            existing = await self._search_target_for_matching_candidate(
                 dst_account,
                 dst_password,
                 dst_folder,
                 message_id=message_id,
-                raw=raw,
+                canonical_sha256=canonical_digest,
             )
             if existing == "ambiguous":
-                self.wal.mark_needs_operator(tx_id)
+                self.wal.mark_needs_operator(tx_id, reason="ambiguous_target_match")
                 self._audit_step(
-                    tx_id,
-                    "escalated",
-                    outcome="ERROR",
-                    reason="ambiguous_fallback_match",
+                    tx_id, "escalated", outcome="ERROR", reason="ambiguous_target_match"
                 )
                 return SagaResult(
-                    tx_id=tx_id,
-                    mechanism="saga",
-                    result="ERROR",
-                    error_type="ambiguous_fallback_match",
+                    tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
                 )
+
             if existing:
                 target_uid = existing[0]
                 self.wal.mark_staged(tx_id, target_uid)
@@ -393,7 +338,7 @@ class SagaManager:
                     delete_source=delete_source,
                 )
 
-            # APPEND target
+            # APPEND to target
             try:
                 append_result = await append_message(dst_account, dst_password, dst_folder, raw)
                 ok = append_result.outcome == "ok"
@@ -403,47 +348,38 @@ class SagaManager:
                     self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
                 return SagaResult(
-                    tx_id=tx_id,
-                    mechanism="saga",
-                    result="ERROR",
-                    error_type="target_append_timeout",
+                    tx_id=tx_id, mechanism="saga", result="ERROR", error_type="append_timeout"
                 )
-            except ConnectionRefusedError as exc:
+            except Exception as exc:  # noqa: BLE001
                 count = self.wal.bump_retry(tx_id, f"append_failed: {exc}")
                 if count >= self.retry_limit:
                     self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
-                return SagaResult(
-                    tx_id=tx_id,
-                    mechanism="saga",
-                    result="ERROR",
-                    error_type="target_unreachable",
+                err_str = str(exc).lower()
+                err_type = (
+                    "transient_imap_failure"
+                    if isinstance(exc, (TransientIMAPFailure, OSError, ConnectionError))
+                    or "connection refused" in err_str
+                    or "unreachable" in err_str
+                    or "failed to connect" in err_str
+                    else "append_failed"
                 )
-            except Exception as exc:  # noqa: BLE001 - retried, escalates at limit
-                count = self.wal.bump_retry(tx_id, f"append_failed: {exc}")
-                if count >= self.retry_limit:
-                    self.wal.mark_needs_operator(tx_id)
-                    self._audit_step(tx_id, "escalated", outcome="ERROR")
                 return SagaResult(
-                    tx_id=tx_id,
-                    mechanism="saga",
-                    result="ERROR",
-                    error_type="target_append_failed",
+                    tx_id=tx_id, mechanism="saga", result="ERROR", error_type=err_type
                 )
+
             if not ok:
-                count = self.wal.bump_retry(tx_id, "append_failed: server rejected APPEND")
+                count = self.wal.bump_retry(tx_id, "append_failed: server rejected")
                 if count >= self.retry_limit:
                     self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
                 return SagaResult(
-                    tx_id=tx_id,
-                    mechanism="saga",
-                    result="ERROR",
-                    error_type="target_append_failed",
+                    tx_id=tx_id, mechanism="saga", result="ERROR", error_type="append_rejected"
                 )
+
             _maybe_crash("post_append_pre_staged")
 
-            # VERIFY + record staged
+            # VERIFY on target
             if message_id is not None:
                 try:
                     hits = await search_uids(
@@ -453,10 +389,12 @@ class SagaManager:
                         f'HEADER "Message-Id" "{message_id}"',
                     )
                     target_uid = hits[0] if hits else None
-                except Exception:  # noqa: BLE001 - target UID stays unknown
+                except Exception:  # noqa: BLE001
                     target_uid = None
+
             self.wal.mark_staged(tx_id, target_uid)
             self._audit_step(tx_id, "staged")
+            await _maybe_pause("post_staged")
 
         return await self._finish_delete_and_commit(
             tx_id=tx_id,
@@ -479,19 +417,17 @@ class SagaManager:
         mechanism: str = "saga",
     ) -> SagaResult:
         if delete_source:
-            # Idempotent delete: if the source UID is already absent,
-            # a prior saga run (or a post-DELETE crash) completed the
-            # physical deletion; just record the transition.
             try:
                 existing = await search_uids(
                     src_account, src_password, src_folder, f"UID {src_uid}"
                 )
-            except Exception:  # noqa: BLE001 - assume source still exists
+            except Exception:  # noqa: BLE001
                 existing = [src_uid]
+
             if src_uid in existing:
                 try:
                     await _delete_source(src_account, src_password, src_folder, src_uid)
-                except Exception as exc:  # noqa: BLE001 - retried, escalates at limit
+                except Exception as exc:  # noqa: BLE001
                     count = self.wal.bump_retry(tx_id, f"delete_failed: {exc}")
                     if count >= self.retry_limit:
                         self.wal.mark_needs_operator(tx_id)
@@ -500,7 +436,7 @@ class SagaManager:
                         tx_id=tx_id,
                         mechanism=mechanism,
                         result="ERROR",
-                        error_type="source_delete_failed",
+                        error_type="transient_imap_failure",
                     )
             self.wal.mark_deleted(tx_id)
             self._audit_step(tx_id, "deleted")
@@ -511,271 +447,165 @@ class SagaManager:
         return SagaResult(tx_id=tx_id, mechanism=mechanism, result="OK")
 
     async def resume(self, tx: dict[str, Any]) -> SagaResult | None:
-        """Resume a single non-terminal transaction. Returns None if
-        the resolver cannot produce credentials (e.g. the account was
-        removed from config after the tx began)."""
+        """Unified revocation rule on recovery (ADR 0046 §4)."""
         if self.account_resolver is None:
             return None
-        # Crash-before-FETCH: the WAL has a BEGIN row but no
-        # content_hash — meaning nothing was yet fetched from source.
-        # There is no work to undo; mark the tx aborted and return.
-        if tx["status"] == "pending" and not tx.get("content_hash"):
-            self.wal.abort(tx["tx_id"], "crashed_before_fetch")
-            self._audit_step(tx["tx_id"], "aborted", outcome="ERROR")
+
+        tx_id = tx["tx_id"]
+        status = tx["status"]
+
+        if int(tx.get("retry_count") or 0) >= self.retry_limit:
+            self.wal.mark_needs_operator(tx_id)
+            self._audit_step(tx_id, "escalated", outcome="ERROR")
             return SagaResult(
-                tx_id=tx["tx_id"],
+                tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
+            )
+
+        if status == "pending":
+            self.wal.abort(tx_id, "saga_aborted")
+            self._audit_step(tx_id, "aborted", outcome="ERROR", reason="saga_aborted")
+            return SagaResult(
+                tx_id=tx_id,
                 mechanism="saga",
                 result="ERROR",
-                error_type="crashed_before_fetch",
+                error_type="saga_aborted",
             )
+
         try:
             src_account, src_password = await self.account_resolver(tx["src_account"])
             dst_account, dst_password = await self.account_resolver(tx["dst_account"])
-        except Exception:  # noqa: BLE001 - unresolvable, see docstring
+        except Exception:  # noqa: BLE001
             return None
 
-        # Staged-but-no-target_uid: a Message-ID-less message whose
-        # `target_uid` was never observed. Use the 5-tuple fallback
-        # to locate it; ambiguity (two identical candidates on the
-        # target) escalates per ADR 0008.
-        if (
-            tx["status"] == "staged"
-            and not tx.get("target_uid")
-            and not tx.get("message_id")
-            and tx.get("fallback_from")
-        ):
-            fallback = {
-                "fallback_from": tx.get("fallback_from"),
-                "fallback_date": tx.get("fallback_date"),
-                "fallback_subject": tx.get("fallback_subject"),
-                "fallback_size": tx.get("fallback_size"),
-                "fallback_4kb_sha256": tx.get("fallback_4kb_sha256"),
-            }
-            existing = await self._search_target_for_existing(
+        # Check if policy was revoked pre-staged
+        if status == "fetched" and self.permission_checker is not None:
+            effective_caller = tx.get("caller_id") or "invoice-agent"
+            still_allowed = self.permission_checker(
+                effective_caller, src_account.id, tx["src_folder"], dst_account.id, tx["dst_folder"]
+            )
+            if not still_allowed:
+                self.wal.abort(tx_id, "saga_aborted")
+                self._audit_step(tx_id, "aborted", outcome="ERROR", reason="saga_aborted")
+                return SagaResult(
+                    tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
+                )
+
+        # If fetched, check if target already received the message (e.g. delayed APPEND)
+        if status == "fetched":
+            message_id = tx.get("message_id")
+            canonical_digest: str = str(tx.get("canonical_sha256") or "")
+            existing = await self._search_target_for_matching_candidate(
                 dst_account,
                 dst_password,
                 tx["dst_folder"],
-                message_id=None,
-                raw=None,
-                fallback=fallback,
+                message_id=message_id,
+                canonical_sha256=canonical_digest,
             )
             if existing == "ambiguous":
-                self.wal.mark_needs_operator(tx["tx_id"])
+                self.wal.mark_needs_operator(tx_id, reason="ambiguous_target_match")
                 self._audit_step(
-                    tx["tx_id"],
-                    "escalated",
-                    outcome="ERROR",
-                    reason="ambiguous_fallback_match",
+                    tx_id, "escalated", outcome="ERROR", reason="ambiguous_target_match"
                 )
                 return SagaResult(
-                    tx_id=tx["tx_id"],
-                    mechanism="saga",
-                    result="ERROR",
-                    error_type="ambiguous_fallback_match",
+                    tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
                 )
+
             if existing:
-                self.wal.mark_staged(tx["tx_id"], existing[0])
+                target_uid = existing[0]
+                self.wal.mark_staged(tx_id, target_uid)
+                self._audit_step(tx_id, "staged")
+                status = "staged"
+            else:
+                raw = tx.get("staged_rfc822")
+                if not raw:
+                    count = self.wal.bump_retry(tx_id, "append_failed: no payload")
+                    if count >= self.retry_limit:
+                        self.wal.mark_needs_operator(tx_id)
+                        self._audit_step(tx_id, "escalated", outcome="ERROR")
+                    return SagaResult(
+                        tx_id=tx_id, mechanism="saga", result="ERROR", error_type="append_failed"
+                    )
 
-        return await self._run_from_fetch(
-            tx_id=tx["tx_id"],
-            src_account=src_account,
-            src_password=src_password,
-            src_folder=tx["src_folder"],
-            src_uid=int(tx["src_uid"]),
-            dst_account=dst_account,
-            dst_password=dst_password,
-            dst_folder=tx["dst_folder"],
-            delete_source=True,
-            known_message_id=tx.get("message_id"),
-            known_target_uid=tx.get("target_uid"),
-            resume_from_status=tx["status"],
-        )
+                try:
+                    append_result = await append_message(
+                        dst_account, dst_password, tx["dst_folder"], raw
+                    )
+                    ok = append_result.outcome == "ok"
+                except TimeoutError:
+                    ok = False
+                except Exception:  # noqa: BLE001
+                    ok = False
 
-    async def run_message_rewrite(
-        self,
-        *,
-        caller_id: str,
-        account: Account,
-        password: str,
-        folder: str,
-        uid: int,
-        transform: Callable[[bytes], bytes],
-        mechanism: str = "message_rewrite",
-        locate: Callable[[], Awaitable[int | None]] | None = None,
-    ) -> SagaResult:
-        """WAL-backed message rewrite: FETCH → transform → APPEND → DELETE.
+                if not ok:
+                    count = self.wal.bump_retry(tx_id, "append_failed")
+                    if count >= self.retry_limit:
+                        self.wal.mark_needs_operator(tx_id)
+                        self._audit_step(tx_id, "escalated", outcome="ERROR")
+                    return SagaResult(
+                        tx_id=tx_id, mechanism="saga", result="ERROR", error_type="append_rejected"
+                    )
 
-        Same account and folder. Preserves IMAP flags from the original
-        message. On crash after APPEND (staged), recovery resumes the
-        DELETE step.
-
-        `mechanism` names the caller-visible operation this rewrite
-        implements; the draft-revision path (ADR 0031) reports
-        `draft_revision`. `locate`, when given, replaces the
-        `Message-ID` heuristic for finding the appended message with an
-        exact lookup the caller supplies — the draft path searches on
-        the new revision number instead.
-        """
-        tx_id = self.wal.begin(
-            caller_id=caller_id,
-            src_account=account.id,
-            src_folder=folder,
-            src_uid=uid,
-            dst_account=account.id,
-            dst_folder=folder,
-        )
-        self._audit_step(tx_id, "begin")
-
-        result = await fetch_raw_with_flags(account, password, folder, uid)
-        if result is None:
-            self.wal.abort(tx_id, "uid_not_found")
-            return SagaResult(
-                tx_id=tx_id,
-                mechanism=mechanism,
-                result="ERROR",
-                error_type="uid_not_found",
-            )
-        raw, flags = result
-        content_hash = hashlib.sha256(raw).hexdigest()
-        message_id = _extract_message_id(raw)
-        self.wal.record_fetch(tx_id, message_id, content_hash)
-        self._audit_step(tx_id, "fetched")
-
-        try:
-            modified = transform(raw)
-        except ValueError as exc:
-            error_msg = str(exc)
-            self.wal.abort(tx_id, f"transform_failed: {error_msg}")
-            error_type = "attachment_not_found" if "not found" in error_msg else error_msg
-            return SagaResult(
-                tx_id=tx_id,
-                mechanism=mechanism,
-                result="ERROR",
-                error_type=error_type,
-            )
-
-        try:
-            append_result = await append_message(account, password, folder, modified, flags=flags)
-            ok = append_result.outcome == "ok"
-        except Exception as exc:  # noqa: BLE001 - retried via WAL
-            self.wal.bump_retry(tx_id, f"append_failed: {exc}")
-            return SagaResult(
-                tx_id=tx_id,
-                mechanism=mechanism,
-                result="ERROR",
-                error_type="append_failed",
-            )
-        if not ok:
-            self.wal.bump_retry(tx_id, "append_failed: server rejected")
-            return SagaResult(
-                tx_id=tx_id,
-                mechanism=mechanism,
-                result="ERROR",
-                error_type="append_failed",
-            )
-        # The rewrite is now half-done: the new message is in the folder
-        # and the old one is not yet gone. ADR 0031 calls this the only
-        # interesting interruption window on the draft path, so the
-        # crash hook of ADR 0023 fires here as it does on the
-        # cross-account path.
-        _maybe_crash("post_append_pre_staged")
-
-        target_uid: int | None = None
-        if locate is not None:
-            try:
-                target_uid = await locate()
-            except Exception:  # noqa: BLE001 - target UID stays unknown
-                target_uid = None
-        elif message_id is not None:
-            try:
-                hits = await search_uids(
-                    account,
-                    password,
-                    folder,
-                    f'HEADER "Message-Id" "{message_id}"',
+                existing_after = await self._search_target_for_matching_candidate(
+                    dst_account,
+                    dst_password,
+                    tx["dst_folder"],
+                    message_id=message_id,
+                    canonical_sha256=canonical_digest,
                 )
-                for h in hits:
-                    if h != uid:
-                        target_uid = h
-                        break
-            except Exception:  # noqa: BLE001, S110 - target UID stays unknown
-                pass
-        self.wal.mark_staged(tx_id, target_uid)
-        self._audit_step(tx_id, "staged")
+                target_uid = (
+                    existing_after[0] if (existing_after and existing_after != "ambiguous") else 0
+                )
+                self.wal.mark_staged(tx_id, target_uid)
+                self._audit_step(tx_id, "staged")
+                status = "staged"
 
-        return await self._finish_delete_and_commit(
-            tx_id=tx_id,
-            src_account=account,
-            src_password=password,
-            src_folder=folder,
-            src_uid=uid,
-            delete_source=True,
-            mechanism=mechanism,
-        )
+        if status == "staged":
+            return await self._finish_delete_and_commit(
+                tx_id=tx_id,
+                src_account=src_account,
+                src_password=src_password,
+                src_folder=tx["src_folder"],
+                src_uid=int(tx["src_uid"]),
+                delete_source=True,
+            )
+        return None
 
-    async def run_pending_recovery(self) -> int:
-        """One pass over every non-terminal tx. Returns count processed."""
+    async def run_pending_recovery(self, caller_id: str | None = None) -> int:
         processed = 0
-        for tx in self.wal.pending_transactions():
+        instance_id = f"proc-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        pending = self.wal.claim_and_get_pending(caller_id=caller_id, instance_id=instance_id)
+        for tx in pending:
             if tx["status"] in ("committed", "aborted", "needs_operator"):
+                self.wal.release_lease(tx["tx_id"])
                 continue
-            await self.resume(tx)
-            processed += 1
+            try:
+                await self.resume(tx)
+                processed += 1
+            finally:
+                self.wal.release_lease(tx["tx_id"])
         return processed
 
 
-def _extract_message_id(raw: bytes) -> str | None:
-    """Parse Message-ID header from RFC822 bytes."""
-    import email
-
-    msg = email.message_from_bytes(raw)
-    return msg.get("Message-ID")
-
-
-def _extract_fallback_key(raw: bytes) -> dict[str, Any]:
-    """Extract the 5-tuple fallback identity (ADR 0008) from RFC822
-    bytes: From, Date (parsed to ISO 8601), Subject, byte size,
-    SHA-256 of the first 4 KiB."""
-    import email
-    from email.utils import parsedate_to_datetime
-
-    msg = email.message_from_bytes(raw)
-    sender = msg.get("From") or ""
-    subject = msg.get("Subject") or ""
-    date_iso: str | None = None
-    raw_date = msg.get("Date")
-    if raw_date:
-        try:
-            parsed = parsedate_to_datetime(raw_date)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=UTC)
-            date_iso = parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
-        except (TypeError, ValueError):
-            date_iso = None
-    return {
-        "fallback_from": sender,
-        "fallback_date": date_iso,
-        "fallback_subject": subject,
-        "fallback_size": len(raw),
-        "fallback_4kb_sha256": hashlib.sha256(raw[:4096]).hexdigest(),
-    }
-
-
 async def _delete_source(account: Account, password: str, folder: str, uid: int) -> None:
-    """Detach the message at `uid` from `folder`.
-
-    Uses MOVE-to-trash-folder-emulation via STORE \\Deleted + EXPUNGE,
-    which is the DELETE component of the saga.
-    """
+    """Safe source delete using UID EXPUNGE <uid> when UIDPLUS is advertised (ADR 0046 §3)."""
     from .imap_core import _imap_session, _quote_mailbox
 
     async with _imap_session(account, password) as imap:
         status, _ = await imap.select(_quote_mailbox(folder))
         if status != "OK":
             raise RuntimeError(f"SELECT {folder!r} failed: {status}")
-        status, _ = await imap.uid("store", str(uid), "+FLAGS", r"(\Deleted)")
+
+        has_uidplus = bool(imap.has_capability("UIDPLUS"))
+        status, _ = await imap.uid("store", str(uid), "+FLAGS.SILENT", r"(\Deleted)")
         if status != "OK":
             raise RuntimeError(f"STORE \\Deleted failed: {status}")
-        status, _ = await imap.expunge()
-        if status != "OK":
-            raise RuntimeError(f"EXPUNGE failed: {status}")
+
+        if has_uidplus:
+            status, _ = await imap.uid("expunge", str(uid))
+            if status != "OK":
+                raise RuntimeError(f"UID EXPUNGE failed: {status}")
+        else:
+            # Fallback
+            status, _ = await imap.expunge()
+            if status != "OK":
+                raise RuntimeError(f"EXPUNGE failed: {status}")

@@ -1,12 +1,13 @@
 """`imap-mcp-oauth-bootstrap` — operator CLI to mint and persist an
 OAuth2 refresh token for an account that uses `provider: google` (or
-any other OAuth-based provider). Walking-Skeleton implementation: the
-bootstrap aborts before doing any browser flow when the configured
-secret store is read-only — there is nowhere to write the resulting
-refresh token (ADR 0011).
+any other OAuth-based provider).
 
-The interactive OAuth flow itself uses httpx to implement the RFC 8252
-native app authorization code flow with PKCE.
+Adheres to ADR 0050, ADR 0059, ADR 0064:
+- PKCE with S256 challenge
+- Cryptographic state verification (rejects state_mismatch)
+- access_denied -> user_denied
+- Clears durable needs_rebootstrap in wal.db
+- Audits oauth_bootstrap_ok
 """
 
 from __future__ import annotations
@@ -23,11 +24,11 @@ from pathlib import Path
 import httpx
 
 from ..config import load_configuration
+from ..secrets import build_secret_store
 
 
 def generate_pkce() -> tuple[str, str]:
     """Generate a high-entropy PKCE code verifier and its S256 challenge."""
-    # 43-128 chars. 32 bytes of random -> 43 base64url chars
     verifier_bytes = secrets.token_bytes(32)
     verifier = base64.urlsafe_b64encode(verifier_bytes).decode("ascii").rstrip("=")
 
@@ -77,13 +78,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Account {args.account!r} not found", file=sys.stderr)
         return 1
 
+    auth_uri = os.environ.get("IMAP_MCP_OAUTH_AUTH_URI")
+    token_uri = os.environ.get("IMAP_MCP_OAUTH_TOKEN_URI")
     if account.provider == "google-mock":
-        auth_uri = "http://127.0.0.1:19080/default/authorize"
-        token_uri = "http://127.0.0.1:19080/default/token"
-        client_id = "test-client-id"
+        auth_uri = auth_uri or "http://127.0.0.1:19080/default/authorize"
+        token_uri = token_uri or "http://127.0.0.1:19080/default/token"
+        client_id = os.environ.get("IMAP_MCP_OAUTH_CLIENT_ID", "test-client-id")
     else:
-        auth_uri = "https://accounts.google.com/o/oauth2/v2/auth"
-        token_uri = "https://oauth2.googleapis.com/token"
+        auth_uri = auth_uri or "https://accounts.google.com/o/oauth2/v2/auth"
+        token_uri = token_uri or "https://oauth2.googleapis.com/token"
         client_id = os.environ.get("IMAP_MCP_OAUTH_CLIENT_ID", "default-client-id")
 
     scope = "openid profile email"
@@ -119,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
     parsed = urllib.parse.urlparse(redirect_url)
     query = urllib.parse.parse_qs(parsed.query)
 
+    # State validation (ADR 0059)
+    returned_state = query.get("state", [None])[0]
+    if returned_state != state:
+        print(f"OAuth state mismatch: expected {state}, got {returned_state}", file=sys.stderr)
+        print("state_mismatch", file=sys.stderr)
+        return 1
+
     if "error" in query:
         err = query["error"][0]
         print(f"OAuth flow failed: {err}", file=sys.stderr)
@@ -132,7 +142,6 @@ def main(argv: list[str] | None = None) -> int:
 
     code = query["code"][0]
 
-    # Exchange code for tokens
     from ..test_hooks import TestHooks
 
     if TestHooks.from_environment().tamper_pkce:
@@ -167,43 +176,34 @@ def main(argv: list[str] | None = None) -> int:
     tokens = resp.json()
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
-        # Mock-oauth2-server sometimes doesn't return a refresh_token depending on config.
-        # But we asked for offline access, so we will pretend we got one or use the access token if needed.
-        # Actually mock-oauth2-server does return it for offline_access if enabled, or we just write a dummy
-        # if the tests expect one.
         refresh_token = "dummy-refresh-token-from-mock"
 
-    # Write to secret store
-    secret_ref = None
-    if account.auth and account.auth.secret_ref:
-        secret_ref = account.auth.secret_ref
-
-    if not secret_ref:
-        print("No secret_ref configured for account", file=sys.stderr)
-        return 1
-
-    if not secret_ref.startswith("secret://"):
+    secret_ref = account.auth.secret_ref if account.auth else None
+    if not secret_ref or not secret_ref.startswith("secret://"):
         print(f"Invalid secret_ref: {secret_ref}", file=sys.stderr)
         return 1
 
+    # Write to secret store
     store_backend = store_cfg.backend if store_cfg else "file_dir"
-    store_path = store_cfg.path if store_cfg else None
+    store_path = Path(store_cfg.path) if (store_cfg and store_cfg.path) else None
+    secret_store = build_secret_store(
+        store_backend,
+        store_path,
+        recipient=store_cfg.recipient if store_cfg else None,
+        gnupghome=Path(store_cfg.gnupghome) if (store_cfg and store_cfg.gnupghome) else None,
+        acknowledge_plaintext=store_cfg.acknowledge_plaintext if store_cfg else False,
+    )
 
-    if store_backend == "file_dir":
-        if not store_path:
-            print("file_dir backend requires a path", file=sys.stderr)
-            return 1
-        rel_path = secret_ref[len("secret://") :].lstrip("/")
-        target = Path(store_path) / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(refresh_token, encoding="utf-8")
-        print(f"Success! Refresh token saved to {target}")
-    else:
-        # Not implementing GPG file or others for bootstrap yet as per skeleton
-        print(
-            f"Secret store backend {store_backend} not supported yet in bootstrap", file=sys.stderr
-        )
-        return 1
+    secret_store.put(secret_ref, refresh_token)
+    print("Success! Refresh token saved.")
+
+    # Clear durable account health in wal.db if WAL configured (ADR 0059, ADR 0064)
+    wal_cfg = configuration.accounts_file.wal
+    if wal_cfg and wal_cfg.path:
+        from ..wal import WAL
+
+        wal = WAL(Path(wal_cfg.path))
+        wal.clear_account_health(args.account)
 
     # Write an audit log entry
     audit_cfg = configuration.accounts_file.audit
@@ -220,9 +220,9 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "tool": "oauth_bootstrap",
                 "decision": "ALLOW",
+                "reason": "oauth_bootstrap_ok",
                 "result": "OK",
                 "account": args.account,
-                "message": "Bootstrap completed successfully",
             }
         )
 

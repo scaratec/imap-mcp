@@ -1,9 +1,9 @@
 """stdio MCP transport.
 
-`run_stdio` wires the JSON-RPC over stdio plumbing from the MCP SDK
-to the dispatcher. The two `_*_from_env_or_exit` helpers resolve
-startup config from the environment and are also re-used by the HTTP
-entry point via `__main__.py`.
+Adheres to:
+- ADR 0015, ADR 0049: Caller validation and single-caller instance boundary
+- ADR 0048: Hash-chained audit logging
+- ADR 0058: Closed test-mode control boundary
 """
 
 from __future__ import annotations
@@ -23,19 +23,18 @@ from ..tracing import install_sigterm_flush
 
 
 async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
-    # ADR-0015: caller validation runs on EVERY stdio start. The two
-    # invalid cases — None or a value not present in callers.yaml —
-    # must surface as a structured JSON-RPC error during the
-    # Initialize handshake, NOT as a SystemExit before the MCP loop
-    # starts. Otherwise the orchestrator sees a broken pipe.
     context, configuration = _build_context(
         config_dir, default_caller_id=caller_id or "<no-caller>"
     )
 
+    if len(configuration.callers_file.callers) != 1:
+        raise SystemExit("callers.yaml must define exactly one caller")
+
+    single_caller = configuration.callers_file.callers[0]
     auth_failure_reason: str | None = None
     if not caller_id:
         auth_failure_reason = "no_caller_identity"
-    elif configuration.caller_by_id(caller_id) is None:
+    elif caller_id != single_caller.id:
         auth_failure_reason = "unknown_caller_id"
 
     if auth_failure_reason is not None:
@@ -47,6 +46,8 @@ async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
 
     _install_sighup_handler(context, config_dir)
     install_sigterm_flush()
+    if context.saga is not None:
+        asyncio.create_task(context.saga.run_pending_recovery(single_caller.id))
     app = build_server(context)
     try:
         async with stdio_server() as (read_stream, write_stream):
@@ -63,20 +64,12 @@ async def run_stdio(config_dir: Path, caller_id: str | None) -> None:
 async def _stdio_deny_initialize(
     context: ServerContext, caller_id: str | None, reason: str
 ) -> None:
-    """Read one JSON-RPC line from stdin, write a JSON-RPC error
-    response keyed to the request id, and exit cleanly. The audit
-    record uses `tool=auth_failed` with `auth_failure_reason=reason`.
-
-    The MCP client's `initialize()` reads the response, raises an
-    `MCPRPCError` with the message matching `reason`, then sees EOF
-    when the server exits."""
     import json as _json
     import sys as _sys
 
-    # Audit the failure first so the BDD harness's assertions can read
-    # the JSONL record after the server exits.
     if context.audit is not None:
         record: dict[str, Any] = {
+            "phase": "single",
             "caller_id": caller_id,
             "caller_addr": f"stdio:pid={os.getpid()}",
             "tool": "auth_failed",
@@ -99,7 +92,7 @@ async def _stdio_deny_initialize(
     error_payload = {
         "jsonrpc": "2.0",
         "id": request_id,
-        "error": {"code": -32001, "message": reason},
+        "error": {"code": -32001, "message": "auth_failed", "data": reason},
     }
     _sys.stdout.write(_json.dumps(error_payload, separators=(",", ":")) + "\n")
     _sys.stdout.flush()
@@ -119,11 +112,5 @@ def _caller_id_from_env_or_exit() -> str:
 def _config_dir_from_env_or_exit() -> Path:
     raw = os.environ.get("IMAP_MCP_CONFIG_DIR")
     if not raw:
-        raise SystemExit(
-            "IMAP_MCP_CONFIG_DIR is not set. The server requires a path to "
-            "the config tree (accounts.yaml, callers.yaml, policies/*.yaml)."
-        )
-    path = Path(raw)
-    if not path.is_dir():
-        raise SystemExit(f"IMAP_MCP_CONFIG_DIR does not point at a directory: {path}")
-    return path
+        return Path(".")
+    return Path(os.path.expanduser(raw))

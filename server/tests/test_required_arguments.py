@@ -173,8 +173,11 @@ def test_the_value_passed_is_never_echoed() -> None:
     assert "geheim-4711" not in message
 
 
-def test_extra_arguments_are_not_judged() -> None:
-    assert _validate_arguments_against_surface("describe_policy", {"impersonate": "x"}) is None
+def test_extra_arguments_are_rejected() -> None:
+    assert (
+        _validate_arguments_against_surface("describe_policy", {"impersonate": "x"})
+        == "describe_policy: unknown argument 'impersonate'"
+    )
 
 
 def test_an_unknown_tool_is_left_to_the_unknown_tool_check() -> None:

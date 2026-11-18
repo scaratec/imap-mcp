@@ -1,121 +1,100 @@
-"""Centralised test-hook configuration (ADR 0023).
+"""Centralised test-hook configuration and closed boundary (ADR 0023, ADR 0058).
 
-The previous scatter of ``os.environ.get("IMAP_MCP_TEST_*")`` reads
-across runtime code is replaced by a single ``TestHooks`` dataclass
-that is populated once at startup. Modules that have access to a
-``ServerContext`` read ``context.test_hooks``; deeply-nested helpers
-that do not receive a context (``audit._now_utc``, ``saga._maybe_*``)
-read the process-global singleton via ``get_global_hooks()``.
-
-Production deployments leave every field at its default. The BDD
-harness sets ``IMAP_MCP_TEST_*`` env vars before spawning the server
-process; ``TestHooks.from_environment()`` reads them once on startup.
+Restricts all test-only fault, clock, pause, and recovery hooks to a closed
+inventory that is completely inert without IMAP_MCP_TEST_MODE=1 and causes
+fatal server startup refusal if any test-hook environment variable is set
+when IMAP_MCP_TEST_MODE != "1".
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from dataclasses import dataclass
+
+_log = logging.getLogger(__name__)
+
+TEST_HOOK_ENV_VARS = (
+    "IMAP_MCP_CRASH_AT",
+    "IMAP_MCP_FAKE_NOW_UTC",
+    "IMAP_MCP_FAKE_NOW_FILE",
+    "IMAP_MCP_SAGA_PAUSE_MARKER",
+    "IMAP_MCP_SAGA_RESUME_FILE",
+    "IMAP_MCP_TEST_INJECT_INTERNAL_ERROR",
+)
+
+
+def enforce_test_mode_startup_gate() -> None:
+    """Enforce fatal startup refusal if any test hook is set without IMAP_MCP_TEST_MODE=1."""
+    test_mode = os.environ.get("IMAP_MCP_TEST_MODE") == "1"
+    if test_mode:
+        return
+    for var in TEST_HOOK_ENV_VARS:
+        val = os.environ.get(var)
+        if val is not None and val.strip() != "":
+            msg = (
+                f"FATAL: Test hook environment variable {var!r} is set ({val!r}), "
+                f"but IMAP_MCP_TEST_MODE != '1'. Refusing server startup (ADR 0058)."
+            )
+            _log.critical(msg)
+            print(msg, file=sys.stderr)
+            sys.exit(1)
 
 
 @dataclass(frozen=True)
 class TestHooks:
-    """All test-only configuration in one place. Frozen so callers
-    cannot mutate the live hooks; ``set_global_hooks`` replaces the
-    process-global reference atomically when tests need to override.
-    """
-
     test_mode: bool = False
-    """Gates discovery of the ``_test_run_*`` tools (ADR 0023).
-    Bound to ``IMAP_MCP_TEST_MODE=1``."""
-
     fake_now_utc: str | None = None
-    """ISO-8601 UTC timestamp that ``audit._now_utc`` returns instead
-    of the real wall clock. Bound to ``IMAP_MCP_FAKE_NOW_UTC``."""
-
     fake_now_file: str | None = None
-    """Path to a file holding an ISO-8601 UTC timestamp. Unlike
-    ``fake_now_utc`` the file is re-read on every ``audit._now_utc``
-    call, so a scenario can move the clock of an already running
-    server (and of several servers at once) across a day boundary.
-    Takes precedence over ``fake_now_utc`` while the file exists and
-    parses. Bound to ``IMAP_MCP_FAKE_NOW_FILE``."""
-
-    oauth_inject_error: str | None = None
-    """If set, the OAuth refresh flow raises with this error code
-    before talking to the token endpoint. Bound to
-    ``IMAP_MCP_TEST_OAUTH_INJECT_ERROR``."""
-
-    oauth_token_lifetime_override: int | None = None
-    """Seconds. Overrides ``expires_in`` returned by the token
-    endpoint. Bound to ``IMAP_MCP_TEST_TOKEN_LIFETIME``."""
-
-    tamper_pkce: bool = False
-    """If true, the PKCE challenge is computed over a fixed wrong
-    string so the server rejects the bootstrap. Bound to
-    ``IMAP_MCP_TEST_TAMPER_PKCE``."""
-
-    append_timeout_override: int | None = None
-    """Seconds. Overrides the default 60s append timeout. Bound to
-    ``IMAP_MCP_APPEND_TIMEOUT``."""
-
     saga_crash_at: str | None = None
-    """Saga step name. When the named step is about to execute, the
-    saga process terminates with ``os._exit(1)``. Bound to
-    ``IMAP_MCP_CRASH_AT``."""
-
-    saga_pause_at: str | None = None
-    """Saga step name. When the named step is about to execute, the
-    saga writes a marker file and polls for a ``.resume`` sibling
-    before continuing. Bound to ``IMAP_MCP_SAGA_PAUSE_AT``."""
-
     saga_pause_marker: str | None = None
-    """Path to the marker file used together with ``saga_pause_at``.
-    Bound to ``IMAP_MCP_SAGA_PAUSE_MARKER``."""
+    saga_resume_file: str | None = None
+    test_inject_internal_error: str | None = None
+
+    # Secondary test helpers retained for BDD/mocks under active test_mode
+    oauth_inject_error: str | None = None
+    oauth_token_lifetime_override: int | None = None
+    tamper_pkce: bool = False
+    append_timeout_override: int | None = None
+    saga_pause_at: str | None = None
 
     @classmethod
     def from_environment(cls) -> TestHooks:
-        """Read every IMAP_MCP_TEST_* env var once at startup."""
+        enforce_test_mode_startup_gate()
+        test_mode = os.environ.get("IMAP_MCP_TEST_MODE") == "1"
+        if not test_mode:
+            return TestHooks(test_mode=False)
 
         def _int_or_none(value: str | None) -> int | None:
             return int(value) if value else None
 
-        return cls(
-            test_mode=os.environ.get("IMAP_MCP_TEST_MODE") == "1",
+        return TestHooks(
+            test_mode=True,
             fake_now_utc=os.environ.get("IMAP_MCP_FAKE_NOW_UTC") or None,
             fake_now_file=os.environ.get("IMAP_MCP_FAKE_NOW_FILE") or None,
+            saga_crash_at=os.environ.get("IMAP_MCP_CRASH_AT") or None,
+            saga_pause_marker=os.environ.get("IMAP_MCP_SAGA_PAUSE_MARKER") or None,
+            saga_resume_file=os.environ.get("IMAP_MCP_SAGA_RESUME_FILE") or None,
+            test_inject_internal_error=os.environ.get("IMAP_MCP_TEST_INJECT_INTERNAL_ERROR")
+            or None,
             oauth_inject_error=os.environ.get("IMAP_MCP_TEST_OAUTH_INJECT_ERROR") or None,
             oauth_token_lifetime_override=_int_or_none(
                 os.environ.get("IMAP_MCP_TEST_TOKEN_LIFETIME")
             ),
             tamper_pkce=bool(os.environ.get("IMAP_MCP_TEST_TAMPER_PKCE")),
             append_timeout_override=_int_or_none(os.environ.get("IMAP_MCP_APPEND_TIMEOUT")),
-            saga_crash_at=os.environ.get("IMAP_MCP_CRASH_AT") or None,
             saga_pause_at=os.environ.get("IMAP_MCP_SAGA_PAUSE_AT") or None,
-            saga_pause_marker=os.environ.get("IMAP_MCP_SAGA_PAUSE_MARKER") or None,
         )
 
 
-# Process-global singleton. Set once at server startup by
-# context._build_context(); deeply-nested helpers (audit, saga,
-# imap_core) read it instead of reaching into os.environ themselves.
 _GLOBAL_HOOKS: TestHooks = TestHooks()
 
 
 def get_global_hooks() -> TestHooks:
-    """Return the active process-global TestHooks instance.
-
-    Defaults to an all-disabled TestHooks() until the server startup
-    path calls set_global_hooks().
-    """
     return _GLOBAL_HOOKS
 
 
 def set_global_hooks(hooks: TestHooks) -> None:
-    """Replace the process-global TestHooks. Called once from
-    ``_build_context`` after parsing the environment. Tests that
-    bypass the normal startup path may call this directly to scope
-    behaviour for a single scenario.
-    """
     global _GLOBAL_HOOKS
     _GLOBAL_HOOKS = hooks

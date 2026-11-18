@@ -1,18 +1,24 @@
-"""Listing/search handlers: search, list_messages, plus criteria helpers.
+"""Listing/search handlers: search, list_messages.
 
-ADR 0024 anchors the duration grammar; ADR 0026 introduces the explicit
-`scope` argument and renames `default_scope` to `applied_scope`; ADR 0036
-adds the calendar bounds `since`/`before` and `outside_scope_total`.
+Adheres to:
+- ADR 0040: Google multi-label composition, opaque object_id
+- ADR 0041: Closed 18-predicate direction-aware grammar with UTC INTERNALDATE comparisons
+- ADR 0043: Non-interference transparency — removal of matched_total, filtered_out, outside_scope_total
+- ADR 0044: Normalized response envelope and folder_absent / select_failed handling
 """
 
 from __future__ import annotations
 
 import math
-import re
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, TypedDict
 
-from ..imap_core import FolderNotSelectable
+from ..config import parse_duration_seconds
+from ..imap_core import (
+    Envelope,
+    FolderNotSelectable,
+    search_uids_with_validity,
+)
 from ..imap_core import (
     count_uids as imap_count_uids,
 )
@@ -20,20 +26,35 @@ from ..imap_core import (
     fetch_envelopes_batch as imap_fetch_envelopes_batch,
 )
 from ..imap_core import (
-    gmail_fetch_msgid as imap_gmail_fetch_msgid,
-)
-from ..imap_core import (
-    gmail_search_by_msgid as imap_gmail_search_by_msgid,
+    folder_stats as imap_folder_stats,
 )
 from ..imap_core import (
     search_uids as imap_search_uids,
 )
+
+__all__ = [
+    "AppliedScope",
+    "Completeness",
+    "ListMessagesResponse",
+    "ScopedSearch",
+    "SearchResponse",
+    "_criteria_match",
+    "_criteria_to_imap_search",
+    "_scoped_search",
+    "handle_list_messages",
+    "handle_search",
+    "imap_count_uids",
+    "imap_search_uids",
+    "parse_calendar_date",
+    "validate_calendar_bounds",
+]
 from ..policy import (
     MessageFacts,
-    _match_single_predicate,
-    evaluate_message_against_folder,
     level_rank,
-    parse_duration,
+    match_single_predicate,
+    normalize_domain,
+    rank_to_level,
+    req_vis,
 )
 from ._common import (
     _facts_from_envelope,
@@ -48,137 +69,85 @@ if TYPE_CHECKING:
 
 
 AppliedScope = Literal["recent_7d", "explicit_window", "all_time"]
-
-
-class GmailSearchEntry(TypedDict, total=False):
-    uid: int
-    gm_msgid: NotRequired[int]
-    canonical_all_mail_uid: NotRequired[int]
+Completeness = Literal["complete", "policy_may_hide", "window_limited", "window_and_policy_limited"]
 
 
 class SearchResponse(TypedDict, total=False):
     decision: Literal["ALLOW", "DENY"]
+    result: NotRequired[Literal["OK", "ERROR"]]
     reason: NotRequired[str]
+    error: NotRequired[dict[str, str]]
     account: str
     folder: str
     uids: NotRequired[list[int]]
-    matched_total: NotRequired[int]
-    matched_visible: NotRequired[int]
-    filtered_out: NotRequired[int]
+    total_visible: NotRequired[int]
+    returned_count: NotRequired[int]
     page_offset: NotRequired[int]
     page_limit: NotRequired[int]
     has_more: NotRequired[bool]
     applied_scope: NotRequired[AppliedScope]
-    outside_scope_total: NotRequired[int]
-    gmail_results: NotRequired[list[GmailSearchEntry]]
-
-
-# Functional TypedDict form so the JSON-wire key `from` can be expressed
-# as the Python-keyword key, eliminating the old `from_` placeholder
-# (ADR 0026 §4).
-MessageEntry = TypedDict(
-    "MessageEntry",
-    {
-        "uid": int,
-        "from": str,
-        "to": list[str],
-        "subject": str,
-        "date": str | None,
-        "has_attachment": bool,
-        "size_bytes": int,
-    },
-)
+    completeness: NotRequired[Completeness]
+    _suppressed_by_policy: NotRequired[bool]
 
 
 class ListMessagesResponse(TypedDict, total=False):
     decision: Literal["ALLOW", "DENY"]
+    result: NotRequired[Literal["OK", "ERROR"]]
     reason: NotRequired[str]
+    error: NotRequired[dict[str, str]]
     account: str
     folder: str
     messages: NotRequired[list[dict[str, Any]]]
-    matched_total: NotRequired[int]
-    matched_visible: NotRequired[int]
-    filtered_out: NotRequired[int]
+    total_visible: NotRequired[int]
+    returned_count: NotRequired[int]
     page_offset: NotRequired[int]
     page_limit: NotRequired[int]
     has_more: NotRequired[bool]
     applied_scope: NotRequired[AppliedScope]
-    outside_scope_total: NotRequired[int]
+    completeness: NotRequired[Completeness]
+    _suppressed_by_policy: NotRequired[bool]
 
 
-def _deny_search(*, reason: str, account: str, folder: str) -> SearchResponse:
-    return {"decision": "DENY", "reason": reason, "account": account, "folder": folder}
-
-
-def _deny_list_messages(*, reason: str, account: str, folder: str) -> ListMessagesResponse:
-    return {"decision": "DENY", "reason": reason, "account": account, "folder": folder}
-
-
-# ADR 0024 durations are relative to now; ADR 0036 calendar bounds are
-# ISO dates with IMAP SEARCH SINCE / BEFORE semantics (RFC 3501 §6.4.4).
-_DURATION_KEYS = ("newer_than", "older_than")
-_CALENDAR_KEYS = ("since", "before")
-_CALENDAR_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-# The default window of ADR 0026 §5.
 RECENT_WINDOW_DAYS = 7
-# Criteria the IMAP SEARCH answers exactly, so no envelope is needed to
-# post-filter them. Durations are absent because sub-day rounding
-# (ADR 0024) makes the IMAP layer over-fetch.
-_ENVELOPE_FREE_KEYS = frozenset(
-    {
-        "from",
-        "from_domain",
-        "to",
-        "to_contains",
-        "subject_contains",
-        "size_gt",
-        "size_lt",
-        "flagged",
-        *_CALENDAR_KEYS,
-    }
-)
 _IMAP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
-def parse_calendar_date(value: object) -> date | None:
-    """Return the day an ISO `YYYY-MM-DD` string names, None otherwise.
+def _imap_date(day: date) -> str:
+    return f"{day.day:02d}-{_IMAP_MONTHS[day.month - 1]}-{day.year}"
 
-    Impossible days such as 2026-02-30 are None too.
-    """
-    if not isinstance(value, str) or not _CALENDAR_DATE_RE.fullmatch(value):
+
+def parse_calendar_date(value: object) -> date | None:
+    if not isinstance(value, str):
         return None
     try:
+        # Strictly enforce YYYY-MM-DD
+        parts = value.split("-")
+        if len(parts) != 3 or len(parts[0]) != 4 or len(parts[1]) != 2 or len(parts[2]) != 2:
+            return None
         return date.fromisoformat(value)
     except ValueError:
         return None
 
 
-def validate_calendar_bounds(criteria: dict[str, Any]) -> str | None:
-    """Check the calendar bounds of `criteria` (ADR 0036).
+def _criteria_match(criteria: dict[str, Any], facts: Any) -> bool:
+    return all(match_single_predicate(k, v, facts=facts) for k, v in criteria.items())
 
-    Returns the invalid-arguments message, or None when the criteria may
-    reach IMAP. Runs before any IMAP command.
-    """
+
+def validate_calendar_bounds(criteria: dict[str, Any]) -> str | None:
     bounds: dict[str, date] = {}
-    for key in _CALENDAR_KEYS:
+    for key in ("since", "before"):
         if key not in criteria:
             continue
         parsed = parse_calendar_date(criteria[key])
         if parsed is None:
-            return (
-                f"Invalid criteria.{key} {criteria[key]!r}: must be an ISO calendar "
-                "date YYYY-MM-DD (ADR 0036)"
-            )
+            return f"Invalid criteria.{key} {criteria[key]!r}: must be an ISO calendar date YYYY-MM-DD (ADR 0036)"
         bounds[key] = parsed
-    if not bounds:
-        return None
+
     if "since" in bounds and "before" in bounds and bounds["since"] >= bounds["before"]:
-        return (
-            f"criteria.since {criteria['since']!r} must be earlier than "
-            f"criteria.before {criteria['before']!r} (ADR 0036)"
-        )
-    durations = [key for key in _DURATION_KEYS if key in criteria]
-    if durations:
+        return f"criteria.since {criteria['since']!r} must be strictly earlier than criteria.before {criteria['before']!r}"
+
+    durations = [k for k in ("newer_than", "older_than") if k in criteria]
+    if bounds and durations:
         return (
             f"criteria cannot combine the calendar bound {', '.join(bounds)} with "
             f"the duration {', '.join(durations)} (ADR 0036)"
@@ -186,240 +155,355 @@ def validate_calendar_bounds(criteria: dict[str, Any]) -> str | None:
     return None
 
 
-def _imap_date(day: date) -> str:
-    """RFC 3501 `date` (e.g. `26-Oct-2026`), independent of the locale."""
-    return f"{day.day:02d}-{_IMAP_MONTHS[day.month - 1]}-{day.year}"
-
-
-def _criteria_match(criteria: dict[str, Any], facts: MessageFacts) -> bool:
-    """Post-filter: check all MCP criteria against envelope facts.
-
-    Catches predicates that cannot be expressed as IMAP SEARCH terms
-    (e.g. has_attachment) and refines inexact IMAP matches. Calendar
-    bounds are skipped: they compare the IMAP internal date, which only
-    the IMAP SEARCH sees, and it answers them exactly.
-    """
-    return all(
-        _match_single_predicate(key, value, facts=facts)
-        for key, value in criteria.items()
-        if key not in _CALENDAR_KEYS
-    )
-
-
 def _criteria_to_imap_search(criteria: dict[str, Any]) -> str:
-    """Translate MCP search criteria dict to an IMAP SEARCH string.
-
-    Duration values are parsed via the single grammar source
-    (`policy.parse_duration`).  Sub-day values are rounded to whole days
-    in the over-inclusive direction so the IMAP-layer result is always
-    a superset of the true match set; the per-message post-filter in
-    `_criteria_match` then narrows the window back to second resolution.
-    See ADR 0024. Calendar bounds map one-to-one onto SINCE / BEFORE
-    (ADR 0036); `validate_calendar_bounds` has checked them already.
-    """
+    """IMAP SEARCH translation with +/- 1 day padding for UTC timezone independence (ADR 0041)."""
     from ..audit import _now_utc
 
     parts: list[str] = []
+    now = _now_utc()
+
     for key, value in criteria.items():
-        if key == "from":
+        if key == "from_address":
             parts.append(f'FROM "{value}"')
         elif key == "from_domain":
-            parts.append(f'FROM "@{value}"')
-        elif key == "to" or key == "to_contains":
+            parts.append(f'FROM "@{normalize_domain(str(value))}"')
+        elif key == "to_address":
             parts.append(f'TO "{value}"')
+        elif key == "to_domain":
+            parts.append(f'TO "@{normalize_domain(str(value))}"')
+        elif key == "recipient_address":
+            parts.append(f'OR TO "{value}" CC "{value}"')
+        elif key == "recipient_domain":
+            dom = normalize_domain(str(value))
+            parts.append(f'OR TO "@{dom}" CC "@{dom}"')
+        elif key == "cc_address":
+            parts.append(f'CC "{value}"')
+        elif key == "cc_domain":
+            parts.append(f'CC "@{normalize_domain(str(value))}"')
         elif key == "subject_contains":
             parts.append(f'SUBJECT "{value}"')
-        elif key == "newer_than":
-            seconds = parse_duration(str(value))
-            days = max(1, math.ceil(seconds / 86400))
-            since = _now_utc() - timedelta(days=days)
-            parts.append(f"SINCE {_imap_date(since)}")
-        elif key == "older_than":
-            seconds = parse_duration(str(value))
-            days = max(0, math.floor(seconds / 86400))
-            before = _now_utc() - timedelta(days=days)
-            parts.append(f"BEFORE {_imap_date(before)}")
-        elif key == "since":
-            parts.append(f"SINCE {_imap_date(date.fromisoformat(str(value)))}")
-        elif key == "before":
-            parts.append(f"BEFORE {_imap_date(date.fromisoformat(str(value)))}")
+        elif key == "flagged":
+            parts.append("FLAGGED" if bool(value) else "UNFLAGGED")
         elif key == "size_gt":
             parts.append(f"LARGER {int(value)}")
         elif key == "size_lt":
             parts.append(f"SMALLER {int(value)}")
-        elif key == "flagged":
-            if bool(value):
-                parts.append("FLAGGED")
-            else:
-                parts.append("UNFLAGGED")
-        elif key == "has_attachment":
-            pass
+        elif key == "newer_than":
+            sec = parse_duration_seconds(str(value))
+            # Pad by 1 extra day to be superset
+            days = max(1, math.ceil(sec / 86400)) + 1
+            since_day = (now - timedelta(days=days)).date()
+            parts.append(f"SINCE {_imap_date(since_day)}")
+        elif key == "older_than":
+            sec = parse_duration_seconds(str(value))
+            days = max(0, math.floor(sec / 86400)) - 1
+            if days >= 0:
+                before_day = (now - timedelta(days=days)).date()
+                parts.append(f"BEFORE {_imap_date(before_day)}")
+        elif key == "since":
+            d = date.fromisoformat(str(value)) - timedelta(days=1)
+            parts.append(f"SINCE {_imap_date(d)}")
+        elif key == "before":
+            d = date.fromisoformat(str(value)) + timedelta(days=1)
+            parts.append(f"BEFORE {_imap_date(d)}")
+
     if not parts:
         return "ALL"
     return " ".join(parts)
 
 
 class ScopedSearch(NamedTuple):
-    """The IMAP SEARCH strings for one criteria/scope pair."""
-
     applied_scope: AppliedScope
     imap_criteria: str
-    # The same criteria before the default window starts; set exactly
-    # when applied_scope is recent_7d (ADR 0036).
-    outside_criteria: str | None
-
-
-def _join_search(criteria: str, term: str) -> str:
-    return term if criteria == "ALL" else f"{criteria} {term}"
+    outside_criteria: str | None = None
 
 
 def _scoped_search(
     criteria: dict[str, Any], scope_arg: str | None, *, now: datetime | None = None
 ) -> ScopedSearch:
-    """Decide the time scope (ADR 0026 §5) and build the IMAP searches.
-
-    Any time bound in `criteria` makes the window explicit; otherwise
-    `scope` picks all time or the seven-day default. SINCE and BEFORE
-    on the same window start split the matches without overlap, so the
-    outside search counts exactly what the window hid.
-    """
     base = _criteria_to_imap_search(criteria)
-    if any(key in criteria for key in (*_DURATION_KEYS, *_CALENDAR_KEYS)):
+    has_time = any(k in criteria for k in ("newer_than", "older_than", "since", "before"))
+
+    if has_time:
         return ScopedSearch("explicit_window", base, None)
     if (scope_arg or "recent").lower() == "all":
         return ScopedSearch("all_time", base, None)
+
+    # 7-day default window
     if now is None:
         from ..audit import _now_utc
 
         now = _now_utc()
-    window_start = _imap_date(now - timedelta(days=RECENT_WINDOW_DAYS))
-    return ScopedSearch(
-        "recent_7d",
-        _join_search(base, f"SINCE {window_start}"),
-        _join_search(base, f"BEFORE {window_start}"),
+    window_start = (now - timedelta(days=RECENT_WINDOW_DAYS)).date()
+    imap_start = _imap_date(window_start)
+    since_term = f"SINCE {imap_start}"
+    before_term = f"BEFORE {imap_start}"
+    joined_since = since_term if base == "ALL" else f"{base} {since_term}"
+    joined_before = before_term if base == "ALL" else f"{base} {before_term}"
+    return ScopedSearch("recent_7d", joined_since, joined_before)
+
+
+async def _run_search_pipeline(
+    context: ServerContext,
+    arguments: dict[str, Any],
+    tool_floor_level: str,
+    *,
+    is_search_tool: bool = False,
+) -> tuple[Any, Any, Any, Any, list[Any], ScopedSearch, str, Completeness, bool]:
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+    criteria_raw = arguments.get("criteria") or {}
+    scope_arg = arguments.get("scope")
+
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        raise _DenialException(folder_decision.reason)
+
+    assert folder_decision.folder_policy is not None
+    fp = folder_decision.folder_policy
+
+    required_floor = max(level_rank(tool_floor_level), level_rank(req_vis(criteria_raw)))
+    max_vis = context.pdp.folder_max_visibility(fp)
+    if level_rank(max_vis) < required_floor:
+        needed = rank_to_level(required_floor)
+        raise _DenialException(f"visibility_below_{needed}")
+
+    account, password = await _password_for(context, account_id)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+
+    stats = await imap_folder_stats(account, password, imap_folder)
+    if stats.kind == "absent":
+        raise _FolderAbsentException(f"Folder {folder_path} absent")
+    if stats.kind == "select_failed":
+        raise _SelectFailedException(stats.imap_response or f"SELECT {folder_path} failed")
+
+    scoped = _scoped_search(criteria_raw, scope_arg)
+
+    try:
+        raw_uids, uv = await search_uids_with_validity(
+            account, password, imap_folder, scoped.imap_criteria
+        )
+        if uv is not None and getattr(context, "session_uidvalidity", None) is not None:
+            context.session_uidvalidity[(account_id, folder_path)] = uv
+    except FolderNotSelectable as exc:
+        raise _SelectFailedException(exc.response_text or str(exc)) from exc
+    except Exception as exc:
+        raise _SelectFailedException(str(exc)) from exc
+
+    # Fast path check (LIM 0023, ADR 0043)
+    fast_path_allowed = (
+        is_search_tool
+        and tool_floor_level == "METADATA"
+        and not _is_google_provider(account)
+        and fp.mode == "blacklist"
+        and len(fp.rules) == 0
+        and level_rank(fp.default) >= required_floor
+        and scoped.applied_scope == "all_time"
+        and not any(
+            k in criteria_raw
+            for k in (
+                "has_attachment",
+                "all_recipients_in_domains",
+                "newer_than",
+                "older_than",
+                "since",
+                "before",
+            )
+        )
     )
+    if fast_path_allowed:
+        sorted_uids = sorted(raw_uids)
+        visible_envelopes: list[tuple[Any, MessageFacts, str]] = []
+        for u in sorted_uids:
+            dummy_env = Envelope(
+                uid=u,
+                from_address="",
+                to_addresses=[],
+                subject="",
+                message_id="",
+                date=None,
+                flags=(),
+            )
+            dummy_facts = _facts_from_envelope(dummy_env)
+            visible_envelopes.append((dummy_env, dummy_facts, "folder_default_applied"))
+        may_hide = context.pdp.folder_may_hide(account_id, folder_path, fp)
+        completeness: Completeness = (
+            ("window_and_policy_limited" if may_hide else "window_limited")
+            if scoped.applied_scope == "recent_7d"
+            else ("policy_may_hide" if may_hide else "complete")
+        )
+        suppressed_by_policy = False
+        top_reason = "folder_default_applied"
+        return (
+            account,
+            imap_folder,
+            fp,
+            [],
+            visible_envelopes,
+            scoped,
+            top_reason,
+            completeness,
+            suppressed_by_policy,
+        )
+
+    # Envelopes batch fetch
+    envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, raw_uids)
+    env_by_uid = {e.uid: e for e in envelopes}
+
+    from ..audit import _now_utc
+
+    now_utc = _now_utc()
+
+    suppressed_by_policy = False
+    visible_envelopes = []
+
+    _is_google_provider(account)
+
+    for uid in sorted(raw_uids):
+        env = env_by_uid.get(uid)
+        if env is None:
+            continue
+        facts = _facts_from_envelope(env)
+
+        if _is_google_provider(account):
+            from dataclasses import replace
+
+            canonical_curr = context.pdp.canonical_folder(account_id, folder_path)
+            if (
+                canonical_curr not in ("[Gmail]/All Mail", "[Gmail]/Starred", "[Gmail]/Important")
+                and canonical_curr not in facts.labels
+            ):
+                facts = replace(facts, labels=facts.labels + (canonical_curr,))
+
+        if any("provenance" in r.match for r in fp.rules):
+            from dataclasses import replace
+
+            from ._common import resolve_provenance_own
+
+            is_own = await resolve_provenance_own(context, account, password, imap_folder, uid, env)
+            if is_own:
+                facts = replace(facts, provenance_own=True)
+
+        # Effective visibility check
+        eff_vis, eff_reason = context.pdp.evaluate_message_effective(
+            context.caller_id, account_id, folder_path, facts, now_utc=now_utc
+        )
+
+        if level_rank(eff_vis) < required_floor:
+            suppressed_by_policy = True
+            continue
+
+        # Exact UTC criteria check
+        if criteria_raw:
+            matches_criteria = all(
+                match_single_predicate(k, v, facts=facts, now_utc=now_utc)
+                for k, v in criteria_raw.items()
+            )
+            if not matches_criteria:
+                continue
+
+        visible_envelopes.append((env, facts, eff_reason))
+
+    # Derive static completeness (ADR 0043 §2)
+    may_hide = context.pdp.folder_may_hide(account_id, folder_path, fp)
+    if scoped.applied_scope == "recent_7d":
+        completeness = "window_and_policy_limited" if may_hide else "window_limited"
+    else:
+        completeness = "policy_may_hide" if may_hide else "complete"
+
+    top_reason = (
+        "rule_matched"
+        if (fp.mode == "whitelist" and visible_envelopes)
+        else "folder_default_applied"
+    )
+
+    return (
+        account,
+        imap_folder,
+        fp,
+        envelopes,
+        visible_envelopes,
+        scoped,
+        top_reason,
+        completeness,
+        suppressed_by_policy,
+    )
+
+
+class _DenialException(Exception):
+    def __init__(self, reason: str):
+        self.reason = reason
+
+
+class _FolderAbsentException(Exception):
+    pass
+
+
+class _SelectFailedException(Exception):
+    def __init__(self, detail: str):
+        self.detail = detail
 
 
 async def handle_search(context: ServerContext, arguments: dict[str, Any]) -> SearchResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
-    criteria_raw = arguments.get("criteria") or {}
     limit = int(arguments.get("limit") or 50)
     offset = int(arguments.get("offset") or 0)
-    scope_arg = arguments.get("scope")
-    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
-    if not folder_decision.allowed:
-        return _deny_search(reason=folder_decision.reason, account=account_id, folder=folder_path)
-    assert folder_decision.folder_policy is not None
-    minimum_for_tool = level_rank("METADATA")
-    if (
-        level_rank(folder_decision.visibility) < minimum_for_tool
-        and not any(
-            level_rank(rule.grant) >= minimum_for_tool
-            for rule in folder_decision.folder_policy.rules
-            if rule.grant is not None
+
+    try:
+        (
+            _account,
+            _imap_folder,
+            _fp,
+            _envelopes,
+            visible_envelopes,
+            scoped,
+            top_reason,
+            completeness,
+            suppressed_by_policy,
+        ) = await _run_search_pipeline(context, arguments, "METADATA", is_search_tool=True)
+    except _DenialException as e:
+        return {
+            "decision": "DENY",
+            "reason": e.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    except _FolderAbsentException:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="folder_absent",
+            detail="Folder does not exist on IMAP server",
+            extra={"account": account_id, "folder": folder_path},
         )
-        and folder_decision.folder_policy.mode == "whitelist"
-    ):
-        return _deny_search(
-            reason="visibility_below_METADATA", account=account_id, folder=folder_path
+    except _SelectFailedException as e:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="select_failed",
+            detail=e.detail,
+            extra={"account": account_id, "folder": folder_path},
         )
 
-    scoped = _scoped_search(criteria_raw, scope_arg)
+    all_uids = [env.uid for env, _, _ in visible_envelopes]
+    page_uids = all_uids[offset : offset + limit]
+    has_more = (offset + limit) < len(all_uids)
 
-    account, password = await _password_for(context, account_id)
-    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    all_uids = await imap_search_uids(account, password, imap_folder, scoped.imap_criteria)
-    matched_total = len(all_uids)
-    outside_scope_total: int | None = None
-    if scoped.outside_criteria is not None:
-        try:
-            outside_scope_total = await imap_count_uids(
-                account, password, imap_folder, scoped.outside_criteria
-            )
-        except FolderNotSelectable:
-            # ADR 0025: an authorized folder that does not exist is
-            # folder_absent, not an empty result.
-            return error_envelope(  # type: ignore[return-value]
-                error_type="folder_absent",
-                reason=folder_decision.reason,
-                extra={"account": account_id, "folder": folder_path},
-            )
-
-    fp = folder_decision.folder_policy
-    pdp_predetermined = (
-        fp.mode == "blacklist" and not fp.rules and level_rank(fp.default) >= minimum_for_tool
-    )
-    criteria_needs_envelope = criteria_raw and any(
-        k not in _ENVELOPE_FREE_KEYS for k in criteria_raw
-    )
-
-    if pdp_predetermined and not criteria_needs_envelope:
-        visible_uids = list(all_uids)
-    else:
-        all_envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, all_uids)
-        envelope_by_uid = {e.uid: e for e in all_envelopes}
-        visible_uids = []
-        for candidate_uid in all_uids:
-            envelope = envelope_by_uid.get(candidate_uid)
-            if envelope is None:
-                continue
-            facts = _facts_from_envelope(envelope)
-            if criteria_raw and not _criteria_match(criteria_raw, facts):
-                continue
-            message_decision = evaluate_message_against_folder(fp, facts=facts)
-            if (
-                message_decision.allowed
-                and level_rank(message_decision.visibility) >= minimum_for_tool
-            ):
-                visible_uids.append(candidate_uid)
-    filtered_out = matched_total - len(visible_uids)
-
-    all_visible = visible_uids
-    page = all_visible[offset : offset + limit]
-    has_more = (offset + limit) < len(all_visible)
-
-    results_with_gmail: list[GmailSearchEntry] | None = None
-    account_obj = context.account_by_id(account_id)
-    if account_obj is not None and _is_google_provider(account_obj) and page and len(page) <= 10:
-        results_with_gmail = []
-        for vuid in page:
-            entry: GmailSearchEntry = {"uid": vuid}
-            try:
-                gm_msgid = await imap_gmail_fetch_msgid(account, password, imap_folder, vuid)
-                if gm_msgid is not None:
-                    entry["gm_msgid"] = gm_msgid
-                    imap_all_mail = await _resolve_imap_folder(
-                        context, account_id, "[Gmail]/All Mail"
-                    )
-                    all_mail_hits = await imap_gmail_search_by_msgid(
-                        account, password, imap_all_mail, gm_msgid
-                    )
-                    if all_mail_hits:
-                        entry["canonical_all_mail_uid"] = all_mail_hits[0]
-            except Exception:  # noqa: BLE001, S110 - canonical UID is optional
-                pass
-            results_with_gmail.append(entry)
-
-    result: SearchResponse = {
+    res: SearchResponse = {
         "decision": "ALLOW",
-        "reason": "rule_matched" if all_visible else "folder_default_applied",
+        "result": "OK",
+        "reason": top_reason,
         "account": account_id,
         "folder": folder_path,
-        "uids": page,
-        "matched_total": matched_total,
-        "matched_visible": len(all_visible),
-        "filtered_out": filtered_out,
+        "uids": page_uids,
+        "total_visible": len(all_uids),
+        "returned_count": len(page_uids),
         "page_offset": offset,
         "page_limit": limit,
         "has_more": has_more,
         "applied_scope": scoped.applied_scope,
+        "completeness": completeness,
     }
-    if outside_scope_total is not None:
-        result["outside_scope_total"] = outside_scope_total
-    if results_with_gmail is not None:
-        result["gmail_results"] = results_with_gmail
-    return result
+    if suppressed_by_policy:
+        res["_suppressed_by_policy"] = True
+    return res
 
 
 async def handle_list_messages(
@@ -427,131 +511,111 @@ async def handle_list_messages(
 ) -> ListMessagesResponse:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
-    criteria_raw = arguments.get("criteria") or {}
     limit = int(arguments.get("limit") or 20)
     offset = int(arguments.get("offset") or 0)
-    scope_arg = arguments.get("scope")
 
-    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
-    if not folder_decision.allowed:
-        return _deny_list_messages(
-            reason=folder_decision.reason, account=account_id, folder=folder_path
+    try:
+        (
+            account,
+            _imap_folder,
+            _fp,
+            _envelopes,
+            visible_envelopes,
+            scoped,
+            top_reason,
+            completeness,
+            suppressed_by_policy,
+        ) = await _run_search_pipeline(context, arguments, "METADATA")
+    except _DenialException as e:
+        return {
+            "decision": "DENY",
+            "reason": e.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    except _FolderAbsentException:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="folder_absent",
+            detail="Folder does not exist on IMAP server",
+            extra={"account": account_id, "folder": folder_path},
         )
-    assert folder_decision.folder_policy is not None
-    minimum_for_tool = level_rank("METADATA")
-    fp = folder_decision.folder_policy
-    if (
-        level_rank(fp.default) < minimum_for_tool
-        and not any(
-            level_rank(rule.grant) >= minimum_for_tool
-            for rule in fp.rules
-            if rule.grant is not None
-        )
-        and fp.mode == "whitelist"
-    ):
-        return _deny_list_messages(
-            reason="visibility_below_METADATA", account=account_id, folder=folder_path
+    except _SelectFailedException as e:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="select_failed",
+            detail=e.detail,
+            extra={"account": account_id, "folder": folder_path},
         )
 
-    scoped = _scoped_search(criteria_raw, scope_arg)
-
-    account, password = await _password_for(context, account_id)
-    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    all_uids = await imap_search_uids(account, password, imap_folder, scoped.imap_criteria)
-    matched_total = len(all_uids)
-    outside_scope_total: int | None = None
-    if scoped.outside_criteria is not None:
-        try:
-            outside_scope_total = await imap_count_uids(
-                account, password, imap_folder, scoped.outside_criteria
-            )
-        except FolderNotSelectable:
-            # ADR 0025: an authorized folder that does not exist is
-            # folder_absent, not an empty result.
-            return error_envelope(  # type: ignore[return-value]
-                error_type="folder_absent",
-                reason=folder_decision.reason,
-                extra={"account": account_id, "folder": folder_path},
-            )
-
-    pdp_predetermined = (
-        fp.mode == "blacklist" and not fp.rules and level_rank(fp.default) >= minimum_for_tool
-    )
-    criteria_needs_envelope = criteria_raw and any(
-        k not in _ENVELOPE_FREE_KEYS for k in criteria_raw
-    )
-
-    if pdp_predetermined and not criteria_needs_envelope:
-        visible_uids = list(all_uids)
-        all_envelopes_map: dict[int, Any] = {}
-    else:
-        all_envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, all_uids)
-        all_envelopes_map = {e.uid: e for e in all_envelopes}
-        visible_uids = []
-        for candidate_uid in all_uids:
-            envelope = all_envelopes_map.get(candidate_uid)
-            if envelope is None:
-                continue
-            facts = _facts_from_envelope(envelope)
-            if criteria_raw and not _criteria_match(criteria_raw, facts):
-                continue
-            message_decision = evaluate_message_against_folder(fp, facts=facts)
-            if (
-                message_decision.allowed
-                and level_rank(message_decision.visibility) >= minimum_for_tool
-            ):
-                visible_uids.append(candidate_uid)
-    filtered_out = matched_total - len(visible_uids)
-
-    page_uids = visible_uids[offset : offset + limit]
-    has_more = (offset + limit) < len(visible_uids)
-
-    if all_envelopes_map:
-        envelope_by_uid = {u: all_envelopes_map[u] for u in page_uids if u in all_envelopes_map}
-    else:
-        envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, page_uids)
-        envelope_by_uid = {e.uid: e for e in envelopes}
+    page_items = visible_envelopes[offset : offset + limit]
+    has_more = (offset + limit) < len(visible_envelopes)
 
     messages: list[dict[str, Any]] = []
-    for uid in page_uids:
-        env = envelope_by_uid.get(uid)
-        if env is None:
-            continue
-        # Surface user-set keywords as `tags` so the bulk_mark_tagged
-        # verification path can read them back. System flags (Seen,
-        # Flagged, Draft, Deleted, Recent) are excluded — the caller
-        # cares about its own tag operations, not the IMAP machinery.
-        _SYSTEM_FLAGS = frozenset(
-            {"\\Seen", "\\Flagged", "\\Draft", "\\Deleted", "\\Recent", "\\Answered"}
-        )
-        tags = [f for f in (env.flags or ()) if f not in _SYSTEM_FLAGS]
-        messages.append(
-            {
-                "uid": env.uid,
-                "from": env.from_address,
-                "to": env.to_addresses,
-                "subject": env.subject,
-                "date": env.date,
-                "has_attachment": env.has_attachment,
-                "size_bytes": env.size_bytes,
-                "tags": tags,
-            }
-        )
+    _SYSTEM_FLAGS = frozenset(
+        {"\\Seen", "\\Flagged", "\\Draft", "\\Deleted", "\\Recent", "\\Answered"}
+    )
 
-    result: ListMessagesResponse = {
+    for env, facts, eff_reason in page_items:
+        eff_vis, _ = context.pdp.evaluate_message_effective(
+            context.caller_id, account_id, folder_path, facts
+        )
+        vis_rank = level_rank(eff_vis)
+
+        # Tags (user keywords)
+        raw_flags = env.flags or ()
+        tags = [f for f in raw_flags if f not in _SYSTEM_FLAGS]
+
+        entry: dict[str, Any] = {
+            "uid": env.uid,
+            "date": env.date,
+            "size_bytes": env.size_bytes,
+            "tags": tags,
+        }
+
+        # Deterministic projection based on eff_vis (ADR 0043 §3.2)
+        if vis_rank == level_rank("METADATA"):
+            entry["from"] = None
+            entry["subject"] = None
+            entry["has_attachment"] = None
+            entry["redacted_fields"] = ["envelope", "headers", "body", "attachments"]
+        elif vis_rank == level_rank("ENVELOPE"):
+            entry["from"] = env.from_address
+            entry["to"] = env.to_addresses
+            entry["subject"] = env.subject
+            entry["has_attachment"] = None
+            entry["redacted_fields"] = ["headers", "body", "attachments"]
+        else:  # BODY or FULL
+            entry["from"] = env.from_address
+            entry["to"] = env.to_addresses
+            entry["subject"] = env.subject
+            entry["has_attachment"] = env.has_attachment
+            entry["redacted_fields"] = (
+                ["attachment_bytes"] if vis_rank == level_rank("BODY") else []
+            )
+
+        if _is_google_provider(account):
+            obj_id = context.pdp.make_google_object_id(
+                context.caller_id, account_id, facts.x_gm_msgid, context.provenance_hmac_key
+            )
+            if obj_id is not None:
+                entry["object_id"] = obj_id
+
+        messages.append(entry)
+
+    res: ListMessagesResponse = {
         "decision": "ALLOW",
-        "reason": "rule_matched" if visible_uids else "folder_default_applied",
+        "result": "OK",
+        "reason": top_reason,
         "account": account_id,
         "folder": folder_path,
         "messages": messages,
-        "matched_total": matched_total,
-        "matched_visible": len(visible_uids),
-        "filtered_out": filtered_out,
+        "total_visible": len(visible_envelopes),
+        "returned_count": len(page_items),
         "page_offset": offset,
         "page_limit": limit,
         "has_more": has_more,
         "applied_scope": scoped.applied_scope,
+        "completeness": completeness,
     }
-    if outside_scope_total is not None:
-        result["outside_scope_total"] = outside_scope_total
-    return result
+    if suppressed_by_policy:
+        res["_suppressed_by_policy"] = True
+    return res

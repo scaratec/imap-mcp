@@ -1,40 +1,14 @@
-"""SQLite-backed write-ahead log for cross-account sagas (ADR 0007).
+"""SQLite-backed write-ahead log for sagas, provenance, and account health.
 
-The WAL is a single-writer, file-backed SQLite database at the path
-configured in accounts.yaml. Schema:
-
-  transactions (
-    tx_id          PRIMARY KEY,
-    status         TEXT NOT NULL,
-    created_at     TEXT NOT NULL,
-    committed_at   TEXT,
-    caller_id      TEXT,
-    src_account    TEXT, src_folder TEXT, src_uid INTEGER,
-    dst_account    TEXT, dst_folder TEXT,
-    message_id     TEXT,
-    content_hash   TEXT,
-    target_uid     INTEGER,
-    retry_count    INTEGER DEFAULT 0,
-    last_error     TEXT
-  )
-
-  transaction_events (
-    tx_id          NOT NULL,
-    step           TEXT NOT NULL,
-    timestamp      TEXT NOT NULL,
-    outcome        TEXT,
-    detail         TEXT
-  )
-
-States advance:
-  pending -> staged -> committed
-  pending -> pending (retry)
-  pending -> aborted (crash before fetch)
-  pending -> needs_operator (retry exhausted)
+Adheres to:
+- ADR 0042: Cryptographic draft provenance and WAL provenance registry
+- ADR 0046: Content-verified transfer sagas, WAL leases, and immediate payload scrubbing
+- ADR 0064: Durable account health and token lifecycle
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -55,14 +29,15 @@ CREATE TABLE IF NOT EXISTS transactions (
     dst_folder TEXT,
     message_id TEXT,
     content_hash TEXT,
+    raw_sha256 TEXT,
+    canonical_sha256 TEXT,
+    size_bytes INTEGER,
     target_uid INTEGER,
     retry_count INTEGER DEFAULT 0,
     last_error TEXT,
-    fallback_from TEXT,
-    fallback_date TEXT,
-    fallback_subject TEXT,
-    fallback_size INTEGER,
-    fallback_4kb_sha256 TEXT
+    staged_rfc822 BLOB,
+    leased_by TEXT,
+    leased_until TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transaction_events (
@@ -72,6 +47,36 @@ CREATE TABLE IF NOT EXISTS transaction_events (
     outcome TEXT,
     detail TEXT
 );
+
+CREATE TABLE IF NOT EXISTS provenance_records (
+    draft_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    caller_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    message_id TEXT,
+    canonical_digest TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (draft_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provenance_own
+ON provenance_records (caller_id, account_id, message_id, canonical_digest);
+
+CREATE TABLE IF NOT EXISTS account_health (
+    account_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    secret_sha256 TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS draft_leases (
+    account_id TEXT NOT NULL,
+    draft_id TEXT NOT NULL,
+    leased_by TEXT NOT NULL,
+    leased_until TEXT NOT NULL,
+    PRIMARY KEY (account_id, draft_id)
+);
 """
 
 
@@ -80,15 +85,21 @@ def _now() -> str:
 
 
 class WAL:
-    """Synchronous SQLite wrapper. Callers invoke from async contexts via
-    `asyncio.to_thread` if ever blocking matters; for the scenarios
-    we exercise the SQLite operations are microseconds."""
+    """Synchronous SQLite wrapper with 0600 mode and WAL journaling."""
 
     def __init__(self, path: Path) -> None:
-        self.path = path
+        self.path = path.resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -96,6 +107,8 @@ class WAL:
         conn.execute("PRAGMA synchronous=FULL")
         conn.row_factory = sqlite3.Row
         return conn
+
+    # -------------------------------------------------------- Sagas & Leases
 
     def begin(
         self,
@@ -127,48 +140,40 @@ class WAL:
             self._event(conn, tx_id, "begin", "OK", None)
         return tx_id
 
-    def record_fetch(self, tx_id: str, message_id: str | None, content_hash: str) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE transactions SET message_id = ?, content_hash = ? WHERE tx_id = ?",
-                (message_id, content_hash, tx_id),
-            )
-            self._event(conn, tx_id, "fetched", "OK", None)
-
-    def record_fallback(
+    def record_fetch(
         self,
         tx_id: str,
+        message_id: str | None,
+        content_hash: str,
         *,
-        fallback_from: str | None,
-        fallback_date: str | None,
-        fallback_subject: str | None,
-        fallback_size: int | None,
-        fallback_4kb_sha256: str | None,
+        raw_sha256: str | None = None,
+        canonical_sha256: str | None = None,
+        size_bytes: int | None = None,
+        staged_rfc822: bytes | None = None,
     ) -> None:
-        """Persist the 5-tuple fallback identity (ADR 0008). Called
-        when a fetched message has no Message-ID header so recovery
-        can re-locate it on the target by from + sent-date + subject
-        + size + first-4-KiB SHA-256."""
         with self._conn() as conn:
             conn.execute(
-                "UPDATE transactions SET "
-                "fallback_from = ?, fallback_date = ?, fallback_subject = ?, "
-                "fallback_size = ?, fallback_4kb_sha256 = ? "
+                "UPDATE transactions SET status = 'fetched', message_id = ?, content_hash = ?, "
+                "raw_sha256 = ?, canonical_sha256 = ?, size_bytes = ?, staged_rfc822 = ? "
                 "WHERE tx_id = ?",
                 (
-                    fallback_from,
-                    fallback_date,
-                    fallback_subject,
-                    fallback_size,
-                    fallback_4kb_sha256,
+                    message_id,
+                    content_hash,
+                    raw_sha256 or content_hash,
+                    canonical_sha256 or content_hash,
+                    size_bytes,
+                    staged_rfc822,
                     tx_id,
                 ),
             )
+            self._event(conn, tx_id, "fetched", "OK", None)
 
     def mark_staged(self, tx_id: str, target_uid: int | None) -> None:
         with self._conn() as conn:
+            # ADR 0046: Scrub staged_rfc822 to NULL upon reaching staged
             conn.execute(
-                "UPDATE transactions SET status = 'staged', target_uid = ? WHERE tx_id = ?",
+                "UPDATE transactions SET status = 'staged', target_uid = ?, staged_rfc822 = NULL "
+                "WHERE tx_id = ?",
                 (target_uid, tx_id),
             )
             self._event(conn, tx_id, "staged", "OK", None)
@@ -180,7 +185,9 @@ class WAL:
     def commit(self, tx_id: str) -> None:
         with self._conn() as conn:
             conn.execute(
-                "UPDATE transactions SET status = 'committed', committed_at = ? WHERE tx_id = ?",
+                "UPDATE transactions SET status = 'committed', committed_at = ?, staged_rfc822 = NULL, "
+                "leased_by = NULL, leased_until = NULL "
+                "WHERE tx_id = ?",
                 (_now(), tx_id),
             )
             self._event(conn, tx_id, "commit", "OK", None)
@@ -199,20 +206,11 @@ class WAL:
             return new
 
     def mark_needs_operator(self, tx_id: str, reason: str = "retry_limit_reached") -> None:
-        """Park a transaction in the operator queue.
-
-        The default reason is the historical one: the retry budget ran
-        out. Other incidents escalate too — draft ambiguity (ADR 0030)
-        is opened and escalated in one breath — and they say so, so the
-        operator does not read every parked transaction as a retry
-        failure. The reason also fills `last_error` when nothing has
-        written there yet — on the retry path the real error message is
-        already in that column and is worth more than this label.
-        """
         with self._conn() as conn:
             conn.execute(
                 "UPDATE transactions SET status = 'needs_operator', "
-                "last_error = COALESCE(last_error, ?) WHERE tx_id = ?",
+                "last_error = COALESCE(last_error, ?), staged_rfc822 = NULL, "
+                "leased_by = NULL, leased_until = NULL WHERE tx_id = ?",
                 (reason, tx_id),
             )
             self._event(conn, tx_id, "escalated", None, reason)
@@ -220,10 +218,19 @@ class WAL:
     def abort(self, tx_id: str, reason: str) -> None:
         with self._conn() as conn:
             conn.execute(
-                "UPDATE transactions SET status = 'aborted', last_error = ? WHERE tx_id = ?",
+                "UPDATE transactions SET status = 'aborted', last_error = ?, staged_rfc822 = NULL, "
+                "leased_by = NULL, leased_until = NULL "
+                "WHERE tx_id = ?",
                 (reason, tx_id),
             )
             self._event(conn, tx_id, "aborted", "ERROR", reason)
+
+    def release_lease(self, tx_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE transactions SET leased_by = NULL, leased_until = NULL WHERE tx_id = ?",
+                (tx_id,),
+            )
 
     def get(self, tx_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
@@ -231,18 +238,55 @@ class WAL:
             return dict(row) if row else None
 
     def pending_transactions(self) -> list[dict[str, Any]]:
-        """Return txs that have not reached a terminal state.
-
-        Used by the saga recovery loop. Terminal states are
-        `committed`, `aborted`, and `needs_operator`.
-        """
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM transactions "
-                "WHERE status IN ('pending','staged') "
+                "WHERE status IN ('pending', 'fetched', 'staged') "
                 "ORDER BY created_at"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def claim_and_get_pending(
+        self,
+        caller_id: str | None = None,
+        instance_id: str = "",
+        ttl_seconds: float = 30.0,
+    ) -> list[dict[str, Any]]:
+        from datetime import datetime, timedelta
+
+        now = _now()
+        now_dt = datetime.fromisoformat(now)
+        until = (now_dt + timedelta(seconds=ttl_seconds)).isoformat()
+        claimed: list[dict[str, Any]] = []
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if caller_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM transactions "
+                    "WHERE caller_id = ? AND status IN ('pending', 'fetched', 'staged') "
+                    "AND (leased_until IS NULL OR leased_until < ?) "
+                    "ORDER BY created_at",
+                    (caller_id, now),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM transactions "
+                    "WHERE status IN ('pending', 'fetched', 'staged') "
+                    "AND (leased_until IS NULL OR leased_until < ?) "
+                    "ORDER BY created_at",
+                    (now,),
+                ).fetchall()
+
+            for r in rows:
+                tx_id = r["tx_id"]
+                cur = conn.execute(
+                    "UPDATE transactions SET leased_by = ?, leased_until = ? "
+                    "WHERE tx_id = ? AND (leased_until IS NULL OR leased_until < ?)",
+                    (instance_id, until, tx_id, now),
+                )
+                if cur.rowcount > 0:
+                    claimed.append(dict(r))
+        return claimed
 
     def _event(
         self,
@@ -257,3 +301,139 @@ class WAL:
             "VALUES (?, ?, ?, ?, ?)",
             (tx_id, step, _now(), outcome, detail),
         )
+
+    # ---------------------------------------------------- Provenance Records (ADR 0042)
+
+    def record_provenance(
+        self,
+        draft_id: str,
+        revision: int,
+        caller_id: str,
+        account_id: str,
+        message_id: str | None,
+        canonical_digest: str,
+        state: str = "active",
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO provenance_records "
+                "(draft_id, revision, caller_id, account_id, message_id, canonical_digest, state, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    draft_id,
+                    revision,
+                    caller_id,
+                    account_id,
+                    message_id,
+                    canonical_digest,
+                    state,
+                    _now(),
+                ),
+            )
+
+    def discard_provenance(self, draft_id: str, account_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE provenance_records SET state = 'discarded' "
+                "WHERE draft_id = ? AND account_id = ?",
+                (draft_id, account_id),
+            )
+
+    def is_caller_draft_owner(self, draft_id: str, caller_id: str, account_id: str) -> bool:
+        """True if draft_id is registered in WAL and owned by caller_id on account_id."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM provenance_records WHERE draft_id = ? AND caller_id = ? AND account_id = ?",
+                (draft_id, caller_id, account_id),
+            ).fetchone()
+            return row is not None
+
+    def match_own_provenance(
+        self, caller_id: str, account_id: str, message_id: str | None, canonical_digest: str
+    ) -> bool:
+        """Check if message matches provenance: 'own' via WAL fallback."""
+        if not message_id:
+            return False
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM provenance_records "
+                "WHERE caller_id = ? AND account_id = ? AND message_id = ? AND canonical_digest = ?",
+                (caller_id, account_id, message_id, canonical_digest),
+            ).fetchone()
+            return row is not None
+
+    def acquire_draft_lease(
+        self,
+        account_id: str,
+        draft_id: str,
+        instance_id: str,
+        ttl_seconds: float = 30.0,
+        timeout: float = 10.0,
+    ) -> bool:
+        import time
+        from datetime import timedelta
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            now = _now()
+            now_dt = datetime.fromisoformat(now)
+            until = (now_dt + timedelta(seconds=ttl_seconds)).isoformat()
+            with self._conn() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "INSERT INTO draft_leases (account_id, draft_id, leased_by, leased_until) VALUES (?, ?, ?, ?)",
+                            (account_id, draft_id, instance_id, until),
+                        )
+                        return True
+                    except sqlite3.IntegrityError:
+                        cur = conn.execute(
+                            "UPDATE draft_leases SET leased_by = ?, leased_until = ? "
+                            "WHERE account_id = ? AND draft_id = ? AND (leased_until < ? OR leased_by = ?)",
+                            (instance_id, until, account_id, draft_id, now, instance_id),
+                        )
+                        if cur.rowcount > 0:
+                            return True
+                except sqlite3.OperationalError:
+                    pass
+            time.sleep(0.05)
+        return False
+
+    def release_draft_lease(
+        self,
+        account_id: str,
+        draft_id: str,
+        instance_id: str,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM draft_leases WHERE account_id = ? AND draft_id = ? AND leased_by = ?",
+                (account_id, draft_id, instance_id),
+            )
+
+    # ------------------------------------------------------ Account Health (ADR 0064)
+
+    def get_account_health(self, account_id: str) -> tuple[str, str | None] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT state, secret_sha256 FROM account_health WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return str(row["state"]), (str(row["secret_sha256"]) if row["secret_sha256"] else None)
+
+    def set_account_health(
+        self, account_id: str, state: str, secret_sha256: str | None = None
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO account_health (account_id, state, secret_sha256, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (account_id, state, secret_sha256, _now()),
+            )
+
+    def clear_account_health(self, account_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM account_health WHERE account_id = ?", (account_id,))

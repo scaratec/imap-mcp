@@ -23,6 +23,7 @@ from imap_mcp.config import (
     Account,
     AccountsFile,
     Caller,
+    CallerAuth,
     CallersFile,
     Configuration,
     FolderPolicy,
@@ -180,7 +181,7 @@ def test_the_criteria_schema_carries_the_calendar_bounds_for_every_tool() -> Non
 def test_listing_descriptions_explain_the_window_and_the_bounds(name: str) -> None:
     tools = {tool.name: tool for tool in _build_tool_list()}
     description = tools[name].description or ""
-    for phrase in ("outside_scope_total", "since", "before", "YYYY-MM-DD", '"all"'):
+    for phrase in ("applied_scope", "since", "before", "YYYY-MM-DD", '"all"'):
         assert phrase in description
 
 
@@ -189,7 +190,7 @@ def test_listing_descriptions_explain_the_window_and_the_bounds(name: str) -> No
 
 def test_calendar_bounds_map_onto_since_and_before() -> None:
     imap = search._criteria_to_imap_search({"since": "2026-07-01", "before": "2026-10-01"})
-    assert imap == "SINCE 01-Jul-2026 BEFORE 01-Oct-2026"
+    assert imap == "SINCE 30-Jun-2026 BEFORE 02-Oct-2026"
 
 
 def test_the_default_window_counts_what_lies_before_it() -> None:
@@ -255,7 +256,9 @@ def _context() -> Any:
     folder = FolderPolicy(path="INBOX", mode="blacklist", default="ENVELOPE")
     configuration = Configuration(
         accounts_file=AccountsFile(accounts=[Account(id=ACCOUNT)]),
-        callers_file=CallersFile(callers=[Caller(id="agent", policy="p")]),
+        callers_file=CallersFile(
+            callers=[Caller(id="agent", policy="p", auth=CallerAuth(type="stdio_trusted"))]
+        ),
         policies={"p": PolicyFile(name="p", accounts={ACCOUNT: [folder]})},
     )
     account = configuration.accounts_file.accounts[0]
@@ -263,6 +266,10 @@ def _context() -> Any:
         caller_id="agent",
         pdp=PolicyDecisionPoint(configuration),
         account_by_id=lambda account_id: account if account_id == ACCOUNT else None,
+        saga=None,
+        audit=None,
+        attachment_sink_directory=None,
+        provenance_hmac_key=b"0" * 32,
     )
 
 
@@ -302,8 +309,17 @@ def imap(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             for uid in uids
         ]
 
+    async def folder_stats(account: Any, password: str, folder: str) -> Any:
+        return imap_core.FolderStatsResult(kind="ok", exists=1, uids=[1])
+
+    async def search_with_validity(account: Any, password: str, folder: str, criteria: str) -> tuple[list[int], int | None]:
+        calls["searches"].append(criteria)
+        return [1], 1
+
     monkeypatch.setattr(search, "_password_for", password_for)
     monkeypatch.setattr(search, "_resolve_imap_folder", resolve)
+    monkeypatch.setattr(search, "imap_folder_stats", folder_stats)
+    monkeypatch.setattr(search, "search_uids_with_validity", search_with_validity)
     monkeypatch.setattr(search, "imap_search_uids", search_uids)
     monkeypatch.setattr(search, "imap_count_uids", count_uids)
     monkeypatch.setattr(search, "imap_fetch_envelopes_batch", envelopes)
@@ -321,13 +337,13 @@ async def _call(tool: str, criteria: dict[str, Any], scope: str | None = None) -
 
 
 @pytest.mark.parametrize("tool", ["search", "list_messages"])
-async def test_the_default_window_reports_the_outside_count(
+async def test_the_default_window_reports_applied_scope_and_completeness(
     imap: dict[str, Any], tool: str
 ) -> None:
     response = await _call(tool, {"from_domain": "nordlicht.example.org"})
     assert response["applied_scope"] == "recent_7d"
-    assert response["outside_scope_total"] == 5
-    assert imap["counts"] == ['FROM "@nordlicht.example.org" BEFORE 26-Oct-2026']
+    assert response["completeness"] in ("complete", "policy_may_hide", "window_limited", "window_and_policy_limited")
+    assert "outside_scope_total" not in response
 
 
 @pytest.mark.parametrize("tool", ["search", "list_messages"])
@@ -344,14 +360,6 @@ async def test_no_outside_count_without_the_default_window(
 ) -> None:
     response = await _call(tool, criteria, scope)
     assert "outside_scope_total" not in response
-    assert imap["counts"] == []
-
-
-@pytest.mark.parametrize("tool", ["search", "list_messages"])
-async def test_a_failed_count_fails_the_call(imap: dict[str, Any], tool: str) -> None:
-    imap["count_error"] = RuntimeError("count SEARCH failed: NO")
-    with pytest.raises(RuntimeError, match="count SEARCH failed"):
-        await _call(tool, {"from_domain": "nordlicht.example.org"})
 
 
 # ------------------------------------------------------------ count search

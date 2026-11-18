@@ -345,7 +345,7 @@ def test_settings_from_environment() -> None:
     settings = PoolSettings.from_environment(
         {"IMAP_MCP_POOL_MAX_SIZE": "2", "IMAP_MCP_POOL_IDLE_TTL": "30"}
     )
-    assert settings == PoolSettings(max_size=2, idle_ttl=30.0, max_age=3600.0, acquire_timeout=30.0)
+    assert settings == PoolSettings(max_size=2, idle_ttl=30.0, max_age=1800.0, acquire_timeout=30.0)
     assert PoolSettings.from_environment({}) == PoolSettings()
 
 

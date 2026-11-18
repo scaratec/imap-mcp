@@ -1,34 +1,37 @@
 """Message-transfer handlers: move, copy.
 
-Both tools share folder-access validation and the intra/cross-account
-branching. Gmail accounts route through label-swap instead of native
-IMAP MOVE because Gmail folders are label projections.
+Adheres to:
+- ADR 0040: Gmail multi-label move to Trash/Spam requires move_out on all active labels
+- ADR 0044: Normalized response envelope and gate priority
+- ADR 0045: Write visibility floor (ENVELOPE), flow monotonicity (relocation_would_escalate)
+- ADR 0046: Content-verified sagas, UIDVALIDITY guard, UID EXPUNGE fallback
+- ADR 0048: Pre-effect intent and post-effect outcome audit records
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from ..imap_core import (
-    FolderNotSelectable,
     LabelMutationFailed,
-    TargetFolderMissing,
-    UidNotFound,
-    UidStale,
 )
 from ..imap_core import (
-    copy_message as imap_copy_message,
+    fetch_envelope as imap_fetch_envelope,
+)
+from ..imap_core import (
+    folder_stats as imap_folder_stats,
 )
 from ..imap_core import (
     gmail_label_swap as imap_gmail_label_swap,
 )
-from ..imap_core import (
-    move_message as imap_move_message,
-)
+from ..policy import level_rank
 from ._common import (
+    _facts_from_envelope,
     _is_google_provider,
     _password_for,
     _resolve_imap_folder,
+    error_envelope,
 )
 
 if TYPE_CHECKING:
@@ -38,246 +41,235 @@ if TYPE_CHECKING:
 class MoveCopyResponse(TypedDict, total=False):
     decision: Literal["ALLOW", "DENY"]
     result: NotRequired[Literal["OK", "ERROR"]]
-    error_type: NotRequired[str | None]
     reason: NotRequired[str]
+    error: NotRequired[dict[str, str]]
     account: NotRequired[str]
     folder: NotRequired[str]
     source_folder: NotRequired[str]
     target_folder: NotRequired[str]
     uid: NotRequired[int]
-    missing_capability: NotRequired[str]
     mechanism: NotRequired[str]
     tx_id: NotRequired[str | None]
-    imap_response: NotRequired[str]
+    _audit_detail_reason: NotRequired[str]
 
 
-def _deny_move(
+def _deny_transfer(
     *,
     reason: str,
     account: str,
     folder: str,
     uid: int | None = None,
-    missing_capability: str | None = None,
 ) -> MoveCopyResponse:
-    response: MoveCopyResponse = {
+    res: MoveCopyResponse = {
         "decision": "DENY",
         "reason": reason,
         "account": account,
         "folder": folder,
     }
     if uid is not None:
-        response["uid"] = uid
-    if missing_capability is not None:
-        response["missing_capability"] = missing_capability
-    return response
+        res["uid"] = uid
+    return res
 
 
-def _ok_saga(
-    *,
-    mechanism: str,
-    account: str,
-    source_folder: str,
-    target_folder: str,
-    uid: int,
-    tx_id: str | None,
-) -> MoveCopyResponse:
-    return {
-        "decision": "ALLOW",
-        "result": "OK",
-        "error_type": None,
-        "mechanism": mechanism,
-        "tx_id": tx_id,
-        "account": account,
-        "source_folder": source_folder,
-        "target_folder": target_folder,
-        "uid": uid,
-    }
+def _write_audit_intent(context: ServerContext, tool: str, arguments: dict[str, Any]) -> str:
+    req_id = context.request_id or str(uuid.uuid4())
+    if context.audit is not None:
+        context.audit.write(
+            {
+                "request_id": req_id,
+                "phase": "intent",
+                "caller_id": context.caller_id,
+                "tool": tool,
+                "decision": "ALLOW",
+                "result": "PENDING",
+            }
+        )
+    return req_id
 
 
-def _error_saga(
-    *,
-    error_type: str,
-    account: str | None = None,
-    folder: str | None = None,
-    source_folder: str | None = None,
-    target_folder: str | None = None,
-    uid: int | None = None,
-    mechanism: str | None = None,
-    tx_id: str | None = None,
-    imap_response: str | None = None,
-) -> MoveCopyResponse:
-    response: MoveCopyResponse = {
-        "decision": "ALLOW",
-        "result": "ERROR",
-        "error_type": error_type,
-    }
-    if mechanism is not None:
-        response["mechanism"] = mechanism
-        response["tx_id"] = tx_id
-    if account is not None:
-        response["account"] = account
-    if folder is not None:
-        response["folder"] = folder
-    if source_folder is not None:
-        response["source_folder"] = source_folder
-    if target_folder is not None:
-        response["target_folder"] = target_folder
-    if uid is not None:
-        response["uid"] = uid
-    if imap_response is not None:
-        response["imap_response"] = imap_response
-    return response
-
-
-async def _handle_move_gmail_label_swap(
+async def _check_transfer_gates(
     context: ServerContext,
-    *,
-    src_account: str,
-    src_folder: str,
-    dst_folder: str,
-    src_uid: int,
-) -> MoveCopyResponse:
-    """Gmail intra-account branch: remove the source label and add the
-    target label. Gmail folders are label projections over a single
-    [Gmail]/All Mail store, so this is the correct primitive instead
-    of IMAP MOVE.
+    arguments: dict[str, Any],
+    tool: str,
+) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, int | None]:
+    src = arguments["source"]
+    dst = arguments["target"]
+    src_account = str(src["account"])
+    src_folder = str(src["folder"])
+    src_uid = int(src["uid"])
+    expected_uidvalidity = src.get("uidvalidity")
+    dst_account = str(dst["account"])
+    dst_folder = str(dst["folder"])
 
-    Both folders arrive canonical (ADR 0033); the labels derive from
-    the canonical paths, and the source folder is selected under its
-    wire path from the account's alias map."""
-    from ..imap_core import _LABEL_TO_FOLDER
+    # 1. Source Account & Folder Gate
+    src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
+    if not src_dec.allowed:
+        raise _TransferDenial(src_dec.reason, src_account, src_folder, src_uid)
+    assert src_dec.folder_policy is not None
+    src_fp = src_dec.folder_policy
 
-    account, password = await _password_for(context, src_account)
-    folder_to_label: dict[str, str] = {v: k for k, v in _LABEL_TO_FOLDER.items()}
-    src_label = folder_to_label.get(src_folder, src_folder)
-    dst_label = folder_to_label.get(dst_folder, dst_folder)
-    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
-    try:
-        await imap_gmail_label_swap(account, password, imap_src, src_uid, src_label, dst_label)
-    except LabelMutationFailed as e:
-        return _error_saga(
-            error_type="provider_rejected",
-            mechanism="gmail_label_swap",
-            tx_id=None,
-            account=src_account,
-            source_folder=src_folder,
-            target_folder=dst_folder,
-            uid=src_uid,
-            imap_response=e.response_text or e.status,
-        )
-    except FolderNotSelectable:
-        return _error_saga(
-            error_type="folder_absent",
-            account=src_account,
-            folder=src_folder,
-            uid=src_uid,
-        )
-    except RuntimeError:
-        return _error_saga(
-            error_type="uid_not_found",
-            account=src_account,
-            folder=src_folder,
-            uid=src_uid,
-        )
-    return _ok_saga(
-        mechanism="gmail_label_swap",
-        tx_id=None,
-        account=src_account,
-        source_folder=src_folder,
-        target_folder=dst_folder,
-        uid=src_uid,
-    )
+    # 2. Target Account & Folder Gate
+    dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
+    if not dst_dec.allowed:
+        raise _TransferDenial(dst_dec.reason, dst_account, dst_folder)
+    assert dst_dec.folder_policy is not None
+    dst_fp = dst_dec.folder_policy
 
+    # 3. Source Capability Gate
+    if tool == "move" and not src_fp.move_out:
+        raise _TransferDenial("capability_missing", src_account, src_folder, src_uid)
+    if tool == "copy" and not src_fp.copy_out:
+        raise _TransferDenial("capability_missing", src_account, src_folder, src_uid)
 
-async def _handle_move_intra_account_standard(
-    context: ServerContext,
-    *,
-    src_account: str,
-    src_folder: str,
-    dst_folder: str,
-    src_uid: int,
-) -> MoveCopyResponse:
-    """Non-Gmail intra-account branch: native IMAP MOVE, falling back
-    to COPY+DELETE inside ``imap_move_message``. The four except arms
-    surface each known failure mode as its own ``error_type``."""
-    account, password = await _password_for(context, src_account)
-    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
-    imap_dst = await _resolve_imap_folder(context, src_account, dst_folder)
-    try:
-        mechanism = await imap_move_message(account, password, imap_src, src_uid, imap_dst)
-    except TargetFolderMissing:
-        return _error_saga(
-            error_type="target_folder_missing",
-            account=src_account,
-            source_folder=src_folder,
-            target_folder=dst_folder,
-            uid=src_uid,
-        )
-    except UidStale:
-        return _error_saga(
-            error_type="uid_stale", account=src_account, folder=src_folder, uid=src_uid
-        )
-    except (UidNotFound, RuntimeError):
-        return _error_saga(
-            error_type="uid_not_found", account=src_account, folder=src_folder, uid=src_uid
-        )
-    return _ok_saga(
-        mechanism=mechanism,
-        tx_id=None,
-        account=src_account,
-        source_folder=src_folder,
-        target_folder=dst_folder,
-        uid=src_uid,
-    )
+    # 4. Target Capability Gate
+    if not dst_fp.accept_incoming:
+        raise _TransferDenial("capability_missing", dst_account, dst_folder)
 
-
-async def _handle_move_cross_account(
-    context: ServerContext,
-    *,
-    src_account: str,
-    src_folder: str,
-    src_uid: int,
-    dst_account: str,
-    dst_folder: str,
-) -> MoveCopyResponse:
-    """Cross-account branch: the saga (ADR 0006) drives BEGIN → FETCH
-    src → APPEND dst → VERIFY → DELETE src → COMMIT with WAL-backed
-    recovery."""
-    if context.saga is None:
-        return _error_saga(error_type="saga_not_configured")
-    src_acct, src_pwd = await _password_for(context, src_account)
-    dst_acct, dst_pwd = await _password_for(context, dst_account)
+    # Resolve IMAP accounts & folders
+    src_acct_model, src_pwd = await _password_for(context, src_account)
+    dst_acct_model, dst_pwd = await _password_for(context, dst_account)
     imap_src = await _resolve_imap_folder(context, src_account, src_folder)
     imap_dst = await _resolve_imap_folder(context, dst_account, dst_folder)
-    result = await context.saga.run_cross_account_move(
-        caller_id=context.caller_id,
-        src_account=src_acct,
-        src_password=src_pwd,
-        src_folder=imap_src,
-        src_uid=src_uid,
-        dst_account=dst_acct,
-        dst_password=dst_pwd,
-        dst_folder=imap_dst,
-        delete_source=True,
+
+    # Check mailbox existence & UIDVALIDITY
+    src_stats = await imap_folder_stats(src_acct_model, src_pwd, imap_src)
+    if src_stats.kind == "absent":
+        raise _TransferError(
+            "folder_absent", "Source folder absent", src_account, src_folder, src_uid
+        )
+    if src_stats.kind == "select_failed":
+        raise _TransferError(
+            "select_failed",
+            src_stats.imap_response or "SELECT source failed",
+            src_account,
+            src_folder,
+            src_uid,
+        )
+
+    if src_account == dst_account:
+        dst_stats = await imap_folder_stats(dst_acct_model, dst_pwd, imap_dst)
+        if dst_stats.kind == "absent":
+            raise _TransferError("folder_absent", "Target folder absent", dst_account, dst_folder)
+        if dst_stats.kind == "select_failed":
+            raise _TransferError(
+                "select_failed",
+                dst_stats.imap_response or "SELECT target failed",
+                dst_account,
+                dst_folder,
+            )
+
+    session_uv = context.session_uidvalidity.get((src_account, src_folder))
+    if src_stats.uidvalidity is not None:
+        if expected_uidvalidity is not None and int(expected_uidvalidity) != src_stats.uidvalidity:
+            raise _TransferError(
+                "uidvalidity_changed",
+                "Observed UIDVALIDITY changed",
+                src_account,
+                src_folder,
+                src_uid,
+            )
+        if session_uv is not None and session_uv != src_stats.uidvalidity:
+            raise _TransferError(
+                "uidvalidity_changed",
+                "Observed UIDVALIDITY changed",
+                src_account,
+                src_folder,
+                src_uid,
+            )
+        context.session_uidvalidity[(src_account, src_folder)] = src_stats.uidvalidity
+
+    # Fetch envelope for per-message evaluation
+    envelope = await imap_fetch_envelope(src_acct_model, src_pwd, imap_src, src_uid)
+    if envelope is None:
+        raise _TransferError(
+            "not_found",
+            "Message not found",
+            src_account,
+            src_folder,
+            src_uid,
+            detail_reason="object_missing",
+        )
+
+    facts = _facts_from_envelope(envelope)
+    eff_src_vis, eff_src_reason = context.pdp.evaluate_message_effective(
+        context.caller_id, src_account, src_folder, facts
     )
-    return {
-        "decision": "ALLOW",
-        "result": result.result,
-        "error_type": result.error_type,
-        "mechanism": result.mechanism,
-        "tx_id": result.tx_id,
-        "account": src_account,
-        "source_folder": src_folder,
-        "target_folder": dst_folder,
-        "uid": src_uid,
-    }
+
+    if level_rank(eff_src_vis) < level_rank("METADATA"):
+        detail_cause = (
+            "message_capped" if eff_src_reason == "rule_matched" else "message_not_granted"
+        )
+        raise _TransferError(
+            "not_found",
+            "Message not found",
+            src_account,
+            src_folder,
+            src_uid,
+            detail_reason=detail_cause,
+        )
+
+    if level_rank(eff_src_vis) < level_rank("ENVELOPE"):
+        raise _TransferDenial("visibility_below_ENVELOPE", src_account, src_folder, src_uid)
+
+    # Flow monotonicity: eff_target(m) <= eff_source(m)
+    eff_dst_vis, _ = context.pdp.evaluate_message_effective(
+        context.caller_id, dst_account, dst_folder, facts
+    )
+    if level_rank(eff_dst_vis) > level_rank(eff_src_vis):
+        raise _TransferDenial("relocation_would_escalate", src_account, src_folder, src_uid)
+
+    # Google [Gmail]/Trash or [Gmail]/Spam check
+    if _is_google_provider(src_acct_model) and tool == "move":
+        canonical_dst = context.pdp.canonical_folder(dst_account, dst_folder)
+        if canonical_dst in (
+            "[Gmail]/Trash",
+            "[Gmail]/Spam",
+        ) and not context.pdp.can_move_to_gmail_trash_or_spam(
+            context.caller_id, src_account, facts
+        ):
+            raise _TransferDenial("capability_missing", src_account, src_folder, src_uid)
+
+    return (
+        src_acct_model,
+        src_pwd,
+        imap_src,
+        dst_acct_model,
+        dst_pwd,
+        imap_dst,
+        facts,
+        envelope,
+        eff_src_reason,
+        src_stats.uidvalidity,
+    )
+
+
+class _TransferDenial(Exception):
+    def __init__(self, reason: str, account: str, folder: str, uid: int | None = None):
+        self.reason = reason
+        self.account = account
+        self.folder = folder
+        self.uid = uid
+
+
+class _TransferError(Exception):
+    def __init__(
+        self,
+        error_type: str,
+        detail: str,
+        account: str,
+        folder: str,
+        uid: int | None = None,
+        detail_reason: str | None = None,
+    ):
+        self.error_type = error_type
+        self.detail = detail
+        self.account = account
+        self.folder = folder
+        self.uid = uid
+        self.detail_reason = detail_reason
 
 
 async def handle_move(context: ServerContext, arguments: dict[str, Any]) -> MoveCopyResponse:
-    """Top-level orchestrator: validation gates first, then dispatch
-    to one of the three branches (Gmail label-swap, native IMAP MOVE,
-    cross-account saga). The validation gates are pre-policy, then
-    src + dst folder-access decisions, then write capabilities."""
     src = arguments["source"]
     dst = arguments["target"]
     src_account = str(src["account"])
@@ -286,68 +278,183 @@ async def handle_move(context: ServerContext, arguments: dict[str, Any]) -> Move
     dst_account = str(dst["account"])
     dst_folder = str(dst["folder"])
 
-    # Pre-policy gate: a degenerate "move INBOX to INBOX" never needs
-    # authorization discussion.
-    if src_account == dst_account and src_folder == dst_folder:
-        return _error_saga(
-            error_type="same_source_and_target",
-            account=src_account,
-            folder=src_folder,
-            uid=src_uid,
+    try:
+        (
+            src_acct_model,
+            src_pwd,
+            imap_src,
+            dst_acct_model,
+            dst_pwd,
+            imap_dst,
+            _facts,
+            _envelope,
+            eff_src_reason,
+            _uidvalidity,
+        ) = await _check_transfer_gates(context, arguments, "move")
+    except _TransferDenial as e:
+        return _deny_transfer(reason=e.reason, account=e.account, folder=e.folder, uid=e.uid)
+    except _TransferError as e:
+        extra: dict[str, Any] = {"account": e.account, "folder": e.folder}
+        if e.uid is not None:
+            extra["uid"] = e.uid
+        if e.detail_reason is not None:
+            extra["_audit_detail_reason"] = e.detail_reason
+        return error_envelope(  # type: ignore[return-value]
+            error_type=e.error_type, detail=e.detail, extra=extra
         )
 
-    src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
-    if not src_dec.allowed:
-        return _deny_move(
-            reason=src_dec.reason, account=src_account, folder=src_folder, uid=src_uid
-        )
-    assert src_dec.folder_policy is not None
-    if not src_dec.folder_policy.move_out:
-        return _deny_move(
-            reason="capability_missing",
-            account=src_account,
-            folder=src_folder,
-            uid=src_uid,
-            missing_capability="move_out",
-        )
-    dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
-    if not dst_dec.allowed:
-        return _deny_move(reason=dst_dec.reason, account=dst_account, folder=dst_folder)
-    assert dst_dec.folder_policy is not None
-    if not dst_dec.folder_policy.accept_incoming:
-        return _deny_move(
-            reason="capability_missing",
-            account=dst_account,
-            folder=dst_folder,
-            missing_capability="accept_incoming",
-        )
+    _write_audit_intent(context, "move", arguments)
 
+    # Branch 1: Cross-account move via Saga (ADR 0046)
     if src_account != dst_account:
-        return await _handle_move_cross_account(
-            context,
-            src_account=src_account,
-            src_folder=src_folder,
+        if context.saga is None:
+            return error_envelope(  # type: ignore[return-value]
+                error_type="transient_imap_failure",
+                detail="WAL saga not configured",
+                extra={
+                    "account": src_account,
+                    "source_folder": src_folder,
+                    "target_folder": dst_folder,
+                    "uid": src_uid,
+                },
+            )
+        saga_result = await context.saga.run_cross_account_move(
+            caller_id=context.caller_id,
+            src_account=src_acct_model,
+            src_password=src_pwd,
+            src_folder=imap_src,
             src_uid=src_uid,
-            dst_account=dst_account,
-            dst_folder=dst_folder,
+            dst_account=dst_acct_model,
+            dst_password=dst_pwd,
+            dst_folder=imap_dst,
+            delete_source=True,
+        )
+        if saga_result.result == "ERROR":
+            err_type = saga_result.error_type or "saga_aborted"
+            if err_type not in (
+                "not_found",
+                "folder_absent",
+                "select_failed",
+                "uidvalidity_changed",
+                "append_rejected",
+                "append_timeout",
+                "append_failed",
+                "saga_aborted",
+                "transient_imap_failure",
+                "unsupported_imap_capability",
+            ):
+                err_type = "saga_aborted"
+            return error_envelope(  # type: ignore[return-value]
+                error_type=err_type,
+                detail=saga_result.error_type or "Saga move failed",
+                extra={
+                    "account": src_account,
+                    "source_folder": src_folder,
+                    "target_folder": dst_folder,
+                    "uid": src_uid,
+                    "tx_id": saga_result.tx_id,
+                    "mechanism": saga_result.mechanism,
+                },
+            )
+        return {
+            "decision": "ALLOW",
+            "result": "OK",
+            "reason": eff_src_reason,
+            "account": src_account,
+            "source_folder": src_folder,
+            "target_folder": dst_folder,
+            "uid": src_uid,
+            "mechanism": saga_result.mechanism,
+            "tx_id": saga_result.tx_id,
+        }
+
+    # Branch 2: Gmail intra-account label swap (ADR 0040)
+    if _is_google_provider(src_acct_model):
+        from ..imap_core import _LABEL_TO_FOLDER
+
+        folder_to_label: dict[str, str] = {v: k for k, v in _LABEL_TO_FOLDER.items()}
+        src_label = folder_to_label.get(src_folder, src_folder)
+        dst_label = folder_to_label.get(dst_folder, dst_folder)
+        try:
+            await imap_gmail_label_swap(
+                src_acct_model, src_pwd, imap_src, src_uid, src_label, dst_label
+            )
+        except LabelMutationFailed as exc:
+            return error_envelope(  # type: ignore[return-value]
+                error_type="transient_imap_failure",
+                detail=exc.response_text or exc.status,
+                extra={
+                    "account": src_account,
+                    "source_folder": src_folder,
+                    "target_folder": dst_folder,
+                    "uid": src_uid,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            return error_envelope(  # type: ignore[return-value]
+                error_type="transient_imap_failure",
+                detail="Gmail label swap failed",
+                extra={
+                    "account": src_account,
+                    "source_folder": src_folder,
+                    "target_folder": dst_folder,
+                    "uid": src_uid,
+                },
+            )
+        return {
+            "decision": "ALLOW",
+            "result": "OK",
+            "reason": eff_src_reason,
+            "account": src_account,
+            "source_folder": src_folder,
+            "target_folder": dst_folder,
+            "uid": src_uid,
+            "mechanism": "gmail_label_swap",
+            "tx_id": None,
+        }
+
+    # Branch 3: Standard IMAP intra-account MOVE with UID EXPUNGE fallback (ADR 0046 §3)
+    from ..imap_core import move_message_with_fallback
+
+    try:
+        mechanism = await move_message_with_fallback(
+            src_acct_model, src_pwd, imap_src, src_uid, imap_dst
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "unsupported" in msg.lower() or "neither move nor uidplus" in msg.lower():
+            return error_envelope(  # type: ignore[return-value]
+                error_type="unsupported_imap_capability",
+                detail="Server supports neither MOVE nor UIDPLUS",
+                extra={
+                    "account": src_account,
+                    "source_folder": src_folder,
+                    "target_folder": dst_folder,
+                    "uid": src_uid,
+                },
+            )
+        return error_envelope(  # type: ignore[return-value]
+            error_type="transient_imap_failure",
+            detail=msg,
+            extra={
+                "account": src_account,
+                "source_folder": src_folder,
+                "target_folder": dst_folder,
+                "uid": src_uid,
+            },
         )
 
-    account_obj = context.account_by_id(src_account)
-    if account_obj is not None and _is_google_provider(account_obj):
-        return await _handle_move_gmail_label_swap(
-            context,
-            src_account=src_account,
-            src_folder=src_folder,
-            dst_folder=dst_folder,
-            src_uid=src_uid,
-        )
-    return await _handle_move_intra_account_standard(
-        context,
-        src_account=src_account,
-        src_folder=src_folder,
-        dst_folder=dst_folder,
-        src_uid=src_uid,
-    )
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": eff_src_reason,
+        "account": src_account,
+        "source_folder": src_folder,
+        "target_folder": dst_folder,
+        "uid": src_uid,
+        "mechanism": mechanism,
+        "tx_id": None,
+    }
 
 
 async def handle_copy(context: ServerContext, arguments: dict[str, Any]) -> MoveCopyResponse:
@@ -359,70 +466,117 @@ async def handle_copy(context: ServerContext, arguments: dict[str, Any]) -> Move
     dst_account = str(dst["account"])
     dst_folder = str(dst["folder"])
 
-    src_dec = context.pdp.decide_folder_access(context.caller_id, src_account, src_folder)
-    if not src_dec.allowed:
-        return _deny_move(
-            reason=src_dec.reason, account=src_account, folder=src_folder, uid=src_uid
+    try:
+        (
+            src_acct_model,
+            src_pwd,
+            imap_src,
+            dst_acct_model,
+            dst_pwd,
+            imap_dst,
+            _facts,
+            _envelope,
+            eff_src_reason,
+            _uidvalidity,
+        ) = await _check_transfer_gates(context, arguments, "copy")
+    except _TransferDenial as e:
+        return _deny_transfer(reason=e.reason, account=e.account, folder=e.folder, uid=e.uid)
+    except _TransferError as e:
+        extra: dict[str, Any] = {"account": e.account, "folder": e.folder}
+        if e.uid is not None:
+            extra["uid"] = e.uid
+        if e.detail_reason is not None:
+            extra["_audit_detail_reason"] = e.detail_reason
+        return error_envelope(  # type: ignore[return-value]
+            error_type=e.error_type, detail=e.detail, extra=extra
         )
-    dst_dec = context.pdp.decide_folder_access(context.caller_id, dst_account, dst_folder)
-    if not dst_dec.allowed:
-        return _deny_move(reason=dst_dec.reason, account=dst_account, folder=dst_folder)
-    assert dst_dec.folder_policy is not None
-    if not dst_dec.folder_policy.accept_incoming:
-        return _deny_move(
-            reason="capability_missing",
-            account=dst_account,
-            folder=dst_folder,
-            missing_capability="accept_incoming",
-        )
+
+    _write_audit_intent(context, "copy", arguments)
+
+    # Cross-account copy via Saga (without delete_source)
     if src_account != dst_account:
         if context.saga is None:
-            return _error_saga(error_type="saga_not_configured")
-        src_acct, src_pwd = await _password_for(context, src_account)
-        dst_acct, dst_pwd = await _password_for(context, dst_account)
-        imap_src = await _resolve_imap_folder(context, src_account, src_folder)
-        imap_dst = await _resolve_imap_folder(context, dst_account, dst_folder)
-        result = await context.saga.run_cross_account_move(
+            return error_envelope(  # type: ignore[return-value]
+                error_type="transient_imap_failure",
+                detail="WAL saga not configured",
+                extra={
+                    "account": src_account,
+                    "source_folder": src_folder,
+                    "target_folder": dst_folder,
+                    "uid": src_uid,
+                },
+            )
+        saga_result = await context.saga.run_cross_account_move(
             caller_id=context.caller_id,
-            src_account=src_acct,
+            src_account=src_acct_model,
             src_password=src_pwd,
             src_folder=imap_src,
             src_uid=src_uid,
-            dst_account=dst_acct,
+            dst_account=dst_acct_model,
             dst_password=dst_pwd,
             dst_folder=imap_dst,
             delete_source=False,
         )
+        if saga_result.result == "ERROR":
+            err_type = saga_result.error_type or "saga_aborted"
+            if err_type not in (
+                "not_found",
+                "folder_absent",
+                "select_failed",
+                "append_rejected",
+                "append_timeout",
+                "append_failed",
+                "saga_aborted",
+                "transient_imap_failure",
+            ):
+                err_type = "saga_aborted"
+            return error_envelope(  # type: ignore[return-value]
+                error_type=err_type,
+                detail=saga_result.error_type or "Saga copy failed",
+                extra={
+                    "account": src_account,
+                    "source_folder": src_folder,
+                    "target_folder": dst_folder,
+                    "uid": src_uid,
+                    "tx_id": saga_result.tx_id,
+                    "mechanism": saga_result.mechanism,
+                },
+            )
         return {
             "decision": "ALLOW",
-            "result": result.result,
-            "error_type": result.error_type,
-            "mechanism": result.mechanism,
-            "tx_id": result.tx_id,
+            "result": "OK",
+            "reason": eff_src_reason,
             "account": src_account,
             "source_folder": src_folder,
             "target_folder": dst_folder,
             "uid": src_uid,
+            "mechanism": saga_result.mechanism,
+            "tx_id": saga_result.tx_id,
         }
-    account, password = await _password_for(context, src_account)
-    imap_src = await _resolve_imap_folder(context, src_account, src_folder)
-    imap_dst = await _resolve_imap_folder(context, src_account, dst_folder)
-    ok = await imap_copy_message(account, password, imap_src, src_uid, imap_dst)
-    if ok:
-        return _ok_saga(
-            mechanism="native_copy",
-            tx_id=None,
-            account=src_account,
-            source_folder=src_folder,
-            target_folder=dst_folder,
-            uid=src_uid,
+
+    # Intra-account native copy
+    from ..imap_core import copy_message as imap_copy_message
+
+    ok = await imap_copy_message(src_acct_model, src_pwd, imap_src, src_uid, imap_dst)
+    if not ok:
+        return error_envelope(  # type: ignore[return-value]
+            error_type="transient_imap_failure",
+            detail="Native copy failed",
+            extra={
+                "account": src_account,
+                "source_folder": src_folder,
+                "target_folder": dst_folder,
+                "uid": src_uid,
+            },
         )
-    return _error_saga(
-        error_type="uid_not_found",
-        mechanism="native_copy",
-        tx_id=None,
-        account=src_account,
-        source_folder=src_folder,
-        target_folder=dst_folder,
-        uid=src_uid,
-    )
+
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": eff_src_reason,
+        "account": src_account,
+        "source_folder": src_folder,
+        "target_folder": dst_folder,
+        "uid": src_uid,
+        "mechanism": "native_copy",
+    }

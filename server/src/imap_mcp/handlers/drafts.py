@@ -1,34 +1,31 @@
 """Draft handlers: create_draft, create_reply_draft, get_draft,
 list_drafts, update_draft, discard_draft.
 
-Draft identity follows ADR 0030: the server injects `X-SC-Draft-Id`
-and `X-SC-Draft-Rev` into every draft it appends and flags the append
-`\\Draft \\Seen`. The mailbox is the only store of that mapping, so
-resolving a handle is a header SEARCH inside the one folder the caller
-named.
-
-A revision (ADR 0031) is a field-wise change executed as one
-message-rewrite saga under an optimistic check on `base_revision`. The
-request itself is hashed into `X-SC-Draft-Change-Hash` so that a retry
-of a call whose response was lost can be told apart from a genuine
-second edit.
-
-`create_draft` takes either a complete message or the field set a
-revision uses (ADR 0035); structured input shares its composition step
-with `update_draft`, and the response names the body format of what
-was appended.
+Adheres to:
+- ADR 0042: Cryptographic draft provenance via HMAC-SHA256 and wal.db
+- ADR 0044: Normalized response envelope and write-only own-draft exception
+- ADR 0045: Capability checks and outbound draft_recipients guardrail
+- ADR 0048: Pre-effect intent and post-effect outcome audit records
+- ADR 0057: Immutable received mail and structured draft composition
+- ADR 0063: Structured own-draft composition, attachments, quote isolation, and revisions
 """
 
 from __future__ import annotations
 
+import base64
+import email
+import email.encoders
+import hashlib
+import json
 import uuid
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, TypedDict
+from email.message import Message
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from .. import reply as reply_builder
-from ..imap_core import (
-    ExpungeScopeUnsafe,
-    find_trash_folder,
-)
 from ..imap_core import (
     append_message as imap_append_message,
 )
@@ -39,13 +36,22 @@ from ..imap_core import (
     fetch_body as imap_fetch_body,
 )
 from ..imap_core import (
+    fetch_envelope as imap_fetch_envelope,
+)
+from ..imap_core import (
     fetch_envelopes_batch as imap_fetch_envelopes_batch,
+)
+from ..imap_core import (
+    fetch_full_message as imap_fetch_full_message,
 )
 from ..imap_core import (
     fetch_message_for_reply as imap_fetch_message_for_reply,
 )
 from ..imap_core import (
     fetch_raw_headers_batch as imap_fetch_raw_headers_batch,
+)
+from ..imap_core import (
+    find_trash_folder,
 )
 from ..imap_core import (
     folder_stats as imap_folder_stats,
@@ -62,13 +68,21 @@ from ..imap_core import (
 from ..imap_core import (
     search_uids as imap_search_uids,
 )
-from ..policy import MessageFacts, evaluate_message_against_folder, level_rank
+from ..policy import (
+    level_rank,
+    normalize_address,
+    normalize_domain,
+)
+from ..provenance import (
+    compute_canonical_digest,
+    compute_provenance_mac,
+    verify_provenance_mac,
+)
 from ._common import (
     _ensure_folder_aliases,
     _facts_from_envelope,
     _is_google_provider,
     _password_for,
-    _require_saga,
     _resolve_imap_folder,
     _walk_attachment_parts,
     decode_mime_words,
@@ -78,44 +92,19 @@ from ._common import (
 if TYPE_CHECKING:
     from ..context import ServerContext
 
-
 DRAFT_ID_HEADER = "X-SC-Draft-Id"
 DRAFT_REV_HEADER = "X-SC-Draft-Rev"
+DRAFT_PROVENANCE_HEADER = "X-SC-Provenance"
 DRAFT_CHANGE_HASH_HEADER = "X-SC-Draft-Change-Hash"
-_DRAFT_HEADER_PREFIX = b"x-sc-draft-"
+_X_SC_PREFIX = b"x-sc-"
 FIRST_REVISION = 1
-# ADR 0030: a draft the server writes is a draft the owner has already
-# seen — it was composed through this server, not delivered to it.
 DRAFT_APPEND_FLAGS = ("\\Draft", "\\Seen")
-# ADR 0035: the body formats `create_draft` reports back.
-DraftFormat = Literal["text/plain", "text/html", "multipart/alternative"]
+
+DraftFormat = Literal["text/plain", "text/html", "multipart/alternative", "multipart/mixed"]
 
 
-def _split_header_block(rfc822: bytes) -> tuple[bytes, bytes]:
-    """Split raw message bytes into (header block, remainder).
-
-    The header block keeps its own trailing line terminator; the
-    remainder starts with the empty line that separates headers from
-    body. A message without a separator is all headers.
-    """
-    candidates: list[tuple[int, int]] = []
-    for separator in (b"\r\n\r\n", b"\n\n"):
-        index = rfc822.find(separator)
-        if index != -1:
-            candidates.append((index, len(separator) // 2))
-    if not candidates:
-        return rfc822, b""
-    index, keep = min(candidates)
-    return rfc822[: index + keep], rfc822[index + keep :]
-
-
-def _strip_draft_headers(header_block: bytes) -> bytes:
-    """Drop every `X-SC-Draft-*` field, folded continuations included.
-
-    Draft identity is assigned by the server (ADR 0030), so a value the
-    caller put there is not carried over. Every other header the caller
-    supplied is left byte-for-byte as it was.
-    """
+def _strip_x_sc_headers(header_block: bytes) -> bytes:
+    """Strip all X-SC-* headers case-insensitively before appending (ADR 0042 §1)."""
     kept: list[bytes] = []
     dropping = False
     for line in header_block.splitlines(keepends=True):
@@ -123,1163 +112,344 @@ def _strip_draft_headers(header_block: bytes) -> bytes:
             if not dropping:
                 kept.append(line)
             continue
-        dropping = line.lower().startswith(_DRAFT_HEADER_PREFIX)
+        dropping = line.lower().startswith(_X_SC_PREFIX)
         if not dropping:
             kept.append(line)
     return b"".join(kept)
 
 
-def _inject_draft_headers(rfc822: bytes, *, draft_id: str, revision: int) -> bytes:
-    """Prepend the draft handle headers to a message about to be appended."""
+def _split_header_block(rfc822: bytes) -> tuple[bytes, bytes]:
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        idx = rfc822.find(sep)
+        if idx != -1:
+            split_len = len(sep) // 2
+            return rfc822[: idx + split_len], rfc822[idx + split_len :]
+    return rfc822, b""
+
+
+def _inject_provenance_headers(
+    rfc822: bytes,
+    *,
+    draft_id: str,
+    revision: int,
+    provenance_mac: str,
+    change_hash: str | None = None,
+) -> bytes:
     header_block, remainder = _split_header_block(rfc822)
-    header_block = _strip_draft_headers(header_block)
-    newline = b"\r\n" if b"\r\n" in rfc822 else b"\n"
-    prefix = (
+    clean_headers = _strip_x_sc_headers(header_block)
+    nl = b"\r\n" if b"\r\n" in rfc822 else b"\n"
+
+    injected = (
         f"{DRAFT_ID_HEADER}: {draft_id}".encode("ascii")
-        + newline
+        + nl
         + f"{DRAFT_REV_HEADER}: {revision}".encode("ascii")
-        + newline
+        + nl
+        + f"{DRAFT_PROVENANCE_HEADER}: {provenance_mac}".encode("ascii")
+        + nl
     )
-    return prefix + header_block + remainder
+    if change_hash:
+        injected += f"{DRAFT_CHANGE_HASH_HEADER}: {change_hash}".encode("ascii") + nl
+
+    return injected + clean_headers + remainder
 
 
-def _new_draft_id() -> str:
-    return str(uuid.uuid4())
+def _write_audit_intent(context: ServerContext, tool: str, arguments: dict[str, Any]) -> str:
+    req_id = getattr(context, "request_id", None) or str(uuid.uuid4())
+    if context.audit is not None:
+        context.audit.write(
+            {
+                "request_id": req_id,
+                "phase": "intent",
+                "caller_id": context.caller_id,
+                "tool": tool,
+                "decision": "ALLOW",
+                "result": "PENDING",
+            }
+        )
+    return req_id
+
+
+def check_draft_recipients(folder_policy: Any, recipients: list[str]) -> bool:
+    """Verify draft_recipients allowlist (ADR 0045 §2)."""
+    if not folder_policy or not folder_policy.draft_recipients:
+        return True
+    cfg = folder_policy.draft_recipients
+    allowed_domains = {normalize_domain(d) for d in cfg.allowed_domains}
+    allowed_addrs = {a.strip().lower() for a in cfg.allowed_addresses}
+
+    if not allowed_domains and not allowed_addrs:
+        return True
+
+    for r in recipients:
+        addr, dom = normalize_address(r)
+        if addr in allowed_addrs:
+            continue
+        if dom and dom in allowed_domains:
+            continue
+        return False
+    return True
 
 
 class _DraftHeaders(NamedTuple):
-    """The draft handle as it was found on one message."""
-
     uid: int
     draft_id: str | None
     revision: int | None
+    provenance_mac: str | None
     change_hash: str | None = None
 
 
 def _parse_draft_headers(uid: int, raw_header: bytes) -> _DraftHeaders:
-    """Read the handle headers off a raw header block.
-
-    `revision` is None when the field is missing, empty, or not a
-    positive integer — the condition ADR 0030 calls "not editable".
-    `change_hash` carries the request hash of the revision that
-    produced this message (ADR 0031); it is absent on revision 1 and on
-    anything a foreign client wrote.
-    """
-    import email
-
-    message = email.message_from_bytes(raw_header)
-    raw_id = message.get(DRAFT_ID_HEADER)
+    msg = email.message_from_bytes(raw_header)
+    raw_id = msg.get(DRAFT_ID_HEADER)
     draft_id = raw_id.strip() if raw_id else None
     if not draft_id:
-        return _DraftHeaders(uid=uid, draft_id=None, revision=None)
-    raw_rev = message.get(DRAFT_REV_HEADER)
-    revision: int | None = None
+        return _DraftHeaders(uid=uid, draft_id=None, revision=None, provenance_mac=None)
+
+    raw_rev = msg.get(DRAFT_REV_HEADER)
+    revision = None
     if raw_rev:
         try:
-            parsed = int(raw_rev.strip())
+            val = int(raw_rev.strip())
+            if val >= 1:
+                revision = val
         except ValueError:
-            parsed = 0
-        if parsed >= 1:
-            revision = parsed
-    raw_hash = message.get(DRAFT_CHANGE_HASH_HEADER)
+            pass
+
+    raw_prov = msg.get(DRAFT_PROVENANCE_HEADER)
+    provenance_mac = raw_prov.strip() if raw_prov else None
+
+    raw_hash = msg.get(DRAFT_CHANGE_HASH_HEADER)
     change_hash = raw_hash.strip() if raw_hash else None
-    return _DraftHeaders(uid=uid, draft_id=draft_id, revision=revision, change_hash=change_hash)
+
+    return _DraftHeaders(
+        uid=uid,
+        draft_id=draft_id,
+        revision=revision,
+        provenance_mac=provenance_mac,
+        change_hash=change_hash,
+    )
 
 
 class _Resolution(NamedTuple):
-    """Outcome of turning a draft_id into a UID.
-
-    Exactly one of `record` and `error_type` is set. `candidates` names
-    the UIDs that could not be told apart on an ambiguous resolution;
-    it is what the escalated transaction hands to the operator.
-    """
-
     record: _DraftHeaders | None
     error_type: str | None
     candidates: tuple[int, ...] = ()
+    raw_msg: bytes | None = None
+    all_uids: tuple[int, ...] = ()
 
 
 async def _resolve_draft_id(
     account: Any, password: str, imap_folder: str, draft_id: str
 ) -> _Resolution:
-    """Resolve a draft handle to the live message inside one folder.
-
-    Follows ADR 0030: the highest `X-SC-Draft-Rev` is authoritative,
-    lower revisions are residue and are left untouched, and two
-    messages carrying the same id *and* the same revision cannot be
-    ordered and are reported as `draft_ambiguous`.
-    """
     criteria = f'HEADER "{DRAFT_ID_HEADER}" "{draft_id}"'
     uids = await imap_search_uids(account, password, imap_folder, criteria)
     if not uids:
-        return _Resolution(record=None, error_type="draft_not_found")
+        return _Resolution(record=None, error_type="not_found")
     raw_headers = await imap_fetch_raw_headers_batch(account, password, imap_folder, uids)
-    # SEARCH HEADER matches a substring of the field value (RFC 3501
-    # §6.4.4), so every hit is re-checked for exact equality here.
     matches: list[_DraftHeaders] = []
     for uid, raw in sorted(raw_headers.items()):
-        record = _parse_draft_headers(uid, raw)
-        if record.draft_id == draft_id:
-            matches.append(record)
+        rec = _parse_draft_headers(uid, raw)
+        if rec.draft_id == draft_id:
+            matches.append(rec)
     if not matches:
-        return _Resolution(record=None, error_type="draft_not_found")
-    ordered = [record for record in matches if record.revision is not None]
+        return _Resolution(record=None, error_type="not_found")
+
+    ordered = [r for r in matches if r.revision is not None]
     if not ordered:
         return _Resolution(record=None, error_type="draft_not_editable")
-    top_revision = max(record.revision or 0 for record in ordered)
-    live = [record for record in ordered if record.revision == top_revision]
+
+    top_rev = max(r.revision or 0 for r in ordered)
+    live = [r for r in ordered if r.revision == top_rev]
     if len(live) > 1:
         return _Resolution(
             record=None,
             error_type="draft_ambiguous",
-            candidates=tuple(record.uid for record in live),
+            candidates=tuple(r.uid for r in live),
+            all_uids=tuple(r.uid for r in matches),
         )
-    return _Resolution(record=live[0], error_type=None)
-
-
-async def _resolve_revision_uid(
-    account: Any, password: str, imap_folder: str, draft_id: str, revision: int
-) -> int | None:
-    """Find the UID of one specific revision of one draft.
-
-    ADR 0031 §4: the message an `update_draft` just appended is located
-    by its revision number rather than by the `Message-ID` heuristic the
-    attachment path uses. SEARCH HEADER matches substrings, so both hits
-    are re-checked for exact equality on id *and* revision.
-    """
-    criteria = f'HEADER "{DRAFT_ID_HEADER}" "{draft_id}" HEADER "{DRAFT_REV_HEADER}" "{revision}"'
-    uids = await imap_search_uids(account, password, imap_folder, criteria)
-    if not uids:
-        return None
-    raw_headers = await imap_fetch_raw_headers_batch(account, password, imap_folder, uids)
-    for uid, raw in sorted(raw_headers.items()):
-        record = _parse_draft_headers(uid, raw)
-        if record.draft_id == draft_id and record.revision == revision:
-            return uid
-    return None
-
-
-class CreateDraftResponse(TypedDict, total=False):
-    decision: Literal["ALLOW", "DENY"]
-    result: NotRequired[Literal["OK", "ERROR"]]
-    account: str
-    folder: str
-    reason: NotRequired[str]
-    error: NotRequired[dict[str, str]]
-    missing_capability: NotRequired[str]
-    draft_id: NotRequired[str]
-    revision: NotRequired[int]
-    format: NotRequired[DraftFormat]
-
-
-class CreateReplyDraftResponse(TypedDict, total=False):
-    decision: Literal["ALLOW", "DENY"]
-    result: NotRequired[Literal["OK", "ERROR"]]
-    reason: NotRequired[str]
-    error: NotRequired[dict[str, str]]
-    account: str
-    folder: NotRequired[str]
-    source_folder: NotRequired[str]
-    drafts_folder: NotRequired[str]
-    uid: NotRequired[int]
-    missing_capability: NotRequired[str]
-    draft_id: NotRequired[str]
-    revision: NotRequired[int]
-
-
-def _ok_draft(
-    *, account: str, folder: str, draft_id: str, revision: int, body_format: DraftFormat
-) -> CreateDraftResponse:
-    return {
-        "decision": "ALLOW",
-        "result": "OK",
-        "account": account,
-        "folder": folder,
-        "draft_id": draft_id,
-        "revision": revision,
-        "format": body_format,
-    }
-
-
-def _deny_draft(
-    *,
-    reason: str,
-    account: str,
-    folder: str,
-    missing_capability: str | None = None,
-) -> CreateDraftResponse:
-    response: CreateDraftResponse = {
-        "decision": "DENY",
-        "reason": reason,
-        "account": account,
-        "folder": folder,
-    }
-    if missing_capability is not None:
-        response["missing_capability"] = missing_capability
-    return response
-
-
-def _error_draft(
-    *,
-    error_type: str,
-    account: str,
-    folder: str,
-    detail: str = "",
-) -> CreateDraftResponse:
-    return error_envelope(  # type: ignore[return-value]
-        error_type=error_type,
-        detail=detail,
-        extra={"account": account, "folder": folder},
+    return _Resolution(
+        record=live[0],
+        error_type=None,
+        all_uids=tuple(r.uid for r in matches),
     )
-
-
-def _deny_reply(
-    *,
-    reason: str,
-    account: str,
-    folder: str | None = None,
-    source_folder: str | None = None,
-    uid: int | None = None,
-    missing_capability: str | None = None,
-) -> CreateReplyDraftResponse:
-    response: CreateReplyDraftResponse = {"decision": "DENY", "reason": reason, "account": account}
-    if folder is not None:
-        response["folder"] = folder
-    if source_folder is not None:
-        response["source_folder"] = source_folder
-    if uid is not None:
-        response["uid"] = uid
-    if missing_capability is not None:
-        response["missing_capability"] = missing_capability
-    return response
-
-
-def _ok_reply(
-    *,
-    account: str,
-    source_folder: str,
-    drafts_folder: str,
-    uid: int,
-    draft_id: str,
-    revision: int,
-) -> CreateReplyDraftResponse:
-    return {
-        "decision": "ALLOW",
-        "result": "OK",
-        "account": account,
-        "source_folder": source_folder,
-        "drafts_folder": drafts_folder,
-        "uid": uid,
-        "draft_id": draft_id,
-        "revision": revision,
-    }
-
-
-def _error_reply(
-    *,
-    error_type: str,
-    account: str,
-    source_folder: str | None = None,
-    drafts_folder: str | None = None,
-    uid: int | None = None,
-    folder: str | None = None,
-    detail: str = "",
-) -> CreateReplyDraftResponse:
-    extra: dict[str, Any] = {"account": account}
-    if folder is not None:
-        extra["folder"] = folder
-    if source_folder is not None:
-        extra["source_folder"] = source_folder
-    if drafts_folder is not None:
-        extra["drafts_folder"] = drafts_folder
-    if uid is not None:
-        extra["uid"] = uid
-    return error_envelope(  # type: ignore[return-value]
-        error_type=error_type, detail=detail, extra=extra
-    )
-
-
-async def handle_create_draft(
-    context: ServerContext, arguments: dict[str, Any]
-) -> CreateDraftResponse:
-    account_id = str(arguments["account"])
-    folder_path = str(arguments["folder"])
-
-    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
-    if not folder_decision.allowed:
-        return _deny_draft(reason=folder_decision.reason, account=account_id, folder=folder_path)
-    assert folder_decision.folder_policy is not None
-    if not folder_decision.folder_policy.draft_append:
-        return _deny_draft(
-            reason="capability_missing",
-            account=account_id,
-            folder=folder_path,
-            missing_capability="draft_append",
-        )
-    account, password = await _password_for(context, account_id)
-    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    draft_id = _new_draft_id()
-    # ADR 0035: a complete message in `rfc822`, or structured fields the
-    # server composes; the dispatcher has already refused both and neither.
-    if "rfc822" in arguments:
-        message_bytes = str(arguments["rfc822"]).encode("utf-8")
-    else:
-        message_bytes = compose_draft(arguments)
-    rfc822_bytes = _inject_draft_headers(message_bytes, draft_id=draft_id, revision=FIRST_REVISION)
-    try:
-        append_result = await imap_append_message(
-            account, password, imap_folder, rfc822_bytes, flags=DRAFT_APPEND_FLAGS
-        )
-    except TimeoutError:
-        return _error_draft(error_type="append_timeout", account=account_id, folder=folder_path)
-    except Exception:  # noqa: BLE001 - any APPEND failure is reported
-        return _error_draft(error_type="append_failed", account=account_id, folder=folder_path)
-    if append_result.outcome == "ok":
-        return _ok_draft(
-            account=account_id,
-            folder=folder_path,
-            draft_id=draft_id,
-            revision=FIRST_REVISION,
-            body_format=stored_format(rfc822_bytes),
-        )
-    return _error_draft(
-        error_type="append_rejected",
-        account=account_id,
-        folder=folder_path,
-        detail=append_result.imap_response or "",
-    )
-
-
-def _validate_reply_preconditions(
-    context: ServerContext,
-    *,
-    account_id: str,
-    source_folder: str,
-    drafts_folder: str,
-    reply_text: str,
-) -> tuple[CreateReplyDraftResponse | None, Any, Any]:
-    """Run pre-fetch validation chain. Returns
-    ``(deny_response, src_decision, drafts_decision)``: when
-    ``deny_response`` is non-None the caller short-circuits; otherwise
-    the two PDP decisions are returned for later message-level checks.
-    """
-    if not reply_text.strip():
-        return (
-            _error_reply(
-                error_type="empty_reply_text",
-                account=account_id,
-                source_folder=source_folder,
-                drafts_folder=drafts_folder,
-            ),
-            None,
-            None,
-        )
-
-    src_decision = context.pdp.decide_folder_access(context.caller_id, account_id, source_folder)
-    if not src_decision.allowed:
-        return (
-            _deny_reply(reason=src_decision.reason, account=account_id, folder=source_folder),
-            None,
-            None,
-        )
-
-    drafts_decision = context.pdp.decide_folder_access(context.caller_id, account_id, drafts_folder)
-    if not drafts_decision.allowed:
-        return (
-            _deny_reply(reason=drafts_decision.reason, account=account_id, folder=drafts_folder),
-            None,
-            None,
-        )
-    assert drafts_decision.folder_policy is not None
-    if not drafts_decision.folder_policy.draft_append:
-        return (
-            _deny_reply(
-                reason="capability_missing",
-                account=account_id,
-                folder=drafts_folder,
-                missing_capability="draft_append",
-            ),
-            None,
-            None,
-        )
-    return None, src_decision, drafts_decision
-
-
-def _assemble_reply_rfc822(
-    *,
-    source_msg: Any,
-    source_body: str,
-    reply_text: str,
-    identity: Any,
-    reply_html: str | None = None,
-) -> bytes:
-    """Take the validated source message + agent-supplied reply_text
-    (and optional reply_html, ADR 0035) and produce the RFC822 bytes
-    for the draft APPEND. Handles subject/recipient derivation,
-    attribution, body quoting, and threading headers via
-    ``reply_builder``.
-    """
-    from email.header import decode_header as _dh
-    from email.header import make_header as _mh
-
-    src_from = str(_mh(_dh(source_msg.get("From") or "")))
-    src_reply_to = source_msg.get("Reply-To")
-    src_to = source_msg.get("To")
-    src_cc = source_msg.get("Cc")
-    src_subject = str(_mh(_dh(source_msg.get("Subject") or "")))
-    src_date = source_msg.get("Date")
-    src_references = source_msg.get("References")
-    src_mid = source_msg.get("Message-ID")
-
-    subject = reply_builder.build_reply_subject(src_subject)
-    to = reply_builder.derive_reply_to(src_reply_to, src_from)
-    cc = reply_builder.derive_reply_cc(src_to, src_cc, identity)
-    attribution = reply_builder.build_attribution(src_date, src_from)
-    quoted = reply_builder.quote_body(source_body)
-    body = reply_builder.build_reply_body(reply_text, attribution, quoted)
-    html_body = (
-        reply_builder.build_reply_html(reply_html, attribution, source_body)
-        if reply_html is not None
-        else None
-    )
-    in_reply_to, references = reply_builder.build_threading_headers(src_mid, src_references)
-
-    return reply_builder.build_reply_message(
-        self_identity=identity,
-        reply_to=to,
-        cc=cc,
-        subject=subject,
-        in_reply_to=in_reply_to,
-        references=references,
-        body=body,
-        html_body=html_body,
-    )
-
-
-def _reply_bodies(arguments: dict[str, Any]) -> tuple[str, str | None]:
-    """Resolve `reply_text` and `reply_html` (ADR 0035).
-
-    A blank `reply_html` counts as absent. A missing or blank
-    `reply_text` is derived from `reply_html` by the tag stripping
-    `fetch_body` uses. With neither, the text is empty and the call
-    ends in `empty_reply_text`, as it always has.
-    """
-    from ..imap_core import _strip_html
-
-    raw_text = arguments.get("reply_text")
-    raw_html = arguments.get("reply_html")
-    reply_html = str(raw_html) if raw_html is not None and str(raw_html).strip() else None
-    reply_text = "" if raw_text is None else str(raw_text)
-    if not reply_text.strip() and reply_html is not None:
-        reply_text = _strip_html(reply_html)
-    return reply_text, reply_html
-
-
-async def handle_create_reply_draft(
-    context: ServerContext, arguments: dict[str, Any]
-) -> CreateReplyDraftResponse:
-    account_id = str(arguments["account"])
-    source_folder = str(arguments["source_folder"])
-    uid = int(arguments["uid"])
-    drafts_folder = str(arguments["drafts_folder"])
-    reply_text, reply_html = _reply_bodies(arguments)
-
-    deny, src_decision, _drafts_decision = _validate_reply_preconditions(
-        context,
-        account_id=account_id,
-        source_folder=source_folder,
-        drafts_folder=drafts_folder,
-        reply_text=reply_text,
-    )
-    if deny is not None:
-        return deny
-
-    account, password = await _password_for(context, account_id)
-
-    imap_src = await _resolve_imap_folder(context, account_id, source_folder)
-    result = await imap_fetch_message_for_reply(account, password, imap_src, uid)
-    if result is None:
-        return _error_reply(
-            error_type="uid_not_found",
-            account=account_id,
-            folder=source_folder,
-            uid=uid,
-        )
-    source_msg, source_body = result
-
-    from email.utils import getaddresses as _ga
-
-    _from_addrs = _ga(source_msg.get_all("From", []))
-    _to_addrs = _ga(source_msg.get_all("To", []) + source_msg.get_all("Cc", []))
-    assert src_decision is not None and src_decision.folder_policy is not None
-    src_facts = MessageFacts(
-        from_address=_from_addrs[0][1] if _from_addrs else "",
-        to_addresses=tuple(a for _, a in _to_addrs if a),
-        subject=source_msg.get("Subject") or "",
-        has_attachment=False,
-        flagged=False,
-        size_bytes=0,
-        date_iso=None,
-    )
-    src_msg_decision = evaluate_message_against_folder(src_decision.folder_policy, facts=src_facts)
-    if not src_msg_decision.allowed:
-        return _deny_reply(
-            reason=src_msg_decision.reason,
-            account=account_id,
-            folder=source_folder,
-            uid=uid,
-        )
-    if level_rank(src_msg_decision.visibility) < level_rank("BODY"):
-        return _deny_reply(
-            reason="visibility_below_BODY",
-            account=account_id,
-            folder=source_folder,
-            uid=uid,
-        )
-
-    if not source_msg.get("Message-ID"):
-        return _deny_reply(
-            reason="missing_message_id",
-            account=account_id,
-            folder=source_folder,
-            uid=uid,
-        )
-
-    if account.identity is None:
-        return _deny_reply(reason="account_identity_missing", account=account_id)
-
-    rfc822_bytes = _assemble_reply_rfc822(
-        source_msg=source_msg,
-        source_body=source_body,
-        reply_text=reply_text,
-        identity=account.identity,
-        reply_html=reply_html,
-    )
-
-    draft_id = _new_draft_id()
-    rfc822_bytes = _inject_draft_headers(rfc822_bytes, draft_id=draft_id, revision=FIRST_REVISION)
-
-    imap_dst = await _resolve_imap_folder(context, account_id, drafts_folder)
-    append_result = await imap_append_message(
-        account, password, imap_dst, rfc822_bytes, flags=DRAFT_APPEND_FLAGS
-    )
-    if append_result.outcome == "ok":
-        return _ok_reply(
-            account=account_id,
-            source_folder=source_folder,
-            drafts_folder=drafts_folder,
-            uid=uid,
-            draft_id=draft_id,
-            revision=FIRST_REVISION,
-        )
-    return _error_reply(
-        error_type="append_failed",
-        account=account_id,
-        source_folder=source_folder,
-        drafts_folder=drafts_folder,
-        uid=uid,
-    )
-
-
-# ------------------------------------------------------------------ reads
-
-
-class AttachmentMetaEntry(TypedDict):
-    index: int
-    filename: str | None
-    mime_type: str
-    size_bytes: int
-
-
-class GetDraftResponse(TypedDict, total=False):
-    decision: Literal["ALLOW", "DENY"]
-    result: NotRequired[Literal["OK", "ERROR"]]
-    reason: NotRequired[str]
-    error: NotRequired[dict[str, str]]
-    visibility_applied: NotRequired[str]
-    account: str
-    folder: str
-    draft_id: str
-    revision: NotRequired[int]
-    subject: NotRequired[str]
-    to: NotRequired[list[str]]
-    cc: NotRequired[list[str]]
-    bcc: NotRequired[list[str]]
-    body_text: NotRequired[str]
-    body_html: NotRequired[str | None]
-    attachments: NotRequired[list[AttachmentMetaEntry]]
-
-
-class DraftListEntry(TypedDict, total=False):
-    draft_id: NotRequired[str]
-    revision: NotRequired[int]
-    subject: str
-    editable: bool
-
-
-class ListDraftsResponse(TypedDict, total=False):
-    decision: Literal["ALLOW", "DENY"]
-    result: NotRequired[Literal["OK", "ERROR"]]
-    reason: NotRequired[str]
-    error: NotRequired[dict[str, str]]
-    account: str
-    folder: str
-    drafts: NotRequired[list[DraftListEntry]]
-
-
-def _folder_ceiling_below(folder_policy: Any, minimum_rank: int) -> bool:
-    """True when no grant in this folder can ever reach `minimum_rank`.
-
-    Mirrors the gate `search` applies (handlers/search.py): only a
-    whitelist folder answers with a denial, because there the default is
-    the floor and the rules are the only way up. A blacklist folder
-    always starts above NONE and its rules subtract rather than add, so
-    its messages are filtered individually further down.
-    """
-    if getattr(folder_policy, "mode", "") != "whitelist":
-        return False
-    if level_rank(folder_policy.default) >= minimum_rank:
-        return False
-    return not any(
-        level_rank(rule.grant) >= minimum_rank
-        for rule in folder_policy.rules
-        if rule.grant is not None
-    )
-
-
-def _deny_draft_read(
-    *, reason: str, account: str, folder: str, draft_id: str | None = None
-) -> dict[str, Any]:
-    response: dict[str, Any] = {
-        "decision": "DENY",
-        "reason": reason,
-        "account": account,
-        "folder": folder,
-    }
-    if draft_id is not None:
-        response["draft_id"] = draft_id
-    return response
-
-
-def _addresses(message: Any, field: str) -> list[str]:
-    """Return the bare addresses of one recipient header."""
-    from email.utils import getaddresses
-
-    return [address for _, address in getaddresses(message.get_all(field, [])) if address]
-
-
-def _html_body(message: Any) -> str | None:
-    """Return the text/html alternative of a message, or None."""
-    for part in message.walk():
-        if part.get_content_type() != "text/html":
-            continue
-        payload = part.get_payload(decode=True)
-        if not isinstance(payload, bytes):
-            continue
-        return payload.decode(part.get_content_charset("utf-8"), errors="replace").rstrip("\r\n")
-    return None
-
-
-def _attachment_meta(message: Any) -> list[AttachmentMetaEntry]:
-    entries: list[AttachmentMetaEntry] = []
-    for index, part in enumerate(_walk_attachment_parts(message)):
-        payload = part.get_payload(decode=True) or b""
-        entries.append(
-            {
-                "index": index,
-                "filename": decode_mime_words(part.get_filename() or "") or None,
-                "mime_type": part.get_content_type(),
-                "size_bytes": len(payload),
-            }
-        )
-    return entries
-
-
-async def handle_get_draft(context: ServerContext, arguments: dict[str, Any]) -> GetDraftResponse:
-    """Return the composed fields of one draft, addressed by its handle."""
-    account_id = str(arguments["account"])
-    folder_path = str(arguments["folder"])
-    draft_id = str(arguments["draft_id"])
-
-    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
-    if not folder_decision.allowed:
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason=folder_decision.reason,
-            account=account_id,
-            folder=folder_path,
-            draft_id=draft_id,
-        )
-    assert folder_decision.folder_policy is not None
-    # A folder whose ceiling stays below BODY can never answer this tool,
-    # whoever the sender is. The denial is a visibility statement, not a
-    # per-message verdict, so it is taken before any IMAP read.
-    if _folder_ceiling_below(folder_decision.folder_policy, level_rank("BODY")):
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason="visibility_below_BODY",
-            account=account_id,
-            folder=folder_path,
-            draft_id=draft_id,
-        )
-
-    account, password = await _password_for(context, account_id)
-    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    resolution = await _resolve_draft_id(account, password, imap_folder, draft_id)
-    if resolution.error_type is not None:
-        return error_envelope(  # type: ignore[return-value]
-            error_type=resolution.error_type,
-            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
-        )
-    assert resolution.record is not None
-    record = resolution.record
-
-    result = await imap_fetch_body(account, password, imap_folder, record.uid)
-    if result is None:
-        return error_envelope(  # type: ignore[return-value]
-            error_type="draft_not_found",
-            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
-        )
-    envelope, body_text, message = result
-
-    facts = _facts_from_envelope(envelope)
-    message_decision = evaluate_message_against_folder(folder_decision.folder_policy, facts=facts)
-    if not message_decision.allowed:
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason=message_decision.reason,
-            account=account_id,
-            folder=folder_path,
-            draft_id=draft_id,
-        )
-    if level_rank(message_decision.visibility) < level_rank("BODY"):
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason="visibility_below_BODY",
-            account=account_id,
-            folder=folder_path,
-            draft_id=draft_id,
-        )
-
-    return {
-        "decision": "ALLOW",
-        "result": "OK",
-        "reason": message_decision.reason,
-        "visibility_applied": message_decision.visibility,
-        "account": account_id,
-        "folder": folder_path,
-        "draft_id": draft_id,
-        "revision": record.revision,  # type: ignore[typeddict-item]
-        "subject": envelope.subject,
-        "to": _addresses(message, "To"),
-        "cc": _addresses(message, "Cc"),
-        "bcc": _addresses(message, "Bcc"),
-        "body_text": body_text,
-        "body_html": _html_body(message),
-        "attachments": _attachment_meta(message),
-    }
-
-
-async def handle_list_drafts(
-    context: ServerContext, arguments: dict[str, Any]
-) -> ListDraftsResponse:
-    """List the drafts in one folder, editable ones under their handle.
-
-    A message without an `X-SC-Draft-Id` was written by some other
-    client; it is listed but cannot be revised through this server
-    (ADR 0030). Where several messages share a handle, the highest
-    revision is reported and the residue is left untouched.
-    """
-    account_id = str(arguments["account"])
-    folder_path = str(arguments["folder"])
-
-    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
-    if not folder_decision.allowed:
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason=folder_decision.reason, account=account_id, folder=folder_path
-        )
-    folder_policy = folder_decision.folder_policy
-    assert folder_policy is not None
-    minimum_for_tool = level_rank("METADATA")
-    # ADR 0031: list_drafts sits at the same bar as list_messages. When
-    # no rule in the folder can ever reach METADATA the answer is a
-    # denial, not an empty list — an empty list would assert that the
-    # folder holds no drafts, which the caller is not entitled to know.
-    if _folder_ceiling_below(folder_policy, minimum_for_tool):
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason="visibility_below_METADATA", account=account_id, folder=folder_path
-        )
-
-    account, password = await _password_for(context, account_id)
-    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
-    uids = await imap_search_uids(account, password, imap_folder, "ALL")
-    if not uids:
-        return {
-            "decision": "ALLOW",
-            "result": "OK",
-            "reason": folder_decision.reason,
-            "account": account_id,
-            "folder": folder_path,
-            "drafts": [],
-        }
-
-    envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, uids)
-    envelope_by_uid = {envelope.uid: envelope for envelope in envelopes}
-    raw_headers = await imap_fetch_raw_headers_batch(account, password, imap_folder, uids)
-
-    entries: list[DraftListEntry] = []
-    live_by_handle: dict[str, int] = {}
-    for uid in sorted(uids):
-        envelope = envelope_by_uid.get(uid)
-        if envelope is None:
-            continue
-        facts = _facts_from_envelope(envelope)
-        message_decision = evaluate_message_against_folder(folder_policy, facts=facts)
-        if not message_decision.allowed:
-            continue
-        if level_rank(message_decision.visibility) < minimum_for_tool:
-            continue
-        raw = raw_headers.get(uid)
-        record = _parse_draft_headers(uid, raw) if raw is not None else None
-        entry: DraftListEntry = {
-            "subject": envelope.subject,
-            "editable": bool(record is not None and record.revision is not None),
-        }
-        if record is not None and record.draft_id is not None:
-            entry["draft_id"] = record.draft_id
-            if record.revision is not None:
-                entry["revision"] = record.revision
-                # Residue of an interrupted revision: only the highest
-                # revision of a handle is live (ADR 0030, rule 2).
-                position = live_by_handle.get(record.draft_id)
-                if position is None:
-                    live_by_handle[record.draft_id] = len(entries)
-                else:
-                    previous = entries[position].get("revision") or 0
-                    if record.revision > previous:
-                        entries[position] = entry
-                    continue
-        entries.append(entry)
-
-    return {
-        "decision": "ALLOW",
-        "result": "OK",
-        "reason": folder_decision.reason,
-        "account": account_id,
-        "folder": folder_path,
-        "drafts": entries,
-    }
-
-
-# ------------------------------------------------------------- revisions
-
-
-# The closed set of members `changes` may carry (ADR 0031). Address
-# fields take a list, everything else a string; every member also
-# accepts `null` (and `[]` for an address list) to remove the field.
-_ADDRESS_CHANGE_FIELDS = ("to", "cc", "bcc")
-_TEXT_CHANGE_FIELDS = ("subject", "in_reply_to")
-_BODY_CHANGE_FIELDS = ("body_text", "body_html")
-CHANGE_FIELDS = _TEXT_CHANGE_FIELDS + _ADDRESS_CHANGE_FIELDS + _BODY_CHANGE_FIELDS
-_HEADER_FOR_CHANGE_FIELD = {
-    "subject": "Subject",
-    "in_reply_to": "In-Reply-To",
-    "to": "To",
-    "cc": "Cc",
-    "bcc": "Bcc",
-}
-_ADDRESS_PATTERN = r"^[^@\s<>,;:\"]+@[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$"
-
-
-def _is_rfc5322_address(value: str) -> bool:
-    """True when `value` is a single address this server will put on a
-    recipient header. Deliberately narrower than RFC 5322 permits: a
-    display name is allowed, the addr-spec must be an ordinary
-    dot-atom@domain."""
-    import re
-    from email.utils import getaddresses
-
-    parsed = getaddresses([value])
-    if len(parsed) != 1:
-        return False
-    _, addr_spec = parsed[0]
-    return bool(re.match(_ADDRESS_PATTERN, addr_spec))
-
-
-def validate_changes(changes: Any) -> str | None:
-    """Validate the `changes` object of `update_draft` (ADR 0031).
-
-    Returns a caller-facing message when the object is malformed and
-    None when it may proceed. Everything rejected here is a malformed
-    call rather than a mailbox condition, so the dispatcher turns it
-    into a JSON-RPC invalid-arguments error before any IMAP connection
-    is opened.
-    """
-    if not isinstance(changes, dict):
-        return "update_draft requires `changes` to be an object (ADR 0031)"
-    if not changes:
-        return "update_draft requires at least one member in `changes` (ADR 0031)"
-    unknown = sorted(set(changes) - set(CHANGE_FIELDS))
-    if unknown:
-        return (
-            f"update_draft `changes` carries unknown member(s) {unknown}; "
-            f"allowed: {sorted(CHANGE_FIELDS)} (ADR 0031)"
-        )
-    return _field_values_error(changes, label="update_draft `changes.", allow_null=True)
-
-
-def _field_values_error(
-    values: dict[str, Any], *, label: str, allow_null: bool, ascii_addresses: bool = False
-) -> str | None:
-    """Check the draft fields present in `values` (ADR 0031, ADR 0035).
-
-    `label` prefixes every field name in a message. `allow_null` admits
-    `null` as "remove this field", which only a revision can mean.
-    `ascii_addresses` additionally refuses an addr-spec outside ASCII,
-    which cannot be RFC 2047 encoded into a pure-ASCII header block.
-    """
-    or_null = " or null" if allow_null else ""
-    for field in _TEXT_CHANGE_FIELDS + _BODY_CHANGE_FIELDS:
-        if field not in values:
-            continue
-        value = values[field]
-        if value is None and allow_null:
-            continue
-        if not isinstance(value, str):
-            return f"{label}{field}` must be a string{or_null}"
-    for field in _ADDRESS_CHANGE_FIELDS:
-        if field not in values:
-            continue
-        value = values[field]
-        if value is None and allow_null:
-            continue
-        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-            return f"{label}{field}` must be an array of strings{or_null}"
-        for item in value:
-            if not _is_rfc5322_address(item):
-                return f"{label}{field}` holds a malformed address"
-            if ascii_addresses and not _addr_spec_is_ascii(item):
-                return f"{label}{field}` holds an address outside ASCII"
-    # ADR 0031: a header value carrying CR or LF is rejected, never
-    # sanitised — silently stripping it would let a caller smuggle a
-    # second header past the schema.
-    for field in _TEXT_CHANGE_FIELDS + _ADDRESS_CHANGE_FIELDS:
-        value = values.get(field)
-        candidates = (
-            [value] if isinstance(value, str) else (value if isinstance(value, list) else [])
-        )
-        for candidate in candidates:
-            if isinstance(candidate, str) and ("\r" in candidate or "\n" in candidate):
-                return (
-                    f"{label}{field}` contains a line break; "
-                    "header values must be a single line (ADR 0031)"
-                )
-    return None
-
-
-def _addr_spec_is_ascii(value: str) -> bool:
-    from email.utils import getaddresses
-
-    return all(address.isascii() for _, address in getaddresses([value]))
-
-
-def validate_create_draft_arguments(arguments: dict[str, Any]) -> str | None:
-    """Validate the two input modes of `create_draft` (ADR 0035).
-
-    Either a complete message in `rfc822` or structured fields with at
-    least one body field — never both, never neither. Like
-    `validate_changes`, a rejection here is a malformed call: the
-    dispatcher answers it with invalid-arguments before any IMAP
-    command.
-    """
-    structured = [field for field in CHANGE_FIELDS if field in arguments]
-    if "rfc822" in arguments:
-        if structured:
-            return (
-                "create_draft takes either `rfc822` or structured fields, "
-                f"not both; got rfc822 and {structured} (ADR 0035)"
-            )
-        if not isinstance(arguments["rfc822"], str):
-            return "create_draft `rfc822` must be a string"
-        return None
-    if not any(field in arguments for field in _BODY_CHANGE_FIELDS):
-        return "create_draft requires `rfc822` or a `body_text` or `body_html` field (ADR 0035)"
-    return _field_values_error(
-        arguments, label="create_draft `", allow_null=False, ascii_addresses=True
-    )
-
-
-def change_hash(changes: dict[str, Any]) -> str:
-    """sha256 over the canonical JSON encoding of `changes` (ADR 0031).
-
-    Members sorted lexicographically, no insignificant whitespace,
-    UTF-8, `null` members preserved. It hashes the *request*, not the
-    produced message, so it survives the regenerated `Date`,
-    `Message-ID` and MIME boundaries.
-    """
-    import hashlib
-    import json
-
-    canonical = json.dumps(changes, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _set_body_part(message: Any, content_type: str, text: str | None) -> None:
-    """Replace the first non-attachment part of `content_type`.
-
-    ADR 0031: removing the last body part leaves an empty `text/plain`
-    part rather than a message with no body, so a removal writes an
-    empty payload instead of dropping the part.
-    """
-    from email.mime.text import MIMEText
-
-    replacement = "" if text is None else text
-    for part in message.walk():
-        if part.get_content_type() != content_type:
-            continue
-        if (part.get_content_disposition() or "") == "attachment":
-            continue
-        del part["Content-Transfer-Encoding"]
-        part.set_payload(replacement + "\n", charset="utf-8")
-        return
-
-    subtype = content_type.split("/", 1)[1]
-    new_part = MIMEText(replacement + "\n", subtype, "utf-8")
-    if message.get_content_maintype() == "multipart":
-        message.attach(new_part)
-        return
-    # A single-part message gaining a second representation becomes a
-    # multipart/alternative holding what was already there plus the new
-    # part; nothing of the original body is lost.
-    original = message.get_payload(decode=True) or b""
-    kept = MIMEText(
-        original.decode(message.get_content_charset("utf-8"), errors="replace"),
-        message.get_content_subtype(),
-        "utf-8",
-    )
-    del message["Content-Type"]
-    del message["Content-Transfer-Encoding"]
-    message.set_type("multipart/alternative")
-    message.set_payload([kept, new_part])
-
-
-def apply_draft_changes(
-    rfc822: bytes, *, changes: dict[str, Any], revision: int, request_hash: str
-) -> bytes:
-    """Produce the bytes of the next revision of a draft (ADR 0031).
-
-    Everything `changes` does not address is carried over verbatim:
-    attachment parts, unknown headers, `From`, `References`. Four
-    headers are regenerated on every revision: `X-SC-Draft-Rev`,
-    `Message-ID`, `Date` and `X-SC-Draft-Change-Hash`.
-    """
-    import email
-    from email.utils import formatdate, make_msgid
-
-    message = email.message_from_bytes(rfc822)
-    _apply_field_values(message, changes)
-
-    for header, value in (
-        ("Date", formatdate(localtime=True)),
-        ("Message-ID", make_msgid()),
-        (DRAFT_REV_HEADER, str(revision)),
-        (DRAFT_CHANGE_HASH_HEADER, request_hash),
-    ):
-        del message[header]
-        message[header] = value
-
-    return _flatten(message, maxheaderlen=0)
 
 
 def _format_address_list(addresses: list[str]) -> str:
-    """Render recipients so that only a display name is RFC 2047
-    encoded; an encoded word must never swallow the addr-spec."""
     from email.utils import formataddr, getaddresses
 
     rendered = [formataddr(pair, charset="utf-8") for pair in getaddresses(addresses)]
     return ", ".join(rendered)
 
 
-def _apply_field_values(message: Any, values: dict[str, Any]) -> None:
-    """Write the draft fields present in `values` onto `message`.
+def compose_draft_message(arguments: dict[str, Any], account: Any) -> tuple[bytes, DraftFormat]:
+    """Compose structured draft into RFC 822 bytes (ADR 0063)."""
+    to_list = arguments.get("to") or []
+    cc_list = arguments.get("cc") or []
+    bcc_list = arguments.get("bcc") or []
+    subject = arguments.get("subject") or ""
+    body_text = arguments.get("body_text")
+    body_html = arguments.get("body_html")
+    in_reply_to = arguments.get("in_reply_to")
+    attachments = arguments.get("attachments") or []
 
-    The one composition step shared by `update_draft` (ADR 0031) and
-    structured `create_draft` (ADR 0035): a member absent leaves the
-    field alone, a value sets it, `null` (or `[]`) removes it. Header
-    values are assigned as whole values, so the generator RFC 2047
-    encodes anything outside ASCII; nothing is concatenated into the
-    header block raw.
-    """
-    for field in _TEXT_CHANGE_FIELDS + _ADDRESS_CHANGE_FIELDS:
-        if field not in values:
-            continue
-        header = _HEADER_FOR_CHANGE_FIELD[field]
-        value = values[field]
-        del message[header]
-        if field in _ADDRESS_CHANGE_FIELDS:
-            addresses = value or []
-            if addresses:
-                message[header] = _format_address_list(addresses)
-            continue
-        if value is not None:
-            message[header] = value
+    # From address derivation (ADR 0050, ADR 0063)
+    from_addr = ""
+    if account.user and "@" in account.user:
+        from_addr = account.user
+    elif account.id and "@" in account.id:
+        from_addr = account.id
+    elif account.identity:
+        from_addr = account.identity
+    else:
+        from_addr = account.id
 
-    if "body_text" in values:
-        _set_body_part(message, "text/plain", values["body_text"])
-    if "body_html" in values:
-        _set_body_part(message, "text/html", values["body_html"])
+    if body_html is not None and body_text is None:
+        body_text = reply_builder.strip_html_preserving_paragraphs(body_html)
 
+    # Determine body structure
+    if body_text is not None and body_html is not None:
+        body_part: MIMEBase = MIMEMultipart("alternative")
+        p_text = MIMEText(body_text + "\n", "plain", "utf-8")
+        p_html = MIMEText(body_html + "\n", "html", "utf-8")
+        body_part.attach(p_text)
+        body_part.attach(p_html)
+        top_format: DraftFormat = "multipart/alternative"
+    elif body_html is not None:
+        p_text = MIMEText((body_text or "") + "\n", "plain", "utf-8")
+        p_html = MIMEText(body_html + "\n", "html", "utf-8")
+        body_part = MIMEMultipart("alternative")
+        body_part.attach(p_text)
+        body_part.attach(p_html)
+        top_format = "multipart/alternative"
+    else:
+        body_part = MIMEText((body_text or "") + "\n", "plain", "utf-8")
+        top_format = "text/plain"
 
-def _flatten(message: Any, *, maxheaderlen: int) -> bytes:
+    if attachments:
+        top_msg = MIMEMultipart("mixed")
+        top_msg.attach(body_part)
+        for att in attachments:
+            fname = att["filename"]
+            mtype = att["mime_type"]
+            c_b64 = att["content_base64"]
+            maintype, _, subtype = mtype.partition("/")
+            part = MIMEBase(maintype, subtype or "octet-stream")
+            part.set_payload(base64.b64decode(c_b64))
+            email.encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=fname)
+            top_msg.attach(part)
+        stored_fmt: DraftFormat = "multipart/mixed"
+        msg: MIMEBase = top_msg
+    else:
+        msg = body_part
+        stored_fmt = top_format
+
+    msg["From"] = from_addr
+    if to_list:
+        msg["To"] = _format_address_list(to_list)
+    if cc_list:
+        msg["Cc"] = _format_address_list(cc_list)
+    if bcc_list:
+        msg["Bcc"] = _format_address_list(bcc_list)
+    if subject:
+        msg["Subject"] = subject
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+
+    # Flatten
     import io
     from email.generator import BytesGenerator
 
-    buffer = io.BytesIO()
-    BytesGenerator(buffer, mangle_from_=False, maxheaderlen=maxheaderlen).flatten(message)
-    return buffer.getvalue()
+    buf = io.BytesIO()
+    BytesGenerator(buf, mangle_from_=False, maxheaderlen=78).flatten(msg)
+    return buf.getvalue(), stored_fmt
 
 
-# The empty message structured composition starts from: one empty UTF-8
-# text/plain part, which the body fields then fill or extend.
-_COMPOSE_SKELETON = b'MIME-Version: 1.0\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\n'
-# RFC 5322 §2.1.1 line limit; keeps every RFC 2047 encoded word short.
-_COMPOSE_MAX_HEADER_LEN = 78
+def apply_draft_changes(
+    rfc822: bytes, *, changes: dict[str, Any], revision: int, request_hash: str
+) -> bytes:
+    return apply_draft_changes_v3(
+        rfc822,
+        changes=changes,
+        revision=revision,
+        request_hash=request_hash,
+        provenance_mac="v1:test",
+        draft_id="d-test",
+    )
+
+
+# Closed change fields (ADR 0031, ADR 0063)
+CHANGE_FIELDS = (
+    "subject",
+    "in_reply_to",
+    "to",
+    "cc",
+    "bcc",
+    "body_text",
+    "body_html",
+    "attachments",
+)
+
+
+def _reply_bodies(arguments: dict[str, Any]) -> tuple[str, str | None]:
+    raw_text = arguments.get("reply_text")
+    raw_html = arguments.get("reply_html")
+    reply_html = str(raw_html) if raw_html is not None and str(raw_html).strip() else None
+    reply_text = str(raw_text) if raw_text is not None else ""
+    if not reply_text.strip() and reply_html is not None:
+        reply_text = reply_builder.strip_html_preserving_paragraphs(reply_html)
+    return reply_text, reply_html
+
+
+def validate_changes(changes: Any) -> str | None:
+    if not isinstance(changes, dict):
+        return "update_draft `changes` must be an object (ADR 0031)"
+    if not changes:
+        return "update_draft requires at least one member in `changes` (ADR 0031)"
+    for k in changes:
+        if k not in CHANGE_FIELDS:
+            return f"update_draft `changes` carries unknown member {k!r} (ADR 0031)"
+    for f in ("subject", "in_reply_to", "body_text", "body_html"):
+        if f in changes and changes[f] is not None and not isinstance(changes[f], str):
+            return f"update_draft `changes.{f}` must be a string or null"
+    for f in ("to", "cc", "bcc"):
+        if (
+            f in changes
+            and changes[f] is not None
+            and (
+                not isinstance(changes[f], list) or not all(isinstance(x, str) for x in changes[f])
+            )
+        ):
+            return f"update_draft `changes.{f}` must be an array of strings or null"
+    return None
+
+
+def _inject_draft_headers(rfc822: bytes, *, draft_id: str, revision: int) -> bytes:
+    header_block, remainder = _split_header_block(rfc822)
+    clean_headers = _strip_x_sc_headers(header_block)
+    nl = b"\r\n" if b"\r\n" in rfc822 else b"\n"
+    prefix = (
+        f"{DRAFT_ID_HEADER}: {draft_id}".encode("ascii")
+        + nl
+        + f"{DRAFT_REV_HEADER}: {revision}".encode("ascii")
+        + nl
+    )
+    return prefix + clean_headers + remainder
 
 
 def compose_draft(fields: dict[str, Any]) -> bytes:
-    """Build a new draft from structured fields (ADR 0035).
-
-    `body_text` alone gives `text/plain; charset=utf-8`. `body_html`,
-    with or without `body_text`, gives `multipart/alternative` with a
-    text/plain and a text/html part; a missing `body_text` is derived
-    from the HTML by the tag stripping `fetch_body` uses. The draft
-    handle headers are not set here; the caller injects them as for an
-    `rfc822` draft.
-    """
-    import email
-    from email.utils import formatdate, make_msgid
-
-    from ..imap_core import _strip_html
-
-    values = {field: fields[field] for field in CHANGE_FIELDS if field in fields}
-    if values.get("body_html") is not None and values.get("body_text") is None:
-        values["body_text"] = _strip_html(str(values["body_html"]))
-
-    message = email.message_from_bytes(_COMPOSE_SKELETON)
-    _apply_field_values(message, values)
-    message["Date"] = formatdate(localtime=True)
-    message["Message-ID"] = make_msgid()
-    return _flatten(message, maxheaderlen=_COMPOSE_MAX_HEADER_LEN)
+    dummy_account = type(
+        "Dummy", (), {"user": "a@example.org", "id": "a@example.org", "identity": None}
+    )()
+    raw, _ = compose_draft_message(fields, dummy_account)
+    return raw
 
 
 def stored_format(rfc822: bytes) -> DraftFormat:
-    """Name the body format of a message about to be appended (ADR 0035).
-
-    A multipart/alternative is reported as such wherever it carries the
-    body; a mixed or related container is followed into its first part,
-    which is the body by convention. A single HTML leaf is `text/html`;
-    every other body is reported as `text/plain`.
-    """
-    import email
-    from email.message import Message
-
-    part = email.message_from_bytes(rfc822)
+    msg = email.message_from_bytes(rfc822)
+    part = msg
     while part.is_multipart():
         if part.get_content_type() == "multipart/alternative":
             return "multipart/alternative"
@@ -1293,182 +463,842 @@ def stored_format(rfc822: bytes) -> DraftFormat:
     return "text/html" if part.get_content_type() == "text/html" else "text/plain"
 
 
-async def _sweep_draft_residue(
-    account: Any,
-    password: str,
-    imap_folder: str,
-    draft_id: str,
-    *,
-    live_revision: int,
-) -> None:
-    """Remove the lower revisions left behind by an interrupted edit.
-
-    ADR 0030 rule 2: at most one live message per handle. A revision
-    that crashed between APPEND and DELETE leaves the previous message
-    in place; the resuming transaction removes it, and when no
-    transaction survived to resume, the next `update_draft` does —
-    which is this call, the only one on the path that holds
-    `draft_edit` and may therefore delete. Reads never reach here.
-
-    A message carrying the handle but no usable revision is left alone:
-    it cannot be ordered against `live_revision`, so it is not residue
-    this rule can identify.
-
-    A failure to delete does not fail the revision. The new message is
-    already in the folder and is authoritative by revision order, so the
-    caller is not blocked by a mailbox that refuses the EXPUNGE
-    (ADR 0031 §the saga); the leftover stays visible as residue for the
-    next attempt.
-    """
-    criteria = f'HEADER "{DRAFT_ID_HEADER}" "{draft_id}"'
-    try:
-        uids = await imap_search_uids(account, password, imap_folder, criteria)
-        if len(uids) < 2:
-            return
-        raw_headers = await imap_fetch_raw_headers_batch(account, password, imap_folder, uids)
-    except Exception:  # noqa: BLE001 - best-effort residue cleanup
-        return
-    residue: list[int] = []
-    for uid, raw in sorted(raw_headers.items()):
-        record = _parse_draft_headers(uid, raw)
-        if record.draft_id != draft_id or record.revision is None:
-            continue
-        if record.revision < live_revision:
-            residue.append(uid)
-    if not residue:
-        return
-    try:
-        await imap_expunge_uids(account, password, imap_folder, residue)
-    except Exception:  # noqa: BLE001 - best-effort residue cleanup
-        return
+def change_hash(changes: dict[str, Any]) -> str:
+    """Canonical JSON encoding sha256 (ADR 0057, ADR 0063)."""
+    canonical = json.dumps(changes, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-class UpdateDraftResponse(TypedDict, total=False):
-    decision: Literal["ALLOW", "DENY"]
-    result: NotRequired[Literal["OK", "ERROR"]]
-    reason: NotRequired[str]
-    error: NotRequired[dict[str, str]]
-    account: str
-    folder: str
-    draft_id: str
-    revision: NotRequired[int]
-    current_revision: NotRequired[int]
-    missing_capability: NotRequired[str]
-    mechanism: NotRequired[str]
-    tx_id: NotRequired[str | None]
-    idempotent_replay: NotRequired[bool]
+# ------------------------------------------------------------- create_draft
 
 
-def _escalate_ambiguity(
-    context: ServerContext,
-    *,
-    account_id: str,
-    folder: str,
-    draft_id: str,
-    candidates: tuple[int, ...],
-) -> str:
-    """Open a transaction for an ambiguous handle and park it at once.
+async def handle_create_draft(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
 
-    ADR 0030: two messages carrying the same handle and the same
-    revision cannot be ordered, and the server picks neither. That is
-    an incident, not merely a caller error — a human has to look at the
-    mailbox. So a transaction is written that never runs a step: it is
-    escalated to `needs_operator` (ADR 0007) in the same breath, it
-    names the UIDs that collided, and the caller is handed its `tx_id`
-    together with `draft_ambiguous`, so the report the caller files and
-    the entry the operator works on are the same case.
-    """
-    wal = _require_saga(context, "update_draft").wal
-    tx_id = wal.begin(
-        caller_id=context.caller_id,
-        src_account=account_id,
-        src_folder=folder,
-        src_uid=candidates[0] if candidates else 0,
-        dst_account=account_id,
-        dst_folder=folder,
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    assert folder_decision.folder_policy is not None
+    fp = folder_decision.folder_policy
+    if not fp.draft_append:
+        return {
+            "decision": "DENY",
+            "reason": "capability_missing",
+            "account": account_id,
+            "folder": folder_path,
+        }
+
+    account, password = await _password_for(context, account_id)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+
+    # Recipient validation
+    all_recips: list[str] = []
+    if "rfc822" in arguments:
+        message_bytes = str(arguments["rfc822"]).encode("utf-8")
+        parsed_msg = email.message_from_bytes(message_bytes)
+        from email.utils import getaddresses
+
+        for h in ("To", "Cc", "Bcc"):
+            all_recips.extend(a for _, a in getaddresses(parsed_msg.get_all(h, [])) if a)
+        fmt = stored_format(message_bytes)
+    else:
+        all_recips.extend(arguments.get("to") or [])
+        all_recips.extend(arguments.get("cc") or [])
+        all_recips.extend(arguments.get("bcc") or [])
+        message_bytes, fmt = compose_draft_message(arguments, account)
+
+    if not check_draft_recipients(fp, all_recips):
+        return {
+            "decision": "DENY",
+            "reason": "recipient_not_allowed",
+            "account": account_id,
+            "folder": folder_path,
+        }
+
+    draft_id = str(uuid.uuid4())
+    canonical_digest = compute_canonical_digest(message_bytes)
+    provenance_mac = compute_provenance_mac(
+        context.provenance_hmac_key,
+        context.caller_id,
+        account_id,
+        draft_id,
+        FIRST_REVISION,
+        canonical_digest,
     )
-    uid_list = ",".join(str(uid) for uid in candidates)
-    wal.mark_needs_operator(
-        tx_id,
-        reason=f"draft_ambiguous: draft_id={draft_id} uids={uid_list}",
+
+    final_rfc822 = _inject_provenance_headers(
+        message_bytes,
+        draft_id=draft_id,
+        revision=FIRST_REVISION,
+        provenance_mac=provenance_mac,
     )
-    return tx_id
+
+    # Pre-effect intent audit
+    _write_audit_intent(context, "create_draft", arguments)
+
+    try:
+        append_res = await imap_append_message(
+            account, password, imap_folder, final_rfc822, flags=DRAFT_APPEND_FLAGS
+        )
+    except TimeoutError:
+        return error_envelope(
+            error_type="append_timeout",
+            detail="APPEND draft timed out",
+            extra={"account": account_id, "folder": folder_path},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return error_envelope(
+            error_type="append_failed",
+            detail=str(exc),
+            extra={"account": account_id, "folder": folder_path},
+        )
+
+    if append_res.outcome != "ok":
+        return error_envelope(
+            error_type="append_rejected",
+            detail=append_res.imap_response or "APPEND draft rejected",
+            extra={"account": account_id, "folder": folder_path},
+        )
+
+    # Record in wal provenance
+    if context.saga is not None:
+        parsed_final = email.message_from_bytes(final_rfc822)
+        mid = parsed_final.get("Message-ID")
+        context.saga.wal.record_provenance(
+            draft_id, FIRST_REVISION, context.caller_id, account_id, mid, canonical_digest
+        )
+
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": folder_decision.reason,
+        "account": account_id,
+        "folder": folder_path,
+        "draft_id": draft_id,
+        "revision": FIRST_REVISION,
+        "format": fmt,
+    }
 
 
-async def handle_update_draft(
+# ------------------------------------------------------------- create_reply_draft
+
+
+async def handle_create_reply_draft(
     context: ServerContext, arguments: dict[str, Any]
-) -> UpdateDraftResponse:
-    """Revise one draft field-wise under an optimistic revision check."""
+) -> dict[str, Any]:
+    account_id = str(arguments["account"])
+    source_folder = str(arguments["source_folder"])
+    uid = int(arguments["uid"])
+    drafts_folder = str(arguments["drafts_folder"])
+    raw_text = arguments.get("reply_text")
+    raw_html = arguments.get("reply_html")
+
+    reply_text = str(raw_text) if raw_text is not None else ""
+    reply_html = str(raw_html) if raw_html is not None and str(raw_html).strip() else None
+    if not reply_text.strip() and reply_html is not None:
+        reply_text = reply_builder.strip_html_preserving_paragraphs(reply_html)
+
+    if not reply_text.strip():
+        return error_envelope(
+            error_type="empty_reply_text",
+            detail="Reply text or html must be non-empty",
+            extra={
+                "account": account_id,
+                "source_folder": source_folder,
+                "drafts_folder": drafts_folder,
+            },
+        )
+
+    src_dec = context.pdp.decide_folder_access(context.caller_id, account_id, source_folder)
+    if not src_dec.allowed:
+        return {
+            "decision": "DENY",
+            "reason": src_dec.reason,
+            "account": account_id,
+            "folder": source_folder,
+        }
+
+    drafts_dec = context.pdp.decide_folder_access(context.caller_id, account_id, drafts_folder)
+    if not drafts_dec.allowed:
+        return {
+            "decision": "DENY",
+            "reason": drafts_dec.reason,
+            "account": account_id,
+            "folder": drafts_folder,
+        }
+    assert drafts_dec.folder_policy is not None
+    if not drafts_dec.folder_policy.draft_append:
+        return {
+            "decision": "DENY",
+            "reason": "capability_missing",
+            "account": account_id,
+            "folder": drafts_folder,
+        }
+
+    account, password = await _password_for(context, account_id)
+    imap_src = await _resolve_imap_folder(context, account_id, source_folder)
+    imap_dst = await _resolve_imap_folder(context, account_id, drafts_folder)
+
+    # Fetch source message
+    envelope = await imap_fetch_envelope(account, password, imap_src, uid)
+    if envelope is None:
+        return error_envelope(
+            error_type="not_found",
+            detail="Source message not found",
+            extra={"account": account_id, "folder": source_folder, "uid": uid},
+        )
+
+    facts = _facts_from_envelope(envelope)
+    eff_vis, eff_reason = context.pdp.evaluate_message_effective(
+        context.caller_id, account_id, source_folder, facts
+    )
+
+    if level_rank(eff_vis) < level_rank("METADATA"):
+        return error_envelope(
+            error_type="not_found",
+            detail="Source message not found",
+            extra={"account": account_id, "folder": source_folder, "uid": uid},
+        )
+
+    if level_rank(eff_vis) < level_rank("BODY"):
+        return {
+            "decision": "DENY",
+            "reason": "visibility_below_BODY",
+            "account": account_id,
+            "folder": source_folder,
+            "uid": uid,
+        }
+
+    if not envelope.message_id:
+        return error_envelope(
+            error_type="missing_message_id",
+            detail="Source message lacks Message-ID",
+            extra={"account": account_id, "folder": source_folder, "uid": uid},
+        )
+
+    fetch_res = await imap_fetch_message_for_reply(account, password, imap_src, uid)
+    if fetch_res is None:
+        return error_envelope(
+            error_type="not_found",
+            detail="Source message not found",
+            extra={"account": account_id, "folder": source_folder, "uid": uid},
+        )
+    source_msg, source_body = fetch_res
+
+    self_identity = account.wire_user()
+    if account.identity:
+        self_identity = account.identity
+
+    from email.header import decode_header as _dh
+    from email.header import make_header as _mh
+
+    src_from = str(_mh(_dh(source_msg.get("From") or "")))
+    src_reply_to = source_msg.get("Reply-To")
+    src_to = source_msg.get("To")
+    src_cc = source_msg.get("Cc")
+    src_subject = str(_mh(_dh(source_msg.get("Subject") or "")))
+    src_date = source_msg.get("Date")
+    src_references = source_msg.get("References")
+    src_mid = envelope.message_id
+
+    subject = reply_builder.build_reply_subject(src_subject)
+    to = reply_builder.derive_reply_to(src_reply_to, src_from)
+    cc = reply_builder.derive_reply_cc(src_to, src_cc, self_identity)
+    attribution = reply_builder.build_attribution(src_date, src_from)
+    quoted = reply_builder.quote_body(source_body)
+    body = reply_builder.build_reply_body(reply_text, attribution, quoted)
+    html_body_val = (
+        reply_builder.build_reply_html(reply_html, attribution, source_body)
+        if reply_html is not None
+        else None
+    )
+    in_reply_to, references = reply_builder.build_threading_headers(src_mid, src_references)
+
+    # Check recipient allowlist on drafts_folder
+    from email.utils import getaddresses
+
+    rep_addrs = [a for _, a in getaddresses([to, cc]) if a]
+    if not check_draft_recipients(drafts_dec.folder_policy, rep_addrs):
+        return {
+            "decision": "DENY",
+            "reason": "recipient_not_allowed",
+            "account": account_id,
+            "folder": drafts_folder,
+        }
+
+    reply_bytes = reply_builder.build_reply_message(
+        self_identity=self_identity,
+        reply_to=to,
+        cc=cc,
+        subject=subject,
+        in_reply_to=in_reply_to,
+        references=references,
+        body=body,
+        html_body=html_body_val,
+    )
+
+    draft_id = str(uuid.uuid4())
+    canonical_digest = compute_canonical_digest(reply_bytes)
+    provenance_mac = compute_provenance_mac(
+        context.provenance_hmac_key,
+        context.caller_id,
+        account_id,
+        draft_id,
+        FIRST_REVISION,
+        canonical_digest,
+    )
+
+    final_rfc822 = _inject_provenance_headers(
+        reply_bytes,
+        draft_id=draft_id,
+        revision=FIRST_REVISION,
+        provenance_mac=provenance_mac,
+    )
+
+    _write_audit_intent(context, "create_reply_draft", arguments)
+
+    append_result = await imap_append_message(
+        account, password, imap_dst, final_rfc822, flags=DRAFT_APPEND_FLAGS
+    )
+    if append_result.outcome != "ok":
+        return error_envelope(
+            error_type="append_failed",
+            detail=append_result.imap_response or "APPEND reply draft failed",
+            extra={
+                "account": account_id,
+                "source_folder": source_folder,
+                "drafts_folder": drafts_folder,
+                "uid": uid,
+            },
+        )
+
+    if context.saga is not None:
+        p_final = email.message_from_bytes(final_rfc822)
+        mid = p_final.get("Message-ID")
+        context.saga.wal.record_provenance(
+            draft_id, FIRST_REVISION, context.caller_id, account_id, mid, canonical_digest
+        )
+
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": eff_reason,
+        "account": account_id,
+        "source_folder": source_folder,
+        "drafts_folder": drafts_folder,
+        "uid": uid,
+        "draft_id": draft_id,
+        "revision": FIRST_REVISION,
+    }
+
+
+# ------------------------------------------------------------- get_draft & list_drafts
+
+
+async def handle_get_draft(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+    draft_id = str(arguments["draft_id"])
+
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+
+    assert folder_decision.folder_policy is not None
+    max_vis = context.pdp.folder_max_visibility(folder_decision.folder_policy)
+    if level_rank(max_vis) < level_rank("BODY"):
+        return {
+            "decision": "DENY",
+            "reason": "visibility_below_BODY",
+            "account": account_id,
+            "folder": folder_path,
+        }
+
+    account, password = await _password_for(context, account_id)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    resolution = await _resolve_draft_id(account, password, imap_folder, draft_id)
+    if resolution.error_type is not None:
+        return error_envelope(
+            error_type=resolution.error_type,
+            detail="Draft not found",
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+
+    assert resolution.record is not None
+    record = resolution.record
+
+    result = await imap_fetch_body(account, password, imap_folder, record.uid)
+    if result is None:
+        return error_envelope(
+            error_type="not_found",
+            detail="Draft message body not found",
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+    envelope, body_text, msg_raw = result
+    msg: Any = msg_raw
+
+    facts = _facts_from_envelope(envelope)
+    eff_vis, eff_reason = context.pdp.evaluate_message_effective(
+        context.caller_id, account_id, folder_path, facts
+    )
+
+    if level_rank(eff_vis) < level_rank("METADATA"):
+        return error_envelope(
+            error_type="not_found",
+            detail="Draft not found",
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+
+    if level_rank(eff_vis) < level_rank("BODY"):
+        return {
+            "decision": "DENY",
+            "reason": "visibility_below_BODY",
+            "account": account_id,
+            "folder": folder_path,
+        }
+
+    from email.utils import getaddresses
+
+    to_addrs = [a for _, a in getaddresses(msg.get_all("To", [])) if a]
+    cc_addrs = [a for _, a in getaddresses(msg.get_all("Cc", [])) if a]
+    bcc_addrs = [a for _, a in getaddresses(msg.get_all("Bcc", [])) if a]
+
+    html_body = None
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            p = part.get_payload(decode=True)
+            if isinstance(p, bytes):
+                html_body = p.decode(part.get_content_charset("utf-8"), errors="replace").rstrip(
+                    "\r\n"
+                )
+                break
+
+    all_parts = _walk_attachment_parts(msg)
+    att_meta = []
+    for idx, p in enumerate(all_parts):
+        payload_bytes = p.get_payload(decode=True) or b""
+        att_meta.append(
+            {
+                "index": idx,
+                "filename": decode_mime_words(p.get_filename() or "") or None,
+                "mime_type": p.get_content_type(),
+                "size_bytes": len(payload_bytes),
+            }
+        )
+
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": eff_reason,
+        "account": account_id,
+        "folder": folder_path,
+        "draft_id": draft_id,
+        "revision": record.revision,
+        "subject": envelope.subject,
+        "to": to_addrs,
+        "cc": cc_addrs,
+        "bcc": bcc_addrs,
+        "body_text": body_text,
+        "body_html": html_body,
+        "attachments": att_meta,
+    }
+
+
+async def handle_list_drafts(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    account_id = str(arguments["account"])
+    folder_path = str(arguments["folder"])
+
+    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not folder_decision.allowed:
+        return {
+            "decision": "DENY",
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    assert folder_decision.folder_policy is not None
+    fp = folder_decision.folder_policy
+
+    max_vis = context.pdp.folder_max_visibility(fp)
+    if level_rank(max_vis) < level_rank("METADATA"):
+        return {
+            "decision": "DENY",
+            "reason": "visibility_below_METADATA",
+            "account": account_id,
+            "folder": folder_path,
+        }
+
+    account, password = await _password_for(context, account_id)
+    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
+    stats = await imap_folder_stats(account, password, imap_folder)
+    if stats.kind == "absent":
+        return error_envelope(
+            error_type="folder_absent",
+            detail="Folder does not exist on IMAP server",
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path},
+        )
+    if stats.kind == "select_failed":
+        return error_envelope(
+            error_type="select_failed",
+            detail=stats.imap_response or "SELECT mailbox failed",
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path},
+        )
+    uids = await imap_search_uids(account, password, imap_folder, "ALL")
+    if not uids:
+        return {
+            "decision": "ALLOW",
+            "result": "OK",
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+            "drafts": [],
+        }
+
+    envelopes = await imap_fetch_envelopes_batch(account, password, imap_folder, uids)
+    env_by_uid = {e.uid: e for e in envelopes}
+    raw_headers = await imap_fetch_raw_headers_batch(account, password, imap_folder, uids)
+
+    entries: list[dict[str, Any]] = []
+    live_by_handle: dict[str, int] = {}
+
+    for uid in sorted(uids):
+        env = env_by_uid.get(uid)
+        if env is None:
+            continue
+        facts = _facts_from_envelope(env)
+        eff_vis, _eff_reason = context.pdp.evaluate_message_effective(
+            context.caller_id, account_id, folder_path, facts
+        )
+        if level_rank(eff_vis) < level_rank("METADATA"):
+            continue
+
+        raw = raw_headers.get(uid)
+        rec = _parse_draft_headers(uid, raw) if raw else None
+
+        # Verify provenance ownership & editability
+        is_editable = False
+        if (
+            rec
+            and rec.draft_id
+            and rec.revision
+            and context.saga is not None
+            and context.saga.wal.is_caller_draft_owner(rec.draft_id, context.caller_id, account_id)
+        ):
+            # Verify provenance header MAC
+            try:
+                full_raw = await imap_fetch_full_message(account, password, imap_folder, uid)
+                if full_raw:
+                    digest = compute_canonical_digest(full_raw)
+                    is_editable = verify_provenance_mac(
+                        context.provenance_hmac_key,
+                        rec.provenance_mac,
+                        context.caller_id,
+                        account_id,
+                        rec.draft_id,
+                        rec.revision,
+                        digest,
+                    )
+            except Exception:  # noqa: BLE001
+                is_editable = False
+
+        subject_val = None if level_rank(eff_vis) == level_rank("METADATA") else env.subject
+        entry: dict[str, Any] = {
+            "subject": subject_val,
+            "editable": is_editable,
+        }
+        if level_rank(eff_vis) == level_rank("METADATA"):
+            entry["redacted_fields"] = ["envelope", "headers", "body", "attachments"]
+
+        if rec and rec.draft_id:
+            entry["draft_id"] = rec.draft_id
+            if rec.revision is not None:
+                entry["revision"] = rec.revision
+                pos = live_by_handle.get(rec.draft_id)
+                if pos is None:
+                    live_by_handle[rec.draft_id] = len(entries)
+                else:
+                    prev_rev = entries[pos].get("revision") or 0
+                    if rec.revision > prev_rev:
+                        entries[pos] = entry
+                    continue
+
+        entries.append(entry)
+
+    return {
+        "decision": "ALLOW",
+        "result": "OK",
+        "reason": folder_decision.reason,
+        "account": account_id,
+        "folder": folder_path,
+        "drafts": entries,
+    }
+
+
+# ------------------------------------------------------------- update_draft
+
+
+def apply_draft_changes_v3(
+    rfc822: bytes,
+    *,
+    changes: dict[str, Any],
+    revision: int,
+    request_hash: str,
+    provenance_mac: str,
+    draft_id: str,
+) -> bytes:
+    msg: Any = email.message_from_bytes(rfc822)
+
+    for field in ("subject", "in_reply_to"):
+        if field in changes:
+            h = "Subject" if field == "subject" else "In-Reply-To"
+            del msg[h]
+            if changes[field] is not None:
+                msg[h] = str(changes[field])
+
+    for field in ("to", "cc", "bcc"):
+        if field in changes:
+            h = field.capitalize()
+            del msg[h]
+            val = changes[field]
+            if val:
+                msg[h] = _format_address_list(val)
+
+    if "body_text" in changes or "body_html" in changes:
+        new_text = changes.get("body_text")
+        new_html = changes.get("body_html")
+        if new_html is not None and new_text is None:
+            new_text = reply_builder.strip_html_preserving_paragraphs(new_html)
+
+        # Replace or update body parts
+        if new_html is not None and new_text is not None:
+            alt_part = MIMEMultipart("alternative")
+            alt_part.attach(MIMEText(new_text + "\n", "plain", "utf-8"))
+            alt_part.attach(MIMEText(new_html + "\n", "html", "utf-8"))
+            replacement: MIMEBase = alt_part
+        elif new_html is not None:
+            alt_part = MIMEMultipart("alternative")
+            alt_part.attach(MIMEText((new_text or "") + "\n", "plain", "utf-8"))
+            alt_part.attach(MIMEText(new_html + "\n", "html", "utf-8"))
+            replacement = alt_part
+        else:
+            replacement = MIMEText((new_text or "") + "\n", "plain", "utf-8")
+
+        old_headers = list(msg.items())
+        # If original was multipart/mixed with attachments, preserve attachments
+        if msg.is_multipart() and msg.get_content_type() == "multipart/mixed":
+            new_mixed = MIMEMultipart("mixed")
+            for k, v in old_headers:
+                if k.lower() not in ("content-type", "mime-version"):
+                    new_mixed[k] = v
+            new_mixed.attach(replacement)
+            # Reattach existing attachments
+            for part in msg.get_payload():
+                if (part.get("Content-Disposition") or "").lower().startswith("attachment"):
+                    new_mixed.attach(part)
+            msg = new_mixed
+        else:
+            msg = replacement
+            for k, v in old_headers:
+                if (
+                    k.lower() not in ("content-type", "mime-version", "content-transfer-encoding")
+                    and k not in msg
+                ):
+                    msg[k] = v
+
+    # Handle changes.attachments if present (ADR 0063)
+    if "attachments" in changes:
+        atts = changes["attachments"] or []
+        old_headers = list(msg.items())
+        # Rebuild as multipart/mixed
+        mixed = MIMEMultipart("mixed")
+        for k, v in old_headers:
+            if k.lower() not in ("content-type", "mime-version"):
+                mixed[k] = v
+        # Extract existing body
+        if msg.is_multipart() and msg.get_content_type() == "multipart/mixed":
+            body_child = msg.get_payload()[0]
+            mixed.attach(body_child)
+        else:
+            mixed.attach(msg)
+        for att in atts:
+            fname = att["filename"]
+            mtype = att["mime_type"]
+            c_b64 = att["content_base64"]
+            maintype, _, subtype = mtype.partition("/")
+            p = MIMEBase(maintype, subtype or "octet-stream")
+            p.set_payload(base64.b64decode(c_b64))
+            email.encoders.encode_base64(p)
+            p.add_header("Content-Disposition", "attachment", filename=fname)
+            mixed.attach(p)
+        msg = mixed
+
+    del msg["Date"]
+    msg["Date"] = formatdate(localtime=True)
+    del msg["Message-ID"]
+    msg["Message-ID"] = make_msgid()
+
+    import io
+    from email.generator import BytesGenerator
+
+    buf = io.BytesIO()
+    BytesGenerator(buf, mangle_from_=False, maxheaderlen=0).flatten(msg)
+    flattened = buf.getvalue()
+
+    return _inject_provenance_headers(
+        flattened,
+        draft_id=draft_id,
+        revision=revision,
+        provenance_mac=provenance_mac,
+        change_hash=request_hash,
+    )
+
+
+async def handle_update_draft(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     draft_id = str(arguments["draft_id"])
     base_revision = int(arguments["base_revision"])
     changes = dict(arguments["changes"])
 
-    identity: dict[str, Any] = {
-        "account": account_id,
-        "folder": folder_path,
-        "draft_id": draft_id,
-    }
-
     folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
     if not folder_decision.allowed:
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason=folder_decision.reason,
-            account=account_id,
-            folder=folder_path,
-            draft_id=draft_id,
-        )
+        return {
+            "decision": "DENY",
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+
     assert folder_decision.folder_policy is not None
-    if not folder_decision.folder_policy.draft_edit:
-        response: UpdateDraftResponse = {
+    fp = folder_decision.folder_policy
+    if not fp.draft_edit:
+        return {
             "decision": "DENY",
             "reason": "capability_missing",
             "account": account_id,
             "folder": folder_path,
-            "draft_id": draft_id,
-            "missing_capability": "draft_edit",
         }
-        return response
 
     account, password = await _password_for(context, account_id)
     imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
 
-    # A folder the caller is authorized for but that does not exist on
-    # the server is `folder_absent`, not an empty search result.
     stats = await imap_folder_stats(account, password, imap_folder)
     if stats.kind == "absent":
-        return error_envelope(  # type: ignore[return-value]
-            error_type="folder_absent", reason=folder_decision.reason, extra=identity
+        return error_envelope(
+            error_type="folder_absent",
+            detail="Folder does not exist on IMAP server",
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+    if stats.kind == "select_failed":
+        return error_envelope(
+            error_type="select_failed",
+            detail=stats.imap_response or "SELECT mailbox failed",
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+
+    instance_id = str(uuid.uuid4())
+    leased = False
+    if context.saga is not None:
+        leased = context.saga.wal.acquire_draft_lease(account_id, draft_id, instance_id)
+
+    try:
+        return await _do_update_draft(
+            context,
+            arguments,
+            account_id,
+            folder_path,
+            draft_id,
+            base_revision,
+            changes,
+            folder_decision,
+            fp,
+            account,
+            password,
+            imap_folder,
+        )
+    finally:
+        if leased and context.saga is not None:
+            context.saga.wal.release_draft_lease(account_id, draft_id, instance_id)
+
+
+async def _do_update_draft(
+    context: ServerContext,
+    arguments: dict[str, Any],
+    account_id: str,
+    folder_path: str,
+    draft_id: str,
+    base_revision: int,
+    changes: dict[str, Any],
+    folder_decision: Any,
+    fp: Any,
+    account: Any,
+    password: str,
+    imap_folder: str,
+) -> dict[str, Any]:
+    # ADR 0042 §2: Ownership verification via WAL
+    if context.saga is not None and not context.saga.wal.is_caller_draft_owner(
+        draft_id, context.caller_id, account_id
+    ):
+        return error_envelope(
+            error_type="not_found",
+            detail="Draft not found",
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
         )
 
     resolution = await _resolve_draft_id(account, password, imap_folder, draft_id)
     if resolution.error_type is not None:
-        extra = dict(identity)
+        extra = {"account": account_id, "folder": folder_path, "draft_id": draft_id}
         if resolution.error_type == "draft_ambiguous":
-            extra["tx_id"] = _escalate_ambiguity(
-                context,
-                account_id=account_id,
-                folder=imap_folder,
-                draft_id=draft_id,
-                candidates=resolution.candidates,
+            ambig_tx_id = ""
+            if context.saga is not None:
+                src_uid = resolution.candidates[0] if resolution.candidates else 0
+                ambig_tx_id = context.saga.wal.begin(
+                    context.caller_id,
+                    account_id,
+                    folder_path,
+                    src_uid,
+                    account_id,
+                    folder_path,
+                )
+                context.saga.wal.mark_needs_operator(ambig_tx_id, reason="draft_ambiguous")
+            extra["tx_id"] = ambig_tx_id
+            return error_envelope(
+                error_type="draft_ambiguous",
+                detail="Draft ambiguous: multiple revisions share draft_id and revision",
+                reason=folder_decision.reason,
+                extra=extra,
             )
-        return error_envelope(  # type: ignore[return-value]
+        return error_envelope(
             error_type=resolution.error_type,
+            detail="Draft not found",
             reason=folder_decision.reason,
             extra=extra,
         )
-    assert resolution.record is not None
-    record = resolution.record
-    current_revision = int(record.revision or FIRST_REVISION)
-    request_hash = change_hash(changes)
 
+    assert resolution.record is not None
+    rec = resolution.record
+    current_revision = int(rec.revision or FIRST_REVISION)
+    req_hash = change_hash(changes)
+
+    # Idempotent replay check (ADR 0063 §3)
     if base_revision != current_revision:
-        # A retry of a call whose response was lost: the caller still
-        # holds the old base and submits the identical change, and the
-        # revision now in the mailbox was produced by exactly that
-        # request. Nothing is written (ADR 0031).
-        if base_revision == current_revision - 1 and record.change_hash == request_hash:
+        if base_revision == current_revision - 1 and rec.change_hash == req_hash:
             return {
                 "decision": "ALLOW",
                 "result": "OK",
@@ -1480,45 +1310,208 @@ async def handle_update_draft(
                 "mechanism": "draft_revision",
                 "idempotent_replay": True,
             }
-        conflict = error_envelope(
+        return error_envelope(
             error_type="draft_revision_conflict",
+            detail="Draft revision conflict",
             reason=folder_decision.reason,
-            extra={**identity, "current_revision": current_revision},
+            extra={
+                "account": account_id,
+                "folder": folder_path,
+                "draft_id": draft_id,
+                "current_revision": current_revision,
+            },
         )
-        return conflict  # type: ignore[return-value]
+
+    # Fetch full raw message to verify existing provenance MAC
+    raw_existing = await imap_fetch_full_message(account, password, imap_folder, rec.uid)
+    if raw_existing is None:
+        return error_envelope(
+            error_type="not_found",
+            detail="Draft message not found",
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+
+    digest_existing = compute_canonical_digest(raw_existing)
+    is_valid_prov = verify_provenance_mac(
+        context.provenance_hmac_key,
+        rec.provenance_mac,
+        context.caller_id,
+        account_id,
+        draft_id,
+        current_revision,
+        digest_existing,
+    )
+    if not is_valid_prov:
+        return error_envelope(
+            error_type="draft_not_editable",
+            detail="Draft provenance broken or tampered",
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+
+    # Check recipient allowlist on updated recipients
+    updated_recips: list[str] = []
+    if "to" in changes or "cc" in changes or "bcc" in changes:
+        existing_msg: Any = email.message_from_bytes(raw_existing)
+        from email.utils import getaddresses
+
+        for h in ("to", "cc", "bcc"):
+            if h in changes:
+                updated_recips.extend(changes[h] or [])
+            else:
+                updated_recips.extend(
+                    a for _, a in getaddresses(existing_msg.get_all(h.capitalize(), [])) if a
+                )
+        if not check_draft_recipients(fp, updated_recips):
+            return {
+                "decision": "DENY",
+                "reason": "recipient_not_allowed",
+                "account": account_id,
+                "folder": folder_path,
+            }
 
     new_revision = current_revision + 1
 
-    def transform(raw: bytes) -> bytes:
-        return apply_draft_changes(
-            raw, changes=changes, revision=new_revision, request_hash=request_hash
-        )
-
-    async def locate() -> int | None:
-        return await _resolve_revision_uid(account, password, imap_folder, draft_id, new_revision)
-
-    saga_result = await _require_saga(context, "update_draft").run_message_rewrite(
-        caller_id=context.caller_id,
-        account=account,
-        password=password,
-        folder=imap_folder,
-        uid=record.uid,
-        transform=transform,
-        mechanism="draft_revision",
-        locate=locate,
+    # Pre-calculate new provenance MAC
+    dummy_mac = compute_provenance_mac(
+        context.provenance_hmac_key,
+        context.caller_id,
+        account_id,
+        draft_id,
+        new_revision,
+        "dummy",
     )
-    if saga_result.result == "ERROR":
-        error_type = saga_result.error_type or "rewrite_failed"
-        if error_type not in ("uid_not_found", "rewrite_failed"):
-            error_type = "rewrite_failed"
-        return error_envelope(  # type: ignore[return-value]
-            error_type=error_type,
-            detail=saga_result.error_type or "",
-            reason=folder_decision.reason,
-            extra=identity,
+    temp_bytes = apply_draft_changes_v3(
+        raw_existing,
+        changes=changes,
+        revision=new_revision,
+        request_hash=req_hash,
+        provenance_mac=dummy_mac,
+        draft_id=draft_id,
+    )
+    new_digest = compute_canonical_digest(temp_bytes)
+    final_mac = compute_provenance_mac(
+        context.provenance_hmac_key,
+        context.caller_id,
+        account_id,
+        draft_id,
+        new_revision,
+        new_digest,
+    )
+    final_bytes = apply_draft_changes_v3(
+        raw_existing,
+        changes=changes,
+        revision=new_revision,
+        request_hash=req_hash,
+        provenance_mac=final_mac,
+        draft_id=draft_id,
+    )
+
+    from ..saga import _maybe_crash
+
+    tx_id: str | None = None
+    if context.saga is not None:
+        tx_id = context.saga.wal.begin(
+            caller_id=context.caller_id,
+            src_account=account_id,
+            src_folder=folder_path,
+            src_uid=rec.uid,
+            dst_account=account_id,
+            dst_folder=folder_path,
         )
-    await _sweep_draft_residue(account, password, imap_folder, draft_id, live_revision=new_revision)
-    return {
+        context.saga.wal.record_fetch(
+            tx_id=tx_id,
+            message_id=draft_id,
+            content_hash=req_hash,
+            raw_sha256=digest_existing,
+            canonical_sha256=new_digest,
+            size_bytes=len(final_bytes),
+            staged_rfc822=final_bytes,
+        )
+        context.saga._audit_step(tx_id, "begin")
+        context.saga._audit_step(tx_id, "fetched")
+
+    _write_audit_intent(context, "update_draft", arguments)
+
+    # Append new revision
+    try:
+        append_res = await imap_append_message(
+            account, password, imap_folder, final_bytes, flags=DRAFT_APPEND_FLAGS
+        )
+    except Exception as exc:  # noqa: BLE001
+        if tx_id and context.saga is not None:
+            context.saga.wal.bump_retry(tx_id, f"append_failed: {exc}")
+        return error_envelope(
+            error_type="append_failed",
+            detail=str(exc),
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+
+    if append_res.outcome != "ok":
+        if tx_id and context.saga is not None:
+            context.saga.wal.bump_retry(tx_id, f"append_rejected: {append_res.imap_response}")
+        return error_envelope(
+            error_type="append_rejected",
+            detail=append_res.imap_response or "APPEND revision failed",
+            reason=folder_decision.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+
+    if tx_id and context.saga is not None:
+        target_uid = getattr(append_res, "append_uid", None)
+        context.saga.wal.mark_staged(tx_id, target_uid)
+        context.saga._audit_step(tx_id, "staged")
+
+    _maybe_crash("post_append")
+
+    # Delete previous revision(s)
+    uids_to_expunge = list(resolution.all_uids) if resolution.all_uids else [rec.uid]
+    expunge_err: Exception | None = None
+    try:
+        await imap_expunge_uids(account, password, imap_folder, uids_to_expunge)
+    except Exception as exc:  # noqa: BLE001
+        expunge_err = exc
+
+    if expunge_err is not None:
+        if tx_id and context.saga is not None:
+            count = context.saga.wal.bump_retry(tx_id, f"delete_failed: {expunge_err}")
+            if count >= context.saga.retry_limit:
+                context.saga.wal.mark_needs_operator(tx_id)
+                context.saga._audit_step(tx_id, "escalated", outcome="ERROR")
+        res_err: dict[str, Any] = {
+            "decision": "ALLOW",
+            "result": "ERROR",
+            "error": {
+                "type": "transient_imap_failure",
+                "message": str(expunge_err),
+            },
+            "reason": folder_decision.reason,
+            "account": account_id,
+            "folder": folder_path,
+            "draft_id": draft_id,
+            "revision": new_revision,
+            "mechanism": "draft_revision",
+        }
+        if tx_id:
+            res_err["tx_id"] = tx_id
+        return res_err
+
+    _maybe_crash("post_delete")
+
+    if tx_id and context.saga is not None:
+        context.saga.wal.mark_deleted(tx_id)
+        context.saga.wal.commit(tx_id)
+        context.saga._audit_step(tx_id, "commit")
+
+        p_final = email.message_from_bytes(final_bytes)
+        mid = p_final.get("Message-ID")
+        context.saga.wal.record_provenance(
+            draft_id, new_revision, context.caller_id, account_id, mid, new_digest
+        )
+
+    res_ok: dict[str, Any] = {
         "decision": "ALLOW",
         "result": "OK",
         "reason": folder_decision.reason,
@@ -1526,39 +1519,19 @@ async def handle_update_draft(
         "folder": folder_path,
         "draft_id": draft_id,
         "revision": new_revision,
-        "mechanism": saga_result.mechanism,
-        "tx_id": saga_result.tx_id,
+        "mechanism": "draft_revision",
     }
+    if tx_id:
+        res_ok["tx_id"] = tx_id
+    return res_ok
 
 
-# --------------------------------------------------------------------- ADR 0034
-
-
-class DiscardDraftResponse(TypedDict, total=False):
-    decision: Literal["ALLOW", "DENY"]
-    result: NotRequired[Literal["OK", "ERROR"]]
-    reason: NotRequired[str]
-    error: NotRequired[dict[str, str]]
-    account: str
-    folder: str
-    draft_id: str
-    missing_capability: NotRequired[str]
-    target_folder: NotRequired[str]
-    discarded_count: NotRequired[int]
-    moved_to: NotRequired[str]
-    mechanism: NotRequired[str]
+# ------------------------------------------------------------- discard_draft
 
 
 async def _uids_carrying_handle(
     account: Any, password: str, imap_folder: str, draft_id: str
 ) -> list[int]:
-    """Every UID in one folder whose `X-SC-Draft-Id` equals `draft_id`.
-
-    Unlike `_resolve_draft_id` this keeps every revision, residue and
-    messages without a usable revision included: ADR 0034 discards
-    whatever carries the handle. SEARCH HEADER matches substrings
-    (RFC 3501 §6.4.4), so each hit is re-checked for equality.
-    """
     criteria = f'HEADER "{DRAFT_ID_HEADER}" "{draft_id}"'
     uids = await imap_search_uids(account, password, imap_folder, criteria)
     if not uids:
@@ -1571,172 +1544,132 @@ async def _uids_carrying_handle(
     ]
 
 
-class _PartialDiscard(RuntimeError):
-    """A label swap failed after `moved` messages had been moved."""
-
-    def __init__(self, moved: int) -> None:
-        super().__init__(f"discard stopped after {moved} message(s)")
-        self.moved = moved
-
-
-async def _discard_by_label_swap(
-    account: Any,
-    password: str,
-    imap_folder: str,
-    uids: list[int],
-    *,
-    folder: str,
-    trash_folder: str,
-) -> None:
-    """Move each UID with the Gmail label swap of ADR 0019.
-
-    Labels derive from the canonical paths (ADR 0033); the source is
-    selected under its wire path. The first failure stops the loop and
-    surfaces as `_PartialDiscard` carrying how many were moved before.
-    """
-    from ..imap_core import _LABEL_TO_FOLDER
-
-    folder_to_label = {path: label for label, path in _LABEL_TO_FOLDER.items()}
-    src_label = folder_to_label.get(folder, folder)
-    dst_label = folder_to_label.get(trash_folder, trash_folder)
-    for moved, uid in enumerate(uids):
-        try:
-            await imap_gmail_label_swap(account, password, imap_folder, uid, src_label, dst_label)
-        except Exception as exc:
-            raise _PartialDiscard(moved) from exc
-
-
-async def handle_discard_draft(
-    context: ServerContext, arguments: dict[str, Any]
-) -> DiscardDraftResponse:
-    """Move every message carrying a draft handle to the account's trash.
-
-    ADR 0034. Authorization is that of `move`: `move_out` on the drafts
-    folder, then `accept_incoming` on the folder flagged `\\Trash`. The
-    trash folder is located by its RFC 6154 flag in one LIST. All
-    authorization and existence checks run before the first mutating
-    command, so nothing is moved on any error that has a type.
-    """
+async def handle_discard_draft(context: ServerContext, arguments: dict[str, Any]) -> dict[str, Any]:
     account_id = str(arguments["account"])
     folder_path = str(arguments["folder"])
     draft_id = str(arguments["draft_id"])
-    identity: dict[str, Any] = {
-        "account": account_id,
-        "folder": folder_path,
-        "draft_id": draft_id,
-    }
 
-    folder_decision = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
-    if not folder_decision.allowed:
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason=folder_decision.reason,
-            account=account_id,
-            folder=folder_path,
-            draft_id=draft_id,
-        )
-    assert folder_decision.folder_policy is not None
-    if not folder_decision.folder_policy.move_out:
+    # 1. Source \Drafts move_out
+    src_dec = context.pdp.decide_folder_access(context.caller_id, account_id, folder_path)
+    if not src_dec.allowed:
+        return {
+            "decision": "DENY",
+            "reason": src_dec.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    assert src_dec.folder_policy is not None
+    if not src_dec.folder_policy.move_out:
         return {
             "decision": "DENY",
             "reason": "capability_missing",
             "account": account_id,
             "folder": folder_path,
-            "draft_id": draft_id,
-            "missing_capability": "move_out",
         }
 
+    # 2. Account \Trash existence
     account, password = await _password_for(context, account_id)
-    imap_folder = await _resolve_imap_folder(context, account_id, folder_path)
     mailboxes = await imap_list_mailboxes(account, password)
+    imap_src = await _resolve_imap_folder(context, account_id, folder_path)
+
+    # Check source \Drafts role (ADR 0063 §3)
+    is_drafts = False
+    for fi in mailboxes:
+        if fi.path == imap_src and any(token.lower() == "\\drafts" for token in fi.flags.split()):
+            is_drafts = True
+            break
+    if not is_drafts and folder_path.lower() in ("drafts", "[gmail]/drafts"):
+        is_drafts = True
+    if not is_drafts:
+        return {
+            "decision": "DENY",
+            "reason": "capability_missing",
+            "account": account_id,
+            "folder": folder_path,
+        }
+
     trash_wire = find_trash_folder(mailboxes)
     if trash_wire is None:
-        return error_envelope(  # type: ignore[return-value]
+        return error_envelope(
             error_type="trash_unavailable",
-            detail="no folder on this account carries the \\Trash special-use flag",
-            reason=folder_decision.reason,
-            extra=identity,
+            detail="no folder carries \\Trash special-use flag",
+            reason=src_dec.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
         )
     await _ensure_folder_aliases(context, account_id)
     trash_folder = context.pdp.canonical_folder(account_id, trash_wire)
 
-    trash_decision = context.pdp.decide_folder_access(context.caller_id, account_id, trash_folder)
-    if not trash_decision.allowed:
-        # The trash folder is not visible to the caller, so its name is
-        # not disclosed either.
-        return _deny_draft_read(  # type: ignore[return-value]
-            reason=trash_decision.reason,
-            account=account_id,
-            folder=folder_path,
-            draft_id=draft_id,
-        )
-    assert trash_decision.folder_policy is not None
-    if not trash_decision.folder_policy.accept_incoming:
+    # 3. \Trash accept_incoming
+    trash_dec = context.pdp.decide_folder_access(context.caller_id, account_id, trash_folder)
+    if not trash_dec.allowed:
+        return {
+            "decision": "DENY",
+            "reason": trash_dec.reason,
+            "account": account_id,
+            "folder": folder_path,
+        }
+    assert trash_dec.folder_policy is not None
+    if not trash_dec.folder_policy.accept_incoming:
         return {
             "decision": "DENY",
             "reason": "capability_missing",
             "account": account_id,
             "folder": folder_path,
-            "draft_id": draft_id,
-            "target_folder": trash_folder,
-            "missing_capability": "accept_incoming",
         }
 
+    imap_src = await _resolve_imap_folder(context, account_id, folder_path)
     listed = {fi.path for fi in mailboxes}
-    if imap_folder not in listed and imap_folder.upper() != "INBOX":
-        return error_envelope(  # type: ignore[return-value]
-            error_type="folder_absent", reason=folder_decision.reason, extra=identity
+    if imap_src not in listed and imap_src.upper() != "INBOX":
+        return error_envelope(
+            error_type="folder_absent",
+            detail="Folder does not exist on IMAP server",
+            reason=src_dec.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
         )
 
-    uids = await _uids_carrying_handle(account, password, imap_folder, draft_id)
+    # 4. Caller provenance verification
+    if context.saga is not None and not context.saga.wal.is_caller_draft_owner(
+        draft_id, context.caller_id, account_id
+    ):
+        return error_envelope(
+            error_type="not_found",
+            detail="Draft not found",
+            reason=src_dec.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
+        )
+
+    uids = await _uids_carrying_handle(account, password, imap_src, draft_id)
     if not uids:
-        return error_envelope(  # type: ignore[return-value]
-            error_type="draft_not_found", reason=folder_decision.reason, extra=identity
+        return error_envelope(
+            error_type="not_found",
+            detail="Draft not found",
+            reason=src_dec.reason,
+            extra={"account": account_id, "folder": folder_path, "draft_id": draft_id},
         )
 
+    _write_audit_intent(context, "discard_draft", arguments)
+
+    # Move to trash
     account_model = context.account_by_id(account_id)
-    try:
-        if account_model is not None and _is_google_provider(account_model):
-            await _discard_by_label_swap(
-                account,
-                password,
-                imap_folder,
-                uids,
-                folder=folder_path,
-                trash_folder=trash_folder,
-            )
-            mechanism = "gmail_label_swap"
-        else:
-            mechanism = await imap_move_uids(account, password, imap_folder, uids, trash_wire)
-    except _PartialDiscard as exc:
-        return error_envelope(  # type: ignore[return-value]
-            error_type="transient_imap_failure",
-            detail=f"label swap failed after {exc.moved} of {len(uids)} message(s)",
-            reason=folder_decision.reason,
-            extra={**identity, "discarded_count": exc.moved, "moved_to": trash_folder},
-        )
-    except ExpungeScopeUnsafe:
-        return error_envelope(  # type: ignore[return-value]
-            error_type="transient_imap_failure",
-            detail=(
-                "server offers neither MOVE nor UIDPLUS and other messages "
-                "in the folder are marked \\Deleted; nothing was moved"
-            ),
-            reason=folder_decision.reason,
-            extra={**identity, "discarded_count": 0, "moved_to": trash_folder},
-        )
-    except Exception:  # noqa: BLE001 - any IMAP failure is reported
-        # How much of a failed MOVE took effect is unknown, so no count
-        # is claimed; a repeated call moves whatever is left (ADR 0034).
-        return error_envelope(  # type: ignore[return-value]
-            error_type="transient_imap_failure",
-            detail="moving the draft to the trash folder failed",
-            reason=folder_decision.reason,
-            extra={**identity, "moved_to": trash_folder},
-        )
+    if account_model is not None and _is_google_provider(account_model):
+        from ..imap_core import _LABEL_TO_FOLDER
+
+        f_to_l = {v: k for k, v in _LABEL_TO_FOLDER.items()}
+        src_label = f_to_l.get(folder_path, folder_path)
+        dst_label = f_to_l.get(trash_folder, trash_folder)
+        for u in uids:
+            await imap_gmail_label_swap(account, password, imap_src, u, src_label, dst_label)
+        mechanism = "gmail_label_swap"
+    else:
+        mechanism = await imap_move_uids(account, password, imap_src, uids, trash_wire)
+
+    if context.saga is not None:
+        context.saga.wal.discard_provenance(draft_id, account_id)
+
     return {
         "decision": "ALLOW",
         "result": "OK",
-        "reason": folder_decision.reason,
+        "reason": src_dec.reason,
         "account": account_id,
         "folder": folder_path,
         "draft_id": draft_id,

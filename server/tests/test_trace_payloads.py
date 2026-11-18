@@ -256,12 +256,11 @@ def test_listing_counts() -> None:
         {
             "decision": "ALLOW",
             "messages": [{"uid": 1}, {"uid": 2}],
-            "matched_total": 4,
-            "matched_visible": 3,
+            "total_visible": 3,
             "has_more": True,
         },
     )
-    assert span.attributes["mcp.result.matched"] == 4
+    assert "mcp.result.matched" not in span.attributes
     assert span.attributes["mcp.result.visible"] == 3
     assert span.attributes["mcp.result.returned"] == 2
     assert span.attributes["mcp.result.has_more"] is True
