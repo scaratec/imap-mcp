@@ -49,7 +49,7 @@ def test_run_metrics_from_sample_evidence() -> None:
     ev = _s1_evidence("…")
     m = run_metrics(ev, {"input_tokens": 1000, "output_tokens": 50}, turns=1)
     assert m["tool_calls"] == 6
-    assert m["ideal_ratio"] == 3.0  # S1 ideal path: 2 calls
+    assert m["ideal_ratio"] == 2.0  # S1 ideal path: 3 calls (6 / 3 == 2.0)
     assert m["calls_by_tool"] == {"fetch_envelope": 1, "list_folders": 2, "list_messages": 1, "move": 1, "search": 1}
     assert [c["tool"] for c in m["failed_calls"]] == ["move"]
     assert [c["tool"] for c in m["denied_calls"]] == ["search"]

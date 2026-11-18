@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+from datetime import UTC
 from pathlib import Path
+from typing import Any
 
 import yaml
 from behave import given, then, use_step_matcher, when
@@ -37,6 +40,7 @@ def _ensure_builder(context: Context) -> PolicyBuilder:
         builder = PolicyBuilder(
             config_dir=context.config_dir,
             secret_store_path=context.secrets_dir,
+            secret_store_acknowledge_plaintext=True,
             audit_directory=context.audit_dir,
             wal_path=context.wal_path,
         )
@@ -53,15 +57,17 @@ def _ensure_account_registered(
 ) -> None:
     if any(a.id == account_id for a in builder.accounts):
         return
-    instance, _user = resolve_account(account_id)
+    instance, user = resolve_account(account_id)
     host, port = context.imap_instances[instance]
+    pwd = "test" if instance == "mock-gmail" else FIXTURE_PASSWORD
     builder.add_account(
         id=account_id,
         host=host,
         port=port,
+        user=user,
         auth_type="password",
         secret_ref=f"secret://accounts/{account_id}/password",
-        password_literal=FIXTURE_PASSWORD,
+        password_literal=pwd,
     )
 
 
@@ -129,90 +135,25 @@ def _assert_special_use_as_declared(context: Context, instance: str, user: str) 
             )
 
 
-@given('the IMAP account "{account_id}" exists with folder "{folder}"')
-def step_imap_account_exists_with_single_folder(
-    context: Context, account_id: str, folder: str
-) -> None:
-    builder = _ensure_builder(context)
-    _ensure_account_registered(context, builder, account_id)
-    instance, user = resolve_account(account_id)
-    context.imap.create_folder(instance, user, folder)
-    builder.write()
 
 
-@given('the IMAP account "{account_id}" exists with explicit user "{imap_user}" and folder "{folder}"')
-def step_imap_account_explicit_user_with_folder(
-    context: Context, account_id: str, imap_user: str, folder: str
-) -> None:
-    """Register an account whose IMAP login name differs from the id."""
-    builder = _ensure_builder(context)
-    instance, dovecot_user = resolve_account(account_id)
-    host, port = context.imap_instances[instance]
-    if not any(a.id == account_id for a in builder.accounts):
-        builder.add_account(
-            id=account_id,
-            host=host,
-            port=port,
-            user=imap_user,
-            auth_type="password",
-            secret_ref=f"secret://accounts/{account_id}/password",
-            password_literal="test123",
-        )
-    context.imap.create_folder(instance, dovecot_user, folder)
-    builder.write()
 
 
-@given('the server date is pinned to "{date}"')
-def step_server_date_pinned(context: Context, date: str) -> None:
+@given('the server clock is pinned to "{ts}"')
+def step_server_clock_pinned(context: Context, ts: str) -> None:
+    if "T" not in ts:
+        raise AssertionError(f"server clock must be pinned to full ISO timestamp (ADR 0023), got: {ts!r}")
     env = getattr(context, "mcp_extra_env", None) or {}
-    env["IMAP_MCP_FAKE_NOW_UTC"] = f"{date}T12:00:00+00:00"
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    env["IMAP_MCP_FAKE_NOW_UTC"] = ts
     context.mcp_extra_env = env
+    context.is_test_hooks = True
 
 
-@given('the secret store "{store_type}" is configured at path $TMPDIR/secrets')
-def step_secret_store_configured(context: Context, store_type: str) -> None:
-    builder = _ensure_builder(context)
-    builder.secret_store_backend = store_type
-    if store_type == "file_dir":
-        builder.secret_store_path = str(context.secrets_dir)
 
-@given('the server is configured with account:')
-def step_server_configured_with_account_table(context: Context) -> None:
-    builder = _ensure_builder(context)
-    for row in context.table:
-        account_id = row["id"]
-        # In walking skeleton, everything points to the local fixtures
-        if "gupta" in account_id or "osthues" in account_id or "gmail-archive" in account_id:
-            host, port = context.imap_instances["imap-a"]
-        else:
-            host, port = context.imap_instances["imap-b"]
-            
-        auth_type = "password"
-        secret_ref = f"secret://accounts/{account_id}/password"
-        
-        # Support OAuth configuration from the table
-        if "oauth_scope" in row.headings:
-            auth_type = "xoauth2"
-            secret_ref = f"secret://accounts/{account_id}/refresh_token"
-            
-        kwargs = {}
-        if "provider" in row.headings:
-            kwargs["provider"] = row["provider"]
-        if "oauth_scope" in row.headings:
-            kwargs["oauth_scope"] = row["oauth_scope"]
-        if "token_cache" in row.headings:
-            kwargs["token_cache"] = row["token_cache"]
 
-        builder.add_account(
-            id=account_id,
-            host=host,
-            port=port,
-            auth_type=auth_type,
-            secret_ref=secret_ref,
-            **kwargs
-        )
-    builder.write()
-
+@given("the server is configured with single caller:")
 @given("the server is configured with caller:")
 def step_server_configured_with_caller(context: Context) -> None:
     """Single-row caller setup. Tolerates table schemas with or
@@ -224,9 +165,12 @@ def step_server_configured_with_caller(context: Context) -> None:
     `auth_type` of `(none)` omits the caller's auth block entirely.
     """
     builder = _ensure_builder(context)
+    builder.callers = []
     for row in context.table:
         caller_id = row["caller_id"]
-        policy = row["policy"] if "policy" in row.headings else f"{caller_id}-policy"
+        if "policy" not in row.headings or not row["policy"]:
+            raise AssertionError(f"Callers table missing mandatory column 'policy' in {row.headings}")
+        policy = row["policy"]
         auth_type: str | None = (
             row["auth_type"] if "auth_type" in row.headings else "stdio_trusted"
         )
@@ -244,29 +188,11 @@ def step_server_configured_with_caller(context: Context) -> None:
             token_secret_ref=token_secret_ref,
         )
         builder.add_policy(policy)
-    # Boot-time invariant: at least one account must exist for the
-    # accounts.yaml schema to validate.
-    _ensure_account_registered(context, builder, "gupta-scaratec")
     builder.write()
 
 
-@given('policy "{policy_name}" grants account access:')
-def step_policy_grants_account_access(context: Context, policy_name: str) -> None:
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        policy = builder.add_policy(policy_name)
-    for row in context.table:
-        account_id = row["account"]
-        policy.accounts.setdefault(account_id, [])
-    builder.write()
 
 
-@given('policy "{policy_name}" grants the following folder capabilities:')
-def step_policy_grants_folder_capabilities(
-    context: Context, policy_name: str
-) -> None:
-    step_policy_grants_folder_policies(context, policy_name)
 
 
 @given('policy "{policy_name}" grants the following folder policies:')
@@ -295,9 +221,27 @@ def step_policy_grants_folder_policies(
             mark_seen=_parse_bool(row["mark_seen"]) if "mark_seen" in row.headings else False,
             mark_tagged=_parse_bool(row["mark_tagged"]) if "mark_tagged" in row.headings else False,
             move_out=_parse_bool(row["move_out"]) if "move_out" in row.headings else False,
+            copy_out=_parse_bool(row["copy_out"]) if "copy_out" in row.headings else False,
             accept_incoming=_parse_bool(row["accept_incoming"]) if "accept_incoming" in row.headings else False,
             draft_append=_parse_bool(row["draft_append"]) if "draft_append" in row.headings else False,
+            draft_edit=_parse_bool(row["draft_edit"]) if "draft_edit" in row.headings else False,
         )
+        if "draft_recipient_domains" in row.headings and row["draft_recipient_domains"].strip():
+            import json
+            raw_domains = row["draft_recipient_domains"].strip()
+            domains = json.loads(raw_domains) if raw_domains.startswith("[") else [d.strip() for d in raw_domains.split(",") if d.strip()]
+            folder.draft_recipients = {
+                "allowed_domains": domains,
+                "allowed_addresses": (folder.draft_recipients or {}).get("allowed_addresses", []),
+            }
+        if "draft_recipient_addresses" in row.headings and row["draft_recipient_addresses"].strip():
+            import json
+            raw_addrs = row["draft_recipient_addresses"].strip()
+            addrs = json.loads(raw_addrs) if raw_addrs.startswith("[") else [a.strip() for a in raw_addrs.split(",") if a.strip()]
+            folder.draft_recipients = {
+                "allowed_domains": (folder.draft_recipients or {}).get("allowed_domains", []),
+                "allowed_addresses": addrs,
+            }
         if "rules" in row.headings:
             rules_raw = row["rules"]
             for parsed_match, grant, cap in _parse_inline_rules(rules_raw):
@@ -305,43 +249,8 @@ def step_policy_grants_folder_policies(
     builder.write()
 
 
-@given('policy "{policy_name}" sets folder "{folder}" capabilities to:')
-def step_policy_sets_folder_capabilities(
-    context: Context, policy_name: str, folder: str
-) -> None:
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        raise AssertionError(f"Policy {policy_name!r} not declared yet.")
-    target = None
-    for folders in policy.accounts.values():
-        for fp in folders:
-            if fp.path == folder:
-                target = fp
-                break
-        if target is not None:
-            break
-    if target is None:
-        raise AssertionError(f"Folder {folder!r} not declared in {policy_name!r}.")
-    row = context.table[0]
-    for key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append"):
-        if key in row.headings:
-            setattr(target, key, _parse_bool(row[key]))
-    builder.write()
 
 
-@given('policy "{policy_name}" grants folder access:')
-def step_policy_grants_folder_access(context: Context, policy_name: str) -> None:
-    builder = _ensure_builder(context)
-    for row in context.table:
-        builder.folder(
-            policy_name=policy_name,
-            account_id=row["account"],
-            path=row["folder"],
-            mode=row["mode"],
-            default=row["default"],
-        )
-    builder.write()
 
 
 @given('policy "{policy_name}" grants folder:')
@@ -383,18 +292,19 @@ def _grant_folders_from_table(
     for row in context.table:
         row_account = row.get("account") or account_id
         if row_account is None:
-            # When no `account` column is present, pick the only
-            # account that is currently registered. Scenarios that
-            # use this shorthand have exactly one account in play.
-            if len(builder.accounts) != 1:
+            policy = next((p for p in builder.policies if p.name == policy_name), None)
+            if policy and len(policy.accounts) == 1:
+                row_account = next(iter(policy.accounts.keys()))
+            elif len(builder.accounts) == 1:
+                row_account = builder.accounts[0].id
+            else:
                 raise AssertionError(
                     "policy grants folder: without an `account` column "
-                    f"requires exactly one registered account; found "
-                    f"{len(builder.accounts)}."
+                    f"requires exactly one registered account or one granted account on {policy_name!r}; found "
+                    f"{len(builder.accounts)} accounts."
                 )
-            row_account = builder.accounts[0].id
         caps: dict[str, bool] = {}
-        for cap_key in ("mark_seen", "mark_tagged", "move_out", "accept_incoming", "draft_append", "modify_message", "draft_edit"):
+        for cap_key in ("mark_seen", "mark_tagged", "move_out", "copy_out", "accept_incoming", "draft_append", "modify_message", "draft_edit"):
             if cap_key in row.headings:
                 caps[cap_key] = _parse_bool(row[cap_key])
         folder = builder.folder(
@@ -405,6 +315,22 @@ def _grant_folders_from_table(
             default=row["default"],
             **caps,
         )
+        if "draft_recipient_domains" in row.headings and row["draft_recipient_domains"].strip():
+            import json
+            raw_domains = row["draft_recipient_domains"].strip()
+            domains = json.loads(raw_domains) if raw_domains.startswith("[") else [d.strip() for d in raw_domains.split(",") if d.strip()]
+            folder.draft_recipients = {
+                "allowed_domains": domains,
+                "allowed_addresses": (folder.draft_recipients or {}).get("allowed_addresses", []),
+            }
+        if "draft_recipient_addresses" in row.headings and row["draft_recipient_addresses"].strip():
+            import json
+            raw_addrs = row["draft_recipient_addresses"].strip()
+            addrs = json.loads(raw_addrs) if raw_addrs.startswith("[") else [a.strip() for a in raw_addrs.split(",") if a.strip()]
+            folder.draft_recipients = {
+                "allowed_domains": (folder.draft_recipients or {}).get("allowed_domains", []),
+                "allowed_addresses": addrs,
+            }
         rules_raw = row["rules"] if "rules" in row.headings else row.get("rule", "[]")
         # The `rule` (singular) column holds a single rule without
         # the surrounding [...] brackets; promote it to the list shape
@@ -413,7 +339,8 @@ def _grant_folders_from_table(
             rule_body = rules_raw.strip()
             if not rule_body.startswith("["):
                 rules_raw = "[{" + rule_body + "}]" if not rule_body.startswith("{") else "[" + rule_body + "]"
-        for parsed_match, grant, cap in _parse_inline_rules(rules_raw):
+        mode = row.get("mode")
+        for parsed_match, grant, cap in _parse_inline_rules(rules_raw, mode=mode):
             from support.policy_builder import SenderRule
 
             folder.rules.append(SenderRule(match=parsed_match, grant=grant, cap=cap))
@@ -422,12 +349,13 @@ def _grant_folders_from_table(
 
 def _parse_inline_rules(
     raw: str,
+    mode: str | None = None,
 ) -> list[tuple[dict[str, object], str | None, str | None]]:
     """Parse `[{k=v AND k2=v2 -> FULL}, {k=v -> cap NONE}]`.
 
     Returns a list of (match_dict, grant, cap). Rules that use the
     `cap X` syntax populate `cap`; rules that name a bare level
-    populate `grant`. Empty-list input yields an empty result.
+    populate `grant` (or `cap` if mode is blacklist). Empty-list input yields an empty result.
     """
     text = raw.strip()
     if text in ("", "[]"):
@@ -458,6 +386,10 @@ def _parse_inline_rules(
         rhs_part = rhs_part.strip()
         if rhs_part.startswith("cap "):
             results.append((match_dict, None, rhs_part[4:].strip()))
+        elif rhs_part.startswith("grant "):
+            results.append((match_dict, rhs_part[6:].strip(), None))
+        elif mode == "blacklist":
+            results.append((match_dict, None, rhs_part))
         else:
             results.append((match_dict, rhs_part, None))
     return results
@@ -529,26 +461,17 @@ def _parse_flags(raw: str) -> list[str]:
     return [f.strip() for f in inner.split(",") if f.strip()]
 
 
-def _body_padded_to(target_size: int, subject: str) -> str:
-    """Produce a body that, combined with standard headers, reaches ~target_size bytes.
-
-    Exact size matching is impossible without measuring; we aim for a
-    body whose length is close enough that IMAP RFC822.SIZE lands in
-    the order-of-magnitude the feature expects. Scenarios that rely on
-    size thresholds use widely-spaced values, so approximate matching
-    is safe.
-    """
-    if target_size <= 500:
-        return f"Body for {subject}".ljust(target_size, " ")
-    filler = "x" * max(target_size - 300, 100)
-    return f"Body for {subject}\n\n{filler}"
-
-
 def _coerce(value: str) -> object:
+    import json
     if value.lower() == "true":
         return True
     if value.lower() == "false":
         return False
+    if value.startswith("[") and value.endswith("]"):
+        try:
+            return json.loads(value)
+        except Exception:
+            pass
     try:
         return int(value)
     except ValueError:
@@ -564,6 +487,7 @@ use_step_matcher("re")
 
 
 @given(r'the folder "(?P<folder>[^"]+)" holds a message with:')
+@given(r'the folder "(?P<folder>[^"]+)" also holds a message with:')
 def step_folder_holds_message_implicit(context: Context, folder: str) -> None:
     """Seed a message into `folder`. Accepts the `account:folder`
     prefix form used by cross-account scenarios."""
@@ -591,6 +515,64 @@ use_step_matcher("parse")
 use_step_matcher("re")
 
 
+@given(r'the folder "(?P<folder>[^"]+)" is reset to hold messages:')
+@when(r'the folder "(?P<folder>[^"]+)" is reset to hold messages:')
+def step_folder_reset_hold_messages(context: Context, folder: str) -> None:
+    if ":" in folder:
+        account_id, _, folder = folder.partition(":")
+    else:
+        account_id = _find_account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+
+    msg_uids = getattr(context, "message_uids", {})
+    context.staged_messages = [
+        s for s in getattr(context, "staged_messages", [])
+        if not (s.get("_account_id") == account_id and s.get("_folder") == folder)
+    ]
+    context.message_uids = {
+        k: v for k, v in msg_uids.items()
+        if not (isinstance(k, tuple) and len(k) == 3 and k[0] == account_id and k[1] == folder)
+    }
+
+    if instance == "mock-gmail":
+        state = getattr(context, "gmail_state", None)
+        if state is not None:
+            for _, msg in list(state.messages_in_folder(folder)):
+                state.remove_message_from_folder(folder, msg)
+    else:
+        context.imap.empty_folder(instance, user, folder)
+
+    _seed_message(context, account_id, folder)
+    flush_staged_messages(context)
+
+
+@given(r'additional messages are seeded into folder "(?P<folder>[^"]+)":')
+@when(r'additional messages are seeded into folder "(?P<folder>[^"]+)":')
+def step_additional_messages_seeded(context: Context, folder: str) -> None:
+    if ":" in folder:
+        account_id, _, folder = folder.partition(":")
+    else:
+        account_id = _find_account_for_folder(context, folder)
+    _seed_message(context, account_id, folder)
+    flush_staged_messages(context)
+
+
+@when(r'the trace sink is cleared and additional messages are seeded into folder "(?P<folder>[^"]+)":')
+def step_trace_sink_cleared_and_additional_messages_seeded(context: Context, folder: str) -> None:
+    collector = getattr(context, "trace_collector", None)
+    if collector is not None:
+        collector.sink.clear()
+    step_additional_messages_seeded(context, folder)
+
+
+@when(r'the trace sink is cleared and the folder "(?P<folder>[^"]+)" is reset to hold messages:')
+def step_trace_sink_cleared_and_folder_reset(context: Context, folder: str) -> None:
+    collector = getattr(context, "trace_collector", None)
+    if collector is not None:
+        collector.sink.clear()
+    step_folder_reset_hold_messages(context, folder)
+
+
 @given(r'the folder "(?P<folder>[^"]+)" holds messages:')
 def step_folder_holds_messages_plural(context: Context, folder: str) -> None:
     if ":" in folder:
@@ -600,85 +582,15 @@ def step_folder_holds_messages_plural(context: Context, folder: str) -> None:
     _seed_message(context, account_id, folder)
 
 
-@given(
-    r'the folder "(?P<folder>[^"]+)" of "(?P<account_id>[^"]+)" holds messages:'
-)
-def step_folder_holds_messages_plural_explicit(
-    context: Context, folder: str, account_id: str
-) -> None:
-    _seed_message(context, account_id, folder)
 
 
-@given(r'the IMAP folder "(?P<folder>[^"]+)" holds messages:')
-def step_imap_folder_holds_messages(context: Context, folder: str) -> None:
-    """Same seeding as `the folder "..." holds messages:`."""
-    step_folder_holds_messages_plural(context, folder)
 
 
-@given(
-    r'the IMAP folder "(?P<folder>[^"]+)" holds drafts carrying the handle '
-    r'"(?P<draft_id>[^"]+)":'
-)
-def step_imap_folder_holds_handle_drafts(
-    context: Context, folder: str, draft_id: str
-) -> None:
-    _stage_handle_drafts(context, _find_account_for_folder(context, folder), folder, draft_id)
 
 
-@given(
-    r'the IMAP folder "(?P<folder>[^"]+)" on "(?P<account_id>[^"]+)" holds drafts '
-    r'carrying the handle "(?P<draft_id>[^"]+)":'
-)
-def step_imap_folder_on_account_holds_handle_drafts(
-    context: Context, folder: str, account_id: str, draft_id: str
-) -> None:
-    _stage_handle_drafts(context, account_id, folder, draft_id)
 
 
 use_step_matcher("parse")
-
-
-def _stage_handle_drafts(
-    context: Context, account_id: str, folder: str, draft_id: str
-) -> None:
-    """Stage one message per row that carries the draft handle headers
-    of ADR 0030 (`X-SC-Draft-Id`, `X-SC-Draft-Rev`) as a server-written
-    draft would, without going through the server.
-
-    Table columns: uid (the scenario's UID hint), revision, subject.
-    Everything else follows the defaults of `_seed_message`.
-    """
-    expected = {"uid", "revision", "subject"}
-    if set(context.table.headings) != expected:
-        raise AssertionError(
-            f"Draft seeding table needs exactly the columns {sorted(expected)}; "
-            f"got {context.table.headings!r}"
-        )
-    context.staged_messages = getattr(context, "staged_messages", [])
-    for row in context.table:
-        context.staged_messages.append(
-            {
-                "_account_id": account_id,
-                "_folder": folder,
-                "uid_hint": int(row["uid"]),
-                "from": None,
-                "to": None,
-                "subject": row["subject"],
-                "message_id_override": None,
-                "has_attachment": False,
-                "size_hint": 0,
-                "date": None,
-                "flags": [],
-                "extra_attachments": [],
-                "extra_headers": [
-                    ("X-SC-Draft-Id", draft_id),
-                    ("X-SC-Draft-Rev", row["revision"]),
-                ],
-                "body_override": None,
-                "html_body": None,
-                "html_only": False,
-            }
-        )
 
 
 @given('the folder "{folder}" holds a verbatim message:')
@@ -700,6 +612,32 @@ def step_folder_holds_verbatim_message(context: Context, folder: str) -> None:
     )
 
 
+@given('the folder "{folder}" is reset to hold a verbatim message:')
+def step_folder_reset_holds_verbatim_message(context: Context, folder: str) -> None:
+    if ":" in folder:
+        account_id, _, folder = folder.partition(":")
+    else:
+        account_id = _find_account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    context.imap.create_folder(instance, user, folder)
+    context.imap.empty_folder(instance, user, folder)
+    context.imap.append_verbatim(
+        instance, user, folder, (context.text or "").encode("utf-8")
+    )
+
+
+def _split_account_folder(context: Context, folder_expr: str) -> tuple[str, str]:
+    if ":" in folder_expr:
+        acct, _, f = folder_expr.partition(":")
+        builder = getattr(context, "policy_builder", None)
+        if builder and any(a.id == acct for a in builder.accounts):
+            return acct, f
+        from support.imap_fixture import _ACCOUNT_ID_TO_INSTANCE_USER
+        if acct in _ACCOUNT_ID_TO_INSTANCE_USER:
+            return acct, f
+    return _find_account_for_folder(context, folder_expr), folder_expr
+
+
 def _find_account_for_folder(context: Context, folder: str) -> str:
     """Look up which configured account declares this folder path.
 
@@ -709,24 +647,33 @@ def _find_account_for_folder(context: Context, folder: str) -> str:
     `of "<account>"` form.
     """
     builder = context.policy_builder
+    if ":" in folder:
+        prefix, _, _suffix = folder.partition(":")
+        if any(a.id == prefix for a in builder.accounts):
+            return prefix
+        from support.imap_fixture import _ACCOUNT_ID_TO_INSTANCE_USER
+        if prefix in _ACCOUNT_ID_TO_INSTANCE_USER:
+            return prefix
     hits: list[str] = []
     for policy in builder.policies:
         for account_id, folder_list in policy.accounts.items():
-            if any(fp.path == folder for fp in folder_list):
-                if account_id not in hits:
-                    hits.append(account_id)
-    # Also check accounts that were registered without any policy
-    # folder declaration (i.e. accounts that exist in the fixture but
-    # intentionally carry no policy — scenario 4 deals with that).
-    instances = context.imap_instances
-    for account in builder.accounts:
-        if account.id in hits:
-            continue
-        instance, user = resolve_account(account.id)
-        _ = instances  # host/port not needed for the imap lookup
-        folders = context.imap.list_folders(instance, user)
-        if folder in folders and account.id not in hits:
-            hits.append(account.id)
+            if any(fp.path == folder for fp in folder_list) and account_id not in hits:
+                hits.append(account_id)
+    if not hits:
+        # Also check accounts that were registered without any policy
+        # folder declaration (i.e. accounts that exist in the fixture but
+        # intentionally carry no policy — scenario 4 deals with that).
+        for account in builder.accounts:
+            if account.id in hits:
+                continue
+            instance, user = resolve_account(account.id)
+            if instance == "mock-gmail":
+                gmail_state = getattr(context, "gmail_state", None)
+                folders = gmail_state.all_folders() if gmail_state else []
+            else:
+                folders = context.imap.list_folders(instance, user)
+            if folder in folders and account.id not in hits:
+                hits.append(account.id)
     if not hits:
         raise AssertionError(
             f"No configured account declares folder {folder!r}. Use the "
@@ -772,19 +719,55 @@ def _seed_message(context: Context, account_id: str, folder: str) -> None:
             extra_headers.append(("Cc", row["cc_header"]))
         if "references_header" in headings and row["references_header"]:
             extra_headers.append(("References", row["references_header"]))
+        if "from_address" in headings and row["from_address"]:
+            from_value = row["from_address"]
+        elif "from" in headings and row["from"]:
+            from_value = row["from"]
+        else:
+            raise AssertionError(
+                f"Seeding table missing mandatory column 'from_address' or 'from' in {headings}"
+            )
+
         if "to_header" in headings and row["to_header"]:
-            to_value: str | None = row["to_header"]
-        elif "to" in headings:
+            to_value = row["to_header"]
+        elif "to_address" in headings and row["to_address"]:
+            to_value = row["to_address"]
+        elif "to" in headings and row["to"]:
             to_value = row["to"]
         else:
-            to_value = None
+            raise AssertionError(
+                f"Seeding table missing mandatory column 'to_address' or 'to' in {headings}"
+            )
+
+        if "subject" in headings and row["subject"]:
+            subject_val = row["subject"]
+        elif "subject_nfd_escaped" in headings and row["subject_nfd_escaped"]:
+            raw_subj = row["subject_nfd_escaped"]
+            subject_val = raw_subj.encode("utf-8").decode("unicode_escape")
+        else:
+            raise AssertionError(
+                f"Seeding table missing mandatory column 'subject' in {headings}"
+            )
+
+        if "header_date" in headings:
+            date_val = row["header_date"]
+        elif "date" in headings and row["date"]:
+            date_val = row["date"]
+        elif "internal_date" in headings and row["internal_date"]:
+            date_val = row["internal_date"]
+        else:
+            raise AssertionError(
+                f"Seeding table missing mandatory column 'date' in {headings}"
+            )
+        internal_date_val = row["internal_date"] if "internal_date" in headings else None
+
         staged: dict[str, object] = {
             "_account_id": account_id,
             "_folder": folder,
             "uid_hint": int(row["uid"]),
-            "from": row["from"] if "from" in headings else None,
+            "from": from_value,
             "to": to_value,
-            "subject": row["subject"] if "subject" in headings else "Test",
+            "subject": subject_val,
             "message_id_override": row["message_id"]
             if "message_id" in headings
             else None,
@@ -794,7 +777,8 @@ def _seed_message(context: Context, account_id: str, folder: str) -> None:
             "size_hint": int(row["size_bytes"])
             if "size_bytes" in headings
             else 0,
-            "date": row["date"] if "date" in headings else None,
+            "date": date_val,
+            "internal_date": internal_date_val,
             "flags": (
                 _parse_flags(row["flags"])
                 if "flags" in headings
@@ -812,7 +796,7 @@ def _seed_message(context: Context, account_id: str, folder: str) -> None:
 def flush_staged_messages(context: Context) -> None:
     """Turn the staged message list into real IMAP APPENDs."""
     import email.utils as _email_utils
-    from datetime import datetime, timezone
+    from datetime import datetime
     from email.utils import format_datetime
 
     staged_list = getattr(context, "staged_messages", [])
@@ -821,12 +805,19 @@ def flush_staged_messages(context: Context) -> None:
     for staged in staged_list:
         account_id = staged["_account_id"]
         folder = staged["_folder"]
+        if ":" in folder and folder.startswith(f"{account_id}:"):
+            folder = folder.split(":", 1)[1]
         uid_hint = staged["uid_hint"]
         instance, user = resolve_account(account_id)
-        context.imap.create_folder(instance, user, folder)
-        sender = staged["from"] or f"{user}@bdd.local"
-        to_addr = staged["to"] or f"{user}@bdd.local"
-        subject = staged["subject"]
+        sender = staged.get("from")
+        if not sender:
+            raise AssertionError(f"Staged message {uid_hint} is missing mandatory 'from'")
+        to_addr = staged.get("to")
+        if not to_addr:
+            raise AssertionError(f"Staged message {uid_hint} is missing mandatory 'to'")
+        subject = staged.get("subject")
+        if not subject:
+            raise AssertionError(f"Staged message {uid_hint} is missing mandatory 'subject'")
         size_hint = staged["size_hint"]
         date_header: str | None = None
         omit_date = False
@@ -835,11 +826,11 @@ def flush_staged_messages(context: Context) -> None:
             omit_date = True
         elif date_str:
             try:
-                parsed = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                parsed = datetime.fromisoformat(date_str)
             except ValueError:
                 parsed = _email_utils.parsedate_to_datetime(date_str)
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
+                parsed = parsed.replace(tzinfo=UTC)
             date_header = format_datetime(parsed)
         body_override = staged["body_override"]
         html_body = staged.get("html_body")
@@ -848,15 +839,9 @@ def flush_staged_messages(context: Context) -> None:
             body = ""
         elif body_override is not None:
             body = body_override
-        elif size_hint:
-            body = _body_padded_to(size_hint, subject)
         else:
             body = f"Body for {subject}"
-        attachments: list[tuple[str, str, bytes]] = []
-        if staged["has_attachment"] and not staged["extra_attachments"]:
-            attachments.append(("stub.bin", "application/octet-stream", b"x" * 16))
-        for extra in staged["extra_attachments"]:
-            attachments.append(extra)
+        attachments: list[tuple[str, str, bytes]] = list(staged["extra_attachments"])
         extra_headers = {
             name: value for name, value in staged["extra_headers"]
         }
@@ -865,6 +850,81 @@ def flush_staged_messages(context: Context) -> None:
             None if omit_msgid
             else (staged["message_id_override"] or f"<scenario-{uid_hint}@bdd.local>")
         )
+
+        if instance == "mock-gmail":
+            from email.message import EmailMessage
+
+            from mock_gmail.state import FOLDER_TO_LABEL, Message
+            state = getattr(context, "gmail_state", None)
+            if state is not None:
+                state.create_folder(folder)
+                email_msg = EmailMessage()
+                email_msg["From"] = sender
+                email_msg["To"] = to_addr
+                email_msg["Subject"] = subject
+                if not omit_msgid and message_id:
+                    email_msg["Message-ID"] = message_id
+                if not omit_date and date_header:
+                    email_msg["Date"] = date_header
+                for h_name, h_val in extra_headers.items():
+                    email_msg[h_name] = h_val
+                if html_body and not body:
+                    email_msg.set_content(html_body, subtype="html")
+                else:
+                    email_msg.set_content(body)
+                    if html_body:
+                        email_msg.add_alternative(html_body, subtype="html")
+                for att in attachments:
+                    if isinstance(att, dict) and "payload" in att:
+                        payload = att["payload"]
+                        mtype, _, stype = att.get("mime_type", "application/octet-stream").partition("/")
+                        fn = att.get("raw_wire_filename") or att.get("raw_8bit_filename") or "att.bin"
+                        email_msg.add_attachment(payload, maintype=mtype, subtype=stype, filename=fn)
+                    elif isinstance(att, tuple) and len(att) == 3:
+                        fn, mime_type, payload = att
+                        mtype, _, stype = mime_type.partition("/")
+                        email_msg.add_attachment(payload, maintype=mtype, subtype=stype, filename=fn)
+                raw_bytes = email_msg.as_bytes()
+                gm_id = int(uid_hint) if (uid_hint and str(uid_hint).isdigit()) else state.new_msgid()
+                labels = set()
+                if folder != "[Gmail]/All Mail":
+                    label = FOLDER_TO_LABEL.get(folder, folder)
+                    if label != "__ALL_MAIL__":
+                        labels.add(label)
+                gmsg = Message(
+                    gm_msgid=gm_id,
+                    gm_thrid=gm_id,
+                    rfc822=raw_bytes,
+                    labels=labels,
+                    flags=set(staged.get("flags", [])),
+                    message_id=message_id,
+                    from_addr=sender,
+                    to_addr=to_addr,
+                    subject=subject,
+                    date=date_header or "",
+                )
+                if staged.get("internal_date"):
+                    int_str = str(staged["internal_date"])
+                    try:
+                        parsed_int = datetime.fromisoformat(int_str)
+                    except Exception:
+                        parsed_int = _email_utils.parsedate_to_datetime(int_str)
+                    if parsed_int.tzinfo is None:
+                        parsed_int = parsed_int.replace(tzinfo=UTC)
+                    gmsg.internal_date = parsed_int
+                state.add_message(gmsg)
+                actual_uid = int(uid_hint) if (uid_hint and str(uid_hint).isdigit()) else state._uid_maps.get(folder, {}).get(gmsg.gm_msgid, 1)
+                if uid_hint and str(uid_hint).isdigit():
+                    actual_uid = int(uid_hint)
+                    uid_map = state._uid_maps.setdefault(folder, {})
+                    uid_map[gmsg.gm_msgid] = actual_uid
+                    state._uid_counters[folder] = max(state._uid_counters.get(folder, 0), actual_uid)
+                context.message_uids = getattr(context, "message_uids", {})
+                context.message_uids[(account_id, folder, uid_hint)] = actual_uid
+                context.message_uids[(account_id, folder, actual_uid)] = actual_uid
+                continue
+
+        context.imap.create_folder(instance, user, folder)
         seeded = context.imap.seed_message(
             instance,
             user,
@@ -879,16 +939,20 @@ def flush_staged_messages(context: Context) -> None:
             message_id=message_id,
             date=date_header,
             flags=staged.get("flags", []),
+            exact_size_bytes=size_hint if size_hint > 0 else None,
             attachments=attachments,
             inline_attachments=staged.get("inline_attachments", []),
             extra_headers=extra_headers,
+            internal_date=staged.get("internal_date"),
         )
         context.message_uids = getattr(context, "message_uids", {})
         context.message_uids[(account_id, folder, uid_hint)] = seeded.uid
+        context.message_uids[(account_id, folder, seeded.uid)] = seeded.uid
     context.staged_messages = []
 
 
 @given('the folder "{folder}" is empty')
+@given('the IMAP folder "{folder}" is empty')
 def step_folder_is_empty(context: Context, folder: str) -> None:
     """Ensure `folder` exists but holds no messages.
 
@@ -911,41 +975,13 @@ def step_folder_is_empty(context: Context, folder: str) -> None:
             )
         instance, user = resolve_account(builder.accounts[0].id)
         context.imap.create_folder(instance, user, folder)
-    # Empty by delete+recreate; simpler than per-message EXPUNGE here.
     uids = context.imap.folder_uids(instance, user, folder)
     if uids:
-        # Leave deletion to reset_user behaviour; if we're here before
-        # reset, this is defensive.
-        pass
+        raise AssertionError(
+            f"IMAP folder {folder!r} on {instance}/{user} is not empty: contains UIDs {uids}"
+        )
 
 
-@given('the folder "{folder}" holds a message with uid {uid:d}')
-def step_folder_holds_message_bare_uid(
-    context: Context, folder: str, uid: int
-) -> None:
-    """Shortcut: seed a single default message at `uid` with no table."""
-    if ":" in folder:
-        account_id, _, folder = folder.partition(":")
-    else:
-        account_id = _find_account_for_folder(context, folder)
-    context.staged_messages = getattr(context, "staged_messages", [])
-    context.staged_messages.append(
-        {
-            "_account_id": account_id,
-            "_folder": folder,
-            "uid_hint": uid,
-            "from": None,
-            "to": None,
-            "subject": f"Stub for uid {uid}",
-            "message_id_override": None,
-            "has_attachment": False,
-            "size_hint": 0,
-            "date": None,
-            "extra_attachments": [],
-            "extra_headers": [],
-            "body_override": None,
-        }
-    )
 
 
 @given(
@@ -955,53 +991,38 @@ def step_folder_holds_message_bare_uid(
 def step_folder_holds_message_repeated_letter_body(
     context: Context, folder: str, uid: int, letter: str, count: int
 ) -> None:
-    """Seed one default message whose text/plain body is exactly `letter * count`."""
+    """Seed one message whose text/plain body is exactly `letter * count`."""
     if len(letter) != 1:
         raise AssertionError(f"Expected a single letter, got {letter!r}")
-    step_folder_holds_message_bare_uid(context, folder, uid)
-    context.staged_messages[-1]["body_override"] = letter * count
-
-
-@given('policy grants mark_tagged=true on "{folder}"')
-def step_policy_grants_mark_tagged(context: Context, folder: str) -> None:
-    """Ensure the single caller's policy has mark_tagged=true on folder."""
-    from support.policy_builder import SenderRule
-
-    builder = _ensure_builder(context)
-    if not builder.policies:
-        raise AssertionError("No policies configured yet")
-    policy = builder.policies[0]
-    account_id = next(iter(policy.accounts.keys()), None)
-    if account_id is None:
-        raise AssertionError("No account in policy")
-    found = None
-    for fp in policy.accounts[account_id]:
-        if fp.path == folder:
-            found = fp
-            break
-    if found is None:
-        found = builder.folder(
-            policy_name=policy.name,
-            account_id=account_id,
-            path=folder,
-            mode="whitelist",
-            default="NONE",
-            mark_tagged=True,
-        )
-        existing_rules = []
-        for fp in policy.accounts[account_id]:
-            if fp.path != folder and fp.rules:
-                existing_rules = fp.rules
-                break
-        if existing_rules:
-            found.rules = list(existing_rules)
-        else:
-            found.rules.append(
-                SenderRule(match={"from_domain": "hornbach.de"}, grant="FULL")
-            )
+    if ":" in folder:
+        account_id, _, folder = folder.partition(":")
     else:
-        found.mark_tagged = True
-    builder.write()
+        account_id = _find_account_for_folder(context, folder)
+    _instance, user = resolve_account(account_id)
+    to_addr = f"{user}@{account_id}.example" if "@" not in user else user
+    context.staged_messages = getattr(context, "staged_messages", [])
+    context.staged_messages.append(
+        {
+            "_account_id": account_id,
+            "_folder": folder,
+            "uid_hint": uid,
+            "from": "sender@example.com",
+            "to": to_addr,
+            "subject": f"Message {uid}",
+            "message_id_override": f"<m-{uid}@{account_id}.example>",
+            "has_attachment": False,
+            "size_hint": 0,
+            "date": "2026-10-30T07:00:00Z",
+            "flags": [],
+            "extra_attachments": [],
+            "extra_headers": [],
+            "body_override": letter * count,
+            "html_body": None,
+            "html_only": False,
+        }
+    )
+
+
 
 
 @given("the audit log directory is a fresh $TMPDIR/audit")
@@ -1013,85 +1034,10 @@ def step_audit_log_fresh(context: Context) -> None:
         context.audit_dir.mkdir(parents=True)
 
 
-@given('the server is configured with audit external_root_hook command "{command}"')
-def step_audit_external_root_hook(context: Context, command: str) -> None:
-    builder = _ensure_builder(context)
-    resolved = command.replace("$TMPDIR", str(context.scratch_dir))
-    builder.audit_external_root_hook = resolved
-    builder.write()
 
 
-@given('the current audit file closes with final_hash "sha256:<hash>"')
-def step_audit_file_closes_with_final_hash(context: Context) -> None:
-    """Prime the audit writer by driving a tool call, then capture the
-    hash chain state. The feature-file placeholder `sha256:<hash>` is
-    not a literal — the step captures the actual final_hash so
-    subsequent Then-steps can compare against it.
-
-    The final_hash that `_emit_eof_day` writes equals the `_prev_hash`
-    after the last content record — which is `sha256:` + SHA-256 of
-    the last written line (including trailing newline)."""
-    import hashlib as _hashlib
-    import json as _json
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    builder = _ensure_builder(context)
-    if not builder.callers:
-        _ensure_account_registered(context, builder, "gupta-scaratec")
-        builder.add_policy("audit-hook-policy")
-        builder.add_caller(
-            id="invoice-agent",
-            policy="audit-hook-policy",
-            auth_type="stdio_trusted",
-        )
-        builder.folder(
-            "audit-hook-policy", "gupta-scaratec",
-            "INBOX", "blacklist", "FULL",
-        )
-        builder.write()
-    client = _ensure_mcp_client(context, "invoice-agent")
-    client.call_tool("list_accounts", {})
-    for p in sorted(context.audit_dir.glob("*.jsonl"), reverse=True):
-        lines = p.read_text().strip().splitlines()
-        if lines:
-            last_line = lines[-1] + "\n"
-            context.expected_final_hash = (
-                "sha256:" + _hashlib.sha256(last_line.encode("utf-8")).hexdigest()
-            )
-            break
 
 
-@given('policy "{policy_name}" grants INBOX/Rechnungen with '
-       'mode=whitelist, default=NONE, rule from_domain=hornbach.de -> FULL')
-def step_policy_specific_shortcut(
-    context: Context, policy_name: str
-) -> None:
-    """Shortcut used by audit_log_format background — equivalent to the
-    more verbose folder-policy + rules tabular form."""
-    from support.policy_builder import SenderRule
-
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        policy = builder.add_policy(policy_name)
-    if len(builder.accounts) < 1:
-        _ensure_account_registered(context, builder, "gupta-scaratec")
-    account_id = builder.accounts[0].id
-    policy.accounts.setdefault(account_id, [])
-    folder = builder.folder(
-        policy_name=policy_name,
-        account_id=account_id,
-        path="INBOX/Rechnungen",
-        mode="whitelist",
-        default="NONE",
-    )
-    folder.rules.append(
-        SenderRule(match={"from_domain": "hornbach.de"}, grant="FULL")
-    )
-    # Make sure the folder is created on the IMAP side too.
-    instance, user = resolve_account(account_id)
-    context.imap.create_folder(instance, user, "INBOX/Rechnungen")
-    builder.write()
 
 
 # Use parse matcher for the bare form; behave resolves the longer
@@ -1113,505 +1059,68 @@ def step_wal_retry_limit(context: Context, limit: int) -> None:
     via an environment variable the server reads."""
     context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
     context.mcp_extra_env["IMAP_MCP_RETRY_LIMIT"] = str(limit)
-    # Retry-scenarios always exercise the test-only recovery tool.
-    context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    if getattr(context, "is_test_hooks", False) and not getattr(context, "without_test_mode", False):
+        context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
 
 
-@given('the IMAP server for "{account_id}" responds to the next APPEND with error {code:d}')
-def step_fault_next_append_error(context: Context, account_id: str, code: int) -> None:
-    _ = code  # the synthesised NO is fixed; real-world IMAP NO has no numeric code
-    _start_imap_proxy(
-        context, account_id,
-        inject_failure_on=[{"command": "APPEND", "remaining": 1}],
-    )
 
 
-@given(
-    'the IMAP server for "{account_id}" responds to the next SELECT of '
-    '"{folder}" with NO response text "{text}"'
-)
-def step_fault_next_select_no_text(
-    context: Context, account_id: str, folder: str, text: str
-) -> None:
-    """Inject NO for the next SELECT on the given folder.
-
-    The proxy fault-matcher is verb-only; the folder name is therefore
-    documented in the scenario for context but not enforced on the
-    wire (BDD Guidelines §1.3 — the fachliche Sache is "SELECT fails
-    with NO", and the next SELECT in the scenario is the one we mean).
-    """
-    _ = folder
-    _start_imap_proxy(
-        context, account_id,
-        inject_failure_on=[
-            {
-                "command": "SELECT",
-                "remaining": 1,
-                "mode": "no_response",
-                "response_text": text,
-            }
-        ],
-    )
 
 
-@given('the IMAP server for "{account_id}" responds to the next APPEND with NO response text "{text}"')
-def step_fault_next_append_no_text(
-    context: Context, account_id: str, text: str
-) -> None:
-    """Tagged NO with caller-chosen reason text. The proxy emits
-    `<tag> NO <text>\\r\\n` verbatim instead of forwarding the APPEND
-    upstream — the text the scenario writes is the text the wire sees."""
-    _start_imap_proxy(
-        context, account_id,
-        inject_failure_on=[
-            {
-                "command": "APPEND",
-                "remaining": 1,
-                "mode": "no_response",
-                "response_text": text,
-            }
-        ],
-    )
 
 
-@given('the IMAP server for "{account_id}" responds to the next APPEND with BAD response text "{text}"')
-def step_fault_next_append_bad_text(
-    context: Context, account_id: str, text: str
-) -> None:
-    """Tagged BAD with caller-chosen reason text. Same shape as the NO
-    variant; the proxy emits `<tag> BAD <text>\\r\\n` verbatim."""
-    _start_imap_proxy(
-        context, account_id,
-        inject_failure_on=[
-            {
-                "command": "APPEND",
-                "remaining": 1,
-                "mode": "bad_response",
-                "response_text": text,
-            }
-        ],
-    )
 
 
-@given(
-    'the IMAP server for "{account_id}" closes the connection after the next APPEND command without responding'
-)
-def step_fault_next_append_close(context: Context, account_id: str) -> None:
-    """Connection-drop injection: the proxy reads the APPEND command
-    line and immediately closes the client-facing writer without
-    sending any tagged response. The IMAP client sees a connection
-    drop with no tagged result and no timeout — the wire-level shape
-    the `append_failed` catch-all in the response contract is meant
-    to classify."""
-    _start_imap_proxy(
-        context, account_id,
-        inject_failure_on=[
-            {
-                "command": "APPEND",
-                "remaining": 1,
-                "mode": "close",
-            }
-        ],
-    )
 
 
-@given('the IMAP server for "{account_id}" responds to every APPEND with error {code:d}')
-def step_fault_every_append_error(context: Context, account_id: str, code: int) -> None:
-    _ = code
-    # The retry-exhaustion scenario also drives the recovery loop via
-    # _test_run_recovery; surface the test-only tool.
-    context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
-    context.mcp_extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
-    _start_imap_proxy(
-        context, account_id,
-        inject_failure_on=[{"command": "APPEND", "remaining": None}],
-    )
 
 
-@given('the IMAP server for "{account_id}" delays the next APPEND response by {seconds:d} seconds')
-def step_fault_append_delay(context: Context, account_id: str, seconds: int) -> None:
-    _start_imap_proxy(
-        context, account_id,
-        delay_command_seconds={
-            "command": "APPEND",
-            "seconds": seconds,
-            "remaining": 1,
-        },
-    )
 
 
-@given('the server append_timeout is configured to {seconds:d} seconds')
-def step_server_append_timeout(context: Context, seconds: int) -> None:
-    context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
-    context.mcp_extra_env["IMAP_MCP_APPEND_TIMEOUT"] = str(seconds)
 
 
-@given('the IMAP server for "{account_id}" responds to the next EXPUNGE with error {code:d} exactly once')
-def step_fault_next_expunge_once(context: Context, account_id: str, code: int) -> None:
-    _ = code
-    _start_imap_proxy(
-        context, account_id,
-        inject_failure_on=[{"command": "EXPUNGE", "remaining": 1}],
-    )
 
 
-@given('the IMAP server for "{account_id}" refuses all connections')
-def step_fault_refuse_connections(context: Context, account_id: str) -> None:
-    """Refuse-all = no proxy listens. We pick a free port, immediately
-    release it, and rewire the account so the server's TCP connect
-    fails with ECONNREFUSED — exactly what `target_unreachable`
-    needs."""
-    _start_imap_proxy(context, account_id, refuse_connections=True)
 
 
 @given('the folder "{folder}" contains no message with uid {uid:d}')
 def step_folder_has_no_uid(context: Context, folder: str, uid: int) -> None:
-    """No-op: the scenario states that the seed fixture never created
-    this uid. The assertion is that the move handler must return
-    uid_not_found when it queries IMAP for a non-existent uid."""
-    _ = (context, folder, uid)
+    if ":" in folder:
+        account_id, _, folder = folder.partition(":")
+    else:
+        account_id = _find_account_for_folder(context, folder)
+    canonical_folder = folder.rstrip("/")
+    if not hasattr(context, "explicit_unseeded_uids"):
+        context.explicit_unseeded_uids = set()
+    context.explicit_unseeded_uids.add((account_id, canonical_folder, uid))
 
-
-@given('policy "{policy_name}" references folder "{folder_path}" with accept_incoming={value}')
-def step_policy_references_folder_incoming(
-    context: Context, policy_name: str, folder_path: str, value: str
-) -> None:
-    """Extend an existing policy to include a folder whose IMAP
-    existence is controlled separately. The scenario that exercises
-    target_folder_missing deliberately *does not* create the folder
-    on IMAP even though policy grants access to it."""
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        policy = builder.add_policy(policy_name)
-    account_id = next(iter(policy.accounts.keys()), None)
-    if account_id is None:
-        raise ValueError(
-            f"Policy {policy_name!r} has no account configured yet; cannot add folder."
-        )
-    builder.folder(
-        policy_name=policy_name,
-        account_id=account_id,
-        path=folder_path,
-        mode="whitelist",
-        default="NONE",
-        accept_incoming=value.strip().lower() == "true",
-    )
-    builder.write()
-
-
-@given("the audit file already contains 5 records R1..R5 forming a valid chain")
-def step_audit_seed_5_records(context: Context) -> None:
-    """Drive five successful fetch_envelope calls so the audit log
-    contains five records chained via prev_hash."""
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    builder = _ensure_builder(context)
-    policy = builder.policies[0]
-    account_id = next(iter(policy.accounts.keys()))
-    folder_path = policy.accounts[account_id][0].path
-    context.staged_messages = getattr(context, "staged_messages", [])
-    for n in range(5):
-        context.staged_messages.append(
-            {
-                "_account_id": account_id,
-                "_folder": folder_path,
-                "uid_hint": 801 + n,
-                "from": "rechnung@hornbach.de",
-                "to": None,
-                "subject": f"Chain-seed {n}",
-                "message_id_override": f"<chain-{n}@test>",
-                "has_attachment": False,
-                "size_hint": 0,
-                "date": None,
-                "extra_attachments": [],
-                "extra_headers": [],
-                "body_override": None,
-            }
-        )
-    flush_staged_messages(context)
-    client = _ensure_mcp_client(context, "invoice-agent")
-    uid_lookup = getattr(context, "message_uids", {})
-    for n in range(5):
-        actual = uid_lookup.get((account_id, folder_path, 801 + n), 801 + n)
-        client.call_tool(
-            "fetch_envelope",
-            {"account": account_id, "folder": folder_path, "uid": actual},
-        )
-
-
-@given(
-    "a sequence of operations over a day creates 20 audit records "
-    "across ALLOW, DENY, saga, and token_refresh"
-)
-def step_audit_20_records(context: Context) -> None:
-    """Fire 20 tool calls producing a mixed audit trail."""
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    builder = _ensure_builder(context)
-    policy = builder.policies[0]
-    account_id = next(iter(policy.accounts.keys()))
-    folder_path = policy.accounts[account_id][0].path
-    # Seed 10 messages: first 5 pass (hornbach), last 5 fail (spam).
-    context.staged_messages = getattr(context, "staged_messages", [])
-    for n in range(5):
-        context.staged_messages.append(
-            {
-                "_account_id": account_id,
-                "_folder": folder_path,
-                "uid_hint": 901 + n,
-                "from": "rechnung@hornbach.de",
-                "to": None,
-                "subject": f"Chain-allow-{n}",
-                "message_id_override": f"<chain-allow-{n}@test>",
-                "has_attachment": False,
-                "size_hint": 0,
-                "date": None,
-                "extra_attachments": [],
-                "extra_headers": [],
-                "body_override": None,
-            }
-        )
-    for n in range(5):
-        context.staged_messages.append(
-            {
-                "_account_id": account_id,
-                "_folder": folder_path,
-                "uid_hint": 911 + n,
-                "from": "spam@other.com",
-                "to": None,
-                "subject": f"Chain-deny-{n}",
-                "message_id_override": f"<chain-deny-{n}@test>",
-                "has_attachment": False,
-                "size_hint": 0,
-                "date": None,
-                "extra_attachments": [],
-                "extra_headers": [],
-                "body_override": None,
-            }
-        )
-    flush_staged_messages(context)
-    client = _ensure_mcp_client(context, "invoice-agent")
-    uid_lookup = getattr(context, "message_uids", {})
-    # 10 ALLOW+DENY calls.
-    for n in range(5):
-        actual = uid_lookup.get((account_id, folder_path, 901 + n), 901 + n)
-        client.call_tool(
-            "fetch_envelope",
-            {"account": account_id, "folder": folder_path, "uid": actual},
-        )
-    for n in range(5):
-        actual = uid_lookup.get((account_id, folder_path, 911 + n), 911 + n)
-        client.call_tool(
-            "fetch_envelope",
-            {"account": account_id, "folder": folder_path, "uid": actual},
-        )
-    # 10 list_accounts/search calls to pad to 20 audit records.
-    for _ in range(5):
-        client.call_tool("list_accounts", {})
-    for _ in range(5):
-        client.call_tool(
-            "search",
-            {
-                "account": account_id,
-                "folder": folder_path,
-                "criteria": {"subject_contains": "Rechnung"},
-            },
-        )
-
-
-@given("a cross-account move begins and succeeds")
-def step_cross_account_move_begins(context: Context) -> None:
-    """Seed a second account + message + cross-account move that
-    commits successfully. Produces the full saga_transition audit
-    trail required by the '#60 saga transitions' scenario."""
-    builder = _ensure_builder(context)
-    # Ensure the second account exists.
-    second_account = "personal"
-    _ensure_account_registered(context, builder, second_account)
-    instance_b, user_b = resolve_account(second_account)
-    context.imap.create_folder(instance_b, user_b, "Archiv/Belege")
-
-    # Ensure the target folder is in the policy with accept_incoming.
-    policy = builder.policies[0]
-    existing = [
-        f
-        for folders in policy.accounts.values()
-        for f in folders
-        if f.path == "Archiv/Belege"
-    ]
-    if not existing:
-        builder.folder(
-            policy_name=policy.name,
-            account_id=second_account,
-            path="Archiv/Belege",
-            mode="whitelist",
-            default="NONE",
-            accept_incoming=True,
-        )
-
-    # Source already exists with from=hornbach.de rule; grant move_out.
-    src_account_id = next(iter(policy.accounts.keys()))
-    for fp in policy.accounts[src_account_id]:
-        if fp.path == "INBOX/Rechnungen":
-            fp.move_out = True
-            break
-    builder.write()
-
-    # Stage a message from hornbach.de (matches the existing rule).
-    context.staged_messages = getattr(context, "staged_messages", [])
-    context.staged_messages.append(
-        {
-            "_account_id": src_account_id,
-            "_folder": "INBOX/Rechnungen",
-            "uid_hint": 701,
-            "from": "rechnung@hornbach.de",
-            "to": None,
-            "subject": "Rechnung 7823",
-            "message_id_override": "<m-cross-@gupta-scaratec.com>",
-            "has_attachment": False,
-            "size_hint": 0,
-            "date": None,
-            "extra_attachments": [],
-            "extra_headers": [],
-            "body_override": None,
-        }
-    )
-    flush_staged_messages(context)
-
-    # Now drive the move via the MCP client.
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    client = _ensure_mcp_client(context, "invoice-agent")
-    uid_lookup = getattr(context, "message_uids", {})
-    actual_uid = uid_lookup.get((src_account_id, "INBOX/Rechnungen", 701), 701)
-    payload = client.call_tool(
-        "move",
-        {
-            "source": {
-                "account": src_account_id,
-                "folder": "INBOX/Rechnungen",
-                "uid": actual_uid,
-            },
-            "target": {
-                "account": second_account,
-                "folder": "Archiv/Belege",
-            },
-        },
-    )
-    import json as _json
-
-    content = payload.get("content") or []
-    if content:
-        data = _json.loads(content[0]["text"])
-        context.last_response = data
-        context.last_tx_id = data.get("tx_id")
-
-
-@given('a cross-account move for uid {uid:d} is in progress, currently at WAL step "fetched"')
-def step_saga_in_progress_at_fetched(context: Context, uid: int) -> None:
-    """Start a cross-account move and pause it at the 'fetched' WAL step.
-
-    Uses file-based coordination: the saga writes a marker file when it
-    reaches 'post_fetch', then polls for a '.resume' sibling. The step
-    returns once the marker appears — the saga is now frozen mid-flight.
-    """
-    import threading
-    import time
-
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    builder = _ensure_builder(context)
-    second_account = "personal"
-    _ensure_account_registered(context, builder, second_account)
-    instance_b, user_b = resolve_account(second_account)
-    context.imap.create_folder(instance_b, user_b, "Archiv/Belege")
-
-    policy = builder.policies[0]
-    existing_target = [
-        f
-        for folders in policy.accounts.values()
-        for f in folders
-        if f.path == "Archiv/Belege"
-    ]
-    if not existing_target:
-        builder.folder(
-            policy_name=policy.name,
-            account_id=second_account,
-            path="Archiv/Belege",
-            mode="whitelist",
-            default="NONE",
-            accept_incoming=True,
-        )
-    src_account_id = next(iter(policy.accounts.keys()))
-    for fp in policy.accounts[src_account_id]:
-        if fp.path == "INBOX/Rechnungen":
-            fp.move_out = True
-            break
-
-    marker = context.scratch_dir / "saga-pause-marker"
-    extra_env = getattr(context, "mcp_extra_env", {})
-    extra_env["IMAP_MCP_SAGA_PAUSE_AT"] = "post_fetch"
-    extra_env["IMAP_MCP_SAGA_PAUSE_MARKER"] = str(marker)
-    extra_env["IMAP_MCP_TEST_MODE"] = "1"
-    context.mcp_extra_env = extra_env
-    context.saga_pause_marker = marker
-    builder.write()
-    flush_staged_messages(context)
-
-    client = _ensure_mcp_client(context, "invoice-agent")
-    uid_lookup = getattr(context, "message_uids", {})
-    actual_uid = uid_lookup.get((src_account_id, "INBOX/Rechnungen", uid), uid)
-
-    def _run_move() -> None:
-        import json as _json
-
-        try:
-            payload = client.call_tool(
-                "move",
-                {
-                    "source": {
-                        "account": src_account_id,
-                        "folder": "INBOX/Rechnungen",
-                        "uid": actual_uid,
-                    },
-                    "target": {
-                        "account": second_account,
-                        "folder": "Archiv/Belege",
-                    },
-                },
-            )
-            content = payload.get("content") or []
-            if content:
-                context.saga_move_result = _json.loads(content[0]["text"])
-        except Exception as exc:
-            context.saga_move_error = exc
-
-    t = threading.Thread(target=_run_move, daemon=True)
-    t.start()
-    context.saga_move_thread = t
-
-    deadline = time.monotonic() + 30
-    while not marker.exists():
-        if time.monotonic() > deadline:
+    instance, user = resolve_account(account_id)
+    if instance == "mock-gmail":
+        state = getattr(context, "gmail_state", None)
+        if state is not None:
+            msg = state.message_by_uid(folder, uid)
+            if msg is not None:
+                raise AssertionError(
+                    f"Folder {folder!r} on {account_id} unexpectedly contains UID {uid}"
+                )
+    else:
+        uids = context.imap.folder_uids(instance, user, folder)
+        if uid in uids:
             raise AssertionError(
-                "Saga did not reach 'fetched' within 30s"
+                f"Folder {folder!r} on {account_id} unexpectedly contains UID {uid}"
             )
-        time.sleep(0.2)
 
 
-@when(
-    'the operator changes policy "{policy_name}" to remove the '
-    'move_out capability from "{folder}"'
-)
-def step_remove_move_out(context: Context, policy_name: str, folder: str) -> None:
-    builder = _ensure_builder(context)
-    policy = next(p for p in builder.policies if p.name == policy_name)
-    for folders in policy.accounts.values():
-        for fp in folders:
-            if fp.path == folder:
-                fp.move_out = False
-    builder.write()
+
+
+
+
+
+
+
+
+
+
 
 
 @given("the server is configured with audit:")
@@ -1628,15 +1137,9 @@ def step_server_with_audit_table(context: Context) -> None:
     if "delete_after_days" in row.headings:
         builder.audit_delete_after_days = int(row["delete_after_days"])
     builder.write()
-    # Make sure at least one caller + account + policy exist so the
-    # loader can boot when the rotation tool is invoked later.
     if not builder.callers:
-        _ensure_account_registered(context, builder, "gupta-scaratec")
-        builder.add_caller(
-            id="invoice-agent", policy="invoice-policy", auth_type="stdio_trusted"
-        )
-        builder.add_policy("invoice-policy")
-        builder.write()
+        raise AssertionError("Audit configuration requires caller to be configured explicitly in scenario")
+    builder.write()
 
 
 @given(
@@ -1651,138 +1154,20 @@ def step_server_audit_inline_retention(
     builder.audit_warm_days = warm
     builder.audit_delete_after_days = delete
     if not builder.callers:
-        _ensure_account_registered(context, builder, "gupta-scaratec")
-        builder.add_caller(
-            id="invoice-agent", policy="invoice-policy", auth_type="stdio_trusted"
-        )
-        builder.add_policy("invoice-policy")
+        raise AssertionError("Audit configuration requires caller to be configured explicitly in scenario")
     builder.write()
 
 
-@given("the audit directory contains:")
-def step_audit_directory_contains_table(context: Context) -> None:
-    """Stage backdated audit files using `os.utime` to set their
-    mtime relative to `IMAP_MCP_FAKE_NOW_UTC` (or wall time)."""
-    import os as _os
-    from datetime import timedelta as _td, timezone as _tz
-
-    now = _now_utc_for_test(context)
-    for row in context.table:
-        filename = row["filename"]
-        age_days = int(row["age_days"])
-        path = context.audit_dir / filename
-        # Plain payload — the actual content is irrelevant for
-        # rotation tests; the rotator inspects mtime, not content.
-        path.write_text(
-            f'{{"placeholder": true, "filename": "{filename}"}}\n',
-            encoding="utf-8",
-        )
-        target_mtime = (now - _td(days=age_days)).timestamp()
-        _os.utime(path, (target_mtime, target_mtime))
 
 
-@given('the audit directory contains a file "{filename}" with age {age:d} days')
-def step_audit_directory_single_file(
-    context: Context, filename: str, age: int
-) -> None:
-    import os as _os
-    from datetime import timedelta as _td
-
-    now = _now_utc_for_test(context)
-    path = context.audit_dir / filename
-    if filename.endswith(".gz"):
-        # Plain bytes are fine for retention age checks; the rotator
-        # only consults mtime + filename for delete decisions.
-        path.write_bytes(b"\x1f\x8b\x08\x00placeholder")
-    else:
-        path.write_text(
-            f'{{"placeholder": true, "filename": "{filename}"}}\n',
-            encoding="utf-8",
-        )
-    target_mtime = (now - _td(days=age)).timestamp()
-    _os.utime(path, (target_mtime, target_mtime))
 
 
-@given('a file "{filename}" with age {age:d} exists in the audit directory')
-def step_audit_directory_with_age(
-    context: Context, filename: str, age: int
-) -> None:
-    step_audit_directory_single_file(context, filename, age)
 
 
-@given('a file "{filename}" with mode {mode} exists')
-def step_audit_file_with_mode(
-    context: Context, filename: str, mode: str
-) -> None:
-    """Create the file with an mtime well past the default hot_days
-    boundary so the next rotation pass actually gzips it. Matches the
-    intent of the warm-file-permissions scenario: the test cares about
-    the gzip code path, not about the age boundary."""
-    import os as _os
-    from datetime import timedelta as _td
-
-    path = context.audit_dir / filename
-    path.write_text(
-        f'{{"placeholder": true, "filename": "{filename}"}}\n',
-        encoding="utf-8",
-    )
-    _os.chmod(path, int(mode, 8))
-    now = _now_utc_for_test(context)
-    target = (now - _td(days=100)).timestamp()
-    _os.utime(path, (target, target))
 
 
-@given("the audit file contains {n:d} records")
-def step_audit_file_contains_n_records(context: Context, n: int) -> None:
-    """Drive `n` ALLOW fetch_envelope-equivalent calls (via list_accounts
-    which is always allowed) so the audit file ends up with `n` records."""
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    client = _ensure_mcp_client(context, "invoice-agent")
-    for _ in range(n):
-        client.call_tool("list_accounts", {})
 
 
-@given(
-    'the audit writer is at {time:S} UTC with seq {seq:d} in file "{filename}"'
-)
-def step_audit_writer_at_time(
-    context: Context, time: str, seq: int, filename: str
-) -> None:
-    """Pin the fake clock to a specific UTC time within the named day,
-    pre-populate the file with `seq` records so the next write hits
-    seq+1, and start the server so subsequent SIGHUP/rotation steps
-    have a recipient.
-
-    The file content uses synthetic chain placeholders; the
-    `audit_log_format.feature:78` scenario checks that the *next*
-    file's first record references the eof_day's hash, not that the
-    pre-seeded records form a valid chain.
-    """
-    import os as _os
-    from datetime import datetime as _dt
-
-    # Parse the day from the filename (`YYYY-MM-DD.jsonl`) and combine
-    # with the `time` portion to produce the exact fake-now value.
-    day = filename.replace(".jsonl", "")
-    fake_now = f"{day}T{time}+00:00"
-    context.mcp_extra_env = getattr(context, "mcp_extra_env", {}) or {}
-    context.mcp_extra_env["IMAP_MCP_FAKE_NOW_UTC"] = fake_now
-    context.audit_pinned_day = day
-
-    # Prime the active file by driving `seq` MCP calls (each emits an
-    # audit record). list_accounts is allowed by the minimal-config
-    # caller and is the simplest record-emitter.
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    _ = _dt.fromisoformat(fake_now)  # validation
-    # Ensure a minimal caller config if none is staged yet.
-    builder = _ensure_builder(context)
-    if not builder.callers:
-        step_server_minimal_configuration(context)
-    client = _ensure_mcp_client(context, "invoice-agent")
-    for _ in range(seq):
-        client.call_tool("list_accounts", {})
 
 
 def _now_utc_for_test(context: Context):
@@ -1793,7 +1178,7 @@ def _now_utc_for_test(context: Context):
     file mtimes line up with what the server will see.
     """
     import os as _os
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
 
     raw = (getattr(context, "mcp_extra_env", None) or {}).get(
         "IMAP_MCP_FAKE_NOW_UTC"
@@ -1802,45 +1187,12 @@ def _now_utc_for_test(context: Context):
         if raw.endswith("Z"):
             raw = raw[:-1] + "+00:00"
         try:
-            return _dt.fromisoformat(raw).astimezone(_tz.utc)
+            return _dt.fromisoformat(raw).astimezone(UTC)
         except ValueError:
             pass
-    return _dt.now(tz=_tz.utc)
+    return _dt.now(tz=UTC)
 
 
-@given('policy "{policy_name}" folder "{folder_path}" has:')
-def step_policy_folder_has(
-    context: Context, policy_name: str, folder_path: str
-) -> None:
-    """Single-row folder spec: mode + default + inline rules string.
-
-    Used by `policy_reload.feature` Background to define INBOX/Rechnungen
-    in one go alongside other Background steps.
-    """
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        policy = builder.add_policy(policy_name)
-    account_id = next(iter(policy.accounts.keys()), None)
-    if account_id is None:
-        # Default to the first registered account if no account has
-        # been linked to this policy yet.
-        account_id = builder.accounts[0].id if builder.accounts else "gupta-scaratec"
-        policy.accounts.setdefault(account_id, [])
-    row = context.table[0]
-    fp = builder.folder(
-        policy_name=policy_name,
-        account_id=account_id,
-        path=folder_path,
-        mode=row["mode"],
-        default=row["default"],
-    )
-    if "rules" in row.headings:
-        from support.policy_builder import SenderRule
-
-        for match, grant, cap in _parse_inline_rules(row["rules"]):
-            fp.rules.append(SenderRule(match=match, grant=grant, cap=cap))
-    builder.write()
 
 
 @when('the operator updates "{folder_path}" rules to:')
@@ -1870,12 +1222,87 @@ def step_operator_updates_rules(context: Context, folder_path: str) -> None:
     builder.write()
 
 
-@given("the current policy file content is:")
-def step_current_policy_file_content(context: Context) -> None:
-    """Informational anchor — the actual operator action is the next
-    `replaces` step. Stash the snapshot for diff-style debugging if a
-    later assertion fails."""
-    context.policy_file_snapshot_before = context.text
+@when('the operator updates folder "{folder}" in policy "{policy_name}" to:')
+def step_operator_updates_folder_policy(
+    context: Context, folder: str, policy_name: str
+) -> None:
+    builder = _ensure_builder(context)
+    policy = next((p for p in builder.policies if p.name == policy_name), None)
+    if policy is None:
+        raise AssertionError(f"Policy {policy_name!r} not found in builder")
+    target_fp = None
+    for fp_list in policy.accounts.values():
+        for fp in fp_list:
+            if fp.path == folder:
+                target_fp = fp
+                break
+        if target_fp is not None:
+            break
+    if target_fp is None:
+        raise AssertionError(f"Folder {folder!r} not found in policy {policy_name!r}")
+    row = context.table[0]
+    if "mode" in row.headings:
+        target_fp.mode = row["mode"]
+    if "default" in row.headings:
+        target_fp.default = row["default"]
+    for cap_key in (
+        "mark_seen", "mark_tagged", "move_out", "copy_out",
+        "accept_incoming", "draft_append", "draft_edit"
+    ):
+        if cap_key in row.headings:
+            setattr(target_fp, cap_key, _parse_bool(row[cap_key]))
+    builder.write()
+
+
+def _fetch_message_by_subject(context: Context, qualified: str, subject: str):
+    import email
+    import email.policy
+    account_id, folder = _split_account_folder(context, qualified)
+    instance, user = resolve_account(account_id)
+    if instance == "mock-gmail":
+        state = getattr(context, "gmail_state", None)
+        if state is None:
+            raise AssertionError("mock-gmail state unavailable")
+        for msg in state.messages:
+            if msg.subject == subject:
+                return email.message_from_bytes(msg.rfc822, policy=email.policy.default)
+        raise AssertionError(f"No message with subject {subject!r} found in {qualified}")
+    else:
+        conn = context.imap.connect(instance, user)
+        conn.select(context.imap.to_wire(instance, user, folder))
+        status, data = conn.uid("SEARCH", None, f'SUBJECT "{subject}"')
+        if status != "OK" or not data or not data[0]:
+            raise AssertionError(f"No message with subject {subject!r} found in {qualified}")
+        uids = [int(u) for u in data[0].split()]
+        return context.imap.fetch_message(instance, user, folder, uids[-1])
+
+
+def _get_plain_text_body(msg) -> str:
+    for part in msg.walk():
+        if part.get_content_type() == "text/plain":
+            payload = part.get_payload(decode=True)
+            if payload:
+                charset = part.get_content_charset() or "utf-8"
+                return payload.decode(charset, errors="replace")
+    payload = msg.get_payload(decode=True)
+    if isinstance(payload, bytes):
+        charset = msg.get_content_charset() or "utf-8"
+        return payload.decode(charset, errors="replace")
+    return str(msg.get_payload() or "")
+
+
+@then('a direct IMAP FETCH of the message with subject "{subject}" in "{qualified}" shows decoded plain text "{expected_body}"')
+def step_direct_imap_fetch_shows_plain_text(
+    context: Context, subject: str, qualified: str, expected_body: str
+) -> None:
+    msg = _fetch_message_by_subject(context, qualified, subject)
+    actual_text = _get_plain_text_body(msg).strip()
+    if actual_text != expected_body.strip():
+        raise AssertionError(
+            f"Expected plain text {expected_body!r}, got {actual_text!r}"
+        )
+
+
 
 
 @when("the operator replaces the policy file with:")
@@ -1899,17 +1326,6 @@ def step_operator_replaces_policy_file(context: Context) -> None:
     target.write_text(context.text, encoding="utf-8")
 
 
-@when('the operator removes account "{account_id}" from accounts.yaml')
-def step_operator_removes_account(
-    context: Context, account_id: str
-) -> None:
-    builder = _ensure_builder(context)
-    builder.accounts = [a for a in builder.accounts if a.id != account_id]
-    # Also drop any policy reference to that account so the loader does
-    # not reject the new state with `unknown account`.
-    for policy in builder.policies:
-        policy.accounts.pop(account_id, None)
-    builder.write()
 
 
 @when('the operator adds to policy "{policy_name}":')
@@ -1941,6 +1357,16 @@ def step_operator_adds_to_policy(
     builder.write()
 
 
+@given('the IMAP account "{account_id}" also has folder "{folder_path}" with special-use "{special_use}"')
+def step_account_also_has_folder_special_use(
+    context: Context, account_id: str, folder_path: str, special_use: str
+) -> None:
+    from support.imap_fixture import resolve_account
+
+    instance, user = resolve_account(account_id)
+    context.imap.create_folder(instance, user, folder_path)
+
+
 @given('the IMAP account "{account_id}" also has folder "{folder_path}"')
 def step_account_also_has_folder(
     context: Context, account_id: str, folder_path: str
@@ -1953,121 +1379,55 @@ def step_account_also_has_folder(
     context.imap.create_folder(instance, user, folder_path)
 
 
-@given('policy "{policy_name}" does NOT grant folder "{folder_path}"')
-def step_policy_does_not_grant_folder(
-    context: Context, policy_name: str, folder_path: str
-) -> None:
-    """Invariant assertion: the named policy must not currently
-    reference the folder. No-op if the convention is honoured by the
-    Background; explicit failure otherwise so the scenario reads
-    accurately."""
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        return
-    for fp_list in policy.accounts.values():
-        for fp in fp_list:
-            if fp.path == folder_path:
-                raise AssertionError(
-                    f"Policy {policy_name!r} unexpectedly already grants {folder_path!r}"
-                )
-
-
-@given(
-    'invoice-agent has made one successful fetch_envelope against '
-    '"{account_id}" in this session'
-)
-def step_one_successful_fetch_envelope(
-    context: Context, account_id: str
-) -> None:
-    """Drive a fetch_envelope so an MCP session is open and at least
-    one IMAP round-trip has happened. Used by the account-removal
-    scenario as a precondition for the pool-drain assertion."""
-    from features.steps.mcp_steps import _ensure_mcp_client
-    from support.imap_fixture import resolve_account
-
+@given('an external mail client strips header "{header}" from the draft in "{location}" while keeping X-SC-Draft-Id and X-SC-Draft-Rev')
+def step_external_client_strips_header(context: Context, header: str, location: str) -> None:
+    account_id, folder = _split_account_folder(context, location)
     instance, user = resolve_account(account_id)
-    # Find a folder seeded in this account from prior steps.
-    builder = _ensure_builder(context)
-    policy = builder.policies[0]
-    fp_list = policy.accounts.get(account_id) or []
-    if not fp_list:
-        raise AssertionError(
-            f"No folder declared for account {account_id!r}; "
-            "Background must seed at least one."
-        )
-    folder_path = fp_list[0].path
-    context.imap.create_folder(instance, user, folder_path)
-    flush_staged_messages(context)
-    client = _ensure_mcp_client(context, "invoice-agent")
-    uid_lookup = getattr(context, "message_uids", {})
-    actual_uid = next(iter(uid_lookup.values()), 1) if uid_lookup else 1
-    client.call_tool(
-        "fetch_envelope",
-        {"account": account_id, "folder": folder_path, "uid": actual_uid},
-    )
+    uids = context.imap.folder_uids(instance, user, folder)
+    target_uid = None
+    target_msg = None
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, folder, u)
+        if msg.get("X-SC-Draft-Id"):
+            target_uid = u
+            target_msg = msg
+            break
+    if target_uid is None or target_msg is None:
+        raise AssertionError(f"No draft found in {location} to strip header from")
+
+    del target_msg[header]
+    raw_bytes = target_msg.as_bytes()
+    conn = context.imap.connect(instance, user)
+    conn.select(context.imap._q(folder))
+    conn.uid("store", str(target_uid), "+FLAGS", "(\\Deleted)")
+    conn.expunge()
+    context.imap.append_verbatim(instance, user, folder, raw_bytes)
 
 
-@given(
-    'the server has 1 open IMAP connection in the pool for '
-    'account "{account_id}"'
-)
-def step_pool_has_one_connection(context: Context, account_id: str) -> None:
-    """No-op. ADR 0013's connection pool is not part of V1 (fresh
-    connection per call). The assertion that the count drops to zero
-    after SIGHUP is therefore trivially true."""
-    _ = (context, account_id)
+@given('an external IMAP client duplicates the draft message in "{location}" so two copies share the returned draft_id and revision {rev:d}')
+def step_external_client_duplicates_draft(
+    context: Context, location: str, rev: int
+) -> None:
+    account_id, folder = _split_account_folder(context, location)
+    instance, user = resolve_account(account_id)
+    uids = context.imap.folder_uids(instance, user, folder)
+    target_uid = None
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, folder, u)
+        if msg.get("X-SC-Draft-Id") and int(msg.get("X-SC-Draft-Rev", 0)) == rev:
+            target_uid = u
+            break
+    if target_uid is None:
+        raise AssertionError(f"No draft with revision {rev} found in {location}")
+
+    raw_bytes = context.imap.fetch_raw(instance, user, folder, target_uid)
+    context.imap.append_verbatim(instance, user, folder, raw_bytes)
 
 
-@given("the server is configured with callers:")
-def step_server_with_callers_table(context: Context) -> None:
-    """Multi-caller setup. Each row drops one caller into the policy
-    builder; the secret store is populated by the dedicated step
-    `the secret store contains value "..." under "..."` (which is
-    distinct so each token can be addressed by name).
-
-    Existing callers with the same id are replaced. This is the
-    natural behaviour for a feature that, in its Background, set up a
-    default-stdio caller and now wants to override the auth_type to
-    shared_token for an HTTP-specific scenario.
-    """
-    builder = _ensure_builder(context)
-    for row in context.table:
-        caller_id = row["caller_id"]
-        auth_type = row["auth_type"]
-        token_secret_ref = row.get("token_secret_ref") if "token_secret_ref" in row.headings else None
-        if token_secret_ref == "(n/a)":
-            token_secret_ref = None
-        # Drop any prior caller with this id (e.g. seeded as stdio
-        # by an earlier Background step). The policy attached to the
-        # caller is preserved if present, otherwise a default one is
-        # created so the loader's invariant holds.
-        existing = next(
-            (c for c in builder.callers if c.id == caller_id), None
-        )
-        if existing is not None:
-            policy_name = existing.policy
-            builder.callers = [c for c in builder.callers if c.id != caller_id]
-        else:
-            policy_name = f"{caller_id}-policy"
-        builder.add_caller(
-            id=caller_id,
-            policy=policy_name,
-            auth_type=auth_type,
-            token_secret_ref=token_secret_ref,
-        )
-        if not any(p.name == policy_name for p in builder.policies):
-            builder.add_policy(policy_name)
-    # Ensure at least one account exists so the loader can boot.
-    _ensure_account_registered(context, builder, "gupta-scaratec")
-    builder.write()
 
 
-@given('the secret store contains value "{value}" under "{path}"')
-def step_secret_store_value(context: Context, value: str, path: str) -> None:
-    target = context.secrets_dir / path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(value, encoding="utf-8")
+
+
 
 
 def _scratch_substitute(context: Context, raw: str) -> str:
@@ -2079,7 +1439,7 @@ def _scratch_substitute(context: Context, raw: str) -> str:
     scratch = getattr(context, "scratch_dir", None)
     out = raw
     if scratch is not None:
-        out = out.replace("$SCRATCH", str(scratch))
+        out = out.replace("$SCRATCH", str(scratch)).replace("$TMPDIR", str(scratch))
     fake_fp = getattr(context, "_gpg_fake_fp", None)
     real_fp = getattr(context, "_gpg_real_fp", None)
     if fake_fp and real_fp:
@@ -2106,6 +1466,7 @@ def step_secret_store_config(context: Context) -> None:
     builder.secret_store_recipient = (
         _scratch_substitute(context, recipient) if recipient else None
     )
+    builder.secret_store_acknowledge_plaintext = parsed.get("acknowledge_plaintext", False)
     gh = parsed.get("gnupghome")
     if gh:
         builder.secret_store_gnupghome = Path(_scratch_substitute(context, gh))
@@ -2117,56 +1478,99 @@ def step_secret_store_config(context: Context) -> None:
             builder.secret_store_gnupghome = prior
 
 
-@given('the file "{path}" contains the exact bytes "{value}"')
-def step_file_contains_bytes(context: Context, path: str, value: str) -> None:
-    target = Path(_scratch_substitute(context, path))
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(value.encode("utf-8"))
+@given("callers.yaml contains an empty callers list")
+def step_callers_yaml_empty(context: Context) -> None:
+    builder = _ensure_builder(context)
+    builder.write()
+    context.custom_callers_yaml = True
+    (context.config_dir / "callers.yaml").write_text("callers: []\n", encoding="utf-8")
 
 
-@given('no file exists at "{path}"')
-def step_no_file_exists(context: Context, path: str) -> None:
-    target = Path(_scratch_substitute(context, path))
-    if target.exists():
-        target.unlink()
+@given('callers.yaml defines two callers "invoice-agent" and "overview-agent"')
+def step_callers_yaml_two_callers(context: Context) -> None:
+    builder = _ensure_builder(context)
+    builder.write()
+    context.custom_callers_yaml = True
+    (context.config_dir / "callers.yaml").write_text(
+        "callers:\n"
+        "  - id: invoice-agent\n"
+        "    policy: invoice-policy\n"
+        "    auth:\n"
+        "      type: stdio_trusted\n"
+        "  - id: overview-agent\n"
+        "    policy: overview-policy\n"
+        "    auth:\n"
+        "      type: stdio_trusted\n",
+        encoding="utf-8",
+    )
 
 
-@given("the server process environment includes")
-@given("the server process environment includes:")
-def step_server_process_env_includes(context: Context) -> None:
+@given('callers.yaml defines caller "no-auth-agent" without an auth block')
+def step_callers_yaml_no_auth_block(context: Context) -> None:
+    builder = _ensure_builder(context)
+    builder.write()
+    context.custom_callers_yaml = True
+    (context.config_dir / "callers.yaml").write_text(
+        "callers:\n"
+        "  - id: no-auth-agent\n"
+        "    policy: no-auth-policy\n",
+        encoding="utf-8",
+    )
+
+
+@given('the server process environment does NOT include "{var_name}"')
+def step_server_env_does_not_include_var(context: Context, var_name: str) -> None:
     extra = getattr(context, "mcp_extra_env", None) or {}
+    extra.pop(var_name, None)
     context.mcp_extra_env = extra
-    for row in context.table:
-        extra[row["name"]] = row["value"]
+    unset = getattr(context, "mcp_unset_env", []) or []
+    if var_name not in unset:
+        unset.append(var_name)
+    context.mcp_unset_env = unset
 
 
-@given('the server process environment does NOT include any variable starting with "{prefix}"')
-def step_server_process_env_excludes_prefix(context: Context, prefix: str) -> None:
-    extra = getattr(context, "mcp_extra_env", None) or {}
-    context.mcp_extra_env = extra
-    for key in [k for k in list(extra) if k.startswith(prefix)]:
-        extra.pop(key, None)
-
-
-@given('a GPG keypair exists with fingerprint "{fake_fp}" and a pinentry that returns passphrase "{passphrase}"')
-def step_gpg_keypair_exists(
-    context: Context, fake_fp: str, passphrase: str
+@given('the IMAP account "{account_id}" exists with explicit user "{user}" and folders:')
+def step_imap_account_exists_explicit_user(
+    context: Context, account_id: str, user: str
 ) -> None:
-    """Generate a real test GPG keypair in `$SCRATCH/gnupg`. Stores
-    the actual fingerprint on the context; subsequent feature
-    references to `fake_fp` are substituted via `_scratch_substitute`.
+    builder = _ensure_builder(context)
+    builder.add_account(
+        id=account_id,
+        provider="imap-standard",
+        host="127.0.0.1",
+        port=11143,
+        user=user,
+        auth_type="password",
+        secret_ref=f"secret://accounts/{account_id}/password",
+    )
+    pw_file = context.secrets_dir / "accounts" / account_id / "password"
+    pw_file.parent.mkdir(parents=True, exist_ok=True)
+    pw_file.write_text("test123", encoding="utf-8")
+    for row in context.table:
+        folder_path = row["folder path"]
+        context.imap.create_folder("imap-a", user, folder_path)
+    builder.write()
 
-    Pinentry is bypassed: every later `gpg --decrypt` call will pipe
-    the passphrase via `--passphrase-fd`, so no interactive agent
-    machinery is needed. The `passphrase` argument is captured here
-    and consumed by the file-encryption step."""
-    import subprocess
 
-    gnupghome = context.scratch_dir / "gnupg"
+@given('the secret store holds the wrong password "{password}" for account "{account_id}"')
+def step_secret_store_wrong_password(
+    context: Context, password: str, account_id: str
+) -> None:
+    pw_file = context.secrets_dir / "accounts" / account_id / "password"
+    pw_file.parent.mkdir(parents=True, exist_ok=True)
+    pw_file.write_text(password, encoding="utf-8")
+
+
+@given('a passphrase-protected GPG keypair is generated in "{gnupghome_raw}" with passphrase "{passphrase}"')
+def step_gpg_keypair_generated(context: Context, gnupghome_raw: str, passphrase: str) -> None:
+    gnupghome = Path(_scratch_substitute(context, gnupghome_raw))
     gnupghome.mkdir(parents=True, exist_ok=True)
     gnupghome.chmod(0o700)
+    (gnupghome / "gpg-agent.conf").write_text(
+        "allow-loopback-pinentry\ndefault-cache-ttl 0\nmax-cache-ttl 0\n",
+        encoding="utf-8",
+    )
     batch = (
-        "%no-protection\n"
         "Key-Type: RSA\n"
         "Key-Length: 2048\n"
         "Subkey-Type: RSA\n"
@@ -2174,12 +1578,13 @@ def step_gpg_keypair_exists(
         "Name-Real: imap-mcp BDD test\n"
         "Name-Email: bdd@imap-mcp.invalid\n"
         "Expire-Date: 0\n"
+        f"Passphrase: {passphrase}\n"
         "%commit\n"
     )
     env = dict(os.environ)
     env["GNUPGHOME"] = str(gnupghome)
     subprocess.run(
-        ["gpg", "--batch", "--quiet", "--gen-key"],
+        ["gpg", "--batch", "--quiet", "--gen-key", "--pinentry-mode", "loopback"],
         input=batch.encode("utf-8"),
         check=True,
         env=env,
@@ -2200,126 +1605,87 @@ def step_gpg_keypair_exists(
             real_fp = parts[9]
             break
     if not real_fp:
-        raise AssertionError(
-            f"Could not extract fingerprint from gpg --list-keys: "
-            f"{list_keys.stdout!r}"
-        )
-    context._gpg_fake_fp = fake_fp
-    context._gpg_real_fp = real_fp
-    context._gpg_passphrase = passphrase
+        raise AssertionError("Could not extract GPG fingerprint")
+    context.gpg_key_fingerprint = real_fp
     context._gpg_gnupghome = gnupghome
 
 
-@given('the file "{path}" was produced by `gpg --encrypt --recipient {fp}` over the exact bytes "{value}"')
-def step_gpg_encrypt_exact(
-    context: Context, path: str, fp: str, value: str
+@given(
+    'secret_store configuration uses backend "gpg_file" at "{path_raw}" with gnupghome "{gnupghome_raw}", '
+    'the generated key fingerprint, and passphrase "{passphrase}"'
+)
+def step_secret_store_uses_backend_gpg(
+    context: Context, path_raw: str, gnupghome_raw: str, passphrase: str
 ) -> None:
-    """Write the GPG-encrypted file at `path`. Uses the keypair the
-    prior step generated."""
-    import subprocess
+    builder = _ensure_builder(context)
+    builder.secret_store_backend = "gpg_file"
+    builder.secret_store_path = Path(_scratch_substitute(context, path_raw))
+    builder.secret_store_gnupghome = Path(_scratch_substitute(context, gnupghome_raw))
+    builder.secret_store_recipient = getattr(context, "gpg_key_fingerprint", "unknown")
+    builder.secret_store_passphrase = passphrase
+    builder.write()
 
-    target = Path(_scratch_substitute(context, path))
+
+@given('the plaintext "{plaintext}" is encrypted with GPG for the generated key into "{target_file_raw}"')
+def step_encrypt_plaintext_gpg(context: Context, plaintext: str, target_file_raw: str) -> None:
+    target = Path(_scratch_substitute(context, target_file_raw))
     target.parent.mkdir(parents=True, exist_ok=True)
-    real_fp = getattr(context, "_gpg_real_fp", None)
-    gnupghome = getattr(context, "_gpg_gnupghome", None)
-    if real_fp is None or gnupghome is None:
-        raise AssertionError(
-            "GPG keypair step must precede the encrypt step"
-        )
     env = dict(os.environ)
-    env["GNUPGHOME"] = str(gnupghome)
-    result = subprocess.run(
+    env["GNUPGHOME"] = str(context._gpg_gnupghome)
+    subprocess.run(
         [
             "gpg",
             "--batch",
             "--yes",
-            "--quiet",
-            "--trust-model", "always",
+            "--homedir", str(context._gpg_gnupghome),
+            "--recipient", getattr(context, "gpg_key_fingerprint", "bdd@imap-mcp.invalid"),
             "--encrypt",
-            "--recipient", real_fp,
-            "-o", str(target),
+            "--output", str(target),
         ],
-        input=value.encode("utf-8"),
+        input=plaintext.encode("utf-8"),
         env=env,
-        capture_output=True,
-        timeout=10,
         check=True,
-    )
-    context._gpg_last_stderr = result.stderr.decode("utf-8", errors="replace")
-
-
-@given('the file "{path}" exists and was produced by the same recipient')
-def step_gpg_file_exists_same_recipient(context: Context, path: str) -> None:
-    """For the wrong-passphrase scenario: the file is encrypted by
-    the same recipient as the keypair step. We re-use the encrypt
-    step over a fixed plaintext."""
-    step_gpg_encrypt_exact(
-        context, path,
-        getattr(context, "_gpg_real_fp", "") or "",
-        "correct-horse-battery",
-    )
-    # Then nuke the secret keys so decryption fails. The
-    # wrong-passphrase scenario actually tests a configuration where
-    # the gnupghome doesn't contain the secret key — modelling
-    # operator key-rotation. Cheaper than wiring a stub pinentry.
-    import subprocess
-    env = dict(os.environ)
-    env["GNUPGHOME"] = str(context._gpg_gnupghome)
-    subprocess.run(
-        ["gpg", "--batch", "--yes", "--quiet", "--delete-secret-keys",
-         context._gpg_real_fp],
-        env=env,
         capture_output=True,
-        timeout=10,
-        check=False,
     )
 
 
-@then("the audit record does NOT contain any line from the gpg subprocess' stderr")
-def step_audit_no_gpg_stderr(context: Context) -> None:
-    """Verify that no audit record contains any line from the gpg
-    encryption stderr captured during the prior step."""
-    import json as _json
-
-    captured = (getattr(context, "_gpg_last_stderr", "") or "").strip()
-    if not captured:
-        return
-    audit_dir = getattr(context, "audit_dir", None)
-    if audit_dir is None or not audit_dir.exists():
-        return
-    audit_lines: list[str] = []
-    for f in sorted(audit_dir.iterdir()):
-        if f.suffix == ".jsonl":
-            audit_lines.extend(f.read_text(encoding="utf-8").splitlines())
-    for line in captured.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        for record_line in audit_lines:
-            try:
-                record = _json.loads(record_line)
-            except Exception:
-                continue
-            if any(line in str(v) for v in record.values()):
-                raise AssertionError(
-                    f"Audit record leaked gpg stderr line: {line!r} "
-                    f"in record {record!r}"
-                )
+@given('the file "{path}" contains the exact bytes "{value}"')
+def step_file_contains_bytes(context: Context, path: str, value: str) -> None:
+    target = Path(_scratch_substitute(context, path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(value.encode("utf-8"))
+    if target.name == "refresh_token":
+        oauth_client = getattr(context, "mock_oauth_client", None)
+        if oauth_client is not None:
+            oauth_client.register_refresh_token(value.strip())
 
 
-@then('the server process environment still has no variable for "{ref}"')
-def step_env_still_no_var(context: Context, ref: str) -> None:
-    """Assertion variant: after a step that should NOT have written
-    any new env vars (e.g. a refused oauth_bootstrap), confirm that
-    none of the variables matching the prefix derived from `ref` were
-    populated. Mapping rule mirrors `EnvVarSecretStore.env_name` in
-    the server (uppercase, `/` → `__`, `-` → `_`)."""
-    expected = "IMAP_MCP_SECRET__" + ref.upper().replace("/", "__").replace("-", "_")
+@given('no file exists at "{path}"')
+def step_no_file_exists(context: Context, path: str) -> None:
+    target = Path(_scratch_substitute(context, path))
+    if target.exists():
+        target.unlink()
+
+
+@given("the server process environment includes")
+@given("the server process environment includes:")
+def step_server_process_env_includes(context: Context) -> None:
     extra = getattr(context, "mcp_extra_env", None) or {}
-    if expected in extra or expected in os.environ:
-        raise AssertionError(
-            f"Env var {expected!r} unexpectedly present after refused bootstrap"
-        )
+    context.mcp_extra_env = extra
+    for row in context.table:
+        extra[row["name"]] = row["value"]
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _start_imap_proxy(
@@ -2352,10 +1718,12 @@ def _start_imap_proxy(
     import subprocess
     import sys
     import time
+
     from support.imap_fixture import resolve_account
 
     builder = _ensure_builder(context)
-    _ensure_account_registered(context, builder, account_id)
+    if not any(a.id == account_id for a in builder.accounts):
+        raise AssertionError(f"Account {account_id!r} has not been declared before proxy setup")
 
     instance, _user = resolve_account(account_id)
     upstream_host, upstream_port = context.imap_instances[instance]
@@ -2509,23 +1877,8 @@ def capture_witnessed_command_logs(context: Context) -> None:
         _start_imap_proxy(context, account_id)
 
 
-@given('the IMAP server for "{account_id}" does not advertise the MOVE capability')
-def step_imap_server_no_move(context: Context, account_id: str) -> None:
-    _start_imap_proxy(context, account_id, strip_capabilities=["MOVE"])
 
 
-@given('the UIDVALIDITY of "{folder}" changes between the caller\'s SEARCH and the server\'s MOVE')
-def step_uidvalidity_changes_mid_call(context: Context, folder: str) -> None:
-    """Trigger the MITM proxy to inject `* OK [UIDVALIDITY <new>]`
-    after the next `UID SEARCH` response. The server's NOOP between
-    SEARCH and MOVE then sees the new UIDVALIDITY in untagged
-    responses and raises `UidStale`."""
-    _ = folder
-    _start_imap_proxy(
-        context, "gupta-scaratec",
-        uidvalidity_change_after="UID SEARCH",
-        uidvalidity_new_value="999999",
-    )
 
 
 def _arm_crash(context: Context, at: str) -> None:
@@ -2538,7 +1891,8 @@ def _arm_crash(context: Context, at: str) -> None:
     """
     context.mcp_extra_env = getattr(context, "mcp_extra_env", {})
     context.mcp_extra_env["IMAP_MCP_CRASH_AT"] = at
-    context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    if getattr(context, "is_test_hooks", False) and not getattr(context, "without_test_mode", False):
+        context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
     context.crash_expected = True
     client = getattr(context, "mcp", None)
     if client is not None:
@@ -2546,396 +1900,42 @@ def _arm_crash(context: Context, at: str) -> None:
         context.mcp = None
 
 
-@given('the server is configured to crash after WAL BEGIN persistence')
-def step_crash_at_post_begin(context: Context) -> None:
-    _arm_crash(context, "post_begin")
-
-
-@given("the server is configured to crash after WAL FETCH persistence")
-def step_crash_at_post_fetch(context: Context) -> None:
-    _arm_crash(context, "post_fetch")
-
-
-@given("the server is configured to crash after APPEND but before WAL staged persistence")
-def step_crash_at_post_append(context: Context) -> None:
-    _arm_crash(context, "post_append_pre_staged")
-
-
-@given("the server is configured to crash after DELETE but before WAL commit persistence")
-def step_crash_at_post_delete(context: Context) -> None:
-    _arm_crash(context, "post_delete")
-
-
-@given('policy "{policy_name}" allows cross-account move between these folders')
-def step_policy_allows_cross_account(context: Context, policy_name: str) -> None:
-    """Shortcut used by saga_crash_recovery.feature. Expands to two
-    folder capabilities: INBOX/Rechnungen on gupta-scaratec grants
-    move_out; Archiv/Belege on personal grants accept_incoming."""
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        policy = builder.add_policy(policy_name)
-    builder.folder(
-        policy_name=policy_name,
-        account_id="gupta-scaratec",
-        path="INBOX/Rechnungen",
-        mode="whitelist",
-        default="NONE",
-        move_out=True,
-    )
-    builder.folder(
-        policy_name=policy_name,
-        account_id="personal",
-        path="Archiv/Belege",
-        mode="whitelist",
-        default="NONE",
-        accept_incoming=True,
-    )
-    builder.write()
-
-
-@given('the folder "{folder}" already contains a message with:')
-def step_folder_already_contains(context: Context, folder: str) -> None:
-    """Alias of 'holds a message with' — feature-file wording for the
-    idempotency scenario where the target pre-exists."""
-    from features.steps.policy_steps import step_folder_holds_message_implicit
-
-    # Delegate to the existing message-seed step.
-    step_folder_holds_message_implicit(context, folder)
-
-
-@given('the folder "{folder}" contains two pre-existing messages with:')
-def step_folder_contains_two_preexisting(context: Context, folder: str) -> None:
-    """Stage two messages with the same 5-tuple (from + subject +
-    sent date + size_bytes), no Message-ID. Used by the ambiguous-
-    fallback recovery scenario."""
-    if ":" in folder:
-        account_id, _, folder = folder.partition(":")
-    else:
-        account_id = _find_account_for_folder(context, folder)
-    context.staged_messages = getattr(context, "staged_messages", [])
-    for row in context.table:
-        msgid = row["message_id"] if "message_id" in row.headings else None
-        context.staged_messages.append({
-            "_account_id": account_id,
-            "_folder": folder,
-            "uid_hint": int(row["uid"]),
-            "from": row["from"],
-            "to": None,
-            "subject": row["subject"],
-            "message_id_override": msgid,
-            "has_attachment": False,
-            "size_hint": int(row["size_bytes"]) if "size_bytes" in row.headings else 0,
-            "date": row["date"] if "date" in row.headings else None,
-            "extra_attachments": [],
-            "extra_headers": [],
-            "body_override": None,
-        })
-
-
-@given(
-    "the WAL has an in-progress transaction with fallback-key "
-    "(from={from_value}, date={date_value}, subject={subject_value}, "
-    "size={size_value:d}, first_4kb_sha256={sha_value}) and status \"{status}\""
-)
-def step_wal_seed_fallback(
-    context: Context, from_value: str, date_value: str,
-    subject_value: str, size_value: int, sha_value: str, status: str,
-) -> None:
-    """Insert a WAL row pre-loaded with the 5-tuple fallback identity.
-
-    `sha_value=same-as-both` is a sentinel meaning "compute the
-    SHA-256 from the just-staged matching messages". When the BDD
-    fixture has staged two identical placeholder messages, both will
-    have the same first-4 KiB hash; we compute it once from one of
-    them and pin that value into the WAL.
-    """
-    import sqlite3
-    import uuid as _uuid
-    from datetime import datetime, timezone
-
-    flush_staged_messages(context)
-
-    # Materialise sha_value (and overwrite size) from the actual
-    # on-disk first-4-KiB SHA-256 / total RFC822 size of the target
-    # account's pre-staged message — both stagings share the same
-    # bytes, so either UID is fine. The feature file's literal
-    # `48213` is a logical placeholder; the BDD harness substitutes
-    # the realised values so the WAL row matches what the IMAP
-    # server actually serves.
-    from support.imap_fixture import resolve_account
-    import imaplib
-    import hashlib as _h
-
-    sha = sha_value
-    actual_size = size_value
-    instance, user = resolve_account("personal")
-    uids = context.imap.folder_uids(instance, user, "Archiv/Belege")
-    if not uids:
-        raise AssertionError(
-            "No pre-staged messages on personal:Archiv/Belege; "
-            "the prior Given step did not seed them."
-        )
-    conn = context.imap.connect(instance, user)
-    conn.select("Archiv/Belege")
-    status_imap, data = conn.uid("FETCH", str(uids[0]), "(RFC822)")
-    if status_imap != "OK" or not data or data[0] is None:
-        raise AssertionError("Could not FETCH RFC822 for hash seed")
-    raw = data[0][1] if isinstance(data[0], tuple) else b""
-    if sha == "same-as-both":
-        sha = _h.sha256(raw[:4096]).hexdigest()
-    actual_size = len(raw)
-
-    # Translate `2026-04-01` to ISO-with-Z form for the WAL.
-    if "T" not in date_value:
-        try:
-            from datetime import datetime as _dt
-            iso = _dt.fromisoformat(date_value).replace(
-                tzinfo=timezone.utc
-            ).isoformat().replace("+00:00", "Z")
-        except ValueError:
-            iso = date_value
-    else:
-        iso = date_value
-
-    context.wal_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(context.wal_path, isolation_level=None)
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            tx_id TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            committed_at TEXT,
-            caller_id TEXT,
-            src_account TEXT,
-            src_folder TEXT,
-            src_uid INTEGER,
-            dst_account TEXT,
-            dst_folder TEXT,
-            message_id TEXT,
-            content_hash TEXT,
-            target_uid INTEGER,
-            retry_count INTEGER DEFAULT 0,
-            last_error TEXT,
-            fallback_from TEXT,
-            fallback_date TEXT,
-            fallback_subject TEXT,
-            fallback_size INTEGER,
-            fallback_4kb_sha256 TEXT
-        );
-        CREATE TABLE IF NOT EXISTS transaction_events (
-            tx_id TEXT NOT NULL,
-            step TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            outcome TEXT,
-            detail TEXT
-        );
-    """)
-    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
-    tx_id = f"tx-{_uuid.uuid4().hex[:16]}"
-    conn.execute(
-        "INSERT INTO transactions ("
-        "tx_id, status, created_at, caller_id, src_account, src_folder, "
-        "src_uid, dst_account, dst_folder, message_id, "
-        "fallback_from, fallback_date, fallback_subject, fallback_size, "
-        "fallback_4kb_sha256) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            tx_id, status, now, "invoice-agent",
-            "gupta-scaratec", "INBOX/Rechnungen", 0,
-            "personal", "Archiv/Belege",
-            None,
-            from_value, iso, subject_value, actual_size, sha,
-        ),
-    )
-    conn.close()
-    context.last_tx_id = tx_id
-    context.last_response = {"tx_id": tx_id}
-
-
-@given('the WAL contains an in-progress transaction with status "{status}" referencing uid {uid:d} and Message-ID "{msgid}"')
-def step_wal_seed_transaction(
-    context: Context, status: str, uid: int, msgid: str
-) -> None:
-    """Directly seed the SQLite WAL with a staged/pending transaction.
-
-    Background rows in the saga_crash_recovery feature establish the
-    source and target folders for this test; the seeded tx references
-    those fixed endpoints.
-    """
-    import sqlite3
-    import uuid as _uuid
-    from datetime import datetime, timezone
-
-    # Ensure any pending MCP client work (message seeding) is flushed
-    # before we reach in to touch the WAL.
-    flush_staged_messages(context)
-
-    context.wal_path.parent.mkdir(parents=True, exist_ok=True)
-    # Use the same schema that the server's WAL module creates. Since
-    # the harness must not import from the server, copy the DDL here.
-    conn = sqlite3.connect(context.wal_path, isolation_level=None)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS transactions (
-            tx_id TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            committed_at TEXT,
-            caller_id TEXT,
-            src_account TEXT,
-            src_folder TEXT,
-            src_uid INTEGER,
-            dst_account TEXT,
-            dst_folder TEXT,
-            message_id TEXT,
-            content_hash TEXT,
-            target_uid INTEGER,
-            retry_count INTEGER DEFAULT 0,
-            last_error TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS transaction_events (
-            tx_id TEXT NOT NULL,
-            step TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            outcome TEXT,
-            detail TEXT
-        )
-        """
-    )
-    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
-    tx_id = f"tx-{_uuid.uuid4().hex[:16]}"
-    conn.execute(
-        "INSERT INTO transactions "
-        "(tx_id, status, created_at, caller_id, src_account, src_folder, "
-        "src_uid, dst_account, dst_folder, message_id, content_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            tx_id,
-            status,
-            now,
-            "invoice-agent",
-            "gupta-scaratec",
-            "INBOX/Rechnungen",
-            uid,
-            "personal",
-            "Archiv/Belege",
-            msgid,
-            "seeded",
-        ),
-    )
-    conn.close()
-    context.last_tx_id = tx_id
-    context.last_response = {"tx_id": tx_id}
-
-
-@given('caller "{caller_id}" has no policy that references any folder named "{folder_path}"')
-def step_caller_no_policy_folder(
-    context: Context, caller_id: str, folder_path: str
-) -> None:
-    """Invariant assertion: the scenario's Background + Given steps must
-    not have declared the named folder in any policy granted to this
-    caller. No-op if the convention is already followed.
-    """
-    builder = _ensure_builder(context)
-    caller = next((c for c in builder.callers if c.id == caller_id), None)
-    if caller is None:
-        return
-    policy = next((p for p in builder.policies if p.name == caller.policy), None)
-    if policy is None:
-        return
-    for folders in policy.accounts.values():
-        for folder in folders:
-            if folder.path == folder_path:
-                raise AssertionError(
-                    f"Policy {caller.policy!r} unexpectedly references folder {folder_path!r}"
-                )
-
-
-@given('the IMAP account "{account_id}" has a hidden folder "{folder_path}"')
-def step_account_has_hidden_folder(
-    context: Context, account_id: str, folder_path: str
-) -> None:
-    """Create the folder on IMAP but do not add it to any policy.
-    The scenario asserts that describe_policy never exposes it."""
-    builder = _ensure_builder(context)
-    _ensure_account_registered(context, builder, account_id)
-    from support.imap_fixture import resolve_account
-
-    instance, user = resolve_account(account_id)
-    context.imap.create_folder(instance, user, folder_path)
-    builder.write()
-
-
-@given('the IMAP account "{account_id}" does not contain folder "{folder_path}"')
-def step_account_lacks_folder(
-    context: Context, account_id: str, folder_path: str
-) -> None:
-    """Assert IMAP-side absence of the folder. The fixture creates
-    folders on demand; if this step runs after a create step for the
-    same path, the step fails to catch the discrepancy."""
-    from support.imap_fixture import resolve_account
-
-    instance, user = resolve_account(account_id)
-    folders = context.imap.list_folders(instance, user)
-    if folder_path in folders:
-        raise AssertionError(
-            f"Account {account_id!r} unexpectedly contains folder "
-            f"{folder_path!r}: {folders!r}"
-        )
 
 
 
 
-@given("the server is started with a minimal caller configuration")
-def step_server_minimal_caller_configuration(context: Context) -> None:
-    step_server_minimal_configuration(context)
 
 
-@given("the server is started with a minimal configuration")
-def step_server_minimal_configuration(context: Context) -> None:
-    """Ensure the server has at least one caller, account and policy so it can boot.
 
-    Used by feature backgrounds that do not otherwise set up policy —
-    they only want to probe the MCP protocol itself (e.g.
-    non_goal_rejection). A well-formed config with a permissive
-    INBOX policy satisfies the server's load-time invariants.
-    """
-    builder = _ensure_builder(context)
-    account_id = "gupta-scaratec"
-    _ensure_account_registered(context, builder, account_id)
-    builder.add_caller(
-        id="invoice-agent", policy="invoice-policy", auth_type="stdio_trusted"
-    )
-    builder.add_policy("invoice-policy")
-    instance, user = resolve_account(account_id)
-    context.imap.create_folder(instance, user, "INBOX/Rechnungen")
-    builder.folder(
-        policy_name="invoice-policy",
-        account_id=account_id,
-        path="INBOX/Rechnungen",
-        mode="whitelist",
-        default="NONE",
-        move_out=True,
-        mark_seen=True,
-        mark_tagged=True,
-    )
-    from support.policy_builder import SenderRule
 
-    policy = next(p for p in builder.policies if p.name == "invoice-policy")
-    folder = policy.accounts[account_id][0]
-    folder.rules.append(
-        SenderRule(match={"from_domain": "hornbach.de"}, grant="ENVELOPE")
-    )
-    builder.write()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @given("{caller_id} completes an Initialize handshake successfully")
 def step_caller_completes_initialize(context: Context, caller_id: str) -> None:
+    client = getattr(context, "mcp", None)
+    if client is not None and not getattr(client, "_initialized", False):
+        client._initialize()
+        return
     from features.steps.mcp_steps import _ensure_mcp_client
 
     _ensure_mcp_client(context, caller_id)
@@ -2957,49 +1957,11 @@ def step_server_configured_with_caller_inline(
     builder.write()
 
 
-@given(r'the server is configured with caller "(?P<caller_id>[^" ]+)"(?! using)')
-def step_server_configured_caller_no_policy(context: Context, caller_id: str) -> None:
-    builder = _ensure_builder(context)
-    # Convention: a caller named `<prefix>-agent` uses policy
-    # `<prefix>-policy`. Keeps the bare form's implicit association
-    # compatible with feature files that declare the rule policy
-    # separately by that name.
-    if caller_id.endswith("-agent"):
-        policy_name = caller_id[: -len("-agent")] + "-policy"
-    else:
-        policy_name = f"{caller_id}-policy"
-    builder.add_caller(id=caller_id, policy=policy_name, auth_type="stdio_trusted")
-    builder.add_policy(policy_name)
-    builder.write()
 
 
 use_step_matcher("parse")
 
 
-@given('policy "{policy_name}" grants account "{account_id}" and folder:')
-def step_policy_grants_account_and_folder(
-    context: Context, policy_name: str, account_id: str
-) -> None:
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        policy = builder.add_policy(policy_name)
-    policy.accounts.setdefault(account_id, [])
-    from support.policy_builder import SenderRule
-
-    for row in context.table:
-        folder = builder.folder(
-            policy_name=policy_name,
-            account_id=account_id,
-            path=row["folder"],
-            mode=row["mode"],
-            default=row["default"],
-        )
-        if "rules" in row.headings:
-            rules_raw = row["rules"]
-            for match, grant, cap in _parse_inline_rules(rules_raw):
-                folder.rules.append(SenderRule(match=match, grant=grant, cap=cap))
-    builder.write()
 
 
 @given('policy "{policy_name}" grants account "{account_id}"')
@@ -3089,133 +2051,125 @@ def step_policy_sets_folder_rules(
     builder.write()
 
 
-@given(
-    'the message has attachment "{filename}" of type "{mime_type}" '
-    "with size {size:d} bytes"
-)
-def step_message_has_attachment(
-    context: Context, filename: str, mime_type: str, size: int
-) -> None:
-    """Attach to the most recently staged message; applied on flush."""
+def _find_staged_by_uid(
+    context: Context, uid: int, account: str | None = None, folder: str | None = None
+) -> dict[str, Any]:
     staged_list = getattr(context, "staged_messages", [])
-    if not staged_list:
-        raise AssertionError(
-            'the "message has attachment" step requires a prior '
-            'Given-step that stages a message (e.g. "the folder X '
-            'holds a message with:")'
-        )
-    staged_list[-1]["extra_attachments"].append(
-        (filename, mime_type, b"x" * size)
-    )
+    for staged in staged_list:
+        if staged.get("uid_hint") == uid:
+            if account and staged.get("_account_id") != account:
+                continue
+            if folder and staged.get("_folder") != folder:
+                continue
+            return staged
+    if staged_list:
+        return staged_list[-1]
+    raise AssertionError(f"No staged message found for uid {uid}")
 
 
 @given(
-    'the message has attachment with raw wire filename "{wire_filename}" '
-    'of type "{mime_type}" with size {size:d} bytes'
+    'the message at uid {uid:d} has attachment "{filename}" of type "{mime_type}" '
+    'with content byte "{byte}" repeated {count:d} times'
 )
-def step_message_has_raw_wire_attachment(
-    context: Context, wire_filename: str, mime_type: str, size: int
+def step_msg_uid_attachment_repeated(
+    context: Context, uid: int, filename: str, mime_type: str, byte: str, count: int
 ) -> None:
-    """Stage an attachment whose Content-Disposition filename is the
-    LITERAL given string on the wire — used to reproduce servers that
-    emit an RFC 2047 encoded-word in the filename parameter.
-
-    A plain `add_attachment(filename=...)` would RFC 2231-encode the
-    name and `get_filename()` would decode it transparently, hiding
-    the bug. The fixture detects the `raw_wire_filename` marker and
-    writes the Content-Disposition header verbatim instead.
-    """
-    staged_list = getattr(context, "staged_messages", [])
-    if not staged_list:
-        raise AssertionError(
-            'the "raw wire filename" step requires a prior Given-step '
-            'that stages a message'
-        )
-    staged_list[-1]["extra_attachments"].append(
-        {
-            "raw_wire_filename": wire_filename,
-            "mime_type": mime_type,
-            "payload": b"x" * size,
-        }
-    )
+    staged = _find_staged_by_uid(context, uid)
+    payload = byte.encode("latin1") * count
+    staged["extra_attachments"].append((filename, mime_type, payload))
 
 
 @given(
-    'the message has attachment with raw 8-bit wire filename "{wire_filename}" '
-    'of type "{mime_type}" with size {size:d} bytes'
+    'the message at uid {uid:d} has an attachment whose original filename is '
+    '{count:d} "{char}" characters plus "{ext}", mime type "{mime_type}", '
+    'content byte "{byte}" repeated {repeat:d} times'
 )
-def step_message_has_raw_8bit_attachment(
-    context: Context, wire_filename: str, mime_type: str, size: int
+def step_msg_uid_attachment_long_name(
+    context: Context, uid: int, count: int, char: str, ext: str, mime_type: str, byte: str, repeat: int
 ) -> None:
-    """Stage an attachment whose Content-Disposition filename carries
-    RAW 8-bit (non-ASCII UTF-8) bytes on the wire — NOT an RFC 2047
-    encoded-word.
-
-    This reproduces the 2026-06-18 crash: such a header parses to an
-    `email.header.Header` object rather than a `str`, and the
-    attachment walk calls `.lower()` on it. Unlike `raw_wire_filename`
-    (which substitutes via ASCII), this marker tells the fixture to
-    write the literal UTF-8 bytes into the serialized message.
-    """
-    staged_list = getattr(context, "staged_messages", [])
-    if not staged_list:
-        raise AssertionError(
-            'the "raw 8-bit wire filename" step requires a prior '
-            "Given-step that stages a message"
-        )
-    staged_list[-1]["extra_attachments"].append(
-        {
-            "raw_8bit_filename": wire_filename,
-            "mime_type": mime_type,
-            "payload": b"x" * size,
-        }
-    )
+    filename = (char * count) + ext
+    staged = _find_staged_by_uid(context, uid)
+    payload = byte.encode("latin1") * repeat
+    staged["extra_attachments"].append((filename, mime_type, payload))
 
 
 @given(
-    'the message has inline attachment "{filename}" of type "{mime_type}" '
-    "with size {size:d} bytes"
+    'the message at uid {uid:d} has attachment with raw wire filename "{raw_wire_filename}" '
+    'of type "{mime_type}" with content byte "{byte}" repeated {repeat:d} times'
 )
-def step_message_has_inline_attachment(
-    context: Context, filename: str, mime_type: str, size: int
+def step_msg_uid_attachment_raw_wire(
+    context: Context, uid: int, raw_wire_filename: str, mime_type: str, byte: str, repeat: int
 ) -> None:
-    """Attach an inline file to the most recently staged message."""
-    staged_list = getattr(context, "staged_messages", [])
-    if not staged_list:
-        raise AssertionError(
-            'the "message has inline attachment" step requires a prior '
-            'Given-step that stages a message'
-        )
-    if "inline_attachments" not in staged_list[-1]:
-        staged_list[-1]["inline_attachments"] = []
-    staged_list[-1]["inline_attachments"].append(
-        (filename, mime_type, b"x" * size)
-    )
+    staged = _find_staged_by_uid(context, uid)
+    payload = byte.encode("latin1") * repeat
+    staged["extra_attachments"].append((raw_wire_filename, mime_type, payload))
 
 
-@given('the message has headers including "{header_line}"')
-def step_message_has_extra_header(context: Context, header_line: str) -> None:
-    staged_list = getattr(context, "staged_messages", [])
-    if not staged_list:
-        raise AssertionError("No staged message; cannot attach header.")
-    name, _, value = header_line.partition(":")
-    staged_list[-1]["extra_headers"].append((name.strip(), value.strip()))
+@given(
+    'the message at uid {uid:d} has attachment with raw 8-bit wire filename "{filename}" '
+    'of type "{mime_type}" with content byte "{byte}" repeated {repeat:d} times'
+)
+def step_msg_uid_attachment_raw_8bit(
+    context: Context, uid: int, filename: str, mime_type: str, byte: str, repeat: int
+) -> None:
+    staged = _find_staged_by_uid(context, uid)
+    payload = byte.encode("latin1") * repeat
+    staged["extra_attachments"].append((filename, mime_type, payload))
 
 
-@given('the message has plain text body "{body}"')
-def step_message_has_plain_body(context: Context, body: str) -> None:
-    staged_list = getattr(context, "staged_messages", [])
-    if not staged_list:
-        raise AssertionError("No staged message; cannot override body.")
-    staged_list[-1]["body_override"] = body
+@given(
+    'the message at uid {uid:d} on "{account}:{folder}" has attachment "{filename}" '
+    'of type "{mime_type}" with content byte "{byte}" repeated {count:d} times'
+)
+def step_msg_uid_on_account_attachment(
+    context: Context, uid: int, account: str, folder: str, filename: str, mime_type: str, byte: str, count: int
+) -> None:
+    try:
+        staged = _find_staged_by_uid(context, uid, account, folder)
+        staged["extra_attachments"].append((filename, mime_type, byte.encode("latin1") * count))
+        return
+    except AssertionError:
+        pass
+    gmail_state = getattr(context, "gmail_state", None)
+    if gmail_state is not None:
+        msg = gmail_state.message_by_uid(folder, uid)
+        if msg is not None:
+            import email
+            payload = byte.encode("latin1") * count
+            mime_msg = email.message_from_bytes(msg.rfc822)
+            maintype, _, subtype = mime_type.partition("/")
+            mime_msg.add_attachment(payload, maintype=maintype, subtype=subtype, filename=filename)
+            msg.rfc822 = mime_msg.as_bytes()
+            return
+    staged = _find_staged_by_uid(context, uid, account, folder)
+    staged["extra_attachments"].append((filename, mime_type, byte.encode("latin1") * count))
 
 
-@given('the message has html body "{html}"')
-def step_message_has_html_body(context: Context, html: str) -> None:
-    staged_list = getattr(context, "staged_messages", [])
-    if not staged_list:
-        raise AssertionError("No staged message; cannot override html body.")
-    staged_list[-1]["html_body"] = html
+@given('the message at uid {uid:d} has headers including "{header}"')
+def step_msg_uid_headers(context: Context, uid: int, header: str) -> None:
+    staged = _find_staged_by_uid(context, uid)
+    k, _, v = header.partition(":")
+    staged["extra_headers"].append((k.strip(), v.strip()))
+
+
+@given('the message at uid {uid:d} has plain text body "{body}"')
+def step_msg_uid_body(context: Context, uid: int, body: str) -> None:
+    staged = _find_staged_by_uid(context, uid)
+    staged["body_override"] = body
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _staged_by_uid(context: Context, uid_hint: int) -> dict[str, object]:
@@ -3245,11 +2199,6 @@ def step_message_at_uid_has_html_body(
     _staged_by_uid(context, uid)["html_body"] = html
 
 
-@given('the message at uid {uid:d} has no plain text body')
-def step_message_at_uid_has_no_plain_body(context: Context, uid: int) -> None:
-    """Mark the staged message as HTML-only (used together with
-    `has html body` to seed a message without any text/plain part)."""
-    _staged_by_uid(context, uid)["html_only"] = True
 
 
 @given("the server loads a policy file containing:")
@@ -3268,22 +2217,37 @@ def step_server_loads_policy_file_containing(context: Context) -> None:
             'step "the server loads a policy file containing" requires a DocString'
         )
     _ensure_builder(context)
-    parsed = yaml.safe_load(raw) or {}
+    try:
+        parsed = yaml.safe_load(raw) or {}
+    except Exception:
+        # Malformed YAML: write it directly as a policy file so server startup rejects it
+        policy_name = "overview-policy"
+        m = re.search(r"^\s*name:\s*(\S+)", raw, re.MULTILINE)
+        if m:
+            policy_name = m.group(1).strip("\"'")
+        target = context.config_dir / "policies" / f"{policy_name}.yaml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(raw, encoding="utf-8")
+        return
 
-    if "policies" in parsed:
+    if isinstance(parsed, dict) and "name" in parsed:
+        policy_name = parsed["name"]
+        target = context.config_dir / "policies" / f"{policy_name}.yaml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(raw, encoding="utf-8")
+    elif isinstance(parsed, dict) and "policies" in parsed:
         for policy_name, policy_body in (parsed["policies"] or {}).items():
             target = context.config_dir / "policies" / f"{policy_name}.yaml"
             target.parent.mkdir(parents=True, exist_ok=True)
             payload = {"name": policy_name, **(policy_body or {})}
-            target.write_text(yaml.safe_dump(payload, sort_keys=False))
-    if "callers" in parsed:
+            target.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    if isinstance(parsed, dict) and "callers" in parsed:
         (context.config_dir / "callers.yaml").write_text(
-            yaml.safe_dump({"callers": parsed["callers"]}, sort_keys=False)
+            yaml.safe_dump({"callers": parsed["callers"]}, sort_keys=False), encoding="utf-8"
         )
 
     # accounts.yaml must exist (the Background already wrote it via
     # PolicyBuilder.write()). We deliberately do not touch it here.
-    _ = os  # kept because env setup hook uses it elsewhere
 
 
 @then("the server refuses to start")
@@ -3299,7 +2263,10 @@ def step_server_refuses_to_start(context: Context) -> None:
     """
     proc = getattr(context, "startup_proc", None)
     if proc is not None:
-        if proc.returncode == 0:
+        if getattr(proc, "timed_out", False):
+            raise AssertionError("Server process timed out during startup")
+        rc = getattr(proc, "returncode", getattr(proc, "exit_code", None))
+        if rc == 0:
             raise AssertionError(
                 "Expected the server to refuse to start, but it exited 0. "
                 f"Stdout: {proc.stdout!r}, stderr: {proc.stderr!r}"
@@ -3307,6 +2274,8 @@ def step_server_refuses_to_start(context: Context) -> None:
         context.startup_error = (proc.stderr or "") + (proc.stdout or "")
         return
     result = _run_bootstrap_probe(context)
+    if result.timed_out:
+        raise AssertionError("Server process timed out during startup probe")
     context.startup_error = result.stderr
     if result.exit_code == 0:
         raise AssertionError(
@@ -3384,86 +2353,13 @@ def _run_bootstrap_probe(context: Context) -> BootstrapResult:
     return try_bootstrap_server(server_binary, context.config_dir, caller_id)
 
 
-@given(
-    'account "{account_id}" is configured with provider "{provider}" '
-    'and oauth_scope "{scope}"'
-)
-def step_account_with_oauth(
-    context: Context, account_id: str, provider: str, scope: str
-) -> None:
-    """Register an account that uses OAuth2 against the given provider.
-    No password is set — the bootstrap CLI is the path that mints the
-    token in production."""
-    builder = _ensure_builder(context)
-    builder.add_account(
-        id=account_id,
-        provider=provider,
-        host="oauth.example.invalid",
-        port=993,
-        auth_type="xoauth2",
-        secret_ref=f"secret://accounts/{account_id}/refresh_token",
-        oauth_scope=scope,
-        password_literal=None,
-    )
-    builder.write()
 
 
-@given('account "{account_id}" is configured with oauth_scope "{scope}"')
-def step_account_with_oauth_scope_only(
-    context: Context, account_id: str, scope: str
-) -> None:
-    builder = _ensure_builder(context)
-    if any(a.id == account_id for a in builder.accounts):
-        for a in builder.accounts:
-            if a.id == account_id:
-                a.auth_type = "xoauth2"
-                a.oauth_scope = scope
-                a.secret_ref = f"secret://accounts/{account_id}/refresh_token"
-                break
-    else:
-        host, port = context.imap_instances["imap-a"]
-        builder.add_account(
-            id=account_id,
-            provider="google-mock",
-            host=host,
-            port=port,
-            auth_type="xoauth2",
-            secret_ref=f"secret://accounts/{account_id}/refresh_token",
-            oauth_scope=scope,
-        )
-    path = context.secrets_dir / "accounts" / account_id / "refresh_token"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("mock_refresh_token")
-    policy = builder.policies[0] if builder.policies else builder.add_policy("invoice-policy")
-    policy.accounts.setdefault(account_id, [])
-    builder.write()
 
 
-@given('the account\'s state is "{state}"')
-def step_account_state_is(context: Context, state: str) -> None:
-    """Verify the account is in the expected state. Side effect: starts
-    the server if not yet running, so the old config is loaded BEFORE
-    any subsequent scope-change + SIGHUP steps."""
-    import json as _json
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    client = _ensure_mcp_client(context, "invoice-agent")
-    payload = client.call_tool("list_accounts", {})
-    content = payload.get("content") or []
-    if not content:
-        return
-    data = _json.loads(content[0]["text"])
-    expected_state = "active" if state == "healthy" else state
-    for acc in data.get("accounts", []):
-        if acc.get("state") != expected_state:
-            continue
-        return
-    # Account may be in the list but with a different state — fail if
-    # the expected state was explicitly named and doesn't match.
-    if state != "healthy":
-        raise AssertionError(f"No account in state {state!r}")
 
 
+@when('the operator changes the oauth_scope for "{account_id}" to "{new_scope}"')
 @when('the operator changes the scope for "{account_id}" to "{new_scope}"')
 def step_change_oauth_scope(context: Context, account_id: str, new_scope: str) -> None:
     builder = _ensure_builder(context)
@@ -3474,134 +2370,174 @@ def step_change_oauth_scope(context: Context, account_id: str, new_scope: str) -
     builder.write()
 
 
-@when('the operator runs `imap-mcp-oauth-bootstrap --account {account_id}`')
-def step_run_oauth_bootstrap(context: Context, account_id: str) -> None:
-    import subprocess
-
-    cli = Path(
-        os.environ.get(
-            "IMAP_MCP_OAUTH_BOOTSTRAP_BINARY",
-            context.bdd_root.parent
-            / "server"
-            / ".venv"
-            / "bin"
-            / "imap-mcp-oauth-bootstrap",
-        )
-    )
-    builder = getattr(context, "policy_builder", None)
-    if builder is not None:
-        builder.write()
-    env = dict(os.environ)
-    env["IMAP_MCP_CONFIG_DIR"] = str(context.config_dir)
-    extra = getattr(context, "mcp_extra_env", None) or {}
-    env.update(extra)
-    if getattr(context, "bootstrap_tamper_pkce", False):
-        env["IMAP_MCP_TEST_TAMPER_PKCE"] = "1"
-
-    proc = subprocess.Popen(
-        [str(cli), "--account", account_id],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.PIPE,
-        env=env,
-        text=True,
-    )
-    context.bootstrap_proc = proc
-    import time
-    time.sleep(0.5)
-
-@then("the bootstrap refuses to start")
-def step_bootstrap_refuses(context: Context) -> None:
-    proc = getattr(context, "bootstrap_proc", getattr(context, "startup_proc", None))
-    if proc is None:
-        raise AssertionError("No process captured")
-    
-    # If it's a Popen object, communicate with timeout
-    if hasattr(proc, "communicate"):
-        try:
-            stdout, stderr = proc.communicate(timeout=2)
-            context.bootstrap_stdout = stdout
-            context.bootstrap_stderr = stderr
-            context.bootstrap_returncode = proc.returncode
-        except Exception:
-            proc.kill()
-            raise AssertionError("Process did not refuse to start quickly enough")
-        
-        ret = context.bootstrap_returncode
-        out, err = context.bootstrap_stdout, context.bootstrap_stderr
-    else:
-        ret = proc.returncode
-        out, err = proc.stdout, proc.stderr
-
-    if ret == 0:
-        raise AssertionError(f"Expected to refuse, but exited 0. Stdout: {out!r}, stderr: {err!r}")
-    context.startup_error = (err or "") + (out or "")
-
-@then('the startup error indicates "{expected}"')
-def step_startup_error_indicates_substring(context: Context, expected: str) -> None:
-    err = getattr(context, "startup_error", "")
-    if not err:
-        proc = getattr(context, "bootstrap_proc", getattr(context, "startup_proc", None))
-        if proc and hasattr(proc, "communicate"):
-            stdout, stderr = proc.communicate(timeout=2)
-            err = (stderr or "") + (stdout or "")
-            context.bootstrap_returncode = proc.returncode
-            context.startup_error = err
-
-    if expected not in err:
-        raise AssertionError(
-            f"Startup error does not contain expected substring {expected!r}. Full message:\n{err}"
-        )
-
-
-@given('policy "{policy_name}" has sender rules:')
-def step_policy_has_sender_rules(context: Context, policy_name: str) -> None:
-    """Parse rows of the form (folder, match, grant) and attach them.
-
-    The `match` column in the feature file is an expression such as
-    `from_domain=hornbach.de`. The step splits it at the first `=` and
-    produces `{from_domain: "hornbach.de"}`. No other interpretation
-    is performed: the resulting map is serialised verbatim into the
-    policy YAML and the server is responsible for validating it.
-    """
+@given('the IMAP account "{account_id}" is configured with provider "{provider}", oauth_scope "{scope}", and a valid refresh token')
+def step_account_configured_oauth(
+    context: Context, account_id: str, provider: str, scope: str
+) -> None:
     builder = _ensure_builder(context)
-    for row in context.table:
-        folder_path = row["folder"]
-        match_expression = row["match"]
-        grant = row["grant"]
-
-        key, _, value = match_expression.partition("=")
-        if not key or not value:
-            raise ValueError(
-                f"Cannot parse match expression {match_expression!r}; "
-                "expected 'key=value'"
-            )
-
-        policy = next((p for p in builder.policies if p.name == policy_name), None)
-        if policy is None:
-            raise ValueError(
-                f"Policy {policy_name!r} was not declared before sender rules "
-                "were added. Check the Given steps' ordering."
-            )
-        folder_list = policy.accounts
-        target_folder = None
-        for folders in folder_list.values():
-            for folder in folders:
-                if folder.path == folder_path:
-                    target_folder = folder
-                    break
-            if target_folder is not None:
-                break
-        if target_folder is None:
-            raise ValueError(
-                f"Folder {folder_path!r} was not declared in policy "
-                f"{policy_name!r} before sender rules were added."
-            )
-
-        from support.policy_builder import SenderRule  # local import avoids cycle
-
-        target_folder.rules.append(SenderRule(match={key: value}, grant=grant))
+    instance, user = resolve_account(account_id)
+    host, port = context.imap_instances[instance]
+    if not any(a.id == account_id for a in builder.accounts):
+        builder.add_account(
+            id=account_id,
+            provider=provider,
+            host=host,
+            port=port,
+            user=user if instance == "mock-gmail" else None,
+            auth_type="xoauth2",
+            secret_ref=f"secret://accounts/{account_id}/refresh_token",
+            oauth_scope=scope,
+        )
+    path = context.secrets_dir / "accounts" / account_id / "refresh_token"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("mock_refresh_token", encoding="utf-8")
     builder.write()
+
+
+@when('the operator removes account "{account_id}" from accounts.yaml and policy "{policy_name}"')
+def step_operator_removes_account_and_policy(
+    context: Context, account_id: str, policy_name: str
+) -> None:
+    builder = _ensure_builder(context)
+    builder.accounts = [a for a in builder.accounts if a.id != account_id]
+    policy = next((p for p in builder.policies if p.name == policy_name), None)
+    if policy:
+        policy.accounts.pop(account_id, None)
+    builder.write()
+
+
+@given('saga pause hook is armed at step "{step}"')
+def step_arm_saga_pause(context: Context, step: str) -> None:
+    marker = context.scratch_dir / "saga-pause-marker"
+    context.mcp_extra_env = getattr(context, "mcp_extra_env", {}) or {}
+    context.mcp_extra_env["IMAP_MCP_SAGA_PAUSE_AT"] = step
+    context.mcp_extra_env["IMAP_MCP_SAGA_PAUSE_MARKER"] = str(marker)
+    if getattr(context, "is_test_hooks", False) and not getattr(context, "without_test_mode", False):
+        context.mcp_extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    context.saga_pause_marker = marker
+
+
+@when('{caller_id} starts an asynchronous move of uid {uid:d} from "{source}" to "{target}" and waits until paused at "{step}"')
+def step_start_async_move_and_wait(
+    context: Context, caller_id: str, uid: int, source: str, target: str, step: str
+) -> None:
+    import json
+    import threading
+    import time
+
+    from features.steps.mcp_steps import _ensure_mcp_client
+    from support.imap_fixture import resolve_uid
+
+    client = _ensure_mcp_client(context, caller_id)
+    src_account, src_folder = _split_account_folder(context, source)
+    dst_account, dst_folder = _split_account_folder(context, target)
+    actual_uid = resolve_uid(context, src_account, src_folder, uid, allow_unseeded_probe=True)
+
+    def _run_move() -> None:
+        try:
+            payload = client.call_tool(
+                "move",
+                {
+                    "source": {"account": src_account, "folder": src_folder, "uid": actual_uid},
+                    "target": {"account": dst_account, "folder": dst_folder},
+                },
+            )
+            context.async_move_response = payload
+            first = (payload.get("content") or [{}])[0]
+            if isinstance(first, dict) and "text" in first:
+                context.async_move_json = json.loads(first["text"])
+                context.last_response = context.async_move_json
+        except Exception as exc:
+            context.async_move_error = exc
+
+    t = threading.Thread(target=_run_move, daemon=True)
+    context.async_move_thread = t
+    t.start()
+
+    marker = getattr(context, "saga_pause_marker", None)
+    if marker is not None:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if marker.exists():
+                return
+            if not t.is_alive():
+                err = getattr(context, "async_move_error", None)
+                resp = getattr(context, "async_move_json", None)
+                stderr = getattr(context.mcp, "stderr_text", "")
+                raise AssertionError(
+                    f"Async move thread died before reaching {step!r}. Error: {err}, Response: {resp}\nStderr: {stderr}"
+                )
+            time.sleep(0.05)
+        raise AssertionError(f"Saga did not reach pause point {step!r} within 15s")
+
+
+@when('the paused saga is released and finishes')
+def step_release_paused_saga_and_finish(context: Context) -> None:
+    from pathlib import Path
+    marker = getattr(context, "saga_pause_marker", None)
+    if marker is not None:
+        resume = Path(str(marker) + ".resume")
+        resume.write_text("resume")
+    t = getattr(context, "async_move_thread", None)
+    if t is not None:
+        t.join(timeout=15)
+        if t.is_alive():
+            raise AssertionError("Asynchronous move did not finish within 15s")
+
+
+@then('the WAL entry for the returned tx_id has status "{status}"')
+@then('the WAL entry for the asynchronous move has status "{status}"')
+def step_wal_async_move_status(context: Context, status: str) -> None:
+    from support.wal_reader import WALReader
+    reader = WALReader(context.wal_path)
+    txs = reader.all_transactions()
+    tx_id = (getattr(context, "last_response", None) or {}).get("tx_id")
+    if tx_id:
+        tx = next((t for t in txs if t.tx_id == tx_id), None)
+        if tx is None:
+            raise AssertionError(f"No WAL transaction found with tx_id {tx_id!r}")
+        if tx.status != status:
+            raise AssertionError(f"Expected WAL tx {tx_id!r} status {status!r}, got {tx.status!r}")
+        return
+    matching = [t for t in txs if t.status == status]
+    if not matching:
+        statuses = [t.status for t in txs]
+        raise AssertionError(
+            f"Expected a WAL transaction with status {status!r}, found: {statuses}"
+        )
+
+
+@then('the asynchronous move response has decision "{decision}", result "{result}", and error.type "{error_type}"')
+def step_async_move_response_assert(
+    context: Context, decision: str, result: str, error_type: str
+) -> None:
+    resp = getattr(context, "async_move_json", None)
+    if resp is None:
+        raise AssertionError("No asynchronous move response captured")
+    if resp.get("decision") != decision:
+        raise AssertionError(f"Expected decision {decision!r}, got {resp.get('decision')!r}")
+    if resp.get("result") != result:
+        raise AssertionError(f"Expected result {result!r}, got {resp.get('result')!r}")
+    err_t = (resp.get("error") or {}).get("type")
+    if err_t != error_type:
+        stderr = getattr(context.mcp, "stderr_text", "")
+        raise AssertionError(
+            f"Expected error.type {error_type!r}, got {err_t!r}. Response: {resp}\nStderr: {stderr}"
+        )
+
+
+@then('the audit log contains a record with tool "{tool}", reason "{reason}"')
+def step_audit_log_contains_tool_reason(context: Context, tool: str, reason: str) -> None:
+    from support.audit_reader import AuditReader
+    reader = AuditReader(context.audit_dir)
+    matches = reader.find(tool=tool, reason=reason)
+    if not matches:
+        present = [rec.record for rec in reader.records_today()]
+        raise AssertionError(
+            f"No audit record with tool={tool!r} reason={reason!r}. Present: {present!r}"
+        )
+
+
 
 
 @given('the account "{account_id}" has identity "{identity}"')
@@ -3622,156 +2558,214 @@ def step_account_has_identity(
     )
 
 
-@given('the IMAP account "{account_id}" also exists with folder "{folder}"')
-def step_imap_account_also_exists_with_folder(
-    context: Context, account_id: str, folder: str
-) -> None:
-    """Add another folder to an already-registered account.
-
-    Distinct verb ('also exists') so a scenario can extend the Background
-    setup without re-declaring the account from scratch."""
-    builder = _ensure_builder(context)
-    if not any(a.id == account_id for a in builder.accounts):
-        raise AssertionError(
-            f"Account {account_id!r} is not registered; use the plain "
-            f"'exists with folder' form instead of 'also exists'."
-        )
-    instance, user = resolve_account(account_id)
-    context.imap.create_folder(instance, user, folder)
-    builder.write()
 
 
 # --------------------------------------------------------------------- bulk seeds
 
 
-def _stage_n_simple_messages(
+def _seed_n_messages(
     context: Context,
     account_id: str,
     folder: str,
     count: int,
     *,
     from_addr: str,
-    tag: str | None = None,
+    date_str: str,
+    flags: list[str] | None = None,
     starting_uid: int = 9000,
 ) -> None:
-    """Stage `count` minimal-shape messages for deferred IMAP APPEND.
+    instance, user = resolve_account(account_id)
+    to_addr = f"{user}@{account_id}.example" if "@" not in user else user
+    flag_list = flags or []
 
-    Used by bulk_* feature scenarios where the per-message content does
-    not matter — only the count, the sender (for criteria matching), and
-    optionally a pre-applied tag (for mode=remove/replace).
-    """
-    context.staged_messages = getattr(context, "staged_messages", [])
-    for offset in range(count):
-        context.staged_messages.append(
-            {
-                "_account_id": account_id,
-                "_folder": folder,
-                "uid_hint": starting_uid + offset,
-                "from": from_addr,
-                "to": None,
-                "subject": f"Bulk seed #{offset + 1}",
-                "message_id_override": None,
-                "has_attachment": False,
-                "size_hint": 0,
-                "date": None,
-                "flags": [tag] if tag else [],
-                "extra_attachments": [],
-                "extra_headers": [],
-                "body_override": None,
-                "html_body": None,
-                "html_only": False,
-            }
-        )
+    if instance == "mock-gmail":
+        from datetime import UTC, datetime
+        from email.message import EmailMessage
+        from email.policy import SMTP
+        from email.utils import format_datetime
+
+        from mock_gmail.state import FOLDER_TO_LABEL, Message
+
+        state = getattr(context, "gmail_state", None)
+        if state is None:
+            raise AssertionError("Mock-gmail state not initialized")
+        state.create_folder(folder)
+        label = FOLDER_TO_LABEL.get(folder, folder)
+        labels = {label} if label != "__ALL_MAIL__" else set()
+
+        parsed_date = datetime.fromisoformat(date_str)
+        if parsed_date.tzinfo is None:
+            parsed_date = parsed_date.replace(tzinfo=UTC)
+        formatted_date = format_datetime(parsed_date)
+
+        for offset in range(count):
+            uid = starting_uid + offset
+            msg_id = f"<bulk-{uid}@{account_id}.example>"
+            subj = f"Bulk message {offset + 1}"
+            em = EmailMessage()
+            em["From"] = from_addr
+            em["To"] = to_addr
+            em["Subject"] = subj
+            em["Date"] = formatted_date
+            em["Message-ID"] = msg_id
+            em.set_content(f"Body for {subj}")
+            raw = em.as_bytes(policy=SMTP)
+
+            gmsg = Message(
+                gm_msgid=uid,
+                gm_thrid=uid,
+                rfc822=raw,
+                labels=set(labels),
+                flags=set(flag_list),
+                message_id=msg_id,
+                from_addr=from_addr,
+                to_addr=to_addr,
+                subject=subj,
+                date=formatted_date,
+            )
+            gmsg.internal_date = parsed_date
+            state.add_message(gmsg)
+            state.assign_uid(folder, gmsg.gm_msgid, uid)
+            context.message_uids = getattr(context, "message_uids", {})
+            context.message_uids[(account_id, folder, uid)] = uid
+    else:
+        context.staged_messages = getattr(context, "staged_messages", [])
+        for offset in range(count):
+            uid = starting_uid + offset
+            context.staged_messages.append(
+                {
+                    "_account_id": account_id,
+                    "_folder": folder,
+                    "uid_hint": uid,
+                    "from": from_addr,
+                    "to": to_addr,
+                    "subject": f"Bulk message {offset + 1}",
+                    "message_id_override": f"<bulk-{uid}@{account_id}.example>",
+                    "has_attachment": False,
+                    "size_hint": 0,
+                    "date": date_str,
+                    "flags": flag_list,
+                    "extra_attachments": [],
+                    "extra_headers": [],
+                    "body_override": None,
+                    "html_body": None,
+                    "html_only": False,
+                }
+            )
 
 
-@given('the folder "{folder}" on "{account_id}" holds {count:d} messages')
-def step_folder_holds_n_messages_explicit(
-    context: Context, folder: str, account_id: str, count: int
+@given('the folder "{folder}" holds {count:d} messages from "{from_addr}" dated "{date_str}" pre-flagged "{tag}"')
+def step_folder_holds_n_messages_from_dated_preflagged(
+    context: Context, folder: str, count: int, from_addr: str, date_str: str, tag: str
 ) -> None:
-    _stage_n_simple_messages(
-        context, account_id, folder, count, from_addr="bulk@example.com"
+    account_id, clean_folder = _split_account_folder(context, folder)
+    _seed_n_messages(
+        context,
+        account_id,
+        clean_folder,
+        count,
+        from_addr=from_addr,
+        date_str=date_str,
+        flags=[tag],
     )
 
 
-@given('the folder "{folder}" holds {count:d} messages')
-def step_folder_holds_n_messages(
-    context: Context, folder: str, count: int
+@given('the folder "{folder}" holds {count:d} messages from "{from_addr}" dated "{date_str}" each tagged "{tag}"')
+def step_folder_holds_n_messages_from_dated_tagged(
+    context: Context, folder: str, count: int, from_addr: str, date_str: str, tag: str
 ) -> None:
-    account_id = _find_account_for_folder(context, folder)
-    _stage_n_simple_messages(
-        context, account_id, folder, count, from_addr="bulk@example.com"
+    account_id, clean_folder = _split_account_folder(context, folder)
+    _seed_n_messages(
+        context,
+        account_id,
+        clean_folder,
+        count,
+        from_addr=from_addr,
+        date_str=date_str,
+        flags=[tag],
     )
 
 
-@given('the folder "{folder}" holds {count:d} messages from "{from_addr}"')
-def step_folder_holds_n_messages_from(
-    context: Context, folder: str, count: int, from_addr: str
+@given('the folder "{folder}" holds {count:d} messages from "{from_addr}" dated "{date_str}" each carrying keyword "{kw}" and flags [{flags_raw}]')
+def step_folder_holds_n_messages_carrying_kw_and_flags(
+    context: Context,
+    folder: str,
+    count: int,
+    from_addr: str,
+    date_str: str,
+    kw: str,
+    flags_raw: str,
 ) -> None:
-    account_id = _find_account_for_folder(context, folder)
-    _stage_n_simple_messages(context, account_id, folder, count, from_addr=from_addr)
-
-
-@given(
-    'the folder "{folder}" holds {count:d} messages from "{from_addr}" '
-    'each tagged "{tag}"'
-)
-def step_folder_holds_n_messages_from_tagged(
-    context: Context, folder: str, count: int, from_addr: str, tag: str
-) -> None:
-    account_id = _find_account_for_folder(context, folder)
-    _stage_n_simple_messages(
-        context, account_id, folder, count, from_addr=from_addr, tag=tag
+    account_id, clean_folder = _split_account_folder(context, folder)
+    flag_list = [kw] + [f.strip() for f in flags_raw.split(",") if f.strip()]
+    _seed_n_messages(
+        context,
+        account_id,
+        clean_folder,
+        count,
+        from_addr=from_addr,
+        date_str=date_str,
+        flags=flag_list,
     )
 
 
-@given('the folder "{folder}" on "{account_id}" holds {count:d} message')
-def step_folder_holds_one_message_explicit(
-    context: Context, folder: str, account_id: str, count: int
+@given('the folder "{folder}" holds {count:d} messages from "{from_addr}" dated "{date_str}"')
+def step_folder_holds_n_messages_from_dated(
+    context: Context, folder: str, count: int, from_addr: str, date_str: str
 ) -> None:
-    _stage_n_simple_messages(
-        context, account_id, folder, count, from_addr="bulk@example.com"
+    account_id, clean_folder = _split_account_folder(context, folder)
+    _seed_n_messages(
+        context, account_id, clean_folder, count, from_addr=from_addr, date_str=date_str
     )
 
 
-@given('policy "{policy_name}" folder defaults are:')
-def step_policy_folder_defaults_table(context: Context, policy_name: str) -> None:
-    """Declare per-folder defaults on a policy in a single tabular step.
+@then('the folder "{folder}" holds {count:d} messages with flag "{tag}"')
+@given('the folder "{folder}" holds {count:d} messages with flag "{tag}"')
+def step_folder_holds_n_messages_with_flag(
+    context: Context, folder: str, count: int, tag: str
+) -> None:
+    account_id, clean_folder = _split_account_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    if instance == "mock-gmail":
+        state = getattr(context, "gmail_state", None)
+        if state is None:
+            raise AssertionError("No mock-gmail state available")
+        msgs = state.messages_in_folder(clean_folder)
+        if count == 0 and not msgs:
+            raise AssertionError(
+                f"Positive control failed: folder {folder!r} holds 0 messages total; "
+                f"cannot witness absence of flag {tag!r}."
+            )
+        matching = 0
+        for _, msg in msgs:
+            if tag in msg.flags or tag in msg.labels:
+                matching += 1
+        if matching != count:
+            raise AssertionError(
+                f"Expected {count} messages with flag {tag!r} in {folder}, found {matching}"
+            )
+    else:
+        all_uids = context.imap.folder_uids(instance, user, clean_folder)
+        if count == 0 and not all_uids:
+            raise AssertionError(
+                f"Positive control failed: folder {folder!r} holds 0 messages total; "
+                f"cannot witness absence of flag {tag!r}."
+            )
+        conn = context.imap.connect(instance, user)
+        conn.select(context.imap.to_wire(instance, user, clean_folder))
+        search_crit = "SEEN" if tag.lower() == "\\seen" else f'KEYWORD "{tag}"'
+        status, data = conn.search(None, search_crit)
+        if status != "OK":
+            raise AssertionError(f"IMAP SEARCH failed on {folder}: {data}")
+        uids = data[0].split() if data and data[0] else []
+        if len(uids) != count:
+            raise AssertionError(
+                f"Expected {count} messages with flag {tag!r} in {folder}, found {len(uids)}"
+            )
 
-    Each row is `| folder | mode | default |` plus optional capability
-    columns. The folder column may contain a leading ``ACCOUNT:`` prefix
-    to disambiguate cross-account scenarios; otherwise the policy's first
-    granted account is used.
-    """
-    from support.policy_builder import FolderPolicy
 
-    builder = _ensure_builder(context)
-    policy = next((p for p in builder.policies if p.name == policy_name), None)
-    if policy is None:
-        raise AssertionError(f"Policy {policy_name!r} not declared yet")
-    if not policy.accounts:
-        raise AssertionError(
-            f"Policy {policy_name!r} has no granted account; declare one first"
-        )
-    default_account = next(iter(policy.accounts.keys()))
-    capability_keys = (
-        "mark_seen",
-        "mark_tagged",
-        "move_out",
-        "accept_incoming",
-        "draft_append",
-        "modify_message",
-    )
-    for row in context.table:
-        folder = row["folder"]
-        account_id = default_account
-        if ":" in folder:
-            account_id, _, folder = folder.partition(":")
-        fp = FolderPolicy(path=folder, mode=row["mode"], default=row["default"])
-        for key in capability_keys:
-            if key in row.headings:
-                setattr(fp, key, _parse_bool(row[key]))
-        policy.accounts.setdefault(account_id, []).append(fp)
-    builder.write()
+
+
 
 
 @given('policy "{policy_name}" grants no accounts')
@@ -3850,31 +2844,474 @@ def step_sink_read_only(context: Context) -> None:
     builder.write()
 
 
-@given(
-    'the message has an attachment whose original filename is {n:d} bytes long, '
-    'mime type "{mime_type}", size {size:d} bytes'
-)
-def step_attachment_long_filename(
-    context: Context, n: int, mime_type: str, size: int
+@given('"{target_dir}" is an empty writable directory and the configured sink path is a symlink pointing to "{target_dir_ref}"')
+def step_sink_path_is_symlink(
+    context: Context, target_dir: str, target_dir_ref: str
 ) -> None:
-    """Stage an attachment whose filename is exactly n bytes of ASCII
-    `a`s plus a single-char extension so the sink's truncation /
-    sanitization rules are exercised on a fully-knowable input.
+    target_path = Path(target_dir.replace("$TMPDIR", str(context.scratch_dir)))
+    target_path.mkdir(parents=True, exist_ok=True)
+    symlink_path = context.scratch_dir / "sink_symlink"
+    if symlink_path.exists() or symlink_path.is_symlink():
+        symlink_path.unlink()
+    symlink_path.symlink_to(target_path)
+    context.attachment_sink_dir = symlink_path
+    context.attachment_sink_state = "configured"
+    builder = _ensure_builder(context)
+    builder.attachment_sink_directory = symlink_path
+    builder.write()
 
-    Re-uses the same staged-message infrastructure the `has attachment`
-    step uses; this is only a long-name variant.
-    """
-    staged = context.staged_messages[-1]
-    # Derive the extension from the mime type. Keep it simple: the
-    # scenarios we care about all use application/pdf -> ".pdf".
-    ext_map = {
-        "application/pdf": "pdf",
-        "application/octet-stream": "bin",
-        "text/plain": "txt",
-    }
-    ext = ext_map.get(mime_type, "bin")
-    base = "a" * max(1, n - len(ext) - 1)
-    filename = f"{base}.{ext}"
-    staged["extra_attachments"].append(
-        (filename, mime_type, b"x" * size)
+
+@given('"{target_dir}" is an empty writable directory and "<sink_base>/{sub_path}" is a symlink pointing to "{target_dir_ref}"')
+def step_sink_subpath_is_symlink(
+    context: Context, target_dir: str, sub_path: str, target_dir_ref: str
+) -> None:
+    target_path = Path(target_dir.replace("$TMPDIR", str(context.scratch_dir)))
+    target_path.mkdir(parents=True, exist_ok=True)
+    base_sink = getattr(context, "attachment_sink_dir", None)
+    if base_sink is None:
+        raise AssertionError("Sink directory not set before planting caller symlink")
+    symlink_path = base_sink / sub_path
+    if symlink_path.exists() or symlink_path.is_symlink():
+        symlink_path.unlink()
+    symlink_path.symlink_to(target_path)
+
+
+
+
+@when('{caller_id} calls fetch_body on the only visible message in "{qualified}"')
+def step_caller_calls_fetch_body_only_visible(
+    context: Context, caller_id: str, qualified: str
+) -> None:
+    from features.steps.mcp_steps import _ensure_mcp_client, _store_result
+    client = _ensure_mcp_client(context, caller_id)
+    account_id, folder = _split_account_folder(context, qualified)
+    payload = client.call_tool("list_messages", {"account": account_id, "folder": folder})
+    _store_result(context, payload)
+    messages = context.last_response.get("messages", [])
+    if len(messages) != 1:
+        raise AssertionError(
+            f"Expected exactly 1 visible message in {qualified!r}, found {len(messages)}"
+        )
+    uid = messages[0]["uid"]
+    payload2 = client.call_tool("fetch_body", {"account": account_id, "folder": folder, "uid": uid})
+    _store_result(context, payload2)
+
+
+@when('{caller_id} calls list_attachments on the only visible message in "{qualified}"')
+def step_caller_calls_list_attachments_only_visible(
+    context: Context, caller_id: str, qualified: str
+) -> None:
+    from features.steps.mcp_steps import _ensure_mcp_client, _store_result
+    client = _ensure_mcp_client(context, caller_id)
+    account_id, folder = _split_account_folder(context, qualified)
+    payload = client.call_tool("list_messages", {"account": account_id, "folder": folder})
+    _store_result(context, payload)
+    messages = context.last_response.get("messages", [])
+    if len(messages) != 1:
+        raise AssertionError(
+            f"Expected exactly 1 visible message in {qualified!r}, found {len(messages)}"
+        )
+    uid = messages[0]["uid"]
+    payload2 = client.call_tool("list_attachments", {"account": account_id, "folder": folder, "uid": uid})
+    _store_result(context, payload2)
+
+
+@when('{caller_id} calls fetch_attachment for part_id {part_id:d} on the only visible message in "{qualified}"')
+def step_caller_calls_fetch_attachment_only_visible(
+    context: Context, caller_id: str, part_id: int, qualified: str
+) -> None:
+    from features.steps.mcp_steps import _ensure_mcp_client, _store_result
+    client = _ensure_mcp_client(context, caller_id)
+    account_id, folder = _split_account_folder(context, qualified)
+    payload = client.call_tool("list_messages", {"account": account_id, "folder": folder})
+    _store_result(context, payload)
+    messages = context.last_response.get("messages", [])
+    if len(messages) != 1:
+        raise AssertionError(
+            f"Expected exactly 1 visible message in {qualified!r}, found {len(messages)}"
+        )
+    uid = messages[0]["uid"]
+    payload2 = client.call_tool(
+        "fetch_attachment",
+        {"account": account_id, "folder": folder, "uid": uid, "part_id": part_id},
     )
+    _store_result(context, payload2)
+
+
+@when('the human mail client sends the draft from "{src_qualified}" into "{dst_qualified}"')
+def step_human_sends_draft(context: Context, src_qualified: str, dst_qualified: str) -> None:
+    src_account, src_folder = _split_account_folder(context, src_qualified)
+    _dst_account, dst_folder = _split_account_folder(context, dst_qualified)
+    instance, user = resolve_account(src_account)
+    if instance == "mock-gmail":
+        state = getattr(context, "gmail_state", None)
+        msgs = state.messages_in_folder(src_folder)
+        if not msgs:
+            raise AssertionError(f"No draft found in {src_qualified}")
+        _uid, msg = msgs[-1]
+        from mock_gmail.state import FOLDER_TO_LABEL
+        src_label = FOLDER_TO_LABEL.get(src_folder, src_folder)
+        dst_label = FOLDER_TO_LABEL.get(dst_folder, dst_folder)
+        msg.labels.discard(src_label)
+        msg.labels.add(dst_label)
+    else:
+        conn = context.imap.connect(instance, user)
+        conn.select(context.imap.to_wire(instance, user, src_folder))
+        status, data = conn.uid("SEARCH", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            raise AssertionError(f"No messages in {src_qualified}")
+        uids = [int(u) for u in data[0].split()]
+        last_uid = uids[-1]
+        _st, fetch_data = conn.uid("FETCH", str(last_uid), "(RFC822)")
+        raw = fetch_data[0][1]
+        conn.create(context.imap.to_wire(instance, user, dst_folder))
+        conn.append(context.imap.to_wire(instance, user, dst_folder), "(\\Seen)", None, raw)
+        conn.uid("STORE", str(last_uid), "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+
+
+@when('the human mail client sends the draft from "{src_qualified}" into "{dst_qualified}" stripping all X-SC-* headers while preserving Message-ID and body')
+def step_human_sends_draft_stripping_headers(context: Context, src_qualified: str, dst_qualified: str) -> None:
+    import email
+    src_account, src_folder = _split_account_folder(context, src_qualified)
+    _dst_account, dst_folder = _split_account_folder(context, dst_qualified)
+    instance, user = resolve_account(src_account)
+    if instance == "mock-gmail":
+        state = getattr(context, "gmail_state", None)
+        msgs = state.messages_in_folder(src_folder)
+        if not msgs:
+            raise AssertionError(f"No draft found in {src_qualified}")
+        _uid, msg = msgs[-1]
+        parsed = email.message_from_bytes(msg.rfc822)
+        for h in list(parsed.keys()):
+            if h.upper().startswith("X-SC-"):
+                del parsed[h]
+        stripped_bytes = parsed.as_bytes()
+        msg.rfc822 = stripped_bytes
+        from mock_gmail.state import FOLDER_TO_LABEL
+        src_label = FOLDER_TO_LABEL.get(src_folder, src_folder)
+        dst_label = FOLDER_TO_LABEL.get(dst_folder, dst_folder)
+        msg.labels.discard(src_label)
+        msg.labels.add(dst_label)
+    else:
+        conn = context.imap.connect(instance, user)
+        conn.select(context.imap.to_wire(instance, user, src_folder))
+        status, data = conn.uid("SEARCH", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            raise AssertionError(f"No messages in {src_qualified}")
+        uids = [int(u) for u in data[0].split()]
+        last_uid = uids[-1]
+        _st, fetch_data = conn.uid("FETCH", str(last_uid), "(RFC822)")
+        raw = fetch_data[0][1]
+        parsed = email.message_from_bytes(raw)
+        for h in list(parsed.keys()):
+            if h.upper().startswith("X-SC-"):
+                del parsed[h]
+        stripped_bytes = parsed.as_bytes()
+        conn.create(context.imap.to_wire(instance, user, dst_folder))
+        conn.append(context.imap.to_wire(instance, user, dst_folder), "(\\Seen)", None, stripped_bytes)
+        conn.uid("STORE", str(last_uid), "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+
+
+@when('an external mail client replaces the body of the draft in "{qualified}" with "{new_body}" while preserving all X-SC-* headers')
+def step_external_replaces_draft_body(context: Context, qualified: str, new_body: str) -> None:
+    import email
+    account_id, folder = _split_account_folder(context, qualified)
+    instance, user = resolve_account(account_id)
+    if instance == "mock-gmail":
+        state = getattr(context, "gmail_state", None)
+        msgs = state.messages_in_folder(folder)
+        if not msgs:
+            raise AssertionError(f"No draft found in {qualified}")
+        _uid, msg = msgs[-1]
+        parsed = email.message_from_bytes(msg.rfc822)
+        if "Content-Transfer-Encoding" in parsed:
+            del parsed["Content-Transfer-Encoding"]
+        parsed.set_payload(new_body + "\r\n")
+        msg.rfc822 = parsed.as_bytes()
+    else:
+        conn = context.imap.connect(instance, user)
+        conn.select(context.imap.to_wire(instance, user, folder))
+        status, data = conn.uid("SEARCH", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            raise AssertionError(f"No draft found in {qualified}")
+        uids = [int(u) for u in data[0].split()]
+        last_uid = uids[-1]
+        _st, fetch_data = conn.uid("FETCH", str(last_uid), "(RFC822)")
+        raw = fetch_data[0][1]
+        parsed = email.message_from_bytes(raw)
+        if "Content-Transfer-Encoding" in parsed:
+            del parsed["Content-Transfer-Encoding"]
+        parsed.set_payload(new_body + "\r\n")
+        new_raw = parsed.as_bytes()
+        conn.append(context.imap.to_wire(instance, user, folder), "(\\Draft)", None, new_raw)
+        conn.uid("STORE", str(last_uid), "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+
+
+@given('an external sender delivers a message into "{qualified}" copying X-SC-Draft-Id, X-SC-Draft-Rev, and X-SC-Provenance from that draft but with body "{body}"')
+def step_external_delivers_forged_draft(context: Context, qualified: str, body: str) -> None:
+    from datetime import datetime
+    from email.message import EmailMessage
+    account_id, folder = _split_account_folder(context, qualified)
+    instance, user = resolve_account(account_id)
+    drafts_msg = _fetch_message_by_subject(context, f"{account_id}:Drafts", "Harmlose Anfrage")
+    draft_id = drafts_msg.get("X-SC-Draft-Id", "")
+    draft_rev = drafts_msg.get("X-SC-Draft-Rev", "1")
+    prov = drafts_msg.get("X-SC-Provenance", "")
+
+    new_msg = EmailMessage()
+    new_msg["From"] = "attacker@external.example"
+    new_msg["To"] = f"{user}@bdd.local"
+    new_msg["Subject"] = "Inbound forged"
+    new_msg["X-SC-Draft-Id"] = draft_id
+    new_msg["X-SC-Draft-Rev"] = draft_rev
+    new_msg["X-SC-Provenance"] = prov
+    new_msg.set_content(body)
+    raw = new_msg.as_bytes()
+
+    if instance == "mock-gmail":
+        from mock_gmail.state import FOLDER_TO_LABEL, Message
+        state = getattr(context, "gmail_state", None)
+        lbl = FOLDER_TO_LABEL.get(folder, folder)
+        gmsg = Message(
+            gm_msgid=state.new_msgid(),
+            gm_thrid=state.new_msgid(),
+            rfc822=raw,
+            labels={lbl} if lbl != "__ALL_MAIL__" else set(),
+            subject="Inbound forged",
+            from_addr="attacker@external.example",
+            date=datetime.now(UTC).isoformat(),
+        )
+        state.add_message(gmsg)
+    else:
+        conn = context.imap.connect(instance, user)
+        conn.create(context.imap.to_wire(instance, user, folder))
+        conn.append(context.imap.to_wire(instance, user, folder), None, None, raw)
+
+
+@given('an external client copies the draft message into "{qualified}"')
+def step_external_copies_draft(context: Context, qualified: str) -> None:
+    from datetime import datetime
+    account_id, folder = _split_account_folder(context, qualified)
+    instance, user = resolve_account(account_id)
+    drafts_msg = _fetch_message_by_subject(context, f"{account_id}:Drafts", "Nicht aus INBOX verwerfbar")
+    raw = drafts_msg.as_bytes()
+    if instance == "mock-gmail":
+        from mock_gmail.state import FOLDER_TO_LABEL, Message
+        state = getattr(context, "gmail_state", None)
+        lbl = FOLDER_TO_LABEL.get(folder, folder)
+        gmsg = Message(
+            gm_msgid=state.new_msgid(),
+            gm_thrid=state.new_msgid(),
+            rfc822=raw,
+            labels={lbl} if lbl != "__ALL_MAIL__" else set(),
+            subject="Nicht aus INBOX verwerfbar",
+            date=datetime.now(UTC).isoformat(),
+        )
+        state.add_message(gmsg)
+    else:
+        conn = context.imap.connect(instance, user)
+        conn.create(context.imap.to_wire(instance, user, folder))
+        conn.append(context.imap.to_wire(instance, user, folder), None, None, raw)
+
+
+@given('a second server instance is started for caller "{caller_id}" with policy granting FULL, draft_append, draft_edit, and move_out on "{folder}" and accept_incoming on "{trash}"')
+def step_second_server_for_caller(context: Context, caller_id: str, folder: str, trash: str) -> None:
+    import os
+    import shutil
+
+    import yaml
+
+    from features.steps.mcp_steps import SERVER_BINARY_ENV, _client_info_kwargs
+    from support.mcp_client import MCPClient
+
+    second_config_dir = context.scratch_dir / f"config-{caller_id}"
+    second_config_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(context.config_dir / "accounts.yaml", second_config_dir / "accounts.yaml")
+    callers_data = {
+        "callers": [
+            {
+                "id": caller_id,
+                "policy": f"{caller_id}-policy",
+                "auth": {"type": "stdio_trusted"},
+            }
+        ]
+    }
+    (second_config_dir / "callers.yaml").write_text(yaml.safe_dump(callers_data), encoding="utf-8")
+    policies_dir = second_config_dir / "policies"
+    policies_dir.mkdir(exist_ok=True)
+    builder = _ensure_builder(context)
+    acct = builder.accounts[0].id
+    policy_data = {
+        "name": f"{caller_id}-policy",
+        "accounts": {
+            acct: [
+                {
+                    "path": folder,
+                    "mode": "blacklist",
+                    "default": "FULL",
+                    "draft_append": True,
+                    "draft_edit": True,
+                    "move_out": True,
+                    "rules": [],
+                },
+                {
+                    "path": trash,
+                    "mode": "blacklist",
+                    "default": "METADATA",
+                    "accept_incoming": True,
+                    "rules": [],
+                },
+            ]
+        },
+    }
+    (policies_dir / f"{caller_id}-policy.yaml").write_text(yaml.safe_dump(policy_data), encoding="utf-8")
+
+    server_binary = Path(
+        os.environ.get(
+            SERVER_BINARY_ENV,
+            context.bdd_root.parent / "server" / ".venv" / "bin" / "imap-mcp",
+        )
+    )
+    extra_env = dict(getattr(context, "mcp_extra_env", None) or {})
+    if getattr(context, "is_test_hooks", False) and not getattr(context, "without_test_mode", False):
+        extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    else:
+        extra_env.pop("IMAP_MCP_TEST_MODE", None)
+    client2 = MCPClient(
+        server_binary=server_binary,
+        config_dir=second_config_dir,
+        caller_id=caller_id,
+        extra_env=extra_env,
+        **_client_info_kwargs(context),
+    )
+    client2.start()
+    clients = getattr(context, "mcp_clients", None)
+    if clients is None:
+        clients = {}
+        context.mcp_clients = clients
+    clients[caller_id] = client2
+    context.mcp = client2
+
+
+@given('a second server instance is started sharing the same config and wal.db for caller "{caller_id}"')
+def step_second_server_sharing_config(context: Context, caller_id: str) -> None:
+    from features.steps.mcp_steps import SERVER_BINARY_ENV, _client_info_kwargs
+    from support.mcp_client import MCPClient
+
+    server_binary = Path(
+        os.environ.get(
+            SERVER_BINARY_ENV,
+            context.bdd_root.parent / "server" / ".venv" / "bin" / "imap-mcp",
+        )
+    )
+    extra_env = dict(getattr(context, "mcp_extra_env", None) or {})
+    if getattr(context, "is_test_hooks", False) and not getattr(context, "without_test_mode", False):
+        extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    else:
+        extra_env.pop("IMAP_MCP_TEST_MODE", None)
+    client2 = MCPClient(
+        server_binary=server_binary,
+        config_dir=context.config_dir,
+        caller_id=caller_id,
+        extra_env=extra_env,
+        unset_env=tuple(getattr(context, "mcp_unset_env", ())),
+        **_client_info_kwargs(context),
+    )
+    client2.start()
+    context.second_mcp = client2
+
+
+@when('the two "{caller_id}" instances concurrently call update_draft on "{location}" for the returned draft_id with base_revision {base_rev:d} and distinct subjects "{subj_a}" and "{subj_b}"')
+def step_concurrent_update_draft(
+    context: Context,
+    caller_id: str,
+    location: str,
+    base_rev: int,
+    subj_a: str,
+    subj_b: str,
+) -> None:
+    import concurrent.futures
+    import json
+
+    from features.steps.mcp_steps import _ensure_mcp_client
+    account_id, folder = _split_account_folder(context, location)
+    draft_id = context.last_response["draft_id"]
+    client1 = _ensure_mcp_client(context, caller_id)
+    client2 = context.second_mcp
+
+    def call(c, subj):
+        res = c.call_tool(
+            "update_draft",
+            {
+                "account": account_id,
+                "folder": folder,
+                "draft_id": draft_id,
+                "base_revision": base_rev,
+                "changes": {"subject": subj},
+            },
+        )
+        if isinstance(res, dict) and "content" in res:
+            content = res.get("content", [])
+            if content and isinstance(content[0], dict) and "text" in content[0]:
+                try:
+                    return json.loads(content[0]["text"])
+                except Exception:
+                    pass
+        return res
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(call, client1, subj_a)
+        f2 = executor.submit(call, client2, subj_b)
+        res1 = f1.result()
+        res2 = f2.result()
+
+    context.concurrent_update_responses = [res1, res2]
+    context.last_response = res1
+
+
+@when('{caller_id} calls update_draft with account "{account}", folder "{folder}", the draft_id created by {creator}, base_revision {rev:d}, changes:')
+def step_caller_calls_update_draft_by_creator(
+    context: Context, caller_id: str, account: str, folder: str, creator: str, rev: int
+) -> None:
+    import json
+
+    from features.steps.mcp_steps import _ensure_mcp_client, _store_result
+    client = _ensure_mcp_client(context, caller_id)
+    draft_id = getattr(context, "last_created_draft_id", None) or getattr(context, "returned_draft_id", None)
+    if not draft_id:
+        draft_id = context.last_response.get("draft_id")
+    changes = json.loads(context.text or "{}")
+    payload = client.call_tool(
+        "update_draft",
+        {
+            "account": account,
+            "folder": folder,
+            "draft_id": draft_id,
+            "base_revision": rev,
+            "changes": changes,
+        },
+    )
+    _store_result(context, payload)
+
+
+@when('{caller_id} calls discard_draft with account "{account}", folder "{folder}", the draft_id created by {creator}')
+def step_caller_calls_discard_draft_by_creator(
+    context: Context, caller_id: str, account: str, folder: str, creator: str
+) -> None:
+    from features.steps.mcp_steps import _ensure_mcp_client, _store_result
+    client = _ensure_mcp_client(context, caller_id)
+    draft_id = getattr(context, "last_created_draft_id", None) or getattr(context, "returned_draft_id", None)
+    if not draft_id:
+        draft_id = context.last_response.get("draft_id")
+    payload = client.call_tool(
+        "discard_draft",
+        {
+            "account": account,
+            "folder": folder,
+            "draft_id": draft_id,
+        },
+    )
+    _store_result(context, payload)

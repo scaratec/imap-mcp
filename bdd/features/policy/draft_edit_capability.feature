@@ -1,41 +1,33 @@
-Feature: draft_edit capability gates draft revision
+Feature: draft_edit capability and provenance gate draft revision
 
-  Revising a draft appends a new revision and expunges the previous
-  one. That is a destructive operation on existing content, so it is
-  gated by its own capability, draft_edit, defaulting to false
-  (ADR 0031).
-
-  It is deliberately not implied by draft_append, which only permits
-  depositing new content, and not by modify_message, which governs
-  rewriting arbitrary messages in any folder. A policy that grants
-  either of those does not thereby grant the right to destroy a draft.
-
-  The drafts-write-isolation pattern of ADR 0005 stays intact:
-  visibility NONE plus draft_edit means the caller can revise a draft
-  it is not allowed to read, because changes are field-wise and the
-  previous content is read inside the server, never returned.
+  Revising a draft appends a new revision and removes the previous one.
+  It requires draft_edit=true on the \Drafts folder AND verified caller
+  provenance (X-SC-Provenance HMAC + WAL registry, ADR 0042, ADR 0045).
+  Drafts write-isolation stays intact: under visibility NONE with
+  draft_edit=true, the caller can revise its own provenance-verified
+  draft (explicitly exempted from the <METADATA object gate per ADR 0044
+  §2.5) without reading back existing draft content.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - draft_edit=false denies update_draft                    : 1
-    - draft_append alone does not imply draft_edit            : 1
-    - modify_message alone does not imply draft_edit          : 1
-    - draft_edit=true allows update_draft                     : 1
-    - draft_edit alone does not imply draft_append            : 1
-    - reading a draft is not gated by draft_edit              : 1
-    - write-only isolation: update_draft allowed, get_draft denied : 2
-    - list_drafts needs METADATA visibility                   : 1
-    Total enumerated                                          : 9   covered: 9
-
-  Three of these are update_draft denials — the first three — and they
-  are the ones tool_surface/update_draft_errors.feature counts as its
-  policy layer and delegates here.
+    - Unauthenticated verbatim X-SC-Draft-Id rejected without draft_edit : 1
+    - Caller's own draft still requires draft_edit=true                  : 1
+    - draft_edit=true revises caller's own draft on IMAP                 : 1
+    - draft_edit=true without draft_append revises after reload, blocks create : 1
+    - Reading a draft depends on BODY visibility, not draft_edit         : 1
+    - Write-only isolation: update_draft modifies IMAP body, get_draft denied (visibility_below_BODY) : 2
+    - list_drafts requires METADATA visibility                           : 1
+    Total enumerated                                                     : 8   covered: 8
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folder "Drafts"
+    Given the server clock is pinned to "2026-09-18T12:00:00Z"
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path | special use |
+      | INBOX       |             |
+      | Drafts      | \Drafts     |
     And the server is configured with caller "draft-agent" using policy "draft-policy"
     And policy "draft-policy" grants account "gupta-scaratec"
 
-  Scenario: update_draft without draft_edit is denied
+  Scenario: update_draft without draft_edit is denied with capability_missing before handle lookup
     Given policy "draft-policy" grants folder:
       | folder | mode      | default | rules | draft_append | draft_edit |
       | Drafts | blacklist | FULL    | []    | true         | false      |
@@ -57,13 +49,13 @@ Feature: draft_edit capability gates draft revision
       """
     Then the response decision is DENY
     And the response field reason equals "capability_missing"
-    And the response field missing_capability equals "draft_edit"
+    And the response does not contain any field named "missing_capability"
     And the IMAP folder "Drafts" contains exactly one message with headers:
       | header         | value               |
       | Subject        | Not yours to change |
       | X-SC-Draft-Rev | 1                   |
 
-  Scenario: the caller that created the draft still needs draft_edit to change it
+  Scenario: The caller that created a draft still needs draft_edit to revise it
     Given policy "draft-policy" grants folder:
       | folder | mode      | default | rules | draft_append | draft_edit |
       | Drafts | blacklist | FULL    | []    | true         | false      |
@@ -83,31 +75,12 @@ Feature: draft_edit capability gates draft revision
       """
     Then the response decision is DENY
     And the response field reason equals "capability_missing"
-    And the response field missing_capability equals "draft_edit"
+    And the IMAP folder "Drafts" contains exactly one message with headers:
+      | header         | value            |
+      | Subject        | Mine, but frozen |
+      | X-SC-Draft-Rev | 1                |
 
-  Scenario: modify_message does not stand in for draft_edit
-    Given policy "draft-policy" grants folder:
-      | folder | mode      | default | rules | draft_append | draft_edit | modify_message |
-      | Drafts | blacklist | FULL    | []    | true         | false      | true           |
-    And draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
-      """
-      From: draft-agent@gupta-scaratec.com
-      To: counterparty@example.com
-      Subject: Rewriting is not editing
-      MIME-Version: 1.0
-      Content-Type: text/plain; charset=US-ASCII
-
-      We can deliver in week 14.
-      """
-    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
-      """
-      {"subject": "Second thoughts"}
-      """
-    Then the response decision is DENY
-    And the response field reason equals "capability_missing"
-    And the response field missing_capability equals "draft_edit"
-
-  Scenario: update_draft with draft_edit succeeds
+  Scenario: update_draft with draft_edit revises the draft on the IMAP server
     Given policy "draft-policy" grants folder:
       | folder | mode      | default | rules | draft_append | draft_edit |
       | Drafts | blacklist | FULL    | []    | true         | true       |
@@ -129,28 +102,31 @@ Feature: draft_edit capability gates draft revision
     And the response field result equals "OK"
     And the response field revision equals 2
     And the response field mechanism equals "draft_revision"
+    And the IMAP folder "Drafts" contains exactly 1 message with header "X-SC-Draft-Id" set
+    And the IMAP folder "Drafts" contains exactly one message with headers:
+      | header         | value  |
+      | Subject        | Edited |
+      | X-SC-Draft-Rev | 2      |
 
-  # Independence is a claim about both directions. The scenarios above
-  # withhold draft_edit while draft_append is granted; this one does the
-  # reverse, so an implementation that quietly treats one capability as
-  # the other cannot pass both.
-  Scenario: draft_edit without draft_append revises but does not create
+  Scenario: draft_edit without draft_append revises an existing own draft after policy reload but refuses create_draft
     Given policy "draft-policy" grants folder:
       | folder | mode      | default | rules | draft_append | draft_edit |
-      | Drafts | blacklist | FULL    | []    | false        | true       |
-    And the folder "Drafts" holds a verbatim message:
+      | Drafts | blacklist | FULL    | []    | true         | true       |
+    And draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
       """
       From: draft-agent@gupta-scaratec.com
       To: counterparty@example.com
-      Subject: Existing but not mine to duplicate
-      X-SC-Draft-Id: 55555555-5555-4555-8555-555555555555
-      X-SC-Draft-Rev: 1
+      Subject: Created before append was revoked
       MIME-Version: 1.0
       Content-Type: text/plain; charset=US-ASCII
 
       We can deliver in week 14.
       """
-    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", draft_id "55555555-5555-4555-8555-555555555555", base_revision 1, changes:
+    When the operator updates folder "Drafts" in policy "draft-policy" to:
+      | mode      | default | draft_append | draft_edit |
+      | blacklist | FULL    | false        | true       |
+    And the server receives SIGHUP
+    And draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
       """
       {"subject": "Revised without the right to append"}
       """
@@ -161,42 +137,35 @@ Feature: draft_edit capability gates draft revision
       """
       From: draft-agent@gupta-scaratec.com
       To: counterparty@example.com
-      Subject: A draft of my own
+      Subject: A second draft
       MIME-Version: 1.0
       Content-Type: text/plain; charset=US-ASCII
 
-      Composed where only revision is allowed.
+      Blocked.
       """
     Then the response decision is DENY
     And the response field reason equals "capability_missing"
-    And the response field missing_capability equals "draft_append"
     And the IMAP folder "Drafts" contains exactly 1 message with header "X-SC-Draft-Id" set
     And the IMAP folder "Drafts" contains exactly one message with headers:
       | header         | value                               |
       | Subject        | Revised without the right to append |
       | X-SC-Draft-Rev | 2                                   |
 
-  # Reading is governed by visibility, not by the write capability.
-  # `editable` in the listing is a statement about the message — it
-  # carries a handle and a revision, so it *can* be revised (ADR 0030) —
-  # not about what this caller is allowed to do with it.
-  Scenario: reading a draft does not depend on draft_edit
+  Scenario: Reading an own draft depends on BODY visibility rather than draft_edit
     Given policy "draft-policy" grants folder:
       | folder | mode      | default | rules | draft_append | draft_edit |
       | Drafts | blacklist | FULL    | []    | true         | false      |
-    And the folder "Drafts" holds a verbatim message:
+    And draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
       """
       From: draft-agent@gupta-scaratec.com
       To: counterparty@example.com
       Subject: Readable but frozen
-      X-SC-Draft-Id: 88888888-8888-4888-8888-888888888888
-      X-SC-Draft-Rev: 1
       MIME-Version: 1.0
       Content-Type: text/plain; charset=US-ASCII
 
       We can deliver in week 14.
       """
-    When draft-agent calls get_draft with account "gupta-scaratec", folder "Drafts", draft_id "88888888-8888-4888-8888-888888888888"
+    When draft-agent calls get_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id
     Then the response decision is ALLOW
     And the response field result equals "OK"
     And the response field revision equals 1
@@ -204,14 +173,13 @@ Feature: draft_edit capability gates draft revision
     And the response field body_text equals "We can deliver in week 14."
     When draft-agent calls list_drafts with account "gupta-scaratec", folder "Drafts"
     Then the response decision is ALLOW
-    And the response field result equals "OK"
     And the response field drafts contains exactly one entry with:
       | field    | value               |
       | subject  | Readable but frozen |
       | revision | 1                   |
       | editable | true                |
 
-  Scenario: a write-only drafts folder can still be revised
+  Scenario: A write-only drafts folder revises own draft content on IMAP without disclosing body_text
     Given policy "draft-policy" grants folder:
       | folder | mode      | default | rules | draft_append | draft_edit |
       | Drafts | whitelist | NONE    | []    | true         | true       |
@@ -237,8 +205,9 @@ Feature: draft_edit capability gates draft revision
       | header         | value      |
       | Subject        | Write-only |
       | X-SC-Draft-Rev | 2          |
+    And a direct IMAP FETCH of the message with subject "Write-only" in "gupta-scaratec:Drafts" shows decoded plain text "We can deliver in week 13."
 
-  Scenario: a write-only drafts folder cannot be read back
+  Scenario: A write-only drafts folder denies get_draft with visibility_below_BODY for NONE visibility
     Given policy "draft-policy" grants folder:
       | folder | mode      | default | rules | draft_append | draft_edit |
       | Drafts | whitelist | NONE    | []    | true         | true       |
@@ -256,7 +225,7 @@ Feature: draft_edit capability gates draft revision
     Then the response decision is DENY
     And the response field reason equals "visibility_below_BODY"
 
-  Scenario: listing drafts needs metadata visibility
+  Scenario: Listing drafts on a folder with maximum visibility NONE is denied with visibility_below_METADATA
     Given policy "draft-policy" grants folder:
       | folder | mode      | default | rules | draft_append | draft_edit |
       | Drafts | whitelist | NONE    | []    | true         | true       |

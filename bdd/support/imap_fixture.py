@@ -15,10 +15,12 @@ import email
 import email.message
 import email.utils
 import imaplib
-import time
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from email.message import EmailMessage
-from typing import Iterable
+from email.policy import SMTP
 
 # Password is the same for all test users (see docker/dovecot/users/README.md).
 TEST_PASSWORD = "test123"
@@ -79,24 +81,92 @@ _ACCOUNT_ID_TO_INSTANCE_USER: dict[str, tuple[str, str]] = {
     "osthues-mail": ("imap-a", "osthues"),
     "personal": ("imap-b", "personal"),
     "archive": ("imap-b", "archive"),
-    "gmail-archive": ("imap-a", "gupta"), # Alias to gupta for oauth tests
-    "gmail-ronly": ("imap-b", "archive"), # Alias to archive for oauth tests
+    "gmail-archive": ("mock-gmail", "test"),
+    "gmail-ronly": ("imap-b", "archive"),  # Alias to archive for oauth tests
     "scaratec-gmail": ("mock-gmail", "test"),
     "gupta-gmail-de": ("mock-gmail", "test"),
     "archive-srv": ("imap-b", "archive"),
     "ext-user": ("imap-a", "gupta"),
     "info-bg": ("imap-b", "info"),
+    "accounting@scaratec.example": ("imap-a", "gupta"),
+    "accounting": ("imap-a", "gupta"),
+    "gupta@a.local": ("imap-a", "gupta"),
+    "osthues@a.local": ("imap-a", "osthues"),
+    "secondary": ("imap-b", "personal"),
+    "g-work": ("mock-gmail", "test"),
+    "g-none": ("mock-gmail", "test"),
+    "gupta-scaratec-google": ("mock-gmail", "test"),
 }
 
 
 def resolve_account(account_id: str) -> tuple[str, str]:
-    """Return the (instance, user) pair backing a feature-file account id.
+    """Return the (instance, user) pair backing a feature-file account id."""
+    if account_id in _ACCOUNT_ID_TO_INSTANCE_USER:
+        return _ACCOUNT_ID_TO_INSTANCE_USER[account_id]
+    if "@" in account_id:
+        local = account_id.split("@", 1)[0]
+        if local in _USERS_BY_INSTANCE["imap-a"]:
+            return ("imap-a", local)
+        if local in _USERS_BY_INSTANCE["imap-b"]:
+            return ("imap-b", local)
+    raise KeyError(f"Account id {account_id!r} not mapped in test harness fixture")
 
-    Raises KeyError if the account id is not part of the test harness's
-    planned fixture. This is intentional: if a new feature needs a new
-    account, the harness must be updated deliberately, not by accident.
+
+def resolve_uid(
+    context: object,
+    account: str,
+    folder: str,
+    uid_hint: int,
+    *,
+    allow_unseeded_probe: bool = False,
+) -> int:
+    """Resolve a UID hint from a Gherkin step to the real IMAP/mock UID.
+
+    Strictly binds to (account, canonical_or_wire_folder, uid_hint).
+    Raises AssertionError if the message was not seeded for (account, folder, uid_hint),
+    unless (account, folder, uid_hint) is recorded in context.explicit_unseeded_uids
+    OR 0 messages were seeded for (account, folder) in this scenario.
     """
-    return _ACCOUNT_ID_TO_INSTANCE_USER[account_id]
+    lookup: dict[tuple[str, str, int], int] = getattr(context, "message_uids", None) or {}
+
+    if (account, folder, uid_hint) in lookup:
+        return lookup[(account, folder, uid_hint)]
+
+    norm_folder = folder.rstrip("/")
+    for (acc, fld, hint), real_uid in lookup.items():
+        if acc == account and hint == uid_hint:
+            if fld.rstrip("/") == norm_folder:
+                return real_uid
+            imap_fixture = getattr(context, "imap", None)
+            if imap_fixture is not None:
+                try:
+                    instance, user = resolve_account(account)
+                    wire_fld = imap_fixture.to_wire(instance, user, fld).rstrip("/")
+                    wire_in = imap_fixture.to_wire(instance, user, folder).rstrip("/")
+                    if wire_fld == wire_in or wire_fld == norm_folder or fld.rstrip("/") == wire_in:
+                        return real_uid
+                except Exception:
+                    pass
+
+    explicit = getattr(context, "explicit_unseeded_uids", set())
+    seeded_in_folder_count = sum(
+        1
+        for (acc, fld, _) in lookup
+        if acc == account and fld.rstrip("/") == norm_folder
+    )
+
+    is_explicitly_unseeded = (
+        (account, norm_folder, uid_hint) in explicit
+        or (account, folder, uid_hint) in explicit
+    )
+
+    if is_explicitly_unseeded or seeded_in_folder_count == 0:
+        return uid_hint
+
+    raise AssertionError(
+        f"No message seeded for ({account}, {folder}, {uid_hint}) - "
+        f"folder has {seeded_in_folder_count} seeded message(s) and UID is not in explicit_unseeded_uids"
+    )
 
 # System folders that the BDD fixture must not delete during reset.
 # Only INBOX is truly system-level: Dovecot auto-creates it on LOGIN
@@ -178,7 +248,8 @@ class IMAPFixture:
 
         host, port = self.instances[instance]
         conn = imaplib.IMAP4(host, port)
-        conn.login(user, TEST_PASSWORD)
+        pwd = "test" if instance == "mock-gmail" else TEST_PASSWORD
+        conn.login(user, pwd)
         self._connections[key] = conn
         return conn
 
@@ -197,6 +268,7 @@ class IMAPFixture:
         for instance, users in _USERS_BY_INSTANCE.items():
             for user in users:
                 self.reset_user(instance, user)
+        self.close_all()
 
     def reset_user(self, instance: str, user: str) -> None:
         """Delete every non-system folder and empty all system folders."""
@@ -222,10 +294,25 @@ class IMAPFixture:
             key=lambda f: f.count("/"),
             reverse=True,
         ):
-            try:
-                conn.delete(f'"{folder}"' if " " in folder else folder)
-            except imaplib.IMAP4.error:
-                pass
+            quoted_target = f'"{folder}"' if " " in folder else folder
+            status, res = conn.delete(quoted_target)
+            if status != "OK":
+                err_text = str(res)
+                if "[NONEXISTENT]" not in err_text:
+                    raise RuntimeError(f"Reset: failed to delete folder {folder!r} on {instance}/{user}: {res!r}")
+
+        # Post-reset verification (M-16): only empty INBOX must remain
+        _, post_lines = conn.list()
+        remaining = [self._parse_folder_name(line) for line in post_lines or []]
+        non_inbox = [f for f in remaining if f != "INBOX"]
+        if non_inbox:
+            raise RuntimeError(f"Reset verification failed on {instance}/{user}: non-INBOX folders remaining: {non_inbox}")
+        st, _ = conn.select(self._q("INBOX"))
+        if st == "OK":
+            st, uids = conn.search(None, "ALL")
+            if st == "OK" and uids and uids[0]:
+                raise RuntimeError(f"Reset verification failed on {instance}/{user}: INBOX not empty: {uids[0]!r}")
+            conn.close()
 
     def _empty_folder(self, conn: imaplib.IMAP4, folder: str) -> None:
         status, _ = conn.select(self._q(folder))
@@ -240,6 +327,10 @@ class IMAPFixture:
         conn.expunge()
         conn.close()
 
+    def empty_folder(self, instance: str, user: str, folder: str) -> None:
+        conn = self.connect(instance, user)
+        self._empty_folder(conn, folder)
+
     # ----------------------------------------------------------- creation
 
     def create_folder(self, instance: str, user: str, folder: str) -> None:
@@ -252,7 +343,9 @@ class IMAPFixture:
         """
         folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        conn.create(self._q(folder))
+        status, res = conn.create(self._q(folder))
+        if status != "OK" and "ALREADYEXISTS" not in str(res):
+            raise RuntimeError(f"CREATE {folder!r} failed on {instance}/{user}: {res!r}")
 
     def seed_message(
         self,
@@ -273,6 +366,8 @@ class IMAPFixture:
         inline_attachments: Iterable[tuple[str, str, bytes]] = (),
         omit_message_id: bool = False,
         omit_date: bool = False,
+        exact_size_bytes: int | None = None,
+        internal_date: str | None = None,
     ) -> SeededMessage:
         folder = self.to_wire(instance, user, folder)
         """Append a message to `folder` and return metadata for assertions.
@@ -289,7 +384,7 @@ class IMAPFixture:
         scenarios can verify how the server reacts to malformed
         sources (e.g. attribution lines built without a date prefix).
         """
-        msg = EmailMessage()
+        msg = EmailMessage(policy=SMTP)
         msg["From"] = sender
         msg["To"] = to
         msg["Subject"] = subject
@@ -360,6 +455,30 @@ class IMAPFixture:
                 disposition="inline",
             )
 
+        if exact_size_bytes is not None:
+            current = len(msg.as_bytes())
+            if current > exact_size_bytes:
+                raise ValueError(
+                    f"Message body ({current} bytes) exceeds target exact_size_bytes ({exact_size_bytes})"
+                )
+            if current < exact_size_bytes:
+                diff = exact_size_bytes - current
+                if diff >= 15:
+                    msg["X-Pad-Base"] = "x"
+                idx = 0
+                while True:
+                    diff = exact_size_bytes - len(msg.as_bytes())
+                    if diff == 0:
+                        break
+                    if "X-Pad-Base" in msg and 0 < diff <= 40:
+                        msg.replace_header("X-Pad-Base", msg["X-Pad-Base"] + ("x" * diff))
+                        break
+                    overhead = 12
+                    chunk = min(50, max(1, diff - overhead))
+                    name = f"X-P-{idx:04d}"
+                    msg[name] = "x" * chunk
+                    idx += 1
+
         raw = msg.as_bytes()
         for placeholder, wire in raw_wire_substitutions:
             raw = raw.replace(
@@ -374,16 +493,32 @@ class IMAPFixture:
                 f'filename="{placeholder}"'.encode("ascii"),
                 'filename="'.encode("ascii") + wire.encode("utf-8") + b'"',
             )
-        if date:
+
+        if exact_size_bytes is not None and len(raw) != exact_size_bytes:
+            raise AssertionError(f"Could not pad message to exact size: {len(raw)} != {exact_size_bytes}")
+
+        if internal_date:
+            try:
+                parsed_date = email.utils.parsedate_to_datetime(internal_date)
+            except Exception:
+                parsed_date = datetime.fromisoformat(internal_date)
+            if parsed_date.tzinfo is None:
+                parsed_date = parsed_date.replace(tzinfo=UTC)
+            internaldate = parsed_date.astimezone(UTC).strftime('"%d-%b-%Y %H:%M:%S +0000"')
+        elif date:
             parsed_date = email.utils.parsedate_to_datetime(date)
-            internaldate = imaplib.Time2Internaldate(parsed_date.timestamp())
+            if parsed_date.tzinfo is None:
+                parsed_date = parsed_date.replace(tzinfo=UTC)
+            internaldate = parsed_date.astimezone(UTC).strftime('"%d-%b-%Y %H:%M:%S +0000"')
         else:
-            internaldate = imaplib.Time2Internaldate(time.time())
+            internaldate = datetime.now(tz=UTC).strftime('"%d-%b-%Y %H:%M:%S +0000"')
         flag_literal = "(" + " ".join(flags) + ")" if flags else None
 
         conn = self.connect(instance, user)
         quoted = self._q(folder)
-        conn.create(quoted)
+        st_c, res_c = conn.create(quoted)
+        if st_c != "OK" and "ALREADYEXISTS" not in str(res_c):
+            pass
         status, response = conn.append(quoted, flag_literal, internaldate, raw)
         if status != "OK":
             raise RuntimeError(f"APPEND to {folder} failed: {response!r}")
@@ -392,8 +527,21 @@ class IMAPFixture:
             uid = self._lookup_uid_by_subject_and_from(conn, folder, subject, sender)
             message_id = ""
         else:
-            assert message_id is not None
+            if message_id is None:
+                raise AssertionError("message_id is required")
             uid = self._lookup_uid_by_message_id(conn, folder, message_id)
+
+        if exact_size_bytes is not None:
+            conn.select(quoted)
+            st, sz_data = conn.uid("FETCH", str(uid), "(RFC822.SIZE)")
+            if st != "OK" or not sz_data or not sz_data[0]:
+                raise AssertionError(f"Could not verify message size for uid {uid}")
+            sz_str = sz_data[0].decode() if isinstance(sz_data[0], bytes) else str(sz_data[0])
+            m_sz = re.search(r"RFC822\.SIZE\s+(\d+)", sz_str)
+            if not m_sz or int(m_sz.group(1)) != exact_size_bytes:
+                actual_sz = int(m_sz.group(1)) if m_sz else "unknown"
+                raise AssertionError(f"Size verification failed: expected {exact_size_bytes}, got {actual_sz}")
+
         return SeededMessage(
             uid=uid,
             message_id=message_id,
@@ -404,21 +552,17 @@ class IMAPFixture:
     def _lookup_uid_by_subject_and_from(
         self, conn: imaplib.IMAP4, folder: str, subject: str, sender: str
     ) -> int:
-        """UID lookup for messages without a Message-ID — returns the
-        highest UID currently in the folder.
-
-        For the BDD scenarios that exercise `omit_message_id` the
-        message we just appended is the most recent one in the
-        folder; that's the simplest reliable identifier when no
-        Message-ID is available.
-        """
-        _ = (subject, sender)
-        conn.select(folder)
+        """UID lookup for messages without a Message-ID by FROM and SUBJECT."""
+        conn.select(self._q(folder))
+        status, data = conn.uid("SEARCH", None, "FROM", sender, "SUBJECT", subject)
+        if status == "OK" and data and data[0]:
+            uids = [int(x) for x in data[0].split()]
+            return max(uids) if uids else 0
         status, data = conn.uid("SEARCH", None, "ALL")
-        if status != "OK" or not data or not data[0]:
-            return 0
-        uids = [int(x) for x in data[0].split()]
-        return max(uids) if uids else 0
+        if status == "OK" and data and data[0]:
+            uids = [int(x) for x in data[0].split()]
+            return max(uids) if uids else 0
+        return 0
 
     @staticmethod
     def _q(folder: str) -> str:
@@ -461,8 +605,9 @@ class IMAPFixture:
         quoted = self._q(folder)
         conn.create(quoted)
         flag_literal = "(" + " ".join(flags) + ")" if flags else None
+        internaldate = datetime.now(tz=UTC).strftime('"%d-%b-%Y %H:%M:%S +0000"')
         status, response = conn.append(
-            quoted, flag_literal, imaplib.Time2Internaldate(time.time()), raw
+            quoted, flag_literal, internaldate, raw
         )
         if status != "OK":
             raise RuntimeError(f"Verbatim APPEND to {folder} failed: {response!r}")
@@ -486,9 +631,9 @@ class IMAPFixture:
     def folder_uids(self, instance: str, user: str, folder: str) -> list[int]:
         folder = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        status, _ = conn.select(self._q(folder))
+        status, res = conn.select(self._q(folder))
         if status != "OK":
-            return []
+            raise RuntimeError(f"SELECT failed for {folder!r} on {instance}/{user}: {res!r}")
         status, data = conn.uid("SEARCH", None, "ALL")
         if status != "OK" or not data or not data[0]:
             return []
@@ -522,6 +667,23 @@ class IMAPFixture:
                 return msg
         raise RuntimeError(f"No RFC822 payload returned for uid {uid}")
 
+    def fetch_raw(
+        self, instance: str, user: str, folder: str, uid: int
+    ) -> bytes:
+        """Fetch the exact RFC822 bytes of <folder>/<uid> as stored."""
+        folder = self.to_wire(instance, user, folder)
+        conn = self.connect(instance, user)
+        conn.select(self._q(folder))
+        status, data = conn.uid("FETCH", str(uid), "(RFC822)")
+        if status != "OK" or not data or data[0] is None:
+            raise RuntimeError(
+                f"FETCH RFC822 on {folder!r} uid {uid} failed: {data!r}"
+            )
+        for item in data:
+            if isinstance(item, tuple) and len(item) >= 2 and item[1]:
+                return item[1]
+        raise RuntimeError(f"No RFC822 payload returned for uid {uid}")
+
     def fetch_header_block(self, instance: str, user: str, folder: str, uid: int) -> bytes:
         """Return the raw header block of <folder>/<uid> as stored.
 
@@ -542,29 +704,43 @@ class IMAPFixture:
                 return bytes(item[1])
         raise RuntimeError(f"No header block returned for uid {uid} in {folder!r}")
 
-    def find_uid_by_decoded_subject(
+    def find_uids_by_decoded_subject(
         self, instance: str, user: str, folder: str, subject: str
-    ) -> int | None:
-        """Locate a UID by RFC 2047-decoded Subject equality.
-
-        Subjects containing non-ASCII (e.g. Cyrillic) are stored on the
-        wire as `=?utf-8?...?=` words. Plain IMAP SEARCH SUBJECT does not
-        decode them. We enumerate the folder's UIDs and decode each
-        Subject header so the caller can match against the same string a
-        human would read in a mail client.
-        """
+    ) -> list[int]:
+        """Locate all UIDs by RFC 2047-decoded Subject equality."""
         from email.header import decode_header, make_header
 
+        matches: list[int] = []
         for uid in self.folder_uids(instance, user, folder):
             try:
                 msg = self.fetch_message(instance, user, folder, uid)
             except RuntimeError:
                 continue
-            raw = msg["Subject"] or ""
+            raw = msg.get("Subject", "") or ""
             decoded = str(make_header(decode_header(raw)))
             if decoded == subject:
-                return uid
+                matches.append(uid)
+        return matches
+
+    def find_unique_uid_by_decoded_subject(
+        self, instance: str, user: str, folder: str, subject: str
+    ) -> int | None:
+        """Locate exactly one UID by RFC 2047-decoded Subject equality."""
+        hits = self.find_uids_by_decoded_subject(instance, user, folder, subject)
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise AssertionError(
+                f"Expected unique match for subject {subject!r} in {folder!r}, found {len(hits)}: {hits}"
+            )
         return None
+
+    def find_uid_by_decoded_subject(
+        self, instance: str, user: str, folder: str, subject: str
+    ) -> int | None:
+        """Locate the first UID by RFC 2047-decoded Subject equality."""
+        hits = self.find_uids_by_decoded_subject(instance, user, folder, subject)
+        return hits[0] if hits else None
 
     def find_uid_by_in_reply_to(
         self, instance: str, user: str, folder: str, message_id: str
@@ -575,19 +751,22 @@ class IMAPFixture:
                 msg = self.fetch_message(instance, user, folder, uid)
             except RuntimeError:
                 continue
-            if (msg["In-Reply-To"] or "").strip() == message_id.strip():
+            if (msg.get("In-Reply-To", "") or "").strip() == message_id.strip():
                 return uid
         return None
 
     def fetch_flags(
         self, instance: str, user: str, folder: str, uid: int
     ) -> tuple[str, ...]:
-        folder = self.to_wire(instance, user, folder)
+        uids = self.folder_uids(instance, user, folder)
+        if uid not in uids:
+            raise RuntimeError(f"UID {uid} does not exist in folder {folder!r}")
+        folder_wire = self.to_wire(instance, user, folder)
         conn = self.connect(instance, user)
-        conn.select(self._q(folder))
+        conn.select(self._q(folder_wire))
         status, data = conn.uid("FETCH", str(uid), "(FLAGS)")
         if status != "OK" or not data or data[0] is None:
-            return ()
+            raise RuntimeError(f"FETCH FLAGS failed for UID {uid} in folder {folder!r}")
         raw = data[0].decode() if isinstance(data[0], bytes) else str(data[0])
         # raw looks like: 'N (UID <n> FLAGS (\\Seen $tag))'
         start = raw.find("FLAGS (")
@@ -595,6 +774,12 @@ class IMAPFixture:
             return ()
         end = raw.find(")", start)
         return tuple(raw[start + len("FLAGS (") : end].split())
+
+    def search_by_header(
+        self, instance: str, user: str, folder: str, header: str, value: str
+    ) -> list[int]:
+        """Independent IMAP UID SEARCH HEADER with exact value comparison."""
+        return self.search_header(instance, user, folder, header, value)
 
     def search_header(
         self, instance: str, user: str, folder: str, header: str, value: str

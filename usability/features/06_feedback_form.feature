@@ -1,17 +1,13 @@
 @agent @feedback
-Feature: F — After every run the agent fills in the feedback form, and its answers are checked
+Feature: F — After every run the agent fills in the feedback form, and its answers are cross-checked
 
   The form (usability/feedback-form.schema.json) asks what the agent
   understood, which tools it used, which errors it saw and how it read
   them, what was unclear or missing, where it deviated from the task,
-  and whether it considered asking. It is asked in the same session, so
-  the agent still has its own context.
-
-  Self-reports are evidence about the agent's understanding, not about
-  what happened. Every factual answer is compared with the audit log and
-  the trace; a contradiction is recorded as a measurement, never
-  corrected and never used to change the task grade. A missing or
-  invalid form does not change the task grade either.
+  and whether it considered asking. Every factual answer is cross-checked
+  against the chained audit log (ADR 0048) and OpenTelemetry spans
+  (ADR 0053); contradictions are recorded as measurements without
+  altering the task grade.
 
   Nondeterministic. Grades, never failures (usability/README.md).
 
@@ -40,7 +36,7 @@ Feature: F — After every run the agent fills in the feedback form, and its ans
     Given the feedback form is valid
     Then the measurement "errors_quoted_correctly" records the share of errors_encountered whose verbatim text appears in a response recorded in the trace
     And the measurement "errors_not_mentioned" records the errors and denials in the audit log that errors_encountered omits
-    And the measurement "error_misreadings" records each error whose your_interpretation contradicts its documented meaning in ADR 0017 or ADR 0027 [judged]
+    And the measurement "error_misreadings" records each error whose your_interpretation contradicts its documented meaning in ADR 0043 or ADR 0044 [judged]
 
   Scenario: F4 — Self-assessment is compared with the task grade
     Given the feedback form is valid

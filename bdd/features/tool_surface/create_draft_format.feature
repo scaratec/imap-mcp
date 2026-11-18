@@ -1,58 +1,48 @@
-Feature: A draft's body format is a visible, deliberate choice, equally easy either way
+Feature: Structured and RFC822 draft formats, attachments on own drafts, header safety, and HTML reply quoting
 
-  Whether a draft is plain text or HTML is the mailbox owner's
-  preference, not the server's. The server must neither impose a format
-  nor make one of them so much harder to produce that the effort
-  decides instead of the caller. Today create_draft accepts only a raw
-  RFC 822 message: a plain-text draft is five header lines and a body,
-  an HTML draft needs a hand-built multipart/alternative tree with
-  boundaries, charsets and an RFC 2047 encoded subject. update_draft,
-  by contrast, already takes body_text and body_html as fields
-  (ADR 0031). ADR 0035 decides the behaviour below. Agents therefore write plain text with manual line breaks
-  by default, and rewrite the whole draft when asked for HTML.
-
-  The server's part in a deliberate choice is threefold: say in the tool
-  description that the format is a choice and that an unknown
-  preference is a reason to ask; report back which format was stored;
-  and offer both formats through the same structured fields create and
-  update share. Whether an agent actually decides deliberately is
-  measured in usability/features/01_draft_format_decision.feature, not
-  here.
-
-  Independent-channel rule. The stored format is read by a direct IMAP
-  FETCH of the appended message's headers and MIME structure, never
-  from the create_draft response it is compared against.
+  ADR 0045 §3 makes plain-text and HTML draft composition equally easy
+  while enforcing strict MIME and header safety:
+    - create_draft accepts either structured fields (to, cc, bcc,
+      subject, body_text, body_html, in_reply_to, attachments) or rfc822,
+      never both, and rejects CR/LF in any header-valued input (-32602).
+    - Structured attachments compose multipart/mixed drafts directly,
+      replacing the retired received-mail attachment rewrite tools.
+    - create_reply_draft supports reply_html with a sanitized blockquote
+      of the original message's inline body.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Tool description names the choice and the reason to ask      : 1
-    - Response reports the stored format                           : 3 (plain, html, alternative)
-    - Structured fields build a well-formed message                : 3 (text, html, both)
-    - Non-ASCII subject and body survive structured composition    : 1
-    - Raw rfc822 and structured fields are mutually exclusive      : 1
-    - Neither raw rfc822 nor any body field                        : 1
-    - create_reply_draft accepts an HTML reply                     : 1
-    Total enumerated                                               : 11  covered by this feature: 11
+    - Tool description names format choice and asking rule         : 1
+    - rfc822 format reporting (text/plain, text/html, alternative) : 3
+    - Structured body composition (text, html, both)               : 3
+    - Structured attachments compose multipart/mixed on own draft  : 1
+    - Non-ASCII subject and HTML body survive with ASCII headers   : 1
+    - CR/LF in structured create_draft header fields -> -32602     : 3
+    - Mutual exclusion (rfc822 + fields) and missing body -> -32602: 2
+    - create_reply_draft with reply_html quotes sanitized blockquote: 1
+    Total enumerated                                               : 15  covered by this feature: 15
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folder "Drafts"
+    Given the server clock is pinned to "2026-10-31T12:00:00Z"
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path | special use |
+      | INBOX       |             |
+      | Drafts      | \Drafts     |
+    And the account "gupta-scaratec" has identity "draft-agent@example.org"
     And the server is configured with caller "draft-agent" using policy "draft-policy"
     And policy "draft-policy" grants account "gupta-scaratec"
-    And policy "draft-policy" grants folder:
+    And policy "draft-policy" grants folder on account "gupta-scaratec":
       | folder | mode      | default | rules | draft_append | draft_edit |
+      | INBOX  | blacklist | FULL    | []    | false        | false      |
       | Drafts | blacklist | FULL    | []    | true         | true       |
 
-  # --- The choice is named where the caller reads it -------------------
-
-  Scenario: The create_draft description presents the format as a choice and asks to clarify an unknown preference
-    When draft-agent lists the available tools
+  Scenario: The create_draft description presents plain text or HTML as a choice and asks when unknown
+    When draft-agent calls the MCP list_tools method
     Then the description of tool "create_draft" contains the literal string "plain text or HTML"
     And the description of tool "create_draft" contains the literal string "If the user's preference is unknown, ask"
     And the description of tool "create_draft" does NOT contain the literal string "prefer HTML"
     And the description of tool "create_draft" does NOT contain the literal string "prefer plain text"
 
-  # --- The stored format is reported back ------------------------------
-
-  Scenario: create_draft reports text/plain for a plain UTF-8 message
+  Scenario: create_draft reports text/plain for a plain UTF-8 rfc822 message
     When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
       """
       From: draft-agent@example.org
@@ -73,7 +63,7 @@ Feature: A draft's body format is a visible, deliberate choice, equally easy eit
     And the response field format equals "text/plain"
     And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows the top-level content type "text/plain"
 
-  Scenario: create_draft reports text/html for an HTML-only message
+  Scenario: create_draft reports text/html for an HTML-only rfc822 message
     When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
       """
       From: draft-agent@example.org
@@ -83,18 +73,13 @@ Feature: A draft's body format is a visible, deliberate choice, equally easy eit
       Content-Type: text/html; charset=UTF-8
       Content-Transfer-Encoding: 8bit
 
-      <html><body>
-      <p>Guten Tag Frau Lindqvist,</p>
-      <p>passt Ihnen ein Termin am Dienstag?</p>
-      <p>Viele Grüße</p>
-      </body></html>
+      <html><body><p>Guten Tag Frau Lindqvist,</p></body></html>
       """
     Then the response decision is ALLOW
-    And the response field result equals "OK"
     And the response field format equals "text/html"
     And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows the top-level content type "text/html"
 
-  Scenario: create_draft reports multipart/alternative for a message with both parts
+  Scenario: create_draft reports multipart/alternative for an rfc822 message with both parts
     When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
       """
       From: draft-agent@example.org
@@ -105,53 +90,49 @@ Feature: A draft's body format is a visible, deliberate choice, equally easy eit
 
       --sc-alt-0001
       Content-Type: text/plain; charset=UTF-8
-      Content-Transfer-Encoding: 8bit
 
-      Guten Tag Frau Lindqvist,
-
-      passt Ihnen ein Termin am Dienstag?
-
-      Viele Grüße
-
+      Guten Tag Frau Lindqvist
       --sc-alt-0001
       Content-Type: text/html; charset=UTF-8
-      Content-Transfer-Encoding: 8bit
 
-      <html><body>
-      <p>Guten Tag Frau Lindqvist,</p>
-      <p>passt Ihnen ein Termin am Dienstag?</p>
-      <p>Viele Grüße</p>
-      </body></html>
-
+      <html><body><p>Guten Tag Frau Lindqvist</p></body></html>
       --sc-alt-0001--
       """
     Then the response decision is ALLOW
-    And the response field result equals "OK"
     And the response field format equals "multipart/alternative"
     And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows the top-level content type "multipart/alternative"
 
-  # --- Both formats through the same structured fields (proposal) -----
-
-  Scenario Outline: create_draft composes the message from structured fields
-    # ADR 0035: create_draft accepts the field set update_draft uses.
+  Scenario Outline: create_draft composes structured body fields into <format>
     When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", fields:
       """
       {"to": ["mara.lindqvist@example.org"], "subject": "Angebot", <bodies>}
       """
-    # A body_html without body_text still gets a text/plain alternative,
-    # derived by the same tag stripping fetch_body uses
-    # (fetch_body_html_fallback.feature), so text-only clients show it.
     Then the response decision is ALLOW
     And the response field format equals "<format>"
     And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows the leaf parts in order "<parts>"
 
     Examples:
-      | bodies                                                    | format                | parts                                  |
-      | "body_text": "Guten Tag,\n\nanbei das Angebot."            | text/plain            | text/plain;utf-8                       |
-      | "body_html": "<p>Guten Tag,</p><p>anbei das Angebot.</p>"  | multipart/alternative | text/plain;utf-8, text/html;utf-8      |
-      | "body_text": "Guten Tag", "body_html": "<p>Guten Tag</p>"  | multipart/alternative | text/plain;utf-8, text/html;utf-8      |
+      | bodies                                                    | format                | parts                             |
+      | "body_text": "Guten Tag,\n\nanbei das Angebot."           | text/plain            | text/plain;utf-8                  |
+      | "body_html": "<p>Guten Tag,</p><p>anbei das Angebot.</p>" | multipart/alternative | text/plain;utf-8, text/html;utf-8 |
+      | "body_text": "Guten Tag", "body_html": "<p>Guten Tag</p>" | multipart/alternative | text/plain;utf-8, text/html;utf-8 |
 
-  Scenario: Non-ASCII subject and body survive structured composition unchanged
+  Scenario: create_draft composes structured attachments on a new draft
+    When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", fields:
+      """
+      {"to": ["mara.lindqvist@example.org"],
+       "subject": "Angebot mit PDF",
+       "body_text": "Anbei das PDF.",
+       "attachments": [{"filename": "angebot.pdf", "mime_type": "application/pdf", "content_base64": "JVBERi0xLjQK"}]}
+      """
+    Then the response decision is ALLOW
+    And the response field format equals "multipart/mixed"
+    When draft-agent calls get_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id
+    Then the response field attachments has 1 entries
+    And attachment 0 has field "filename" equal to "angebot.pdf"
+    And attachment 0 has field "size_bytes" equal to 9
+
+  Scenario: Non-ASCII subject and HTML body survive structured composition with pure-ASCII headers
     When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", fields:
       """
       {"to": ["jonas.hartmann@example.org"],
@@ -163,31 +144,42 @@ Feature: A draft's body format is a visible, deliberate choice, equally easy eit
     And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows a text/html part whose decoded text contains "Grüße aus Köln"
     And the raw header block of the newest message in "gupta-scaratec:Drafts" contains only ASCII characters
 
-  Scenario: Raw rfc822 and structured fields in one call are refused as ambiguous
-    When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 "Subject: A\r\n\r\nB" and fields {"body_text": "C"}
-    Then the tool call fails with an invalid-arguments error
+  Scenario Outline: CR/LF header injection in structured create_draft <field> is rejected with JSON-RPC -32602
+    When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", fields:
+      """
+      <payload>
+      """
+    Then the server responds with JSON-RPC error code -32602
+    And the IMAP folder "Drafts" is empty
+
+    Examples:
+      | field      | payload                                                                                                                                     |
+      | subject    | {"to": ["mara@example.org"], "subject": "Hi\r\nBcc: evil@example.com", "body_text": "Body"}                                                 |
+      | to         | {"to": ["mara@example.org\r\nBcc: evil@example.com"], "subject": "Hi", "body_text": "Body"}                                                 |
+      | attachment | {"to": ["mara@example.org"], "subject": "Hi", "body_text": "Body", "attachments": [{"filename": "a\r\n.pdf", "mime_type": "application/pdf", "content_base64": "dGVzdA=="}]} |
+
+  Scenario: Passing both rfc822 and structured fields in one call is rejected with JSON-RPC -32602
+    When draft-agent calls create_draft with the arguments {"account": "gupta-scaratec", "folder": "Drafts", "rfc822": "Subject: A\r\n\r\nB", "body_text": "C"}
+    Then the server responds with JSON-RPC error code -32602
     And the IMAP folder "Drafts" contains no message with subject "A"
 
-  Scenario: A call with neither rfc822 nor any body field is refused
+  Scenario: Calling create_draft with neither rfc822 nor any body field is rejected with JSON-RPC -32602
     When draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", fields:
       """
       {"to": ["mara.lindqvist@example.org"], "subject": "Leer"}
       """
-    Then the tool call fails with an invalid-arguments error
+    Then the server responds with JSON-RPC error code -32602
     And the IMAP folder "Drafts" contains no message with subject "Leer"
 
-  Scenario: create_reply_draft accepts an HTML reply alongside the quoted text
-    # ADR 0035: reply_html is optional; the quoted original is rendered
-    # as a blockquote in the HTML part.
-    Given the IMAP account "gupta-scaratec" also has folder "INBOX"
-    And the account "gupta-scaratec" has identity "draft-agent@example.org"
-    And policy "draft-policy" grants folder:
-      | folder | mode      | default | rules |
-      | INBOX  | blacklist | FULL    | []    |
-    And the folder "INBOX" holds messages:
-      | uid | from                       | subject       | date                 |
-      | 801 | mara.lindqvist@example.org | Angebot Q1    | 2026-10-28T09:00:00Z |
-    When draft-agent calls create_reply_draft with account "gupta-scaratec", source folder "INBOX", uid 801, drafts folder "Drafts", reply_html "<p>Danke, passt.</p>"
+  Scenario: create_reply_draft with reply_html renders a sanitized blockquote and signed provenance
+    Given the folder "INBOX" holds messages:
+      | uid | message_id               | from_address               | to_address              | subject    | date                 |
+      | 801 | <oferta-801@example.org> | mara.lindqvist@example.org | draft-agent@example.org | Angebot Q1 | 2026-10-28T09:00:00Z |
+    And the message at uid 801 has html body "<p>Bitte pruefen.</p><script>alert('xss')</script>"
+    When draft-agent calls create_reply_draft with account "gupta-scaratec", source_folder "INBOX", uid 801, drafts_folder "Drafts", reply_html "<p>Danke, passt.</p>"
     Then the response decision is ALLOW
     And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows the top-level content type "multipart/alternative"
     And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows a text/html part whose decoded text contains "Danke, passt."
+    And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows a text/html part whose decoded text contains "<blockquote"
+    And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows a text/html part whose decoded text contains "Bitte pruefen."
+    And a direct IMAP FETCH of the newest message in "gupta-scaratec:Drafts" shows a text/html part whose decoded text does NOT contain "<script>"

@@ -14,18 +14,16 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from behave.model import Feature, Scenario
+from behave.model import Scenario
 from behave.runner import Context
-
-import sys
-import threading
-
-import urllib.request
-import urllib.error
 
 # This file lives at bdd/features/environment.py; the `bdd/` dir holds
 # the `support/` package that the steps import from.
@@ -38,6 +36,10 @@ if str(BDD_ROOT) not in sys.path:
 _MOCK_GMAIL_SRC = BDD_ROOT / "mock-gmail" / "src"
 if str(_MOCK_GMAIL_SRC) not in sys.path:
     sys.path.insert(0, str(_MOCK_GMAIL_SRC))
+
+_MOCK_OAUTH_SRC = BDD_ROOT / "mock-oauth" / "src"
+if str(_MOCK_OAUTH_SRC) not in sys.path:
+    sys.path.insert(0, str(_MOCK_OAUTH_SRC))
 
 from support.imap_fixture import IMAPFixture
 from support.mcp_client import MCPClient
@@ -73,6 +75,19 @@ def before_all(context: Context) -> None:
     _wait_for_imap_ready()
     _wait_for_oauth_ready()
 
+    # Start the in-process MockOAuth control proxy.
+    from mock_oauth.client import MockOAuthClient
+    from mock_oauth.server import MockOAuthServer
+
+    mock_oauth_server = MockOAuthServer(
+        upstream_url="http://127.0.0.1:19080", host="127.0.0.1", port=19085
+    )
+    mock_oauth_server.start()
+    context.mock_oauth_server = mock_oauth_server
+    context.mock_oauth_client = MockOAuthClient(
+        base_url="http://127.0.0.1:19085", server=mock_oauth_server
+    )
+
     # Start the in-process Gmail mock IMAP server.
     from mock_gmail.server import start_gmail_mock
     from mock_gmail.state import GmailState
@@ -83,7 +98,7 @@ def before_all(context: Context) -> None:
         import asyncio
 
         async def _serve() -> None:
-            server, actual_port = await start_gmail_mock(state, port=port)
+            server, _ = await start_gmail_mock(state, port=port)
             async with server:
                 await server.serve_forever()
 
@@ -94,6 +109,7 @@ def before_all(context: Context) -> None:
     )
     gmail_thread.start()
     _wait_for_port("mock-gmail", "127.0.0.1", 13143)
+    gmail_state.token_validator = context.mock_oauth_client.validate_bearer
     context.gmail_state = gmail_state
 
     context.imap_instances = IMAP_INSTANCES
@@ -101,20 +117,16 @@ def before_all(context: Context) -> None:
 
 
 def after_all(context: Context) -> None:
-    """Tear the dovecot fixture down completely."""
+    """Tear the fixtures down completely."""
+    oauth_server = getattr(context, "mock_oauth_server", None)
+    if oauth_server is not None:
+        oauth_server.stop()
+        context.mock_oauth_server = None
     _compose("down", "-v", check=False)
 
 
 def before_scenario(context: Context, scenario: Scenario) -> None:
-    """Reset state so every scenario starts from a clean slate.
-
-    Steps performed:
-      1. Wipe and re-create a scratch directory for this scenario
-         (config, secrets, wal, audit all live here).
-      2. Wipe every test user's mailbox on both dovecot instances.
-      3. Leave the server process not-yet-started. A step file will
-         start it once the scenario's server configuration is known.
-    """
+    """Reset state so every scenario starts from a clean slate."""
     context.scratch_dir = Path(tempfile.mkdtemp(prefix="imap-mcp-bdd-"))
     context.config_dir = context.scratch_dir / "config"
     context.secrets_dir = context.scratch_dir / "secrets"
@@ -130,25 +142,43 @@ def before_scenario(context: Context, scenario: Scenario) -> None:
     gmail_state = getattr(context, "gmail_state", None)
     if gmail_state is not None:
         gmail_state.reset()
+        oauth_client = getattr(context, "mock_oauth_client", None)
+        if oauth_client is not None:
+            gmail_state.token_validator = oauth_client.validate_bearer
 
-    context.mcp: MCPClient | None = None  # step files create it lazily
+    oauth_client = getattr(context, "mock_oauth_client", None)
+    if oauth_client is not None:
+        oauth_client.reset()
 
-    # Wipe per-scenario response state. The list grows on every tool
-    # call via _store_result so that multi-call assertions
-    # ("both responses report …") can compare the last two entries.
+    context.mcp: MCPClient | None = None
+    context.mcp_http = None
+
     context.last_response = None
     context.last_rpc_error = None
     context.response_history = []
+    context.captured_responses = []
+    context.remembered_values = {}
+    context.mcp_extra_env = {}
+    context.without_test_mode = False
+    context.is_test_hooks = "test_hooks" in scenario.effective_tags
+    context.server_instances = {}
+    context.imap_proxy_procs = {}
+    context.imap_proxy_ports = {}
+    context.imap_proxy_log_paths = {}
 
-    # Attachment-sink scenario state (ADR 0028). The sink directory is
-    # outside scratch_dir so a `chmod 0o500` does not also lock down
-    # the rest of the scenario's writable scratch.
     context.attachment_sink_dir = None
-    context.attachment_sink_state = "unset"  # unset | configured | broken
+    context.attachment_sink_state = "unset"
 
 
 def after_scenario(context: Context, scenario: Scenario) -> None:
     """Terminate the MCP server and remove scratch state."""
+    imap = getattr(context, "imap", None)
+    if imap is not None:
+        imap.close_all()
+    clients = getattr(context, "mcp_clients", None) or {}
+    for c in list(clients.values()):
+        c.close()
+    context.mcp_clients = {}
     mcp = getattr(context, "mcp", None)
     if mcp is not None:
         mcp.close()
@@ -162,10 +192,10 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
         try:
             proxy_proc.terminate()
             proxy_proc.wait(timeout=2)
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             try:
                 proxy_proc.kill()
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 pass
     if hasattr(context, "imap_proxy_procs"):
         context.imap_proxy_procs = {}
@@ -205,7 +235,13 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
 def _compose(*args: str, check: bool = True) -> None:
     """Invoke `docker compose` from the BDD docker directory."""
     cmd = ["docker", "compose", *args]
-    subprocess.run(cmd, cwd=DOCKER_DIR, check=check, capture_output=True)
+    proc = subprocess.run(cmd, cwd=DOCKER_DIR, check=False, capture_output=True)
+    if check and proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"docker compose {' '.join(args)} failed (rc={proc.returncode}):\n{stderr}\n{stdout}"
+        )
 
 
 # Instances started by docker compose (not in-process mocks).
@@ -229,7 +265,7 @@ def _wait_for_imap_ready() -> None:
                     banner = sock.recv(128)
                 if b"OK" in banner:
                     break
-            except (OSError, socket.timeout):
+            except (TimeoutError, OSError):
                 pass
             time.sleep(0.5)
 
@@ -245,7 +281,7 @@ def _wait_for_port(name: str, host: str, port: int) -> None:
         try:
             with socket.create_connection((host, port), timeout=1.0):
                 break
-        except (OSError, socket.timeout):
+        except (TimeoutError, OSError):
             pass
         time.sleep(0.3)
 
@@ -264,6 +300,6 @@ def _wait_for_oauth_ready() -> None:
             with urllib.request.urlopen(req, timeout=1.0) as response:
                 if response.status == 200:
                     break
-        except (urllib.error.URLError, socket.timeout, ConnectionError):
+        except (TimeoutError, urllib.error.URLError, ConnectionError):
             pass
         time.sleep(0.5)

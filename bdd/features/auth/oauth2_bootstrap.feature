@@ -1,94 +1,173 @@
-Feature: OAuth2 bootstrap and token lifecycle
+@test_hooks
+Feature: OAuth2 PKCE bootstrap, XOAUTH2 token lifecycle, and durable needs_rebootstrap
 
-  The server authenticates against IMAP providers via XOAUTH2. A
-  bootstrap script obtains a refresh token interactively; the server
-  redeems it for access tokens as needed. Per-account scope
-  minimization acts as a second authorization layer beneath policy.
-  Token cache strategy is per-account (memory_only or persist_all).
-  See ADR 0009 and ADR 0010.
+  ADR 0050 specifies interactive OAuth2 Authorization Code + PKCE
+  bootstrap with cryptographic state verification, XOAUTH2 IMAP
+  authentication against real provider/mock endpoints, proactive refresh
+  at 80% lifetime with pool drain, single reactive retry on stale cached
+  tokens, durable needs_rebootstrap persistence in wal.db across restarts
+  and SIGHUP reloads, and startup rejection of narrow OAuth scopes paired
+  with write capabilities.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Bootstrap happy path                  : 1
-    - Bootstrap user denies consent         : 1
-    - Scope minimization blocks write op    : 1
-    - Token refresh: happy path             : 1
-    - Token refresh: invalid_grant          : 1  (-> needs_rebootstrap)
-    - Token cache: memory_only              : 1
-    - Token cache: persist_all              : 1
-    - PKCE verifier mismatch                : 1
-    Total enumerated                        : 8   covered by this feature: 8
+    - Bootstrap happy path writes refresh token & clears needs_rebootstrap : 1
+    - Bootstrap user denies consent (access_denied)                        : 1
+    - Bootstrap rejects OAuth state mismatch before token exchange         : 1
+    - Bootstrap fails when token endpoint rejects PKCE code_verifier       : 1
+    - Narrow provider OAuth scope + write capability rejected at startup   : 1
+    - Proactive 80% token refresh + pool drain                             : 1
+    - Single reactive XOAUTH2 refresh retry on first auth rejection        : 1
+    - invalid_grant persists needs_rebootstrap across restart & SIGHUP     : 1
+    - Token cache strategies: memory_only vs persist_all                   : 2
+    Total enumerated                                                       : 10  covered by this feature: 10
 
   Background:
-    Given a mock OAuth2 provider "google-mock" listens on https://localhost:mock-oauth2
-    And the secret store "file_dir" is configured at path $TMPDIR/secrets
-    And the server is configured with account:
-      | id             | provider     | host                 | oauth_scope                   | token_cache  |
-      | gmail-archive  | google-mock  | imap.localhost-mock  | https://mail.google.com/      | persist_all  |
-      | gmail-ronly    | google-mock  | imap.localhost-mock  | gmail.readonly                | memory_only  |
+    Given the audit log directory is a fresh $TMPDIR/audit
+    And the mock OAuth2 server is reset and healthy
+    And secret_store configuration is:
+      """
+      backend: file_dir
+      path: $TMPDIR/secrets
+      acknowledge_plaintext: true
+      """
 
-  Scenario: Bootstrap happy path — user consents and the refresh token lands in the secret store
-    Given the mock OAuth2 provider is primed to consent on the next authorization request
-    When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive`
-    And the bootstrap opens the provider consent URL and the browser returns authorization code "authcode-xyz"
-    Then the bootstrap reports success
-    And the secret store contains a non-empty value under key "accounts/gmail-archive/refresh_token"
-    And the audit log contains an entry with tool "oauth_bootstrap", decision "ALLOW", result "OK"
+  Scenario: Bootstrap happy path verifies state and PKCE and writes refresh_token to SecretStore
+    Given account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "persist_all"
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive` and completes the browser consent callback
+    Then the bootstrap exits with code 0
+    And the secret store file "accounts/gmail-archive/refresh_token" exists with mode 0600 and non-empty content
+    And the audit log contains an entry with tool "oauth_bootstrap", decision "ALLOW", result "OK", reason "oauth_bootstrap_ok"
 
-  Scenario: Bootstrap aborted — user denies consent leaves the secret store unchanged
-    Given the mock OAuth2 provider is primed to deny on the next authorization request
-    When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive`
-    And the browser returns error "access_denied"
-    Then the bootstrap reports failure with reason "user_denied"
-    And the secret store has no value under key "accounts/gmail-archive/refresh_token"
+  Scenario: Bootstrap aborted when user denies consent maps access_denied to user_denied and leaves SecretStore untouched
+    Given account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "persist_all"
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive` and the callback returns error "access_denied"
+    Then the bootstrap exits with a non-zero code and stderr mentioning "user_denied"
+    And no file exists in the secret store at "accounts/gmail-archive/refresh_token"
+    And the mock OAuth2 token endpoint recorded 0 token requests
 
-  Scenario: Scope minimization — a readonly-scope account refuses a write tool regardless of policy
-    Given the secret store contains a valid refresh token for "gmail-ronly"
-    And policy "ronly-policy" grants capability "mark_seen" on folder "INBOX"
-    And caller "reader-agent" uses policy "ronly-policy"
-    And the folder "gmail-ronly:INBOX" holds a message with uid 1001
-    When reader-agent calls mark_seen with account "gmail-ronly", folder "INBOX", uid 1001, seen true
+  Scenario: Bootstrap rejects a callback with mismatched state parameter before contacting the token endpoint
+    Given account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "persist_all"
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive` and the callback returns a tampered state value
+    Then the bootstrap exits with a non-zero code and stderr mentioning "state_mismatch"
+    And no file exists in the secret store at "accounts/gmail-archive/refresh_token"
+    And the mock OAuth2 token endpoint recorded 0 token requests
+
+  Scenario: Bootstrap fails cleanly when the OAuth2 provider rejects PKCE verification
+    Given account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "persist_all"
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    And the mock OAuth2 server is primed to reject the next authorization_code exchange with OAuth error "invalid_grant" and description "PKCE verification failed"
+    When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive` and completes the browser consent callback
+    Then the bootstrap exits with a non-zero code and stderr mentioning "PKCE"
+    And no file exists in the secret store at "accounts/gmail-archive/refresh_token"
+
+  Scenario: Startup rejects a narrow read-only OAuth scope paired with folder write capabilities
+    Given account "custom-oauth" is configured with provider "imap-standard", auth "oauth2", oauth_scope "imap.readonly", and token_cache "memory_only"
+    And the server is configured with caller "writer-agent" using policy "writer-policy"
+    And policy "writer-policy" grants account "custom-oauth"
+    And policy "writer-policy" grants folder on account "custom-oauth":
+      | folder | mode      | default  | mark_seen | rules |
+      | INBOX  | blacklist | ENVELOPE | true      | []    |
+    When the server process is started with transport "stdio"
+    Then the server refuses to start
+    And the startup error indicates "oauth_scope"
+
+  Scenario: Proactive token refresh at 80% of lifetime renews the XOAUTH2 token and drains pooled connections
+    Given the shared fake clock file is set to "2026-11-17T10:00:00Z"
+    And account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "memory_only"
+    And the secret store contains a valid refresh token for "gmail-archive"
+    And the mock OAuth2 server issues access tokens with expires_in 100 seconds
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    And policy "archive-policy" grants folder on account "gmail-archive":
+      | folder | mode      | default  | rules |
+      | INBOX  | blacklist | ENVELOPE | []    |
+    When archive-agent calls list_folders with account "gmail-archive"
+    Then the response decision is ALLOW
+    And the mock OAuth2 token endpoint recorded 1 token request
+    And the IMAP command log for "gmail-archive" contains 1 AUTHENTICATE XOAUTH2 command
+    When the shared fake clock file advances to "2026-11-17T10:01:25Z"
+    And archive-agent calls list_folders with account "gmail-archive"
+    Then the response decision is ALLOW
+    And the mock OAuth2 token endpoint recorded 2 token requests
+    And the audit log contains an entry with tool "token_refresh", result "OK", reason "token_refresh_ok"
+    And the audit log contains an entry with tool "pool_drain", reason "pool_drain"
+
+  Scenario: Reactive single retry refreshes token once when XOAUTH2 authentication fails with a cached token
+    Given account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "memory_only"
+    And the secret store contains a valid refresh token for "gmail-archive"
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    And policy "archive-policy" grants folder on account "gmail-archive":
+      | folder | mode      | default  | rules |
+      | INBOX  | blacklist | ENVELOPE | []    |
+    And archive-agent calls list_folders with account "gmail-archive"
+    And the mock-gmail server revokes the currently cached XOAUTH2 access token once and closes every open IMAP connection
+    When archive-agent calls list_folders with account "gmail-archive"
+    Then the response decision is ALLOW
+    And the mock OAuth2 token endpoint recorded 2 token requests
+    And the IMAP command log for "gmail-archive" contains 3 AUTHENTICATE XOAUTH2 commands
+
+  Scenario: invalid_grant persists needs_rebootstrap in wal.db across SIGHUP and process restart until re-bootstrapped
+    Given account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "memory_only"
+    And the secret store contains a refresh token for "gmail-archive"
+    And the mock OAuth2 server is primed to reject the next refresh_token exchange with OAuth error "invalid_grant"
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    And policy "archive-policy" grants folder on account "gmail-archive":
+      | folder | mode      | default  | rules |
+      | INBOX  | blacklist | ENVELOPE | []    |
+    When archive-agent calls list_folders with account "gmail-archive"
     Then the response decision is DENY
-    And the response field reason equals "oauth_scope_insufficient"
-    And the response field required_scope contains "https://mail.google.com/"
-    And the response field granted_scope equals "gmail.readonly"
-    And the IMAP command STORE \Seen was NEVER issued against the provider
+    And the response field reason equals "needs_rebootstrap"
+    And the audit log contains an entry with tool "token_refresh", decision "DENY", reason "token_refresh_failed"
+    When the server receives SIGHUP
+    And the server is restarted
+    And archive-agent calls list_accounts
+    Then the account entry for "gmail-archive" has field "state" equal to "needs_rebootstrap"
+    When archive-agent calls list_folders with account "gmail-archive"
+    Then the response decision is DENY
+    And the response field reason equals "needs_rebootstrap"
+    And the mock OAuth2 token endpoint recorded 1 token request
+    And the mock-gmail server received 0 IMAP connections
+    When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive` and completes the browser consent callback
+    And the server receives SIGHUP
+    And archive-agent calls list_folders with account "gmail-archive"
+    Then the response decision is ALLOW
 
-  Scenario: Token refresh happy path — access token is renewed at 80% of lifetime in the background
-    Given the secret store contains a valid refresh token for "gmail-archive"
-    And the mock OAuth2 provider returns access tokens with lifetime 60 seconds
-    When the server starts and opens an IMAP connection to "gmail-archive"
-    And the server runs for 50 seconds
-    Then the mock OAuth2 token endpoint records at least 2 token-exchange requests
-    And the currently open IMAP connection has never failed authentication
-    And the audit log contains at least 1 entry with tool "token_refresh", result "OK", account "gmail-archive"
+  Scenario: Token cache memory_only never writes access_token to disk
+    Given account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "memory_only"
+    And the secret store contains a valid refresh token for "gmail-archive"
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    And policy "archive-policy" grants folder on account "gmail-archive":
+      | folder | mode      | default  | rules |
+      | INBOX  | blacklist | ENVELOPE | []    |
+    When archive-agent calls list_folders with account "gmail-archive"
+    Then the response decision is ALLOW
+    And the secret store file "accounts/gmail-archive/refresh_token" exists
+    And no file exists in the secret store at "accounts/gmail-archive/access_token"
 
-  Scenario: Refresh-token revoked — invalid_grant moves the account to needs_rebootstrap and halts connections
-    Given the secret store contains a refresh token for "gmail-archive"
-    And the mock OAuth2 provider responds to the next token-exchange request with error "invalid_grant"
-    When the server attempts to open an IMAP connection to "gmail-archive"
-    Then the connection attempt fails
-    And the account state for "gmail-archive" is "needs_rebootstrap"
-    And the audit log contains an entry with tool "token_refresh", decision "DENY", reason "invalid_grant"
-    And no further connection attempts to "gmail-archive" occur until the operator reruns the bootstrap
-
-  Scenario: Token cache "memory_only" does NOT persist the access token on disk
-    Given the secret store contains a valid refresh token for "gmail-ronly"
-    When the server starts and completes one token exchange for "gmail-ronly"
-    Then the secret store contains a value under key "accounts/gmail-ronly/refresh_token"
-    And the secret store does NOT contain a value under key "accounts/gmail-ronly/access_token"
-
-  Scenario: Token cache "persist_all" stores BOTH refresh and access tokens
-    Given the secret store contains a valid refresh token for "gmail-archive"
-    When the server starts and completes one token exchange for "gmail-archive"
-    Then the secret store contains a value under key "accounts/gmail-archive/refresh_token"
-    And the secret store contains a value under key "accounts/gmail-archive/access_token"
+  Scenario: Token cache persist_all persists access_token and reuses it across a server restart
+    Given account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "persist_all"
+    And the secret store contains a valid refresh token for "gmail-archive"
+    And the mock OAuth2 server issues access tokens with expires_in 3600 seconds
+    And the server is configured with caller "archive-agent" using policy "archive-policy"
+    And policy "archive-policy" grants account "gmail-archive"
+    And policy "archive-policy" grants folder on account "gmail-archive":
+      | folder | mode      | default  | rules |
+      | INBOX  | blacklist | ENVELOPE | []    |
+    When archive-agent calls list_folders with account "gmail-archive"
+    Then the response decision is ALLOW
+    And the secret store file "accounts/gmail-archive/access_token" exists with mode 0600
+    And the mock OAuth2 token endpoint recorded 1 token request
     When the server is restarted
-    Then the server reuses the persisted access token without issuing a new token-exchange request
-    And the mock OAuth2 token endpoint records only the prior token-exchange count
-
-  Scenario: PKCE verifier mismatch — bootstrap fails and no secret is written
-    Given the mock OAuth2 provider is primed to tamper with the code_challenge
-    When the operator runs `imap-mcp-oauth-bootstrap --account gmail-archive`
-    And the bootstrap opens the provider consent URL and the browser returns authorization code "authcode-xyz"
-    Then the bootstrap reports failure with reason "pkce_verification_failed"
-    And the secret store has no value under key "accounts/gmail-archive/refresh_token"
+    And archive-agent calls list_folders with account "gmail-archive"
+    Then the response decision is ALLOW
+    And the mock OAuth2 token endpoint recorded 1 token request

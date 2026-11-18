@@ -1,76 +1,131 @@
-Feature: Non-goal tool surface is genuinely absent
+Feature: Non-goal, retired, system-flag, and parameter-smuggling paths fail closed
 
-  The server's defence against misbehaving callers is partly by
-  omission: certain operations are not exposed as MCP tools at all.
-  Attempts to invoke them, send them raw, or reach them through
-  side channels must fail closed. See ADR 0018.
+  ADR 0045, ADR 0048, and ADR 0052 defend the mediation boundary by
+  omission and strict input rejection:
+    - Destructive, structural, admin, bypass, retired 2.x rewrite,
+      deferred bulk_move (LIM 0011), and production-disabled _test_run_*
+      tools return JSON-RPC -32601 and log reason="unknown_tool".
+    - Every \-prefixed IMAP system flag (\Deleted, \Flagged, \Seen,
+      \Answered, \Draft, \Recent) is rejected in mark_tagged with
+      reason="forbidden_flag".
+    - Undeclared extra arguments (such as {"impersonate": ...}) are
+      rejected with JSON-RPC -32602 rather than ignored.
+    - HTTP /admin endpoints return 404.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Tool does not exist (JSON-RPC unknown method) : 5
-    - Tool exists but arg constitutes bypass        : 2
-    - Admin-shape channel absent                    : 3
-    Total enumerated                                 : 10   covered by this feature: 10
+    - Non-goal, retired, deferred, and test tools (-32601)  : 24
+    - Move to unlisted Trash folder denied as folder_hidden : 1
+    - All 6 \-system flags rejected as forbidden_flag       : 6
+    - describe_policy never leaks hidden folder names       : 1
+    - HTTP /admin and /admin/reload-policy return 404       : 2
+    - Extra argument smuggling rejected with -32602         : 1
+    Total enumerated                                        : 35  covered by this feature: 35
 
   Background:
-    Given the server is started with a minimal configuration
-    And invoice-agent completes an Initialize handshake successfully
+    Given the server clock is pinned to "2026-05-07T12:00:00Z"
+    And the audit log directory is a fresh $TMPDIR/audit
+    And secret_store configuration is:
+      """
+      backend: file_dir
+      path: $TMPDIR/secrets
+      acknowledge_plaintext: true
+      """
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path      |
+      | INBOX            |
+      | INBOX/Rechnungen |
+      | Banking          |
+    And the server is configured with single caller:
+      | caller_id     | auth_type     | policy         |
+      | invoice-agent | stdio_trusted | invoice-policy |
+    And policy "invoice-policy" grants account "gupta-scaratec"
+    And policy "invoice-policy" grants folder on account "gupta-scaratec":
+      | folder           | mode      | default  | mark_tagged | move_out | rules |
+      | INBOX/Rechnungen | blacklist | ENVELOPE | true        | true     | []    |
 
-  Scenario Outline: Calling a non-goal tool yields JSON-RPC error method_not_found
+  Scenario Outline: Calling non-goal, retired, or unenabled test tool <tool> returns JSON-RPC -32601
+    Given the server process is started without IMAP_MCP_TEST_MODE on transport "stdio" with IMAP_MCP_CALLER_ID="invoice-agent"
+    And invoice-agent completes an Initialize handshake successfully
     When invoice-agent calls the MCP method "tools/call" with name "<tool>"
     Then the server responds with JSON-RPC error code -32601
-    And the audit log contains an entry with tool "auth_failed_or_unknown_method", decision "DENY", reason "unknown_tool"
+    And the audit log contains an entry with decision "DENY", reason "unknown_tool"
 
     Examples:
-      | tool                  |
-      | delete                |
-      | expunge               |
-      | raw_imap_command      |
-      | fetch_raw_rfc822      |
-      | impersonate           |
-      | subscribe_to_new_mail |
-      | search_across_accounts|
-      | create_folder         |
-      | rename_folder         |
-      | rotate_tokens         |
-      | reload_policy         |
-      | get_audit_log         |
-      | get_server_config     |
-      | bulk_move             |
+      | tool                     |
+      | delete                    |
+      | hard_delete               |
+      | delete_draft              |
+      | expunge                   |
+      | store_deleted_flag        |
+      | add_attachment            |
+      | replace_attachment        |
+      | delete_attachment         |
+      | raw_imap_command          |
+      | fetch_raw_rfc822          |
+      | impersonate               |
+      | bypass_redaction          |
+      | subscribe_to_new_mail     |
+      | search_across_accounts    |
+      | create_folder             |
+      | rename_folder             |
+      | rotate_tokens             |
+      | reload_policy             |
+      | get_audit_log             |
+      | get_server_config         |
+      | initiate_oauth            |
+      | bulk_move                 |
+      | _test_run_recovery        |
+      | _test_run_audit_rotation  |
 
-  Scenario: A move call whose target is a non-existent "Trash" (because no Trash folder policy exists) yields capability_missing, not silent deletion
-    Given caller "invoice-agent" has no policy that references any folder named "Trash"
-    And the folder "INBOX/Rechnungen" holds a message with uid 701
-    When invoice-agent calls move with source {"account":"gupta-scaratec","folder":"INBOX/Rechnungen","uid":701}, target {"account":"gupta-scaratec","folder":"Trash"}
+  Scenario: Moving to an unlisted Trash folder is denied with folder_hidden and leaves source intact
+    Given the folder "INBOX/Rechnungen" holds messages:
+      | uid | from_address         | to_address            | subject    | date                 |
+      | 701 | rechnung@hornbach.de | me@gupta-scaratec.com | Rechnung 1 | 2026-05-06T09:00:00Z |
+    When invoice-agent calls move with source {"account": "gupta-scaratec", "folder": "INBOX/Rechnungen", "uid": 701}, target {"account": "gupta-scaratec", "folder": "Trash"}
     Then the response decision is DENY
     And the response field reason equals "folder_hidden"
     And the IMAP folder "INBOX/Rechnungen" still contains uid 701
-    And the IMAP server has no folder named "Trash" that now holds uid 701
 
-  Scenario: A mark_tagged call attempting to set \Deleted is rejected
-    Given the folder "INBOX/Rechnungen" holds a message with uid 702
-    And policy grants mark_tagged=true on "INBOX/Rechnungen"
-    When invoice-agent calls mark_tagged with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 702, tags ["\Deleted"], mode "add"
+  Scenario Outline: mark_tagged rejects IMAP system flag <sys_flag> with forbidden_flag
+    Given the folder "INBOX/Rechnungen" holds messages:
+      | uid | from_address         | to_address            | subject    | flags | date                 |
+      | 702 | rechnung@hornbach.de | me@gupta-scaratec.com | Rechnung 2 | []    | 2026-05-06T09:00:00Z |
+    When invoice-agent calls mark_tagged with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 702, tags ["<sys_flag>"], mode "add"
     Then the response decision is DENY
-    And the response field reason equals "forbidden_system_flag"
-    And the IMAP message at "INBOX/Rechnungen" uid 702 does NOT have flag "\Deleted"
+    And the response field reason equals "forbidden_flag"
+    And the IMAP message at "INBOX/Rechnungen" uid 702 does NOT have flag "<raw_flag>"
 
-  Scenario: Calling describe_policy never returns rule patterns or hidden folder names (re-asserted against bypass attempts)
-    Given the IMAP account "gupta-scaratec" has a hidden folder "Banking"
+    Examples:
+      | sys_flag   | raw_flag  |
+      | \\Deleted  | \Deleted  |
+      | \\Flagged  | \Flagged  |
+      | \\Seen     | \Seen     |
+      | \\Answered | \Answered |
+      | \\Draft    | \Draft    |
+      | \\Recent   | \Recent   |
+
+  Scenario: describe_policy omits hidden folder names on granted accounts
     When invoice-agent calls describe_policy
-    Then the JSON response does NOT contain the literal string "Banking"
+    Then the response decision is ALLOW
+    And the JSON response does NOT contain the literal strings:
+      | forbidden_string |
+      | Banking          |
 
-  Scenario: An attempt to reach `/admin` over HTTP transport is 404, not a routed endpoint
-    Given the server is configured with callers:
-      | caller_id     | auth_type    | token_secret_ref                     |
-      | invoice-agent | shared_token | secret://callers/invoice-agent/token |
-    And the secret store contains value "tok" under "callers/invoice-agent/token"
-    And the server is started with transport "http" on a random port
-    When an HTTP client makes GET /admin against the server
-    Then the HTTP response status code is 404
-    When an HTTP client makes POST /admin/reload-policy against the server
+  Scenario Outline: HTTP admin-shaped path <method> <path> returns 404
+    Given the file "$TMPDIR/secrets/callers/invoice-agent/token" contains the exact bytes "tok-secret"
+    And the server is configured with single caller:
+      | caller_id     | auth_type    | token_secret_ref                     | policy         |
+      | invoice-agent | shared_token | secret://callers/invoice-agent/token | invoice-policy |
+    And the server process is started with transport "http" on 127.0.0.1 and a random port
+    When an HTTP client makes <method> <path> against the server
     Then the HTTP response status code is 404
 
-  Scenario: Invocation of a meta-tool with an "impersonate" argument ignores it silently
-    When invoice-agent calls describe_policy with extra argument {"impersonate": "overview-agent"}
-    Then the response field caller_id equals "invoice-agent"
-    And the response field accounts describes the "invoice-agent" policy, not "overview-agent"
+    Examples:
+      | method | path                 |
+      | GET    | /admin               |
+      | POST   | /admin/reload-policy |
+
+  Scenario: Passing an undeclared impersonate argument to describe_policy is rejected with JSON-RPC -32602
+    When invoice-agent calls describe_policy with the arguments {"impersonate": "overview-agent"}
+    Then the server responds with JSON-RPC error code -32602
+    And the audit log contains an entry with decision "DENY", reason "invalid_arguments"

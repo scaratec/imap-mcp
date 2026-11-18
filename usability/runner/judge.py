@@ -169,7 +169,7 @@ class ClaudeJudge:
             try:
                 proc = subprocess.run(
                     argv, cwd=cwd, env=harness_env(Path(cwd)), capture_output=True, text=True,
-                    timeout=self.cfg.timeout_seconds, stdin=subprocess.DEVNULL,
+                    timeout=self.cfg.timeout_seconds, stdin=subprocess.DEVNULL, check=False,
                 )
             except subprocess.TimeoutExpired:
                 return Judgement(None, "", error=f"timeout: judge exceeded {self.cfg.timeout_seconds} s")

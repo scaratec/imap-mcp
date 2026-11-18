@@ -92,7 +92,8 @@ def make_decider(ev: Evidence, judge: Judge) -> Callable[[Criterion], Decision]:
     tasks = "\n---\n".join(conversation or [t.prompt for t in ev.scenario.turns])
 
     def decide(criterion: Criterion) -> Decision:
-        assert criterion.text is not None
+        if criterion.text is None:
+            raise AssertionError("criterion.text must not be None")
         evaluator = REGISTRY.get(criterion.text)
         if evaluator is None:
             return Decision(None, error=f"no implementation for criterion: {criterion.text}")

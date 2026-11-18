@@ -61,6 +61,15 @@ class PolicyRow:
 
 
 @dataclass(frozen=True)
+class VariantPolicyRequirement:
+    folder: str
+    mode: str
+    default: str
+    variant: str | None = None
+    capabilities: dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Criterion:
     """`Then the run is graded "<grade>" if <text>` (text None = otherwise)."""
 
@@ -99,12 +108,14 @@ class ScenarioSpec:
     empty_folders: list[str] = field(default_factory=list)
     caller: str = ""
     custom_policy: list[PolicyRow] | None = None
+    variant_policy_requirements: list[VariantPolicyRequirement] = field(default_factory=list)
     server_date: str | None = None
     sink_empty: bool = False
     simulator_default: str | None = None
     simulator_answers: dict[str, str] = field(default_factory=dict)
     instructions_statement: str | None = None
     ideal_calls: int | None = None
+    ideal_calls_by_variant: dict[str, int] = field(default_factory=dict)
     ideal_path: str = ""
     turns: list[Turn] = field(default_factory=list)
     rubric: list[Criterion] = field(default_factory=list)
@@ -113,6 +124,16 @@ class ScenarioSpec:
     @property
     def tasks(self) -> list[Turn]:
         return self.turns
+
+    def get_ideal_calls(self, variant: str | None = None) -> int | None:
+        if variant and self.ideal_calls_by_variant:
+            if variant in self.ideal_calls_by_variant:
+                return self.ideal_calls_by_variant[variant]
+            if variant == "today":
+                return self.ideal_calls_by_variant.get("today", self.ideal_calls)
+            if "draft_edit" in self.ideal_calls_by_variant:
+                return self.ideal_calls_by_variant["draft_edit"]
+        return self.ideal_calls
 
 
 @dataclass
@@ -130,13 +151,21 @@ _SEEDED = _P(
     r'^the usability mailbox "(?P<acct>[^"]+)" is seeded fresh with provider "(?P<prov>[^"]+)"'
     r"(?P<loc> and localized folder names:)?$"
 )
-_EMPTY = _P(r'^the folder "(?P<folder>[^"]+)" of "(?P<acct>[^"]+)" is empty$')
-_CALLER_VARIANT = _P(r'^the agent works as caller "(?P<caller>[^"]+)" with the policy of the server variant$')
+_EMPTY = _P(r'^the folder "(?P<folder>[^"]+)" of "(?P<acct>[^"]+)" is empty(?:\s+unless seeded below)?$')
+_CALLER_VARIANT_REQ = _P(
+    r'^the agent works as caller "(?P<caller>[^"]+)" with variant policy requiring:$'
+)
+_CALLER_VARIANT_DEFAULT = _P(
+    r'^the agent works as caller "(?P<caller>[^"]+)" with the policy of the server variant$'
+)
 _CALLER_TABLE = _P(r'^the agent works as caller "(?P<caller>[^"]+)" with a policy that grants:$')
 _SIM_DEFAULT = _P(r'^the user simulator answers any question it does not recognise with "(?P<text>[^"]*)"$')
 _SIM_TOPIC = _P(r'^the user simulator answers questions about (?:the )?(?P<topic>.+?) with "(?P<text>[^"]*)"$')
-_IDEAL = _P(r"^the ideal path takes (?P<n>\d+) tool calls?: (?P<path>.+)$")
-_DATE = _P(r'^the server date is pinned to "(?P<date>[^"]+)"$')
+_IDEAL_MULTI = _P(
+    r"^the ideal path takes (?P<n1>\d+) tool calls on variants with (?P<v1>\w+)\s*(?:\([^)]*\))?\s*or\s*(?P<n2>\d+) tool calls on variant \"(?P<v2>[^\"]+)\"\s*(?:\([^)]*\))?$"
+)
+_IDEAL = _P(r"^the ideal path takes (?P<n>\d+) tool calls?(?::\s*|\s+on\s+)(?P<path>.+)$")
+_DATE = _P(r'^the server (?:date|clock) is pinned to "(?P<date>[^"]+)"$')
 _HOLDS = _P(r'^the mailbox "(?P<acct>[^"]+)" holds messages:$')
 _SINK_EMPTY = _P(r"^the attachment sink directory is empty$")
 _NO_PREF = _P(r"^no format preference is stated in the harness instructions file$")
@@ -191,8 +220,49 @@ def _message_rows(table: Any) -> list[MessageRow]:
     return rows
 
 
+ALLOWED_POLICY_COLUMNS = frozenset({"folder", "mode", "default", "rules", "move_out"})
+CAPABILITY_COLUMNS = frozenset(
+    {"draft_append", "draft_edit", "move_out", "copy_out", "accept_incoming", "mark_seen", "mark_tagged"}
+)
+ALLOWED_VARIANT_POLICY_COLUMNS = frozenset({"variant", "folder", "mode", "default"}) | CAPABILITY_COLUMNS
+
+
+def _variant_policy_rows(table: Any) -> list[VariantPolicyRequirement]:
+    headings = set(table.headings)
+    unknown = headings - ALLOWED_VARIANT_POLICY_COLUMNS
+    if unknown:
+        raise FeatureError(f"unknown columns in variant policy requiring table: {sorted(unknown)}")
+    for req_col in ("folder", "mode", "default"):
+        if req_col not in headings:
+            raise FeatureError(f"variant policy requiring table missing mandatory column {req_col!r}")
+
+    rows: list[VariantPolicyRequirement] = []
+    for row in table:
+        var = row["variant"].strip() if "variant" in headings and row["variant"] else None
+        caps = {
+            col: _bool(row[col])
+            for col in CAPABILITY_COLUMNS
+            if col in headings and row[col] is not None and row[col].strip() != ""
+        }
+        rows.append(
+            VariantPolicyRequirement(
+                folder=row["folder"].strip(),
+                mode=row["mode"].strip(),
+                default=row["default"].strip(),
+                variant=var,
+                capabilities=caps,
+            )
+        )
+    return rows
+
+
 def _policy_rows(table: Any) -> list[PolicyRow]:
     import json
+
+    headings = set(table.headings)
+    unknown = headings - ALLOWED_POLICY_COLUMNS
+    if unknown:
+        raise FeatureError(f"unknown columns in policy table: {sorted(unknown)}")
 
     rows: list[PolicyRow] = []
     for row in table:
@@ -229,7 +299,13 @@ def _apply_step(spec: ScenarioSpec, step: Any, where: str) -> None:
     if m := _EMPTY.match(text):
         spec.empty_folders.append(m["folder"])
         return
-    if m := _CALLER_VARIANT.match(text):
+    if m := _CALLER_VARIANT_REQ.match(text):
+        spec.caller = m["caller"]
+        if step.table is None:
+            raise FeatureError(f"{where}: variant policy requirement table missing")
+        spec.variant_policy_requirements = _variant_policy_rows(step.table)
+        return
+    if m := _CALLER_VARIANT_DEFAULT.match(text):
         spec.caller = m["caller"]
         return
     if m := _CALLER_TABLE.match(text):
@@ -244,10 +320,20 @@ def _apply_step(spec: ScenarioSpec, step: Any, where: str) -> None:
     if m := _SIM_TOPIC.match(text):
         spec.simulator_answers[m["topic"]] = m["text"]
         return
-    if m := _IDEAL.match(text):
-        spec.ideal_calls = int(m["n"])
-        spec.ideal_path = m["path"]
-        return
+    if text.startswith("the ideal path takes"):
+        if m := _IDEAL_MULTI.match(text):
+            spec.ideal_calls = int(m["n1"])
+            spec.ideal_calls_by_variant[m["v1"]] = int(m["n1"])
+            spec.ideal_calls_by_variant[m["v2"]] = int(m["n2"])
+            spec.ideal_path = text
+            return
+        if m := _IDEAL.match(text):
+            spec.ideal_calls = int(m["n"])
+            spec.ideal_path = m["path"]
+            return
+        if re.search(r"\b\d+\b.*\bor\b.*\b\d+\b", text):
+            raise FeatureError(f"{where}: multiple ideal numbers without variant mapping: {text}")
+        raise FeatureError(f"{where}: invalid ideal path syntax: {text}")
     if m := _DATE.match(text):
         spec.server_date = m["date"]
         return

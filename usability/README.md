@@ -132,21 +132,12 @@ scenario in one cell, one repetition. Per run the runner:
   choice cannot be told apart from a lucky one.
 - **Self-reports are unreliable.** Feedback is always cross-checked
   against audit and trace; contradictions are a measurement of their own.
-- **Fixture fidelity.** mock-gmail models labels, localized folders and
-  drafts only as far as we built it; occasional manual smoke tests on a
-  dedicated Google test account complement it.
-- **Cost, quotas, terms.** Copilot premium requests and Antigravity
-  quotas bound the matrix size; automated use of each CLI is subject to
-  its terms.
-- **Results age fast.** Harness, model and server versions are recorded
-  on every run record; a report states the versions it covers.
-- **Fixture fidelity gaps seen while building the runner** (mock-gmail,
-  2026-11-03): `UID SEARCH` ignores `BEFORE` (only `SINCE`, `FROM`,
-  `SUBJECT`, `HEADER`), `BODYSTRUCTURE` always answers `text/plain`, so
-  `list_messages` reports `has_attachment: false` for the invoice mails,
-  and `STATUS` counts are 0, so `list_folders` shows `message_count: 0`.
-  These affect S2 (quarter window), S3/A2 (attachments) and every agent
-  that trusts folder counts; they do not affect E1.
+- **Fixture fidelity.** `mock-gmail` models RFC 3501 search keys
+  (`BEFORE`, `ON`, `SINCE`, `SENT*`, `LARGER`, `SMALLER`, `FLAGGED`),
+  full `BODYSTRUCTURE` with attachment dispositions, `STATUS` counts,
+  `X-GM-MSGID`/`X-GM-LABELS` (including atom vs quoted system labels),
+  and localized mUTF-7 folder names (`ADR 0040`, `ADR 0044`); occasional
+  manual smoke tests on a dedicated Google test account complement it.
 
 ## Running the matrix
 
@@ -217,13 +208,18 @@ be built, an invalid feedback schema, an unusable server binary.
    Gmail names are served in modified UTF-7.
 2. A fresh mock-gmail (own thread, free loopback port), a fresh server
    config (`accounts.yaml`, `callers.yaml`, the variant policy from
-   `fixtures/policies/`, or the scenario's own policy table for P1/P2),
+   `fixtures/policies/` — verified cell-for-cell against the scenario's
+   `with variant policy requiring:` table, aborting the run setup with an
+   error on any mismatch — or the scenario's own policy table for P1/P2),
    fresh audit dir, WAL and attachment sink, and a fresh in-process OTLP
-   collector. The server gets `IMAP_MCP_FAKE_NOW_UTC`,
-   `IMAP_MCP_TRACE_PAYLOADS=full` and
+   collector. Because the synthetic scenarios pin calendar time via
+   `IMAP_MCP_FAKE_NOW_UTC`, the runner passes `IMAP_MCP_TEST_MODE=1`,
+   `IMAP_MCP_FAKE_NOW_UTC`, `IMAP_MCP_TRACE_PAYLOADS=full` and
    `OTEL_RESOURCE_ATTRIBUTES=run.id=…,harness=…,model=…,scenario=…,server.variant=…`
-   through the harness's MCP config only; the harness process itself
-   gets no `OTEL_*`/`IMAP_MCP_*` variables.
+   exclusively to the per-run synthetic `imap-mcp` subprocess (ADR 0058,
+   ADR 0060; `_test_run_*` tools remain omitted from `tools/list` and any
+   call to them is recorded in the run's audit log); the harness process
+   itself gets no `OTEL_*`/`IMAP_MCP_*` variables.
 3. Turns: the task, then for every turn whose last paragraphs contain a
    question the simulator's answer (topics from `matrix.yaml`, answers
    from the scenario), then follow-up tasks, all in the same session,
@@ -236,13 +232,12 @@ be built, an invalid feedback schema, an unusable server binary.
    timeouts, quota/auth/model errors and isolation breaches end the run
    `not-assessable` with the cause.
 
-Server variants: `today` lists every Gmail system folder under its
-canonical and German name with identical settings and grants no
-`draft_edit`; `fixed` lists canonical names only and grants
-`draft_edit` on drafts; `format-hint` uses the `fixed` policy. All
-variants run the server of this checkout: the `@pending` server
-behaviour that `fixed`/`format-hint` presuppose is whatever this
-checkout implements.
+Server variants: `today` grants no `draft_edit` on `[Gmail]/Drafts`
+(measuring how agents behave when draft editing is restricted by policy);
+`fixed` grants `draft_edit` and `move_out` on `[Gmail]/Drafts` and
+`accept_incoming` on `[Gmail]/Trash`; `format-hint` uses the `fixed`
+policy. All variants execute against the 3.0.0 server binary of this
+checkout.
 
 ### Isolation per harness
 
@@ -293,7 +288,7 @@ cwd.
   else "subjects_or_bodies" when the answer contains amounts.
 - F6 theme grouping is mechanical (by `unclear.subject`, `missing`,
   `free_text` and tool names mentioned); the judged thematic grouping is
-  not automated. `error_misreadings` is judged with ADR 0017 and 0027 as
-  context, only when the form lists errors.
+  not automated. `error_misreadings` is judged with ADR 0043 and ADR 0044
+  as context, only when the form lists errors.
 - `wall_clock_seconds` covers the task turns; the feedback turn has its
   own budget (`limits.feedback_seconds`).

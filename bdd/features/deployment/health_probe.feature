@@ -1,55 +1,48 @@
-@pending
-Feature: HTTP health probe for orchestrated deployment
-  As a cluster operator running imap-mcp as a sidecar (ADR-0029),
-  I want an unauthenticated GET /healthz that reports whether the
-  server has loaded its configuration and is serving,
-  so that a liveness probe can restart a wedged container without
-  holding a caller credential and without widening the tool surface.
+Feature: Loopback HTTP /healthz liveness probe for sidecar deployment
 
-  # @pending: this whole feature is a red-first specification for
-  # ADR-0029 §7. `/healthz` does not exist yet — runtime/http.py
-  # answers 404 for every path except the MCP endpoint. The tag comes
-  # off in the change that implements the endpoint; it is NOT a
-  # fixture gap. See docs/ROADMAP.md entry 23.
-
-  The probe is the only path besides the MCP endpoint that the HTTP
-  transport answers. Everything else — including `/admin` and
-  `/admin/reload-policy` (ADR-0018, non_goal_rejection.feature) —
-  stays 404. The probe carries no authentication because a kubelet
-  cannot hold a caller token, and it therefore must disclose nothing
-  a caller has not already been granted.
-
-  Design note recorded during specification (ADR-0029 §7): the
-  distinction between "ready" and "unready" is narrow in this server.
-  A configuration error is fatal at startup (SystemExit), so the
-  process either serves or does not exist. The 503 state is reachable
-  only in the window between the listener binding and configuration
-  finishing to load. If the implementation binds the socket only
-  after the application object is fully constructed, that window is
-  empty and `/healthz` is a liveness signal, not a readiness signal.
-  Scenario "reports unavailable before configuration has loaded"
-  pins the required behaviour either way; whether it is observable
-  is an implementation property that the scenario will reveal.
+  ADR 0051 §2 exposes a single unauthenticated HTTP endpoint GET /healthz
+  on the loopback HTTP server:
+    - Returns HTTP 200 with {"status": "ok"} when configuration is loaded
+      and the audit directory is writable.
+    - Returns HTTP 503 with {"status": "unavailable"} when the audit
+      directory becomes unwritable.
+    - Discloses zero account, caller, path, or version details, writes no
+      audit entries, and returns HTTP 404 for non-GET methods and all
+      other non-MCP routes.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Ready       : configuration loaded          : 1
-    - Unready     : configuration not yet loaded  : 1
-    - Auth        : no credentials presented      : 1
-    - Auth        : wrong credentials presented   : 1
-    - Disclosure  : body reveals nothing further  : 1
-    - Method      : non-GET on /healthz           : 1
-    - Surface     : other paths remain 404        : 1
-    - Audit       : probe traffic is not recorded : 1
-    Total enumerated                              : 8   covered by this feature: 8
+    - Healthy server returns 200 {"status": "ok"}                    : 1
+    - Unauthenticated GET /healthz succeeds                          : 1
+    - Wrong Authorization header on /healthz still returns 200       : 1
+    - Response body contains only key "status", zero metadata leaks  : 1
+    - Unwritable audit directory flips /healthz to 503 unavailable   : 1
+    - Non-GET methods on /healthz return 404                         : 3
+    - Other HTTP paths (/health, /healthz/detail, /readyz, /metrics, /admin) : 5
+    - Probe requests write zero records to the audit chain           : 1
+    Total enumerated                                                 : 14  covered by this feature: 14
 
   Background:
-    Given the server is configured with callers:
-      | caller_id     | auth_type    | token_secret_ref                     |
-      | invoice-agent | shared_token | secret://callers/invoice-agent/token |
-    And the secret store contains value "correct-horse-battery" under "callers/invoice-agent/token"
+    Given the audit log directory is a fresh $TMPDIR/audit
+    And secret_store configuration is:
+      """
+      backend: file_dir
+      path: $SCRATCH/secrets
+      acknowledge_plaintext: true
+      """
+    And the file "$SCRATCH/secrets/callers/invoice-agent/token" contains the exact bytes "correct-horse-battery"
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path |
+      | INBOX       |
+    And the server is configured with single caller:
+      | caller_id     | auth_type    | token_secret_ref                     | policy         |
+      | invoice-agent | shared_token | secret://callers/invoice-agent/token | invoice-policy |
+    And policy "invoice-policy" grants account "gupta-scaratec"
+    And policy "invoice-policy" grants folder on account "gupta-scaratec":
+      | folder | mode      | default  | rules |
+      | INBOX  | blacklist | ENVELOPE | []    |
 
-  Scenario: A started server reports itself healthy
-    Given the server is started with transport "http" on a random port
+  Scenario: A started server reports HTTP 200 {"status": "ok"}
+    Given the server process is started with transport "http" on 127.0.0.1 and a random port
     When an HTTP client makes GET /healthz against the server
     Then the HTTP response status code is 200
     And the HTTP response body is the JSON object:
@@ -57,8 +50,8 @@ Feature: HTTP health probe for orchestrated deployment
       {"status": "ok"}
       """
 
-  Scenario: The probe requires no credentials
-    Given the server is started with transport "http" on a random port
+  Scenario: The probe requires no Authorization header
+    Given the server process is started with transport "http" on 127.0.0.1 and a random port
     When an HTTP client makes GET /healthz against the server without an Authorization header
     Then the HTTP response status code is 200
     And the HTTP response body is the JSON object:
@@ -66,45 +59,47 @@ Feature: HTTP health probe for orchestrated deployment
       {"status": "ok"}
       """
 
-  Scenario: A wrong bearer token does not turn the probe into an auth failure
-    Given the server is started with transport "http" on a random port
+  Scenario: A wrong bearer token on /healthz returns 200 without logging auth_failed
+    Given the server process is started with transport "http" on 127.0.0.1 and a random port
     When an HTTP client makes GET /healthz against the server with bearer token "wrong-token"
     Then the HTTP response status code is 200
     And the HTTP response body is the JSON object:
       """
       {"status": "ok"}
       """
-    And the audit log contains no entry with reason "auth_failed"
+    And the audit log contains 0 records with reason "auth_failed"
 
-  Scenario: The probe body discloses nothing beyond the status
-    Given the server is started with transport "http" on a random port
+  Scenario: The probe body contains only "status" and discloses no accounts, callers, paths, or versions
+    Given the server process is started with transport "http" on 127.0.0.1 and a random port
     When an HTTP client makes GET /healthz against the server
-    Then the HTTP response body has exactly the keys:
-      | key    |
-      | status |
-    And the HTTP response body does not mention any configured account id
-    And the HTTP response body does not mention any configured caller id
-    And the HTTP response body does not mention any configured filesystem path
-    And the HTTP response body does not mention the package version
+    Then the HTTP response body has the exact keys ["status"]
+    And the HTTP response text does NOT contain any of the literal strings:
+      | forbidden_string |
+      | gupta-scaratec   |
+      | invoice-agent    |
+      | secrets          |
+      | 3.0.0            |
 
-  Scenario: The probe reports unavailable before configuration has loaded
-    # Requires a startup hold-point so the listener is observable while
-    # the configuration load is still in flight. If no such window
-    # exists in the implementation, this scenario documents that
-    # `/healthz` is a liveness signal only — see the design note above.
-    Given the server is started with transport "http" on a random port with configuration loading held
+  Scenario: An unwritable audit directory switches GET /healthz to 503 {"status": "unavailable"} and recovers when writable
+    Given the test runner is not executing as root
+    And the server process is started with transport "http" on 127.0.0.1 and a random port
+    And the audit directory and current day file are made read-only
     When an HTTP client makes GET /healthz against the server
     Then the HTTP response status code is 503
     And the HTTP response body is the JSON object:
       """
       {"status": "unavailable"}
       """
-    When configuration loading is released
+    When writability of the audit directory and current day file is restored
     And an HTTP client makes GET /healthz against the server
     Then the HTTP response status code is 200
+    And the HTTP response body is the JSON object:
+      """
+      {"status": "ok"}
+      """
 
-  Scenario Outline: Only GET reaches the probe
-    Given the server is started with transport "http" on a random port
+  Scenario Outline: Non-GET HTTP methods on /healthz return 404
+    Given the server process is started with transport "http" on 127.0.0.1 and a random port
     When an HTTP client makes <method> /healthz against the server
     Then the HTTP response status code is 404
 
@@ -114,24 +109,20 @@ Feature: HTTP health probe for orchestrated deployment
       | PUT    |
       | DELETE |
 
-  Scenario Outline: Adding the probe does not widen the HTTP surface
-    Given the server is started with transport "http" on a random port
+  Scenario Outline: Other HTTP paths besides /mcp and /healthz return 404
+    Given the server process is started with transport "http" on 127.0.0.1 and a random port
     When an HTTP client makes GET <path> against the server
     Then the HTTP response status code is 404
 
     Examples:
-      | path             |
-      | /health          |
-      | /healthz/detail  |
-      | /readyz          |
-      | /metrics         |
-      | /admin           |
+      | path            |
+      | /health         |
+      | /healthz/detail |
+      | /readyz         |
+      | /metrics        |
+      | /admin          |
 
-  Scenario: Probe traffic does not enter the audit chain
-    # A liveness probe fires every few seconds for the life of the pod.
-    # Auditing it would bury every real decision under probe records
-    # and inflate the hash chain without adding evidence (ADR-0021).
-    Given the server is started with transport "http" on a random port
-    And the audit log is empty
+  Scenario: Probe traffic writes zero records into the audit chain
+    Given the server process is started with transport "http" on 127.0.0.1 and a random port
     When an HTTP client makes GET /healthz against the server 5 times
-    Then the audit log contains no entries
+    Then the audit log contains 0 records

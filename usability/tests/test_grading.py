@@ -152,8 +152,10 @@ def test_e2_partial_when_asked_although_preference_known() -> None:
 
 
 def test_r1_fulfilled_with_one_html_draft() -> None:
-    ev = evidence("R1", mutate=lambda s: append_draft(s, "mara.lindqvist@example.org", "Termin", html=True),
-                  turns=[turn(0, "ok"), turn(1, "ok", source="followup")])
+    t0 = turn(0, "ok", [("create_draft", True)])
+    t0.result.tool_calls[0].input = {"body_text": "Langer erster Entwurf mit zwei ausfuehrlichen Absaetzen an Mara Lindqvist."}
+    ev = evidence("R1", mutate=lambda s: append_draft(s, "mara.lindqvist@example.org", "Termin", html=True, body="Kurzer Entwurf."),
+                  turns=[t0, turn(1, "ok", source="followup")])
     assert grade(ev, StubJudge()).grade == "fulfilled"
 
 

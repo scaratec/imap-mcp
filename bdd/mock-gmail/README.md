@@ -189,26 +189,31 @@ Limitation — never shrugged off. When the validation passes:
   `Resolved` when the mock plus any subsidiary Limitations cover
   everything the server's Gmail adapter does.
 
-## Layout (planned)
+## Layout
 
-```
+```text
 bdd/mock-gmail/
-├── pyproject.toml         # isolated project
-├── README.md              # this file
-├── traces/                # Phase 1 capture (git-annotated, redacted)
-│   ├── mbsync/
-│   └── imapsync/
+├── pyproject.toml
+├── README.md
 ├── src/mock_gmail/
 │   ├── __init__.py
-│   ├── __main__.py        # mock-gmail-server entry point
-│   ├── protocol/          # IMAP command parsing & serialisation
-│   ├── state/             # labels, folders, UID mapping
-│   ├── extensions/        # X-GM-MSGID, X-GM-LABELS, X-GM-THRID
-│   └── server.py          # connection acceptor, session state
-└── tests/                 # unit tests for each layer
+│   ├── __main__.py
+│   ├── mime.py
+│   ├── search.py
+│   ├── server.py
+│   └── state.py
+└── tests/
+    └── test_mock_gmail.py
 ```
 
-None of this is implemented yet — Phase 1 has not started.
+Implemented and active across `providers/gmail_*.feature`,
+`providers/localized_gmail_resolution.feature`, `performance/*.feature`,
+`auth/oauth2_bootstrap.feature`, and `tool_surface/bulk_mark_seen.feature`
+(enforcing password and `AUTHENTICATE XOAUTH2` checks, IMAP session state
+machine, `NO [TRYCREATE]` on unknown target mailboxes, RFC 3501 `SEARCH`
+and `BODYSTRUCTURE`, and localized mUTF-7 special-use folders per
+[ADR-0040](../../docs/adr/0040-message-centric-policy-and-gmail-composition.md)
+and [ADR-0056](../../docs/adr/0056-canonical-folder-resolution-and-code-registry.md)).
 
 ## Operator notes
 

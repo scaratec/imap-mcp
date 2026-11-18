@@ -250,7 +250,8 @@ class _Parser:
             if not parts:
                 raise SearchSyntaxError("empty parenthesised list")
             return lambda c: all(p(c) for p in parts)
-        assert isinstance(token, str)
+        if not isinstance(token, str):
+            raise SearchSyntaxError("Expected string token")
         word = token.upper()
         if word == "ALL":
             return lambda c: True

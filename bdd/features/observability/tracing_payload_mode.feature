@@ -1,62 +1,35 @@
-Feature: Trace payloads follow an operator-chosen mode: off, redacted or full
+Feature: Trace payloads follow an operator-chosen mode: off, redacted, or full
 
-  Each tool call produces a span tool.<name> (tracing.py, dispatch.py).
-  Today the span carries the complete request arguments as
-  mcp.request, draft bodies and recipients included, and a partly
-  filtered response as mcp.response. The audit log, by contrast, never
-  records content (ADR 0021).
-
-  Full payloads are valuable when the operator alone reads the trace
-  store and wants to see exactly what an agent sent and received; they
-  are a liability anywhere else. The company observability standard
-  (.scaratec/handbuch/observability.md §1, §7) forbids personal data in
-  telemetry. The mode is therefore an explicit operator choice through
-  IMAP_MCP_TRACE_PAYLOADS, the default is redacted, and full is an
-  opt-in that is visible on every span it affects.
-
-  ADR 0037 records the modes and the deviation of mode full from the
-  observability standard.
-
-  Rules used below:
-    - off: the span has no mcp.request and no mcp.response attribute.
-    - redacted: mcp.request holds the arguments as the audit log records
-      them (ADR 0021); mcp.response holds the response without message
-      content, addresses, subjects, headers, bodies or attachment data.
-    - full: both attributes hold the complete JSON, each cut at
-      IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS (default 16384) and marked
-      "…[truncated <n> chars]" when cut.
-    - In every mode each tool span carries imap_mcp.trace.payloads with
-      the active mode, so a reader can tell "redacted" from "empty".
-    - Secrets from the secret store never appear in any mode.
-
-  What is at stake. In redacted mode a single leaking field puts mail
-  subjects and addresses into a trace store that was assumed to be
-  clean. In full mode a silent truncation, or a mode nobody can see on
-  the span, makes the trace misleading exactly when it is consulted.
-
-  Independent-channel rule. Every Then reads the test trace sink, which
-  receives OTLP from the server process like a production collector and
-  is never consulted by the server. Negative witnesses search every
-  attribute of every span in the sink.
+  ADR 0053 §1 controls request/response attributes on
+  OpenTelemetry tool.<name> spans via IMAP_MCP_TRACE_PAYLOADS:
+    - redacted (default): mcp.request and mcp.response omit message
+      bodies, subjects, addresses, headers, and attachment filenames or
+      paths (saved_to, saved_path).
+    - full: complete JSON up to IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS
+      (default 16384), marked "…[truncated <n> chars]" when cut.
+    - off: neither mcp.request nor mcp.response is emitted.
+    - Secrets never appear in any mode, and unknown mode values refuse
+      server startup.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Default mode is redacted                                 : 1
-    - redacted: no content in request (write tool)              : 1
-    - redacted: no content in response (read tool)              : 1
-    - full: request and response complete                       : 1
-    - full: oversized payload truncated and marked              : 1
-    - off: no payload attributes, span still present            : 1
-    - Active mode recorded on the span                          : 3 (one per mode)
-    - Secrets absent in every mode                              : 3 (one per mode)
-    - Unknown mode value refused at startup                     : 1
-    Total enumerated                                            : 13  covered by this feature: 13
+    - Default mode when env unset is redacted                    : 1
+    - redacted scrubs draft content & recipients from request    : 1
+    - redacted scrubs subjects & addresses from fetch_envelope   : 1
+    - redacted scrubs attachment filenames & paths on sink fetch : 1
+    - full records complete request and response                 : 1
+    - full truncates oversized payloads with explicit marker     : 1
+    - off omits payload attributes while keeping timing          : 1
+    - Active mode recorded & secrets absent across all 3 modes   : 3
+    - Unknown mode value refuses startup                         : 1
+    Total enumerated                                             : 11  covered by this feature: 11
 
   Background:
-    Given a test trace collector is listening and the server exports traces to it
+    Given the server clock is pinned to "2026-10-31T12:00:00Z"
+    And a test trace collector is listening and the server exports traces to it
     And the IMAP account "gupta-scaratec" exists with folders:
-      | folder path |
-      | INBOX       |
-      | Drafts      |
+      | folder path | special use |
+      | INBOX       |             |
+      | Drafts      | \Drafts     |
     And the secret store holds the password "pw-Q7c!kX29" for account "gupta-scaratec"
     And the server is configured with caller "trace-agent" using policy "trace-policy"
     And policy "trace-policy" grants account "gupta-scaratec"
@@ -65,19 +38,15 @@ Feature: Trace payloads follow an operator-chosen mode: off, redacted or full
       | INBOX  | blacklist | FULL    | []    | false        |
       | Drafts | blacklist | FULL    | []    | true         |
     And the folder "INBOX" holds messages:
-      | uid | from                       | subject               | date                 |
-      | 311 | mara.lindqvist@example.org | Kündigung Mietvertrag | 2026-10-30T07:00:00Z |
+      | uid | from_address               | to_address            | subject               | date                 |
+      | 311 | mara.lindqvist@example.org | me@gupta-scaratec.com | Kündigung Mietvertrag | 2026-10-30T07:00:00Z |
 
-  # --- Default ---------------------------------------------------------
-
-  Scenario: Without a configured mode the payloads are redacted
+  Scenario: Without a configured mode the payloads default to redacted
     Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is not set
     When trace-agent calls fetch_envelope with account "gupta-scaratec", folder "INBOX", uid 311
     Then within 10 seconds the trace sink contains a span "tool.fetch_envelope" with attribute "imap_mcp.trace.payloads" equal to "redacted"
 
-  # --- redacted --------------------------------------------------------
-
-  Scenario: redacted keeps draft content and recipients out of the request attribute
+  Scenario: redacted keeps draft content and recipients out of mcp.request
     Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is set to "redacted"
     When trace-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
       """
@@ -94,14 +63,20 @@ Feature: Trace payloads follow an operator-chosen mode: off, redacted or full
     And no span in the trace sink contains the value "Mieterhöhung"
     And no span in the trace sink contains the value "42 Euro"
 
-  Scenario: redacted keeps subjects and addresses out of the response attribute
+  Scenario: redacted keeps subjects and addresses out of mcp.response
     Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is set to "redacted"
     When trace-agent calls fetch_envelope with account "gupta-scaratec", folder "INBOX", uid 311
     Then within 10 seconds the trace sink contains a span "tool.fetch_envelope" whose attribute "mcp.response" contains "\"decision\": \"ALLOW\""
     And no span in the trace sink contains the value "mara.lindqvist@example.org"
     And no span in the trace sink contains the value "Kündigung Mietvertrag"
 
-  # --- full ------------------------------------------------------------
+  Scenario: redacted scrubs attachment filenames and filesystem paths on fetch_attachment
+    Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is set to "redacted"
+    And the server attachment sink directory is a fresh writable directory
+    And the message at uid 311 has attachment "Geheimer_Mietvertrag.pdf" of type "application/pdf" with content byte "M" repeated 128 times
+    When trace-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX", uid 311, part_id 0
+    Then within 10 seconds the trace sink contains a span "tool.fetch_attachment" whose attribute "mcp.response" contains "\"decision\": \"ALLOW\""
+    And no span in the trace sink contains the value "Geheimer_Mietvertrag"
 
   Scenario: full records the complete request and response
     Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is set to "full"
@@ -110,7 +85,7 @@ Feature: Trace payloads follow an operator-chosen mode: off, redacted or full
     And the span "tool.fetch_envelope" in the trace sink has attribute "mcp.response" containing "Kündigung Mietvertrag"
     And the span "tool.fetch_envelope" in the trace sink has attribute "mcp.response" containing "mara.lindqvist@example.org"
 
-  Scenario: full cuts an oversized payload at the configured limit and marks the cut
+  Scenario: full truncates an oversized payload at IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS and appends the marker
     Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is set to "full"
     And the environment variable "IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS" is set to "2000"
     And the folder "INBOX" holds a message with uid 312 whose plain-text body is the letter "x" repeated 5000 times
@@ -118,9 +93,7 @@ Feature: Trace payloads follow an operator-chosen mode: off, redacted or full
     Then within 10 seconds the trace sink contains a span "tool.fetch_body" whose attribute "mcp.response" is at most 2000 characters before the marker
     And the span "tool.fetch_body" in the trace sink has attribute "mcp.response" ending with a marker of the form "…[truncated <n> chars]" where n is greater than 3000
 
-  # --- off -------------------------------------------------------------
-
-  Scenario: off drops both payload attributes but keeps the span and its timing
+  Scenario: off drops both payload attributes while preserving the span and latency
     Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is set to "off"
     When trace-agent calls fetch_envelope with account "gupta-scaratec", folder "INBOX", uid 311
     Then within 10 seconds the trace sink contains a span "tool.fetch_envelope" with attribute "imap_mcp.trace.payloads" equal to "off"
@@ -128,9 +101,7 @@ Feature: Trace payloads follow an operator-chosen mode: off, redacted or full
     And the span "tool.fetch_envelope" in the trace sink has no attribute "mcp.request"
     And the span "tool.fetch_envelope" in the trace sink has no attribute "mcp.response"
 
-  # --- Invariants across modes -----------------------------------------
-
-  Scenario Outline: The active mode is on the span and secrets never appear
+  Scenario Outline: The active mode is recorded on the span and secrets never appear in any mode
     Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is set to "<mode>"
     When trace-agent calls fetch_envelope with account "gupta-scaratec", folder "INBOX", uid 311
     Then within 10 seconds the trace sink contains a span "tool.fetch_envelope" with attribute "imap_mcp.trace.payloads" equal to "<mode>"
@@ -142,11 +113,7 @@ Feature: Trace payloads follow an operator-chosen mode: off, redacted or full
       | redacted |
       | full     |
 
-  # --- Error path: configuration ---------------------------------------
-
-  Scenario: An unknown mode is refused at startup instead of falling back silently
-    # Falling back to redacted would hide a typo in "full"; falling back
-    # to full would leak. Refusing is the only choice that cannot surprise.
+  Scenario: An unknown mode value is refused at startup
     Given the environment variable "IMAP_MCP_TRACE_PAYLOADS" is set to "verbose"
     When the server process is started with transport "stdio"
     Then the server refuses to start

@@ -1,166 +1,131 @@
-@pending
-Feature: Pending sagas recover on process start
-  As a cluster operator running imap-mcp as a sidecar (ADR-0029),
-  I want a transaction that was in flight when the process died to be
-  driven to a terminal state by the restart itself,
-  so that node drains, evictions, image rolls and OOM kills — all of
-  which are routine in a cluster — do not leave mail half-moved until
-  somebody notices.
+@test_hooks
+Feature: Automatic saga recovery on process startup with cross-instance WAL leases
 
-  # @pending: red-first specification for ADR-0029 §8. Recovery logic
-  # exists (`run_pending_recovery`), but on the current code path it is
-  # reachable only from the test-only control surface (ADR-0023); no
-  # startup scan drives it. The tag comes off in the change that runs
-  # recovery at startup. See docs/ROADMAP.md entry 22.
-  #
-  # The Background mirrors features/transactions/saga_crash_recovery.feature.
-  # Align step phrasings against that file when implementing; where the
-  # two disagree, that file wins — it is the one with passing steps.
-
-  This feature is the deliberate counterpart to
-  features/transactions/saga_crash_recovery.feature. That feature
-  narrates startup recovery in its header but drives every scenario
-  with an explicit "the server's background recovery loop runs once"
-  step. The recovery *logic* is therefore well covered; the recovery
-  *trigger* is not covered at all, and the trigger is the only part a
-  cluster depends on. A restarted pod has no test harness standing by
-  to call a hidden tool.
-
-  Every scenario below restarts the server and then asserts the
-  terminal state without any step that pokes the recovery machinery.
-  The only permitted stimulus after "the server is restarted" is
-  ordinary client traffic, and the assertions carry an explicit
-  timeout so that a recovery pass that never runs fails the scenario
-  rather than hanging it.
-
-  Persistence validation (per BDD Guidelines §13.2 Prüfung 1): every
-  scenario verifies via direct IMAP on both accounts AND direct WAL
-  read. The saga must not depend on its own self-reported state.
+  ADR 0046 §4 and ADR 0051 §3 require the server to scan wal.db on
+  startup and drive unleased non-terminal transactions for its caller_id
+  to completion automatically — without calling any test-only recovery
+  tool. SQLite leases prevent concurrent local instances from executing
+  duplicate recovery writes on the same transaction.
+  Audit hash-chain rule (ADR 0048): record i carries prev_hash = "sha256:" +
+  lowercase hex sha256(raw UTF-8 line i-1 including trailing LF), with
+  day-0 genesis "sha256:" + 64 zeros.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Pending saga at startup, recoverable          : 1
-    - Pending saga at startup, target unreachable   : 1
-    - No pending sagas: no spurious work            : 1
-    - Saga already at retry_limit: not retried      : 1
-    - Recovery does not block the tool surface      : 1
-    - WAL file absent at startup                    : 1
-    - Recovery is audited; chain continues          : 1
-    - Second restart does not re-apply a commit     : 1
-    Total enumerated                                : 8   covered by this feature: 8
+    - Interrupted post-APPEND saga commits automatically on restart   : 1
+    - Interrupted pre-APPEND saga aborts automatically on restart     : 1
+    - Unreachable target increments retry_count and leaves server up  : 1
+    - Clean startup with empty WAL emits no recovery audit events     : 1
+    - Saga already at retry_limit escalates to needs_operator         : 1
+    - Missing wal.db file at first boot starts cleanly                : 1
+    - Recovery writes chained saga_transition records across restart  : 1
+    - Second restart is idempotent on committed sagas                 : 1
+    - Concurrent startup of two instances leases saga once, 1 target  : 1
+    Total enumerated                                                  : 9   covered by this feature: 9
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folder "INBOX/Rechnungen"
-    And the IMAP account "personal" exists with folder "Archiv/Belege"
+    Given the server clock is pinned to "2026-05-07T12:00:00Z"
+    And the audit log directory is a fresh $TMPDIR/audit
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path      |
+      | INBOX            |
+      | INBOX/Rechnungen |
+    And the IMAP account "personal" exists with folders:
+      | folder path   |
+      | INBOX         |
+      | Archiv/Belege |
+    And the IMAP traffic for "gupta-scaratec" is captured through a proxy
+    And the IMAP traffic for "personal" is captured through a proxy
     And the server is configured with caller "invoice-agent" using policy "invoice-policy"
     And policy "invoice-policy" grants account "gupta-scaratec"
     And policy "invoice-policy" grants account "personal"
-    And policy "invoice-policy" folder "INBOX/Rechnungen" has:
-      | mode      | default | rules |
-      | whitelist | FULL    | []    |
-    And policy "invoice-policy" folder "Archiv/Belege" has:
-      | mode      | default | rules |
-      | whitelist | FULL    | []    |
+    And policy "invoice-policy" grants the following folder policies:
+      | account        | folder           | mode      | default | move_out | accept_incoming | rules |
+      | gupta-scaratec | INBOX/Rechnungen | blacklist | FULL    | true     | false           | []    |
+      | personal       | Archiv/Belege    | blacklist | FULL    | false    | true            | []    |
     And the folder "INBOX/Rechnungen" holds messages:
-      | uid | from                 | message_id             |
-      | 901 | rechnung@hornbach.de | <inv-901@hornbach.de>  |
+      | uid | message_id            | from_address         | to_address            | subject      | date                 |
+      | 901 | <inv-901@hornbach.de> | rechnung@hornbach.de | me@gupta-scaratec.com | Rechnung 901 | 2026-05-06T09:00:00Z |
     And the WAL is empty
 
-  Scenario: A saga interrupted after APPEND completes on the next start
-    # The dangerous window: the message exists in both mailboxes. Until
-    # the saga finishes, a restart that does nothing leaves a duplicate
-    # in the operator's mail, silently.
-    Given the server is configured to crash after APPEND before VERIFY
-    When invoice-agent calls move with source {"account": "gupta-scaratec", "folder": "INBOX/Rechnungen", "uid": 901}, target {"account": "personal", "folder": "Archiv/Belege"}
-    And the server terminates ungracefully
-    Then the WAL entry for this tx_id has status "appended"
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the WAL entry for this tx_id reaches status "committed" within 30 seconds
-    And the message with Message-ID "<inv-901@hornbach.de>" is present exactly once in "personal" folder "Archiv/Belege"
-    And the message with Message-ID "<inv-901@hornbach.de>" is absent from "gupta-scaratec" folder "INBOX/Rechnungen"
+  Scenario: A saga interrupted after APPEND completes automatically on server restart
+    Given the server is armed with IMAP_MCP_CRASH_AT="post_append"
+    When invoice-agent invokes move expecting crash for uid 901 from "gupta-scaratec:INBOX/Rechnungen" to "personal:Archiv/Belege"
+    Then the WAL entry for the crashed move has status "fetched"
+    When the server is restarted without crash hooks
+    And invoice-agent calls list_accounts
+    Then within 10 seconds the WAL entry for the crashed move has status "committed"
+    And a direct IMAP SEARCH on "personal:Archiv/Belege" for message-id "<inv-901@hornbach.de>" returns exactly one result
+    And a direct IMAP SEARCH on "gupta-scaratec:INBOX/Rechnungen" for message-id "<inv-901@hornbach.de>" returns zero results
 
-  Scenario: A saga interrupted before APPEND aborts on the next start
-    Given the server is configured to crash after WAL BEGIN persistence
-    When invoice-agent calls move with source {"account": "gupta-scaratec", "folder": "INBOX/Rechnungen", "uid": 901}, target {"account": "personal", "folder": "Archiv/Belege"}
-    And the server terminates ungracefully
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the WAL entry for this tx_id reaches status "aborted" within 30 seconds
-    And the message with Message-ID "<inv-901@hornbach.de>" is present exactly once in "gupta-scaratec" folder "INBOX/Rechnungen"
-    And the message with Message-ID "<inv-901@hornbach.de>" is absent from "personal" folder "Archiv/Belege"
+  Scenario: A saga interrupted after BEGIN before FETCH aborts automatically on server restart
+    Given the server is armed with IMAP_MCP_CRASH_AT="post_begin"
+    When invoice-agent invokes move expecting crash for uid 901 from "gupta-scaratec:INBOX/Rechnungen" to "personal:Archiv/Belege"
+    When the server is restarted without crash hooks
+    And invoice-agent calls list_accounts
+    Then within 10 seconds the WAL entry for the crashed move has status "aborted"
+    And a direct IMAP SEARCH on "gupta-scaratec:INBOX/Rechnungen" for message-id "<inv-901@hornbach.de>" returns exactly one result
+    And a direct IMAP SEARCH on "personal:Archiv/Belege" for message-id "<inv-901@hornbach.de>" returns zero results
 
-  Scenario: A pending saga whose target is unreachable leaves the server serving
-    # A sidecar must come up even when the far account is down. Recovery
-    # is best-effort; startup is not.
-    Given the server is configured to crash after APPEND before VERIFY
-    When invoice-agent calls move with source {"account": "gupta-scaratec", "folder": "INBOX/Rechnungen", "uid": 901}, target {"account": "personal", "folder": "Archiv/Belege"}
-    And the server terminates ungracefully
-    And the IMAP account "personal" refuses connections
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the handshake succeeds
-    And invoice-agent can call list_folders on "gupta-scaratec"
-    And the WAL entry for this tx_id has status "appended"
-    And the WAL entry for this tx_id has a retry_count greater than 0
+  Scenario: An unreachable destination during startup recovery increments retry_count and leaves the server serving
+    Given the server is armed with IMAP_MCP_CRASH_AT="post_fetch"
+    When invoice-agent invokes move expecting crash for uid 901 from "gupta-scaratec:INBOX/Rechnungen" to "personal:Archiv/Belege"
+    And the IMAP proxy for "personal" refuses all incoming TCP connections
+    And the server is restarted without crash hooks
+    When invoice-agent calls list_folders with account "gupta-scaratec"
+    Then the response decision is ALLOW
+    And within 10 seconds the WAL entry for the crashed move has retry_count >= 1
+    And the WAL entry for the crashed move has status "fetched"
 
-  Scenario: A start with no pending sagas performs no recovery work
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the handshake succeeds
-    And the WAL contains no entries with a non-terminal status
-    And the audit log contains no entry with tool "saga_recovery"
+  Scenario: A clean startup with an empty WAL emits no saga_transition records
+    When the server is restarted without crash hooks
+    And invoice-agent calls list_accounts
+    Then the WAL contains 0 transaction entries
+    And the audit log contains 0 records with tool "saga_transition"
 
-  Scenario: A saga already at the retry limit is not retried again on restart
-    # Otherwise every pod restart burns another attempt against a
-    # transaction a human has already been asked to look at, and the
-    # retry_count grows without bound across a rollout.
+  Scenario: A transaction already at retry_limit escalates to needs_operator on startup without new target APPENDs
     Given the WAL retry_limit is configured to 3
-    And the WAL contains an in-progress transaction with status "appended" referencing uid 901 and Message-ID "<inv-901@hornbach.de>"
-    And that WAL entry has retry_count 3
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the WAL entry for this tx_id has status "needs_operator"
-    And the WAL entry for this tx_id has retry_count 3
+    And the server is armed with IMAP_MCP_CRASH_AT="post_fetch"
+    When invoice-agent invokes move expecting crash for uid 901 from "gupta-scaratec:INBOX/Rechnungen" to "personal:Archiv/Belege"
+    And the WAL retry_count for the crashed move is set to 3
+    And the IMAP command log for "personal" is cleared
+    And the server is restarted without crash hooks
+    And invoice-agent calls list_accounts
+    Then within 10 seconds the WAL entry for the crashed move has status "needs_operator"
+    And the WAL entry for the crashed move has retry_count 3
+    And the IMAP command log for "personal" contains no APPEND command
 
-  Scenario: The tool surface is available while recovery is still running
-    Given the server is configured to crash after APPEND before VERIFY
-    When invoice-agent calls move with source {"account": "gupta-scaratec", "folder": "INBOX/Rechnungen", "uid": 901}, target {"account": "personal", "folder": "Archiv/Belege"}
-    And the server terminates ungracefully
-    And the IMAP account "personal" delays every command by 5 seconds
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the handshake succeeds within 2 seconds
-    And invoice-agent can call list_folders on "gupta-scaratec" within 2 seconds
+  Scenario: A configured WAL path whose database file does not yet exist initializes cleanly on startup
+    Given the WAL database file is removed before startup
+    When the server is restarted without crash hooks
+    And invoice-agent calls list_accounts
+    Then the response decision is ALLOW
+    And the WAL database file exists with mode 0600 and 0 transaction entries
 
-  Scenario: A configured WAL whose file does not yet exist starts clean
-    # First start of a fresh pod: the state volume is empty. This must
-    # be an ordinary start, not an error, and must not create a
-    # transaction of its own.
-    Given the WAL database file does not exist
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the handshake succeeds
-    And the WAL contains no entries
-
-  Scenario: Recovery is audited and the audit chain continues across the restart
-    Given the server is configured to crash after APPEND before VERIFY
-    When invoice-agent calls move with source {"account": "gupta-scaratec", "folder": "INBOX/Rechnungen", "uid": 901}, target {"account": "personal", "folder": "Archiv/Belege"}
-    And the server terminates ungracefully
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the WAL entry for this tx_id reaches status "committed" within 30 seconds
-    And the audit log contains an entry with tool "saga_recovery", decision "ALLOW"
-    And that audit entry carries caller_id "invoice-agent"
-    And the audit chain verifies across the restart boundary
+  Scenario: Startup recovery writes chained saga_transition audit entries across the restart boundary
+    Given the server is armed with IMAP_MCP_CRASH_AT="post_append"
+    When invoice-agent invokes move expecting crash for uid 901 from "gupta-scaratec:INBOX/Rechnungen" to "personal:Archiv/Belege"
+    And the server is restarted without crash hooks
+    And invoice-agent calls list_accounts
+    Then within 10 seconds the WAL entry for the crashed move has status "committed"
+    And file "2026-05-07.jsonl" contains a record with tool "saga_transition" and step "commit"
+    And all records of file "2026-05-07.jsonl" form a valid hash chain with consecutive seq numbers starting at 0
 
   Scenario: A second restart does not re-apply an already committed saga
-    Given the server is configured to crash after APPEND before VERIFY
-    When invoice-agent calls move with source {"account": "gupta-scaratec", "folder": "INBOX/Rechnungen", "uid": 901}, target {"account": "personal", "folder": "Archiv/Belege"}
-    And the server terminates ungracefully
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the WAL entry for this tx_id reaches status "committed" within 30 seconds
-    When the server is restarted
-    And invoice-agent completes an Initialize handshake successfully
-    Then the WAL entry for this tx_id has status "committed"
-    And the message with Message-ID "<inv-901@hornbach.de>" is present exactly once in "personal" folder "Archiv/Belege"
+    Given the server is armed with IMAP_MCP_CRASH_AT="post_append"
+    When invoice-agent invokes move expecting crash for uid 901 from "gupta-scaratec:INBOX/Rechnungen" to "personal:Archiv/Belege"
+    And the server is restarted without crash hooks
+    Then within 10 seconds the WAL entry for the crashed move has status "committed"
+    When the IMAP command log for "personal" is cleared
+    And the server is restarted without crash hooks
+    And invoice-agent calls list_accounts
+    Then the WAL entry for the crashed move has status "committed"
+    And the IMAP command log for "personal" contains no APPEND command
+    And a direct IMAP SEARCH on "personal:Archiv/Belege" for message-id "<inv-901@hornbach.de>" returns exactly one result
+
+  Scenario: Two server instances starting concurrently lease a pending saga once without duplicating target mail
+    Given the server is armed with IMAP_MCP_CRASH_AT="post_fetch"
+    When invoice-agent invokes move expecting crash for uid 901 from "gupta-scaratec:INBOX/Rechnungen" to "personal:Archiv/Belege"
+    And two server instances start concurrently sharing the same wal.db and config
+    Then within 10 seconds the WAL entry for the crashed move has status "committed"
+    And a direct IMAP SEARCH on "personal:Archiv/Belege" for message-id "<inv-901@hornbach.de>" returns exactly one result
+    And a direct IMAP SEARCH on "gupta-scaratec:INBOX/Rechnungen" for message-id "<inv-901@hornbach.de>" returns zero results

@@ -6,7 +6,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from .base import (
     MCP_SERVER_NAME,
@@ -64,24 +64,24 @@ class OpenCodeDriver(HarnessDriver):
     # ("token authentication failed") and the next request succeeds.
     transient_auth_retry = True
 
-    restrictions = [
-        "Per-run project config (opencode.json in the working directory) adds the run's MCP server "
-        "with codemode=false, so its tools are native tools named imap_<tool>.",
-        "Permissions: deny '*' first, then allow imap_*, read, glob, grep; external_directory "
+    restrictions: ClassVar[list[str]] = [
+        ("Per-run project config (opencode.json in the working directory) adds the run's MCP server "
+        "with codemode=false, so its tools are native tools named imap_<tool>."),
+        ("Permissions: deny '*' first, then allow imap_*, read, glob, grep; external_directory "
         "denied. Shell, edit/write, webfetch, websearch, question, subagents and Code Mode "
         "(execute) are denied, which also hides MCP servers delivered by the user's global config "
-        "or a connected Console/integration (they cannot be removed by a project policy).",
-        "Turns run through the user's OpenCode background service; the preflight warms up the "
+        "or a connected Console/integration (they cannot be removed by a project policy)."),
+        ("Turns run through the user's OpenCode background service; the preflight warms up the "
         "service's MCP connection for the run directory and requires `opencode mcp list` to show "
-        "exactly one connected server, the run's imap (foreign ones listed as disabled).",
+        "exactly one connected server, the run's imap (foreign ones listed as disabled)."),
         "PWD is set to the working directory: OpenCode takes its project directory from PWD.",
-        "Preflight: `opencode debug config` must list the per-run opencode.json; every MCP server "
-        "named in any other config source (plus 'imap-mcp') is overridden as disabled.",
-        "Runtime guard: execute/Code Mode, a foreign tool, or a shell/write call that ran aborts the "
-        "run as not-assessable (isolation_breach).",
-        "Global config (~/.config/opencode) cannot be isolated: the github-copilot provider login "
+        ("Preflight: `opencode debug config` must list the per-run opencode.json; every MCP server "
+        "named in any other config source (plus 'imap-mcp') is overridden as disabled."),
+        ("Runtime guard: execute/Code Mode, a foreign tool, or a shell/write call that ran aborts the "
+        "run as not-assessable (isolation_breach)."),
+        ("Global config (~/.config/opencode) cannot be isolated: the github-copilot provider login "
         "lives under ~/.config, so XDG_CONFIG_HOME cannot be redirected; global instructions "
-        "(AGENTS.md) would still load.",
+        "(AGENTS.md) would still load."),
     ]
 
     def _config(self, disabled: set[str]) -> dict[str, Any]:
@@ -112,7 +112,7 @@ class OpenCodeDriver(HarnessDriver):
             out = subprocess.run(
                 [self.cfg.binary, "debug", "config"], cwd=directory,
                 env={**self.env(), "PWD": str(directory)},
-                capture_output=True, text=True, timeout=90,
+                capture_output=True, text=True, timeout=90, check=False,
             )
             data = json.loads(out.stdout)
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
@@ -160,7 +160,7 @@ class OpenCodeDriver(HarnessDriver):
         try:
             out = subprocess.run(
                 [self.cfg.binary, "mcp", "list"], cwd=self.workdir, env=self.env(),
-                capture_output=True, text=True, timeout=90,
+                capture_output=True, text=True, timeout=90, check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             return {}

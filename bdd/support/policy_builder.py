@@ -58,10 +58,11 @@ class FolderPolicy:
     mark_seen: bool = False
     mark_tagged: bool = False
     move_out: bool = False
+    copy_out: bool = False
     accept_incoming: bool = False
     draft_append: bool = False
-    modify_message: bool = False
     draft_edit: bool = False
+    draft_recipients: dict[str, Any] | None = None
 
 
 @dataclass
@@ -92,6 +93,8 @@ class PolicyBuilder:
     secret_store_path: Path | None = None
     secret_store_recipient: str | None = None
     secret_store_gnupghome: Path | None = None
+    secret_store_passphrase: str | None = None
+    secret_store_acknowledge_plaintext: bool = False
     audit_directory: Path | None = None
     audit_hot_days: int | None = None
     audit_warm_days: int | None = None
@@ -113,6 +116,9 @@ class PolicyBuilder:
         return caller
 
     def add_policy(self, name: str) -> Policy:
+        for p in self.policies:
+            if p.name == name:
+                return p
         policy = Policy(name=name)
         self.policies.append(policy)
         return policy
@@ -148,7 +154,7 @@ class PolicyBuilder:
         # lets the server authenticate to Dovecot when a tool actually
         # needs to talk to IMAP. Plain files; git-crypt / LUKS would
         # provide confidentiality in a real deployment.
-        if self.secret_store_path is not None:
+        if self.secret_store_backend in (None, "file_dir") and self.secret_store_path is not None:
             for account in self.accounts:
                 if account.password_literal is None or account.secret_ref is None:
                     continue
@@ -195,6 +201,10 @@ class PolicyBuilder:
                             "recipient": self.secret_store_recipient,
                             "gnupghome": str(self.secret_store_gnupghome)
                             if self.secret_store_gnupghome
+                            else None,
+                            "passphrase": self.secret_store_passphrase,
+                            "acknowledge_plaintext": self.secret_store_acknowledge_plaintext
+                            if self.secret_store_backend == "file_dir"
                             else None,
                         }
                     ),
@@ -269,12 +279,14 @@ def _folder_to_dict(folder: FolderPolicy) -> dict[str, Any]:
         "mark_seen": folder.mark_seen,
         "mark_tagged": folder.mark_tagged,
         "move_out": folder.move_out,
+        "copy_out": folder.copy_out,
         "accept_incoming": folder.accept_incoming,
         "draft_append": folder.draft_append,
-        "modify_message": folder.modify_message,
         "draft_edit": folder.draft_edit,
         "rules": [_rule_to_dict(r) for r in folder.rules],
     }
+    if folder.draft_recipients is not None:
+        payload["draft_recipients"] = folder.draft_recipients
     return payload
 
 

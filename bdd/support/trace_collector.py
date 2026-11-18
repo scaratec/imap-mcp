@@ -67,7 +67,7 @@ class _TraceService(trace_service_pb2_grpc.TraceServiceServicer):
     def __init__(self, sink: TraceSink) -> None:
         self._sink = sink
 
-    def Export(  # noqa: N802 - gRPC method name
+    def Export(
         self, request: trace_service_pb2.ExportTraceServiceRequest, context: Any
     ) -> trace_service_pb2.ExportTraceServiceResponse:
         records: list[SinkSpan] = []
@@ -114,6 +114,12 @@ class TraceSink:
     def spans(self) -> list[SinkSpan]:
         with self._lock:
             return list(self._spans)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._spans.clear()
+            if self.jsonl_path.exists():
+                self.jsonl_path.write_text("", encoding="utf-8")
 
 
 class TraceCollector:

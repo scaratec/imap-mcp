@@ -1,70 +1,31 @@
 # BDD Test Suite
 
-This directory hosts the behavior-driven specification and test harness for
-`imap-mcp`. It is **fully isolated** from the server implementation under
-`../server/` — no Python imports cross the boundary in either direction.
+This directory hosts the executable Gherkin specification (`64` `.feature`
+files, zero `@pending` scenarios) and isolated Python test harness for
+`imap-mcp` `3.0.0`. It is strictly isolated from `../server/` — no Python
+imports or source-tree reads cross the boundary in either direction.
 
-## Isolation rules
+## Isolation & honesty rules (BDD Guidelines v1.8.0)
 
-- Own virtual environment: `bdd/.venv/`.
-- Own `pyproject.toml` with its own dependency set.
-- No `from imap_mcp import ...`. The server is a black box exercised
-  through:
-  - the MCP protocol over a stdio subprocess,
-  - direct filesystem inspection of the audit log (`docs/adr/0021`),
-  - direct read of the SQLite WAL (`docs/adr/0007`) for saga verification.
-- No shared helpers, no shared type definitions, no symlinks.
-
-This isolation is a deliberate design choice aligned with the project's
-BDD guidelines (circular-test prohibition) and with the user's explicit
-requirement.
-
-## Setup
-
-```sh
-cd bdd
-python3 -m venv .venv          # any Python >= 3.11
-. .venv/bin/activate
-pip install -e '.[dev]'
-```
+- Dedicated virtual environment (`bdd/.venv/`) and `pyproject.toml`.
+- Zero `from imap_mcp import ...` and zero reading of `../server/`.
+- Every write/artifact scenario validates persistence over an independent
+  second channel:
+  - Direct IMAP queries via `imaplib` against Dovecot (`11143`, `12143`)
+    or `mock-gmail`,
+  - Wire-level command & connection logs from `support/imap_proxy.py`,
+  - Read-only SQLite inspection of `wal.db` (`support/wal_reader.py`),
+  - Direct filesystem & hash-chain verification of `audit/*.jsonl`
+    (`support/audit_reader.py`),
+  - Real OTLP gRPC collector spans (`support/trace_collector.py`).
+- Test-only hooks (`@test_hooks`, [ADR-0048](../docs/adr/0048-pre-effect-audit-and-test-boundary.md))
+  are enabled only for tagged crash/clock/pause scenarios; discovery and
+  non-goal suites run without `IMAP_MCP_TEST_MODE`.
 
 ## Running
 
 ```sh
-behave                                   # full suite
-behave features/policy/                  # one group
-behave -n "default-deny"                 # one scenario by name
+cd bdd
+docker compose -f docker/docker-compose.yml up -d
+.venv/bin/behave --no-color --format=progress features/
 ```
-
-## Structure
-
-```
-bdd/
-├── pyproject.toml
-├── environment.py              # behave hooks (server lifecycle, IMAP fixture)
-├── features/
-│   ├── policy/                 # default-deny, visibility, whitelist, ...
-│   ├── transactions/           # moves, saga, recovery
-│   ├── auth/                   # caller identity, OAuth2
-│   ├── tool_surface/           # MCP discovery, transparency, non-goals
-│   ├── providers/              # Gmail label semantics
-│   ├── audit/                  # log format, retention
-│   └── steps/                  # modular step implementations
-└── support/
-    ├── mcp_client.py           # stdio-subprocess MCP client wrapper
-    ├── imap_fixture.py         # local dovecot (docker) fixture
-    ├── policy_builder.py       # YAML generator
-    └── audit_reader.py         # JSONL + hash-chain parser
-```
-
-## Dependencies of the harness on the server
-
-Exactly two:
-
-1. The compiled server binary (`imap-mcp` entry point from
-   `../server/pyproject.toml`) reachable via subprocess.
-2. The documented on-disk shapes of the audit log and WAL, which are part
-   of the server's specification.
-
-Neither is a Python import. Changes to server internals that preserve
-these two contracts must not require changes in this directory.

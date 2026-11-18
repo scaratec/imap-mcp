@@ -70,8 +70,12 @@ def _read_audit(audit_dir: Path) -> list[dict[str, Any]]:
 
 def _fake_now(spec: ScenarioSpec, matrix: Matrix) -> str:
     configured = matrix.server_environment.get("IMAP_MCP_FAKE_NOW_UTC", "")
-    if spec.server_date and not configured.startswith(spec.server_date):
-        return f"{spec.server_date}T09:00:00Z"
+    if spec.server_date:
+        if "T" not in spec.server_date:
+            raise ValueError(
+                f"server_date must be a full ISO timestamp with time, got: {spec.server_date!r}"
+            )
+        return spec.server_date
     return configured
 
 
@@ -159,7 +163,9 @@ def execute_run(ctx: RunContext, run: PlannedRun, run_id: str, out_dir: Path) ->
         mock = MockGmail(state)
         mock.start()
         mailbox_start = mock.call(lambda: snapshot(state))
-        server_cfg = write_server_config(temp / "server", spec, matrix.variants[run.variant].policy, mock.port)
+        server_cfg = write_server_config(
+            temp / "server", spec, matrix.variants[run.variant].policy, mock.port, variant=run.variant
+        )
         if spec.sink_empty and any(server_cfg.sink_dir.iterdir()):
             raise RuntimeError("attachment sink is not empty")
         collector = TraceCollector(evidence_dir / "spans.jsonl")
@@ -172,13 +178,21 @@ def execute_run(ctx: RunContext, run: PlannedRun, run_id: str, out_dir: Path) ->
             }.items()
         )
         env = dict(matrix.server_environment)
+        fake_now = _fake_now(spec, matrix)
         env.update({
             "IMAP_MCP_CONFIG_DIR": str(server_cfg.config_dir),
             "IMAP_MCP_CALLER_ID": spec.caller,
-            "IMAP_MCP_FAKE_NOW_UTC": _fake_now(spec, matrix),
             "OTEL_EXPORTER_OTLP_ENDPOINT": collector.endpoint,
             "OTEL_RESOURCE_ATTRIBUTES": resource,
         })
+        if fake_now:
+            # ADR 0058 / ADR 0060 §2: IMAP_MCP_TEST_MODE is strictly gated
+            # and required only when the fake-clock test hook is active.
+            env["IMAP_MCP_FAKE_NOW_UTC"] = fake_now
+            env["IMAP_MCP_TEST_MODE"] = "1"
+        else:
+            env.pop("IMAP_MCP_TEST_MODE", None)
+            env.pop("IMAP_MCP_FAKE_NOW_UTC", None)
         mcp = McpServerSpec(MCP_SERVER_NAME, str(ctx.server.binary), ["--transport", "stdio"], env)
         workdir = temp / "work"
         workdir.mkdir(parents=True)
@@ -293,6 +307,7 @@ def execute_run(ctx: RunContext, run: PlannedRun, run_id: str, out_dir: Path) ->
             mailbox_start=mailbox_start, mailbox_end=mailbox_end, turns=turns,
             sink_dir=str(server_cfg.sink_dir), sink_files=file_entries(server_cfg.sink_dir),
             wall_clock_seconds=wall_clock, known_folders=known_folders,
+            variant=run.variant,
         )
         (evidence_dir / "audit.jsonl").write_text(
             "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in audit), encoding="utf-8"

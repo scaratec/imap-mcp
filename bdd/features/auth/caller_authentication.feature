@@ -1,121 +1,133 @@
-Feature: Caller identity and authentication
+Feature: Single-caller instance boundary and caller authentication
 
-  Every MCP session is bound to a caller identity resolved at
-  connection time. V1 supports two mechanisms: stdio_trusted (the
-  orchestrator signals identity via argv or environment) and
-  shared_token (bearer token verified with constant-time comparison).
-  Identity is immutable for the duration of the session.
-  See ADR 0015.
+  Every server instance serves strictly one configured caller in
+  callers.yaml (ADR 0049). stdio_trusted is permitted only on stdio and
+  requires matching IMAP_MCP_CALLER_ID; shared_token verifies bearer
+  credentials in constant time and is required on HTTP. Session identity
+  is immutable after the Initialize handshake, and every failed
+  authentication writes a chained auth_failed audit record.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - stdio_trusted : unset caller id      : 1
-    - stdio_trusted : unknown caller id    : 1
-    - shared_token  : missing token        : 1
-    - shared_token  : wrong token          : 1
-    - shared_token  : correct token        : 1
-    - Immutability  : mid-session claim    : 1
-    - Config error  : stdio_trusted over HTTP : 1
-    - Config error  : caller without auth over HTTP : 2
-    - Timing        : constant-time compare : 1 (indirectly via audit latency variance)
-    Total enumerated                        : 10  covered by this feature: 9
+    - Single-caller startup check (0 callers, 2 callers)       : 2
+    - Invalid caller auth config (missing auth, stdio on HTTP) : 2
+    - stdio_trusted: matching, unknown, unset caller_id        : 3
+    - shared_token over HTTP: valid (+ caller_addr) + 3 invalid: 4
+    - Session identity immutable on active session             : 1
+    Total enumerated                                           : 12  covered by this feature: 12
 
   Background:
-    Given the server is configured with callers:
-      | caller_id      | auth_type      | token_secret_ref                     |
-      | invoice-agent  | shared_token   | secret://callers/invoice-agent/token |
-    And the secret store contains value "correct-horse-battery" under "callers/invoice-agent/token"
+    Given the audit log directory is a fresh $TMPDIR/audit
+    And secret_store configuration is:
+      """
+      backend: file_dir
+      path: $SCRATCH/secrets
+      acknowledge_plaintext: true
+      """
+    And the file "$SCRATCH/secrets/callers/invoice-agent/token" contains the exact bytes "correct-horse-battery"
 
-  # The three stdio_trusted scenarios below add their own
-  # `overview-agent` caller in a per-scenario Given. Keeping
-  # stdio_trusted callers out of the Background lets the HTTP
-  # scenarios run against a strictly-shared_token configuration
-  # (ADR-0015 forbids stdio_trusted on non-stdio transport).
+  Scenario: Server refuses to start when callers.yaml defines zero callers
+    Given callers.yaml contains an empty callers list
+    When the server process is started with transport "stdio"
+    Then the server refuses to start
+    And the startup error indicates "callers.yaml must define exactly one caller"
 
-  Scenario: stdio_trusted — a known caller id in IMAP_MCP_CALLER_ID is accepted
-    Given the server is configured with caller:
-      | caller_id      | auth_type     |
-      | overview-agent | stdio_trusted |
+  Scenario: Server refuses to start when callers.yaml defines multiple callers
+    Given callers.yaml defines two callers "invoice-agent" and "overview-agent"
+    When the server process is started with transport "http"
+    Then the server refuses to start
+    And the startup error indicates "callers.yaml must define exactly one caller"
+
+  Scenario: Server refuses to start when a caller omits its auth block
+    Given callers.yaml defines caller "no-auth-agent" without an auth block
+    When the server process is started with transport "http"
+    Then the server refuses to start
+    And the startup error indicates "no-auth-agent" and "auth"
+
+  Scenario: A stdio_trusted caller on HTTP transport is a fatal startup configuration error
+    Given the server is configured with single caller:
+      | caller_id    | auth_type     | policy         |
+      | wrong-config | stdio_trusted | invoice-policy |
+    And policy "invoice-policy" grants no accounts
+    When the server process is started with transport "http"
+    Then the server refuses to start
+    And the startup error indicates "stdio_trusted"
+
+  Scenario: stdio_trusted — matching IMAP_MCP_CALLER_ID is accepted
+    Given the server is configured with single caller:
+      | caller_id      | auth_type     | policy          |
+      | overview-agent | stdio_trusted | overview-policy |
+    And policy "overview-policy" grants no accounts
     And the server process is started with transport "stdio" and environment IMAP_MCP_CALLER_ID="overview-agent"
     When the MCP client performs an Initialize handshake
     Then the handshake succeeds
-    And a subsequent get_caller_identity returns caller_id "overview-agent"
+    When the MCP client calls get_caller_identity on the established stdio session
+    Then the response field caller_id equals "overview-agent"
 
-  Scenario: stdio_trusted — an unknown caller id is rejected at Initialize time
-    Given the server process is started with transport "stdio" and environment IMAP_MCP_CALLER_ID="ghost-agent"
+  Scenario: stdio_trusted — mismatched IMAP_MCP_CALLER_ID is rejected and audited
+    Given the server is configured with single caller:
+      | caller_id      | auth_type     | policy          |
+      | overview-agent | stdio_trusted | overview-policy |
+    And policy "overview-policy" grants no accounts
+    And the server process is started with transport "stdio" and environment IMAP_MCP_CALLER_ID="ghost-agent"
     When the MCP client performs an Initialize handshake
-    Then the handshake fails with error "unknown_caller_id"
+    Then the handshake fails with error "auth_failed"
     And the audit log contains an entry with:
-      | field       | value            |
-      | tool        | auth_failed      |
-      | decision    | DENY             |
-      | reason      | auth_failed      |
-      | caller_addr | stdio:pid=*      |
+      | field    | value       |
+      | tool     | auth_failed |
+      | decision | DENY        |
+      | reason   | auth_failed |
+    And the most recent audit entry has field "caller_addr" starting with "stdio:pid="
 
-  Scenario: stdio_trusted — no caller id at all is rejected
-    Given the server process is started with transport "stdio" and no IMAP_MCP_CALLER_ID set
+  Scenario: stdio_trusted — unset IMAP_MCP_CALLER_ID is rejected and audited
+    Given the server is configured with single caller:
+      | caller_id      | auth_type     | policy          |
+      | overview-agent | stdio_trusted | overview-policy |
+    And policy "overview-policy" grants no accounts
+    And the server process is started with transport "stdio" and no IMAP_MCP_CALLER_ID set
     When the MCP client performs an Initialize handshake
-    Then the handshake fails with error "no_caller_identity"
-
-  Scenario: shared_token — the correct bearer token is accepted
-    Given the server process is started with transport "http" on a random port
-    When the MCP client performs an Initialize handshake with caller_id "invoice-agent" and bearer token "correct-horse-battery"
-    Then the handshake succeeds
-    And a subsequent get_caller_identity returns caller_id "invoice-agent"
-
-  Scenario Outline: shared_token — wrong or missing token is rejected with auth_failed
-    Given the server process is started with transport "http" on a random port
-    When the MCP client performs an Initialize handshake with caller_id "invoice-agent" and bearer token "<provided_token>"
     Then the handshake fails with error "auth_failed"
     And the audit log contains an entry with tool "auth_failed", decision "DENY", reason "auth_failed"
 
-    Examples:
-      | provided_token      |
-      | wrong-token         |
-      | correct-horse-batte |
-      |                     |
+  Scenario: shared_token — the correct bearer token is accepted over loopback HTTP and logs http caller_addr
+    Given the server is configured with single caller:
+      | caller_id     | auth_type    | token_secret_ref                     | policy         |
+      | invoice-agent | shared_token | secret://callers/invoice-agent/token | invoice-policy |
+    And policy "invoice-policy" grants no accounts
+    And the server process is started with transport "http" on 127.0.0.1 and a random port
+    When the MCP client performs an Initialize handshake with caller_id "invoice-agent" and bearer token "correct-horse-battery"
+    Then the handshake succeeds
+    When the MCP client calls get_caller_identity on the established HTTP session
+    Then the response field caller_id equals "invoice-agent"
+    And the most recent audit entry for tool "get_caller_identity" has field "caller_addr" starting with "http:127.0.0.1:"
 
-  Scenario: Identity is immutable for the duration of a session
-    Given the server process is started with transport "http" on a random port
-    And the MCP client completes an Initialize handshake as "invoice-agent" with the correct token
-    When the MCP client sends an Initialize-like message claiming caller_id "overview-agent"
-    Then the server responds with error "identity_immutable"
-    And a subsequent get_caller_identity still returns caller_id "invoice-agent"
-
-  Scenario: A stdio_trusted caller on HTTP transport is a fatal configuration error detected at startup
-    Given the server is configured with caller:
-      | caller_id     | auth_type     |
-      | wrong-config  | stdio_trusted |
-    And the server process is started with transport "http"
-    Then the server refuses to start
-    And the startup error indicates caller "wrong-config" as "stdio_trusted not permitted on non-stdio transport"
-
-  # callers.yaml accepts a caller without an auth block. Over HTTP such
-  # a caller has no token to present, so it must be refused like any
-  # other non-shared_token caller, and its presence must not affect how
-  # the other callers authenticate.
-  Scenario: A caller without an auth block is refused over HTTP
-    Given the server is configured with caller:
-      | caller_id     | auth_type |
-      | no-auth-agent | (none)    |
-    And the server process is started with transport "http" on a random port
-    When the MCP client performs an Initialize handshake with caller_id "no-auth-agent" and bearer token "correct-horse-battery"
+  Scenario Outline: shared_token — wrong, truncated, or empty bearer token is rejected with auth_failed
+    Given the server is configured with single caller:
+      | caller_id     | auth_type    | token_secret_ref                     | policy         |
+      | invoice-agent | shared_token | secret://callers/invoice-agent/token | invoice-policy |
+    And policy "invoice-policy" grants no accounts
+    And the server process is started with transport "http" on 127.0.0.1 and a random port
+    When the MCP client performs an Initialize handshake with caller_id "invoice-agent" and bearer token "<provided_token>"
     Then the handshake fails with error "auth_failed"
-    And the audit log contains an entry with:
-      | field               | value           |
-      | tool                | auth_failed     |
-      | decision            | DENY            |
-      | reason              | auth_failed     |
-      | auth_failure_reason | wrong_auth_type |
-
-  Scenario Outline: A caller without an auth block does not affect other callers over HTTP
-    Given the server is configured with caller:
-      | caller_id     | auth_type |
-      | no-auth-agent | (none)    |
-    And the server process is started with transport "http" on a random port
-    When the MCP client performs an Initialize handshake with caller_id "<caller_id>" and bearer token "<token>"
-    Then the handshake fails with error "<error>"
+    And the audit log contains an entry with tool "auth_failed", decision "DENY", reason "auth_failed"
+    And the audit file does NOT contain any of the literal strings:
+      | forbidden_string      |
+      | correct-horse-battery |
+      | wrong-token-secret    |
 
     Examples:
-      | caller_id     | token         | error             |
-      | invoice-agent | wrong-token   | auth_failed       |
-      | ghost-agent   | wrong-token   | unknown_caller_id |
+      | provided_token        |
+      | wrong-token-secret    |
+      | correct-horse-batte   |
+      |                       |
+
+  Scenario: Session identity is immutable for the duration of an established session
+    Given the server is configured with single caller:
+      | caller_id     | auth_type    | token_secret_ref                     | policy         |
+      | invoice-agent | shared_token | secret://callers/invoice-agent/token | invoice-policy |
+    And policy "invoice-policy" grants no accounts
+    And the server process is started with transport "http" on 127.0.0.1 and a random port
+    And the MCP client performs an Initialize handshake with caller_id "invoice-agent" and bearer token "correct-horse-battery"
+    When the MCP client sends a second Initialize request on the same HTTP session claiming caller_id "overview-agent"
+    Then the second Initialize request is rejected with error "identity_immutable"
+    When the MCP client calls get_caller_identity on the established HTTP session without re-initializing
+    Then the response field caller_id equals "invoice-agent"

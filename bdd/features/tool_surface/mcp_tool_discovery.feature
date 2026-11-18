@@ -1,136 +1,143 @@
-Feature: MCP tool discovery
+Feature: MCP tool discovery for Tool Surface 3.0.0
 
-  A connected client enumerates the server's tools via the standard
-  MCP list_tools handshake. The 2.2.0 surface exposes exactly 30
-  tools partitioned into 13 read, 13 write, and 4 meta. The
-  advertised shape matches ADR 0026 + ADR 0028 + ADR 0030 + ADR 0031
-  + ADR 0034 + ADR 0035 + ADR 0036. 2.1.0 added the draft surface
-  (get_draft, list_drafts, update_draft); 2.2.0 adds discard_draft
-  (ADR 0034), structured create_draft fields and reply_html
-  (ADR 0035), and since/before with outside_scope_total (ADR 0036).
-  Both bumps are additive and break nothing that came before.
+  A connected client enumerates the server's tools via the standard MCP
+  tools/list call without test mode enabled. Surface 3.0.0 exposes
+  exactly 27 tools partitioned into 13 read, 10 write, and 4 meta tools
+  (ADR 0052). Received-mail attachment-rewrite tools (add_attachment,
+  replace_attachment, delete_attachment) and test-only tools
+  (_test_run_*) are absent. Each tool publishes machine-readable
+  x-mcp-imap / annotations metadata naming its category,
+  minimum_visibility, and required_capabilities.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Tool presence           : 1 (exact set)
-    - Tool absence            : 1 (no extras, especially no non-goals)
-    - Tool metadata           : 3 (read: minimum-level, write: capability, meta: none)
-    - Version advertisement   : 2 (serverInfo + tool_surface_info tool)
-    - Package version in serverInfo : 1
-    Total enumerated          : 8   covered by this feature: 8
+    - Exact 27-tool presence in production mode              : 1
+    - Non-goal, retired 2.x, and _test_run_* tool absence    : 1
+    - Tool metadata on tools/list (read, write, meta)        : 3
+    - Version advertisement in serverInfo + tool_surface_info: 2
+    Total enumerated                                         : 7   covered by this feature: 7
 
   Background:
-    Given the server is started with a minimal caller configuration
+    Given secret_store configuration is:
+      """
+      backend: file_dir
+      path: $TMPDIR/secrets
+      acknowledge_plaintext: true
+      """
+    And the server is configured with single caller:
+      | caller_id     | auth_type     | policy         |
+      | invoice-agent | stdio_trusted | invoice-policy |
+    And policy "invoice-policy" grants no accounts
+    And the server process is started without IMAP_MCP_TEST_MODE on transport "stdio" with IMAP_MCP_CALLER_ID="invoice-agent"
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: The 2.2 tool set consists of exactly these 30 tools
+  Scenario: The 3.0.0 tool set consists of these exact 27 tools
     When invoice-agent calls the MCP list_tools method
     Then the returned tool names equal exactly:
+      | tool                   |
+      | list_accounts          |
+      | list_folders           |
+      | list_labels            |
+      | folder_stats           |
+      | search                 |
+      | list_messages          |
+      | fetch_envelope         |
+      | fetch_headers          |
+      | fetch_body             |
+      | list_attachments       |
+      | fetch_attachment       |
+      | list_drafts            |
+      | get_draft              |
+      | mark_seen              |
+      | bulk_mark_seen         |
+      | mark_tagged            |
+      | bulk_mark_tagged       |
+      | move                   |
+      | copy                   |
+      | create_draft           |
+      | create_reply_draft     |
+      | update_draft           |
+      | discard_draft          |
+      | describe_policy        |
+      | get_transaction_status |
+      | get_caller_identity    |
+      | tool_surface_info      |
+
+  Scenario: Non-goal, retired 2.x rewrite, and test-only tool names are absent from tools/list
+    When invoice-agent calls the MCP list_tools method
+    Then the returned tool names do NOT contain any of:
       | tool                      |
-      | list_accounts             |
-      | list_folders              |
-      | list_labels               |
-      | folder_stats              |
-      | search                    |
-      | list_messages             |
-      | fetch_envelope            |
-      | fetch_headers             |
-      | fetch_body                |
-      | list_attachments          |
-      | fetch_attachment          |
-      | list_drafts               |
-      | get_draft                 |
-      | mark_seen                 |
-      | bulk_mark_seen            |
-      | mark_tagged               |
-      | bulk_mark_tagged          |
-      | move                      |
-      | copy                      |
-      | create_draft              |
-      | create_reply_draft        |
-      | update_draft              |
-      | discard_draft             |
+      | delete                    |
+      | expunge                   |
       | add_attachment            |
       | replace_attachment        |
       | delete_attachment         |
-      | describe_policy           |
-      | get_transaction_status    |
-      | get_caller_identity       |
-      | tool_surface_info         |
+      | raw_imap_command          |
+      | fetch_raw_rfc822          |
+      | impersonate               |
+      | subscribe_to_new_mail     |
+      | search_across_accounts    |
+      | create_folder             |
+      | rename_folder             |
+      | delete_folder             |
+      | rotate_tokens             |
+      | reload_policy             |
+      | get_audit_log             |
+      | initiate_oauth            |
+      | bulk_move                 |
+      | _test_run_recovery        |
+      | _test_run_audit_rotation  |
 
-  Scenario: Non-goal tool names are never advertised
+  Scenario: Read tools advertise their exact minimum_visibility in tools/list metadata
     When invoice-agent calls the MCP list_tools method
-    Then the returned tool names do NOT contain any of:
-      | tool                  |
-      | delete                |
-      | expunge               |
-      | raw_imap_command      |
-      | fetch_raw_rfc822      |
-      | impersonate           |
-      | subscribe_to_new_mail |
-      | search_across_accounts|
-      | create_folder         |
-      | rename_folder         |
-      | delete_folder         |
-      | rotate_tokens         |
-      | reload_policy         |
-      | get_audit_log         |
-      | bulk_move             |
+    Then the tools/list metadata for each read tool has "minimum_visibility" equal to:
+      | tool             | minimum_visibility |
+      | list_accounts    | (none)             |
+      | list_folders     | COUNT              |
+      | list_labels      | COUNT              |
+      | folder_stats     | COUNT              |
+      | search           | METADATA           |
+      | list_messages    | METADATA           |
+      | fetch_envelope   | ENVELOPE           |
+      | fetch_headers    | HEADERS            |
+      | fetch_body       | BODY               |
+      | list_attachments | BODY               |
+      | fetch_attachment | FULL               |
+      | list_drafts      | METADATA           |
+      | get_draft        | BODY               |
 
-  Scenario: Read tools advertise their minimum visibility level in metadata
+  Scenario: Write tools advertise their required_capabilities list and minimum_visibility floor in tools/list metadata
     When invoice-agent calls the MCP list_tools method
-    Then each read tool's metadata contains "minimum_visibility" matching:
-      | tool               | minimum_visibility |
-      | list_accounts      | (n/a)              |
-      | list_folders       | COUNT              |
-      | list_labels        | COUNT              |
-      | folder_stats       | COUNT              |
-      | search             | METADATA           |
-      | list_messages      | METADATA           |
-      | fetch_envelope     | ENVELOPE           |
-      | fetch_headers      | HEADERS            |
-      | fetch_body         | BODY               |
-      | list_attachments   | BODY               |
-      | fetch_attachment   | FULL               |
-      | list_drafts        | METADATA           |
-      | get_draft          | BODY               |
+    Then the tools/list metadata for each write tool has "required_capabilities" and "minimum_visibility" equal to:
+      | tool               | required_capabilities           | minimum_visibility |
+      | mark_seen          | ["mark_seen"]                   | METADATA           |
+      | bulk_mark_seen     | ["mark_seen"]                   | METADATA           |
+      | mark_tagged        | ["mark_tagged"]                 | ENVELOPE           |
+      | bulk_mark_tagged   | ["mark_tagged"]                 | ENVELOPE           |
+      | move               | ["move_out", "accept_incoming"] | ENVELOPE           |
+      | copy               | ["copy_out", "accept_incoming"] | ENVELOPE           |
+      | create_draft       | ["draft_append"]                | (none)             |
+      | create_reply_draft | ["draft_append"]                | BODY               |
+      | update_draft       | ["draft_edit"]                  | (none)             |
+      | discard_draft      | ["move_out", "accept_incoming"] | (none)             |
 
-  Scenario: Write tools advertise their required capability in metadata
+  Scenario: Meta tools advertise category "meta" with neither minimum_visibility nor required_capabilities
     When invoice-agent calls the MCP list_tools method
-    Then each write tool's metadata contains "required_capability" matching:
-      | tool               | required_capability |
-      | mark_seen          | mark_seen           |
-      | bulk_mark_seen     | mark_seen           |
-      | mark_tagged        | mark_tagged         |
-      | bulk_mark_tagged   | mark_tagged         |
-      | move               | move_out            |
-      | copy               | accept_incoming     |
-      | create_draft       | draft_append        |
-      | create_reply_draft | draft_append        |
-      | update_draft       | draft_edit          |
-      | discard_draft      | move_out            |
-      | add_attachment     | modify_message      |
-      | replace_attachment | modify_message      |
-      | delete_attachment  | modify_message      |
+    Then each of these tools in tools/list has category "meta" and omits "minimum_visibility" and "required_capabilities":
+      | tool                   |
+      | describe_policy        |
+      | get_transaction_status |
+      | get_caller_identity    |
+      | tool_surface_info      |
 
-  Scenario: Meta tools advertise no visibility requirement
-    When invoice-agent calls the MCP list_tools method
-    Then each of these tools has no "minimum_visibility" and no "required_capability" metadata:
-      | tool                     |
-      | describe_policy          |
-      | get_transaction_status   |
-      | get_caller_identity      |
-      | tool_surface_info        |
+  Scenario: serverInfo advertises package version 3.0.0 and tool_set_version 3.0.0
+    Then the server info version equals "3.0.0"
+    And the server info metadata contains "tool_set_version" equal to "3.0.0"
 
-  Scenario: serverInfo metadata advertises tool_set_version 2.x.y
-    Then the server info metadata contains "tool_set_version" matching the regex "^2\.\d+\.\d+$"
-    And the major version of tool_set_version equals 2
-
-  Scenario: tool_surface_info returns the same version as serverInfo
+  Scenario: tool_surface_info returns version 3.0.0 matching serverInfo
     When invoice-agent calls tool_surface_info
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    And the response field tool_set_version matches the regex "^2\.\d+\.\d+$"
+    And the response field reason equals "authenticated"
+    And the response field tool_set_version equals "3.0.0"
+    And the response field package_version equals "3.0.0"
     And the response field tool_set_version matches the serverInfo tool_set_version
-
-  Scenario: serverInfo.version matches the installed package version
-    Then the server info version matches the installed sc-imap-mcp package version

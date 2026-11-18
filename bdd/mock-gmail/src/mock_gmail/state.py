@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import itertools
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
-
 
 _msgid_counter = itertools.count(1_800_000_000_000_000_000)
 
@@ -52,9 +52,30 @@ def decode_mutf7(wire: str) -> str:
         try:
             raw = base64.b64decode(b64 + "=" * pad)
             out.append(raw.decode("utf-16-be"))
-        except Exception:
+        except (ValueError, binascii.Error, UnicodeDecodeError):
             return wire
         i = end + 1
+    return "".join(out)
+
+
+def encode_mutf7(text: str) -> str:
+    """UTF-8 → RFC 3501 §5.1.3 modified UTF-7 (mock-side, vendored)."""
+    out: list[str] = []
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if buffer:
+            raw = "".join(buffer).encode("utf-16-be")
+            out.append("&" + base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",") + "-")
+            buffer.clear()
+
+    for ch in text:
+        if 0x20 <= ord(ch) <= 0x7E:
+            flush()
+            out.append("&-" if ch == "&" else ch)
+        else:
+            buffer.append(ch)
+    flush()
     return "".join(out)
 
 
@@ -163,6 +184,11 @@ class GmailState:
         self._uidvalidity: dict[str, int] = {}
         self._created_folders: set[str] = set()
         self.password: str = "test"
+        self.revoked_tokens: set[str] = set()
+        self._revoke_current_token_once: bool = False
+        self.token_validator: Any = None
+        self._fetch_delay_ms: int = 0
+        self._fetch_delay_once: bool = False
         self.total_connections: int = 0
         # Connection bookkeeping. `epoch` advances on every reset, so a
         # connection of a previous scenario that is still closing counts
@@ -193,6 +219,10 @@ class GmailState:
         self._uid_counters.clear()
         self._created_folders.clear()
         self._localized_folders.clear()
+        self.revoked_tokens.clear()
+        self._revoke_current_token_once = False
+        self._fetch_delay_ms = 0
+        self._fetch_delay_once = False
         self.total_connections = 0
         self.epoch += 1
         self.max_concurrent_connections = 0
@@ -202,6 +232,43 @@ class GmailState:
         self.command_log.clear()
 
     # ------------------------------------------------- connection bookkeeping
+
+    @property
+    def peak_concurrent_connections(self) -> int:
+        """Alias for max_concurrent_connections."""
+        return self.max_concurrent_connections
+
+    def revoke_current_token_once(self) -> None:
+        """Revoke the currently cached / incoming XOAUTH2 token on the next authentication."""
+        self._revoke_current_token_once = True
+
+    def set_fetch_delay_ms(self, delay_ms: int, once: bool = False) -> None:
+        """Introduce artificial latency on FETCH operations."""
+        self._fetch_delay_ms = delay_ms
+        self._fetch_delay_once = once
+
+    def uidnext(self, folder: str) -> int:
+        """Next predicted UID for folder based on counter (RFC 3501)."""
+        return self._uid_counters.get(folder, 0) + 1
+
+    def set_next_uid(self, folder: str, next_uid: int) -> None:
+        """Set the counter so the next assigned UID is at least next_uid."""
+        if self._uid_counters.get(folder, 0) < next_uid - 1:
+            self._uid_counters[folder] = next_uid - 1
+
+    def assign_uid(self, folder: str, msg_id: int, uid: int) -> None:
+        """Assign an explicit UID to a message in a folder."""
+        uid_map = self._uid_maps.setdefault(folder, {})
+        uid_map[msg_id] = uid
+        self._uid_counters[folder] = max(self._uid_counters.get(folder, 0), uid)
+
+    def get_uid_counter(self, folder: str) -> int:
+        """Return the current UID counter for folder."""
+        return self._uid_counters.get(folder, 0)
+
+    def get_uid_map(self, folder: str) -> dict[int, int]:
+        """Return a copy of the message-id to UID mapping for folder."""
+        return dict(self._uid_maps.get(folder, {}))
 
     @property
     def open_connections(self) -> int:
@@ -288,10 +355,11 @@ class GmailState:
 
     def _resolve_localized(self, folder: str) -> str:
         """Map a localized folder name back to the canonical name."""
+        decoded = decode_mutf7(folder)
         for canonical, (localized, _flags) in self._localized_folders.items():
-            if folder == localized:
+            if folder == localized or decoded == localized or decoded == decode_mutf7(localized):
                 return canonical
-        return folder
+        return decoded
 
     def mailbox_for_wire_name(self, wire: str) -> str | None:
         """Resolve a mailbox name received on the wire to internal state.
@@ -303,7 +371,7 @@ class GmailState:
         canonical key the state uses internally; anything else passes
         through.
         """
-        if wire in self._localized_folders:
+        if wire in self._localized_folders or decode_mutf7(wire) in self._localized_folders:
             return None
         return self._resolve_localized(wire)
 
@@ -327,7 +395,14 @@ class GmailState:
                 return label == exclusive
         if label == "__ALL_MAIL__":
             return True
-        return label in msg.labels or folder in msg.labels
+        return (
+            label in msg.labels
+            or folder in msg.labels
+            or decode_mutf7(label) in msg.labels
+            or decode_mutf7(folder) in msg.labels
+            or encode_mutf7(label) in msg.labels
+            or encode_mutf7(folder) in msg.labels
+        )
 
     def messages_in_folder(self, folder: str) -> list[tuple[int, Message]]:
         folder = self._resolve_localized(folder)
@@ -382,6 +457,26 @@ class GmailState:
         if uid_map is not None:
             uid_map.pop(msg.gm_msgid, None)
         self._sync_uids(msg)
+
+    def remove_message_from_folder(self, folder: str, msg: Message) -> None:
+        """Remove `msg` from `folder` according to Gmail semantics.
+
+        - Trash or Spam: message is expunged permanently (delete_message).
+        - [Gmail]/All Mail: \\Deleted flag is cleared and the message is
+          removed from all folders/labels (delete_message).
+        - Any other label folder: message simply leaves that mailbox
+          (leave_mailbox) while remaining in All Mail.
+        """
+        canonical = self._resolve_localized(folder)
+        label = FOLDER_TO_LABEL.get(canonical, canonical)
+        if label in EXCLUSIVE_LABELS:
+            self.delete_message(msg)
+        elif canonical == "[Gmail]/All Mail" or label == "__ALL_MAIL__":
+            msg.flags.discard("\\Deleted")
+            msg.labels.clear()
+            self.delete_message(msg)
+        else:
+            self.leave_mailbox(msg, canonical)
 
     def _sync_uids(self, msg: Message) -> None:
         """Align the per-mailbox UID maps with where `msg` is now shown.
@@ -445,6 +540,10 @@ class GmailState:
 
     def _get_uid(self, folder: str, gm_msgid: int) -> int | None:
         uid_map = self._uid_maps.get(folder)
+        if uid_map is None:
+            uid_map = self._uid_maps.get(decode_mutf7(folder))
+        if uid_map is None:
+            uid_map = self._uid_maps.get(encode_mutf7(folder))
         if uid_map is None:
             return None
         return uid_map.get(gm_msgid)

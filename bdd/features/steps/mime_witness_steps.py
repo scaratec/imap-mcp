@@ -133,6 +133,26 @@ def step_newest_message_html_part_contains(
 
 
 @then(
+    'a direct IMAP FETCH of the newest message in "{location}" shows a '
+    'text/html part whose decoded text does NOT contain "{forbidden}"'
+)
+def step_newest_message_html_part_not_contains(
+    context: Context, location: str, forbidden: str
+) -> None:
+    message = _newest_message(context, location)
+    html_parts = [
+        part for part in _leaf_parts(message) if part.get_content_type() == "text/html"
+    ]
+    if not html_parts:
+        raise AssertionError(f"Newest message in {location!r} has no text/html part.")
+    texts = [_decoded_text(part) for part in html_parts]
+    if any(forbidden in text for text in texts):
+        raise AssertionError(
+            f"A text/html part of newest message in {location!r} unexpectedly contains {forbidden!r}; parts: {texts!r}"
+        )
+
+
+@then(
     'the raw header block of the newest message in "{location}" contains '
     "only ASCII characters"
 )

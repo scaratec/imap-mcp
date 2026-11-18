@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 from .base import (
     MCP_SERVER_NAME,
@@ -25,17 +25,17 @@ SETTINGS = {"permissions": {"deny": ["command(*)", "unsandboxed(*)", "write_file
 
 
 class AntigravityDriver(HarnessDriver):
-    restrictions = [
-        "Per-run HOME: ~/.gemini (mcp_config.json, settings, GEMINI.md, plugins, skills) is fresh "
-        "and holds only the run's MCP server; the login comes from the system keyring.",
-        "--dangerously-skip-permissions with session settings denying command(*), unsandboxed(*) "
-        "and write_file(*): shell commands and file writes fail with a deny error.",
-        "Not restricted (no verified rule names): browser tools, read_url_content/search_web, "
+    restrictions: ClassVar[list[str]] = [
+        ("Per-run HOME: ~/.gemini (mcp_config.json, settings, GEMINI.md, plugins, skills) is fresh "
+        "and holds only the run's MCP server; the login comes from the system keyring."),
+        ("--dangerously-skip-permissions with session settings denying command(*), unsandboxed(*) "
+        "and write_file(*): shell commands and file writes fail with a deny error."),
+        ("Not restricted (no verified rule names): browser tools, read_url_content/search_web, "
         "subagents, file reads, and the ask_question tool: headless agy skips it unanswered and "
         "stream-json reports only an undescribed step (recorded as agy_unknown_step), so the "
-        "simulator cannot answer it.",
-        "Runtime guard: a call to another MCP server or a shell/write call that was not denied "
-        "aborts the run as not-assessable (isolation_breach).",
+        "simulator cannot answer it."),
+        ("Runtime guard: a call to another MCP server or a shell/write call that was not denied "
+        "aborts the run as not-assessable (isolation_breach)."),
     ]
 
     def prepare(self, instructions: str | None) -> None:

@@ -1,116 +1,132 @@
-"""IMAP MITM proxy for BDD scenarios that need wire-level fault
-injection (LIM-0005 paydown).
+"""IMAP MITM proxy for BDD scenarios that need wire-level fault injection.
 
 The proxy listens on a free local port and forwards every byte to a
 real Dovecot instance. Several hooks let scenarios induce behaviour
-the live Dovecot cannot produce on its own:
-
-- **`strip_capabilities`** — token-list to remove from any
-  `* CAPABILITY` line and from `* OK [CAPABILITY …]` status responses.
-  Used by the "no MOVE extension" scenario to make the server fall
-  back to COPY+STORE+EXPUNGE.
-
-- **`uidvalidity_change_after`** — a string substring that triggers
-  the proxy to inject one extra `* OK [UIDVALIDITY <new>]` untagged
-  response immediately before the *next* upstream→client frame after
-  the matching client→upstream command. Used by the UIDVALIDITY-
-  staleness scenario.
-
-- **`inject_failure_on`** — list of `{command, remaining}` specs.
-  When the next client→upstream command's verb matches `command`
-  (case-insensitive), the proxy synthesises a tagged `<tag> NO
-  simulated error 500\r\n` reply to the client and does NOT forward
-  the command to upstream. Used by the saga's APPEND-5xx and
-  EXPUNGE-5xx scenarios. `remaining` decrements per match; `null`
-  means unlimited.
-
-- **`delay_command_seconds`** — single `{command, seconds, remaining}`
-  spec. When the next client→upstream command's verb matches, the
-  proxy `await asyncio.sleep(seconds)` BEFORE forwarding it upstream.
-  Used by the APPEND-timeout scenario in conjunction with the server's
-  `IMAP_MCP_APPEND_TIMEOUT` to make the server-side `wait_for` fire.
-
-- **`login_credentials`** — `{scenario_password: fixture_password}`.
-  A LOGIN whose quoted password is a scenario password reaches Dovecot
-  with the fixture password instead. Lets a scenario store its own
-  password in the server's secret store (the secret-absence witnesses
-  of tracing_payload_mode.feature) while the fixture keeps one
-  password per user.
-
-Every client→upstream command line is also written, with a UTC
-timestamp, into a per-account command log file. The harness reads
-the file as a second verification channel (BDD Guidelines §13.2).
-Every accepted client connection likewise appends one timestamped line
-to `connection_log_path`, so a scenario can count the IMAP connections
-the server opened.
-
-The proxy parses only enough of the IMAP framing to honour
-synchronous literals (`{N}`-prefixed continuation lines). It does NOT
-implement IMAP semantics — it is a byte-level bridge with three
-keyhole rewrite rules.
-
-Configuration is loaded from the JSON file pointed at by
-`IMAP_MCP_PROXY_CONFIG`:
-
-    {
-      "upstream_host": "127.0.0.1",
-      "upstream_port": 11143,
-      "command_log_path": "/tmp/.../proxy.log",
-      "connection_log_path": "/tmp/.../proxy-connections.log",
-      "strip_capabilities": ["MOVE"],
-      "uidvalidity_change_after": "UID SEARCH",
-      "uidvalidity_new_value": "99999",
-      "inject_failure_on": [{"command": "APPEND", "remaining": 1}],
-      "delay_command_seconds": {"command": "APPEND", "seconds": 45, "remaining": 1}
-    }
-
-The file is read ONCE at proxy startup and shared across all
-sessions. Fault counters live inside the shared dict and mutate in
-place so they persist across the per-retry IMAP reconnects the
-saga's recovery loop performs. To flip rules, the harness writes a
-new config and restarts the proxy.
+the live Dovecot cannot produce on its own.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import json
+import logging
 import re
 import sys
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
 
 CAPABILITY_LINE_RE = re.compile(rb"^(\*\s+CAPABILITY\s+)(.+)$", re.IGNORECASE)
-CAPABILITY_BRACKET_RE = re.compile(
-    rb"\[CAPABILITY\s+([^\]]+)\]", re.IGNORECASE
-)
+CAPABILITY_BRACKET_RE = re.compile(rb"\[CAPABILITY\s+([^\]]+)\]", re.IGNORECASE)
 LITERAL_TRAILER_RE = re.compile(rb"\{(\d+)\}\s*$")
+UIDVALIDITY_RE = re.compile(rb"\[UIDVALIDITY\s+(\d+)\]", re.IGNORECASE)
+
+
+def _decode_mutf7(wire: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(wire)
+    while i < n:
+        if wire[i] != "&":
+            out.append(wire[i])
+            i += 1
+            continue
+        end = wire.find("-", i + 1)
+        if end < 0:
+            return wire
+        if end == i + 1:
+            out.append("&")
+            i = end + 1
+            continue
+        b64 = wire[i + 1 : end].replace(",", "/")
+        pad = (4 - len(b64) % 4) % 4
+        try:
+            raw = base64.b64decode(b64 + "=" * pad)
+            out.append(raw.decode("utf-16-be"))
+        except (ValueError, binascii.Error, UnicodeDecodeError):
+            return wire
+        i = end + 1
+    return "".join(out)
+
+
+def _encode_mutf7(utf8: str) -> str:
+    out: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if not buf:
+            return
+        raw = "".join(buf).encode("utf-16-be")
+        b64 = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+        out.append("&" + b64 + "-")
+        buf.clear()
+
+    for ch in utf8:
+        cp = ord(ch)
+        if 0x20 <= cp <= 0x7E:
+            flush()
+            if ch == "&":
+                out.append("&-")
+            else:
+                out.append(ch)
+        else:
+            buf.append(ch)
+    flush()
+    return "".join(out)
+
+
+def _extract_mailbox(command_line: bytes) -> str | None:
+    parts = command_line.split(maxsplit=2)
+    if len(parts) < 3:
+        return None
+    rest = parts[2].strip()
+    if not rest:
+        return None
+    if rest.startswith(b'"'):
+        end = rest.find(b'"', 1)
+        if end > 0:
+            return rest[1:end].decode("ascii", errors="replace")
+    first = rest.split(None, 1)[0]
+    return first.decode("ascii", errors="replace")
+
+
+def _mailbox_matches(spec_mailbox: str | None, cmd_mailbox: str | None) -> bool:
+    if spec_mailbox is None:
+        return True
+    if cmd_mailbox is None:
+        return False
+    sm = spec_mailbox.strip('"')
+    cm = cmd_mailbox.strip('"')
+    if sm == cm:
+        return True
+    if _decode_mutf7(sm) == _decode_mutf7(cm):
+        return True
+    return bool(_encode_mutf7(sm) == cm or sm == _encode_mutf7(cm))
 
 
 def _parse_tag_and_verb(command_line: bytes) -> tuple[bytes, str]:
-    """Split an IMAP command line into `(tag, verb_upper)`. Returns
-    `(b'', '')` if the line is malformed (not enough tokens)."""
     parts = command_line.split(maxsplit=2)
     if len(parts) < 2:
         return b"", ""
-    return parts[0], parts[1].decode("ascii", errors="replace").upper()
+    tag = parts[0]
+    verb = parts[1].decode("ascii", errors="replace").upper()
+    if verb == "UID" and len(parts) >= 3:
+        sub = parts[2].split(None, 1)[0].decode("ascii", errors="replace").upper()
+        return tag, f"UID {sub}"
+    return tag, verb
 
 
-def _consume_command_match(specs: list, verb_upper: str) -> dict | None:
-    """If any spec in `specs` matches `verb_upper` and has a non-zero
-    `remaining` slot (or `null` = unlimited), decrement and return the
-    matched spec dict. Returns None when no spec matches.
-
-    Specs are mutated in place — list contents are shared with the
-    `ProxySession.config` dict, which is how the count survives
-    across sequential commands within a single connection."""
+def _consume_command_match(specs: list[dict[str, Any]], verb_upper: str, mailbox: str | None) -> dict[str, Any] | None:
     for spec in specs:
         cmd = (spec.get("command") or "").upper()
         if cmd != verb_upper:
+            continue
+        if not _mailbox_matches(spec.get("mailbox"), mailbox):
             continue
         remaining = spec.get("remaining")
         if remaining is None:
@@ -122,11 +138,11 @@ def _consume_command_match(specs: list, verb_upper: str) -> dict | None:
     return None
 
 
-def _consume_delay_match(spec: dict, verb_upper: str) -> bool:
-    """Same idea as `_consume_command_match` but for the singular
-    `delay_command_seconds` spec."""
+def _consume_delay_match(spec: dict[str, Any], verb_upper: str, mailbox: str | None) -> bool:
     cmd = (spec.get("command") or "").upper()
     if cmd != verb_upper:
+        return False
+    if not _mailbox_matches(spec.get("mailbox"), mailbox):
         return False
     remaining = spec.get("remaining")
     if remaining is None:
@@ -144,11 +160,6 @@ def _build_tagged_response(
     status: str = "NO",
     text: str | None = None,
 ) -> bytes:
-    """Tagged response line synthesised in lieu of forwarding `tag verb`
-    to upstream. `status` is "NO" or "BAD". `text` is the reason text
-    after the status token; when None, the default text mentions
-    `simulated error 500` so grepping the IMAP client's exception text
-    from logs is unambiguous."""
     if not tag:
         tag = b"*"
     status_upper = status.upper()
@@ -165,8 +176,6 @@ def _build_tagged_response(
 
 
 def _strip_tokens(payload: bytes, tokens: list[str]) -> bytes:
-    """Remove `tokens` (case-insensitive whole words) from a
-    capability-list payload, preserving spacing."""
     if not tokens:
         return payload
     text = payload.decode("ascii", errors="replace")
@@ -176,8 +185,6 @@ def _strip_tokens(payload: bytes, tokens: list[str]) -> bytes:
 
 
 def _rewrite_capability(line: bytes, tokens: list[str]) -> bytes:
-    """Rewrite a single response line, stripping any capability
-    tokens that match `tokens`."""
     if not tokens:
         return line
     match = CAPABILITY_LINE_RE.match(line)
@@ -187,17 +194,13 @@ def _rewrite_capability(line: bytes, tokens: list[str]) -> bytes:
             b"\r\n"
         ) else head + _strip_tokens(payload, tokens)
 
-    def _bracket_sub(m: "re.Match[bytes]") -> bytes:
+    def _bracket_sub(m: re.Match[bytes]) -> bytes:
         return b"[CAPABILITY " + _strip_tokens(m.group(1), tokens) + b"]"
 
     return CAPABILITY_BRACKET_RE.sub(_bracket_sub, line)
 
 
 def _translate_login(line: bytes, credentials: dict[str, str]) -> bytes:
-    """Swap a scenario password in a LOGIN command for the one Dovecot
-    knows, so a scenario can put its own password into the secret store
-    and the fixture still accepts it. Only the quoted password argument
-    is matched; nothing else on the line changes."""
     for scenario_password, fixture_password in credentials.items():
         quoted = b'"' + scenario_password.encode("utf-8") + b'"'
         if line.rstrip(b"\r\n").endswith(quoted):
@@ -207,37 +210,29 @@ def _translate_login(line: bytes, credentials: dict[str, str]) -> bytes:
 
 
 def _now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
 
 
 class ProxySession:
-    """One client↔upstream session. Owns its own pair of relays.
-
-    The `config` dict is SHARED across all sessions (passed in by
-    `_main`). Per-session UIDVALIDITY state lives on the instance so
-    each connection re-arms the trigger; fault-counter state lives on
-    the shared dict so `inject_failure_on[*].remaining` and
-    `delay_command_seconds.remaining` decrement across reconnects (the
-    server's recovery loop opens fresh IMAP connections per retry)."""
+    """One client <-> upstream session."""
 
     def __init__(
         self,
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
         config: dict[str, Any],
+        config_path: Path | None = None,
     ) -> None:
         self.client_reader = client_reader
         self.client_writer = client_writer
         self.config = config
-        # Three states on the UIDVALIDITY-injection state machine:
-        #   "idle"      — trigger not yet seen
-        #   "saw_cmd"   — client sent the trigger command; awaiting
-        #                  upstream's tagged completion of THAT cmd
-        #   "inject"    — tagged completion seen; the FIRST response
-        #                  line of the NEXT upstream burst gets the
-        #                  injection prepended
+        self.config_path = config_path
         self._uidv_state = "idle"
         self._cmd_log_lock = asyncio.Lock()
+        self.pending_delay_seconds: float = 0.0
+        self.drop_before_tagged: bool = False
+        self._awaiting_list_response = False
+        self._current_selected_mailbox: str | None = None
 
     @staticmethod
     def _load_config(config_path: Path) -> dict[str, Any]:
@@ -252,12 +247,10 @@ class ProxySession:
             return
         async with self._cmd_log_lock:
             try:
-                with open(path, "a", encoding="utf-8") as fh:
-                    fh.write(
-                        f"{_now_iso()}\t{line.rstrip().decode('ascii', 'replace')}\n"
-                    )
-            except OSError:
-                pass
+                with open(path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230
+                    fh.write(f"{_now_iso()}\t{line.rstrip().decode('ascii', 'replace')}\n")
+            except OSError as exc:
+                logger.warning("Failed to write to proxy command log %s: %s", path, exc)
 
     async def run(self) -> None:
         upstream_host = self.config.get("upstream_host", "127.0.0.1")
@@ -267,13 +260,14 @@ class ProxySession:
                 upstream_host, upstream_port
             )
         except OSError as exc:
+            logger.warning("Proxy could not connect to upstream %s:%d: %s", upstream_host, upstream_port, exc)
             self.client_writer.close()
             return
 
         c2s = asyncio.create_task(self._pump_c2s(upstream_writer))
         s2c = asyncio.create_task(self._pump_s2c(upstream_reader))
         try:
-            done, pending = await asyncio.wait(
+            _done, pending = await asyncio.wait(
                 {c2s, s2c}, return_when=asyncio.FIRST_COMPLETED
             )
             for t in pending:
@@ -283,44 +277,17 @@ class ProxySession:
                 try:
                     w.close()
                     await w.wait_closed()
-                except Exception:
-                    pass
-
-    async def _read_imap_frame(
-        self, reader: asyncio.StreamReader
-    ) -> bytes:
-        """Read one IMAP frame: a CRLF-terminated line, plus any
-        synchronous literals it inlines (`{N}`-trailer expansion).
-
-        Returns the entire frame including the terminating CRLF for
-        each constituent line. Returns `b''` on EOF.
-        """
-        line = await reader.readline()
-        if not line:
-            return b""
-        chunks = [line]
-        while True:
-            stripped = chunks[-1].rstrip(b"\r\n")
-            m = LITERAL_TRAILER_RE.search(stripped)
-            if not m:
-                break
-            n = int(m.group(1))
-            payload = await reader.readexactly(n)
-            chunks.append(payload)
-            cont = await reader.readline()
-            if not cont:
-                break
-            chunks.append(cont)
-        return b"".join(chunks)
+                except OSError as exc:
+                    logger.debug("Error closing proxy stream: %s", exc)
 
     async def _pump_c2s(self, upstream: asyncio.StreamWriter) -> None:
-        """Client → Upstream. Logs commands; arms UIDVALIDITY-inject
-        if the configured trigger matches; honours fault-injection
-        hooks (`inject_failure_on`, `delay_command_seconds`)."""
-        trigger = (self.config.get("uidvalidity_change_after") or "").upper()
-        inject_specs = list(self.config.get("inject_failure_on", []) or [])
-        delay_spec = self.config.get("delay_command_seconds") or None
         while True:
+            if self.config_path:
+                self.config = ProxySession._load_config(self.config_path) or self.config
+            trigger = (self.config.get("uidvalidity_change_after") or "").upper()
+            inject_specs = list(self.config.get("inject_failure_on", []) or [])
+            delay_spec = self.config.get("delay_command_seconds") or None
+
             line = await self.client_reader.readline()
             if not line:
                 upstream.close()
@@ -328,33 +295,67 @@ class ProxySession:
             command_line = line.rstrip(b"\r\n")
             await self._log_command(command_line)
             tag, verb = _parse_tag_and_verb(command_line)
+            mailbox = _extract_mailbox(command_line)
+
+            if verb in ("SELECT", "EXAMINE", "STATUS") and mailbox:
+                self._current_selected_mailbox = mailbox
+
+            if verb == "LIST":
+                self._awaiting_list_response = True
+
             if verb == "LOGIN":
                 line = _translate_login(line, self.config.get("login_credentials") or {})
 
             matched_spec = (
-                _consume_command_match(inject_specs, verb) if verb else None
+                _consume_command_match(inject_specs, verb, mailbox) if verb else None
             )
             if matched_spec is not None:
+                if self.config_path:
+                    try:
+                        self.config["inject_failure_on"] = inject_specs
+                        self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+                    except OSError:
+                        pass
                 mode = (matched_spec.get("mode") or "no_response").lower()
-                # Do NOT forward upstream. The client's APPEND-literal
-                # body never gets a `+ continue` so it stays unsent —
-                # upstream sees nothing.
                 if mode == "close":
-                    # Close the client-facing writer without sending any
-                    # tagged response. The IMAP client sees a connection
-                    # drop after its command line was acknowledged on
-                    # the wire — exactly the "no tagged response, no
-                    # timeout either" surface the append_failed
-                    # catch-all maps to.
                     try:
                         self.client_writer.close()
-                    except Exception:
-                        pass
+                    except OSError as exc:
+                        logger.debug("Error closing client writer on close fault: %s", exc)
                     return
-                if mode == "bad_response":
-                    status = "BAD"
-                else:
-                    status = "NO"
+
+                if mode == "close_after_forward":
+                    self.drop_before_tagged = True
+                    upstream.write(line)
+                    try:
+                        await upstream.drain()
+                    except OSError as exc:
+                        logger.debug("Upstream drain failed on close_after_forward: %s", exc)
+                        return
+                    tail = command_line
+                    while True:
+                        m = LITERAL_TRAILER_RE.search(tail)
+                        if not m:
+                            break
+                        n = int(m.group(1))
+                        payload = await self.client_reader.readexactly(n)
+                        upstream.write(payload)
+                        cont = await self.client_reader.readline()
+                        if not cont:
+                            try:
+                                await upstream.drain()
+                            except OSError:
+                                pass
+                            return
+                        upstream.write(cont)
+                        try:
+                            await upstream.drain()
+                        except OSError:
+                            return
+                        tail = cont.rstrip(b"\r\n")
+                    continue
+
+                status = "BAD" if mode == "bad_response" else "NO"
                 resp = _build_tagged_response(
                     tag,
                     verb,
@@ -364,23 +365,24 @@ class ProxySession:
                 self.client_writer.write(resp)
                 try:
                     await self.client_writer.drain()
-                except Exception:
+                except OSError as exc:
+                    logger.debug("Client write error: %s", exc)
                     return
                 continue
 
             if (
                 delay_spec is not None
                 and verb
-                and _consume_delay_match(delay_spec, verb)
+                and _consume_delay_match(delay_spec, verb, mailbox)
             ):
-                # Sleep, then DO NOT forward. The server's
-                # `wait_for(timeout=N)` will have fired by the time we
-                # wake, and forwarding stale literal-body bytes after
-                # the client's APPEND was cancelled leads to upstream
-                # confusion. Subsequent commands (LOGOUT, retry on a
-                # fresh connection) are handled normally.
-                await asyncio.sleep(float(delay_spec.get("seconds", 0) or 0))
-                continue
+                # Arm delayed response delivery on the response pump
+                self.pending_delay_seconds = float(delay_spec.get("seconds", 0) or 0)
+                if self.config_path:
+                    try:
+                        self.config["delay_command_seconds"] = delay_spec
+                        self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+                    except OSError:
+                        pass
 
             if (
                 trigger
@@ -389,20 +391,13 @@ class ProxySession:
             ):
                 self._uidv_state = "saw_cmd"
 
-            # Forward the command line FIRST. Synchronous IMAP literals
-            # require the upstream to send `+ continue` (handled by
-            # `_pump_s2c` in parallel) before the client sends the body
-            # bytes — so reading the body before forwarding the command
-            # would deadlock.
             upstream.write(line)
             try:
                 await upstream.drain()
-            except Exception:
+            except OSError as exc:
+                logger.debug("Upstream drain failed: %s", exc)
                 return
 
-            # Then iteratively forward any literal-body bytes the
-            # client sends after seeing `+`, plus the trailing CRLF
-            # line (which itself may carry another `{N}` trailer).
             tail = command_line
             while True:
                 m = LITERAL_TRAILER_RE.search(tail)
@@ -415,51 +410,82 @@ class ProxySession:
                 if not cont:
                     try:
                         await upstream.drain()
-                    except Exception:
+                    except OSError:
                         pass
                     return
                 upstream.write(cont)
                 try:
                     await upstream.drain()
-                except Exception:
+                except OSError:
                     return
                 tail = cont.rstrip(b"\r\n")
 
     async def _pump_s2c(self, upstream: asyncio.StreamReader) -> None:
-        """Upstream → Client. Rewrites CAPABILITY lines and (when
-        armed) prepends a `* OK [UIDVALIDITY <new>]` untagged
-        response to the very first response line that follows the
-        trigger command's tagged completion."""
-        strip = list(self.config.get("strip_capabilities", []) or [])
-        new_validity = str(self.config.get("uidvalidity_new_value") or "")
         while True:
+            if self.config_path:
+                self.config = ProxySession._load_config(self.config_path) or self.config
+            strip = list(self.config.get("strip_capabilities", []) or [])
+            new_validity = str(self.config.get("uidvalidity_new_value") or "")
+            rewrite_rules = self.config.get("rewrite_uidvalidity")
+
             line = await upstream.readline()
             if not line:
                 self.client_writer.close()
                 return
 
-            # State machine: when armed and the trigger command's
-            # tagged completion has just gone through, the *next*
-            # incoming line gets the injection prepended.
+            if self.drop_before_tagged and not line.startswith(b"+") and not line.startswith(b"*"):
+                self.drop_before_tagged = False
+                try:
+                    self.client_writer.close()
+                except OSError:
+                    pass
+                return
+
+            # Apply pending delay before delivering response line to client,
+            # but do not delay continuation (+) requests needed for literal transfer.
+            if self.pending_delay_seconds > 0 and not line.startswith(b"+"):
+                delay = self.pending_delay_seconds
+                self.pending_delay_seconds = 0.0
+                await asyncio.sleep(delay)
+
+            # Handle inject_list_entry before the tagged completion of LIST
+            if self._awaiting_list_response and not line.startswith(b"*"):
+                self._awaiting_list_response = False
+                inject_entry = self.config.get("inject_list_entry")
+                if inject_entry:
+                    raw_inject = inject_entry if inject_entry.endswith("\r\n") else inject_entry + "\r\n"
+                    self.client_writer.write(raw_inject.encode("ascii", errors="replace"))
+
+            # State machine for general UIDVALIDITY injection
             if self._uidv_state == "saw_cmd" and not line.startswith(b"*"):
-                # Tagged completion of the trigger command. Forward
-                # it normally, then arm the next response.
                 rewritten = _rewrite_capability(line, strip)
                 self.client_writer.write(rewritten)
                 self._uidv_state = "inject"
             elif self._uidv_state == "inject":
-                inject = (
-                    f"* OK [UIDVALIDITY {new_validity}] UIDs invalidated\r\n"
-                ).encode("ascii")
+                inject = f"* OK [UIDVALIDITY {new_validity}] UIDs invalidated\r\n".encode("ascii")
                 self.client_writer.write(inject)
                 self._uidv_state = "idle"
                 rewritten = _rewrite_capability(line, strip)
                 self.client_writer.write(rewritten)
             else:
                 rewritten = _rewrite_capability(line, strip)
+                # Check folder-specific rewrite_uidvalidity
+                if rewrite_rules and UIDVALIDITY_RE.search(rewritten):
+                    target_val = None
+                    if isinstance(rewrite_rules, dict):
+                        target_mbox = rewrite_rules.get("mailbox")
+                        if _mailbox_matches(target_mbox, self._current_selected_mailbox):
+                            target_val = rewrite_rules.get("new_value")
+                    elif isinstance(rewrite_rules, list):
+                        for r in rewrite_rules:
+                            if _mailbox_matches(r.get("mailbox"), self._current_selected_mailbox):
+                                target_val = r.get("new_value")
+                                break
+                    if target_val is not None:
+                        rewritten = UIDVALIDITY_RE.sub(f"[UIDVALIDITY {target_val}]".encode("ascii"), rewritten)
+
                 self.client_writer.write(rewritten)
-            # Pass through any literals that follow (mostly applies to
-            # FETCH responses; CAPABILITY rewrites never carry literals).
+
             stripped = line.rstrip(b"\r\n")
             m = LITERAL_TRAILER_RE.search(stripped)
             if m:
@@ -467,7 +493,8 @@ class ProxySession:
                 self.client_writer.write(payload)
             try:
                 await self.client_writer.drain()
-            except Exception:
+            except OSError as exc:
+                logger.debug("Client writer drain failed: %s", exc)
                 return
 
 
@@ -479,27 +506,26 @@ def _log_connection(config: dict[str, Any], writer: asyncio.StreamWriter) -> Non
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(f"{_now_iso()}\tCONNECT {peer!r}\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("Failed to write connection log %s: %s", path, exc)
 
 
 async def _main(host: str, port: int, config_path: Path) -> None:
-    # Load the config dict ONCE per proxy process and share it across
-    # every session. Fault counters (`inject_failure_on[*].remaining`,
-    # `delay_command_seconds.remaining`) live inside this dict and
-    # mutate in place — they must persist across the per-retry IMAP
-    # reconnects the saga's recovery loop performs.
     shared_config = ProxySession._load_config(config_path)
 
     async def _on_client(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        _log_connection(shared_config, writer)
-        session = ProxySession(reader, writer, shared_config)
+        cfg = ProxySession._load_config(config_path) or shared_config
+        _log_connection(cfg, writer)
+        if cfg.get("refuse_connections"):
+            writer.close()
+            return
+        session = ProxySession(reader, writer, cfg, config_path=config_path)
         try:
             await session.run()
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.debug("Proxy session error: %s", exc)
 
     server = await asyncio.start_server(_on_client, host, port)
     sys.stdout.write(f"LISTEN {host}:{port}\n")
@@ -508,14 +534,10 @@ async def _main(host: str, port: int, config_path: Path) -> None:
         await server.serve_forever()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(prog="imap-proxy")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--config", required=True)
-    args = parser.parse_args()
-    asyncio.run(_main(args.host, args.port, Path(args.config)))
-
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--config", type=Path, required=True)
+    args = parser.parse_args()
+    asyncio.run(_main(args.host, args.port, args.config))

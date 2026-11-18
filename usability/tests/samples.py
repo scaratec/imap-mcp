@@ -27,24 +27,24 @@ def mailbox_after(scenario: str, mutate: Any = None) -> tuple[Any, list[dict[str
     return fixture, start, snapshot(state)
 
 
-def append_draft(state: GmailState, to: str, subject: str, *, html: bool, body: str = "Hallo,\n\nTest.\n") -> None:
+def append_draft(state: GmailState, to: str, subject: str, *, html: bool, body: str = "Hallo,\n\nDienstag um 10 Uhr am 12. November.\n") -> None:
     from mock_gmail.state import Message
 
     if html:
         raw = (
-            f"From: inhaber@example.org\r\nTo: {to}\r\nSubject: {subject}\r\nMessage-ID: <d-{subject}@x>\r\n"
+            f"From: owner@de-gmail.example\r\nTo: {to}\r\nSubject: {subject}\r\nMessage-ID: <d-{subject}@x>\r\n"
             "MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n\r\n"
             f"--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
             "--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hallo</p>\r\n--b--\r\n"
         )
     else:
         raw = (
-            f"From: inhaber@example.org\r\nTo: {to}\r\nSubject: {subject}\r\nMessage-ID: <d-{subject}@x>\r\n"
+            f"From: owner@de-gmail.example\r\nTo: {to}\r\nSubject: {subject}\r\nMessage-ID: <d-{subject}@x>\r\n"
             f"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}"
         )
     msgid = state.new_msgid()
     state.add_message(Message(gm_msgid=msgid, gm_thrid=msgid, rfc822=raw.encode(), labels={"\\Drafts"},
-                              message_id=f"<d-{subject}@x>", from_addr="inhaber@example.org", to_addr=to,
+                              message_id=f"<d-{subject}@x>", from_addr="owner@de-gmail.example", to_addr=to,
                               subject=subject))
 
 

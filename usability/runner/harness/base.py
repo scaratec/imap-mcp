@@ -12,7 +12,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from ..matrix import HarnessConfig
 
@@ -180,7 +180,7 @@ class HarnessDriver(ABC):
     """Builds the headless command for one harness and parses its output."""
 
     #: What could and could not be restricted, for the run record and README.
-    restrictions: list[str] = []
+    restrictions: ClassVar[list[str]] = []
     #: Retry a turn once when it failed with an auth error before any tool ran.
     transient_auth_retry = False
 
@@ -215,7 +215,7 @@ class HarnessDriver(ABC):
     def version(self) -> str | None:
         try:
             out = subprocess.run(
-                [self.cfg.binary, "--version"], capture_output=True, text=True, timeout=30,
+                [self.cfg.binary, "--version"], capture_output=True, text=True, timeout=30, check=False,
                 env=self.env(), cwd=self.workdir,
             )
         except (OSError, subprocess.TimeoutExpired):

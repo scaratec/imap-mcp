@@ -30,6 +30,11 @@ class BootstrapResult:
     """The server neither refused nor finished within the timeout and
     was killed; `exit_code` then says nothing about a refusal."""
 
+    @property
+    def refused_to_start(self) -> bool:
+        """True when the server definitively refused to start with a non-zero exit code (not via timeout)."""
+        return not self.timed_out and self.exit_code != 0
+
 
 def try_bootstrap_server(
     server_binary: Path,
@@ -88,9 +93,12 @@ def try_bootstrap_server(
         proc.kill()
         stdout, stderr = proc.communicate()
         timed_out = True
+    err_text = stderr.decode("utf-8", errors="replace")
+    if timed_out:
+        err_text = f"[TIMEOUT] Server subprocess timed out after {timeout}s without exit\n" + err_text
     return BootstrapResult(
         exit_code=proc.returncode if proc.returncode is not None else -1,
-        stderr=stderr.decode("utf-8", errors="replace"),
+        stderr=err_text,
         stdout=stdout.decode("utf-8", errors="replace"),
         timed_out=timed_out,
     )

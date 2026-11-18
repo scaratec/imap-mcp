@@ -1,108 +1,133 @@
-Feature: Audit trail shared by several local server instances
+@test_hooks
+Feature: Audit trail shared across concurrent local server instances and pre-effect fail-closed writes
 
-  An MCP client such as OpenCode starts one stdio server per session or
-  sub-agent, and every one of them is configured with the same audit
-  directory. The instances therefore share one audit trail: the day
-  files, the day roll that seals a file with its `eof_day` record, and
-  the hash chain. Whichever instance writes first on a new UTC day
-  closes the previous day; every other instance continues the chain
-  from what is on disk, not from what it remembers. A sealed file is
-  never written to again. See ADR 0021, ADR 0022 and ADR 0032.
+  Multiple local stdio server instances configured with the same audit
+  directory coordinate through flock on .audit.lock, continue a single
+  daily SHA-256 hash chain from disk, seal past UTC days idempotently
+  with eof_day (mode 0400), and fsync a pre-effect intent record before
+  executing any write side-effect so that an unwritable audit trail
+  prevents IMAP mutations completely (ADR 0048).
 
-  Regression for the incident of 2026-10-16: a long-running instance
-  kept targeting the previous day's file after another instance had
-  sealed it at start-up, and every tool call failed with
-  "[Errno 13] Permission denied" until the process was restarted.
-
-  The audit clock is shared by all instances of a scenario and can be
-  moved while they run (test hook `IMAP_MCP_FAKE_NOW_FILE`, ADR 0023).
+  Hash-chain rule: record i carries prev_hash = "sha256:" + sha256(raw
+  UTF-8 line i-1 including trailing LF), with day-0 genesis
+  "sha256:" + 64 zeros and day rollover chaining onto final_hash of the
+  previous day's eof_day trailer.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Day rolled by another instance while a writer is running : 1
-    - Start-up of further instances on an already sealed day   : 1
-    - Interleaved writes of concurrent instances               : 1
-    - Simultaneous writes of concurrent instances              : 1
-    - Restart within the same day                              : 1
-    - Records written outside the audit writer (token refresh) : 1
-    - Audit trail not writable                                 : 1
-    Total enumerated                                           : 7   covered by this feature: 7
+    - Day rolled by instance B while instance A stays running      : 1
+    - Starting further instances leaves sealed day file untouched  : 1
+    - Interleaved writes of two instances form one hash chain      : 1
+    - Simultaneous burst writes of two instances form one chain    : 1
+    - Restart within the same day continues the day's chain        : 1
+    - OAuth token refresh failure recorded in the shared chain     : 1
+    - Unwritable audit aborts read call with explicit error        : 1
+    - Unwritable audit aborts write call BEFORE any IMAP mutation  : 1
+    Total enumerated                                               : 8   covered by this feature: 8
 
   Background:
     Given the audit log directory is a fresh $TMPDIR/audit
-    And the audit clock reads "2026-10-15T21:00:00Z"
+    And the shared fake clock file is set to "2026-10-15T21:00:00Z"
+    And secret_store configuration is:
+      """
+      backend: file_dir
+      path: $TMPDIR/secrets
+      acknowledge_plaintext: true
+      """
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path | special use |
+      | INBOX       |             |
+      | Drafts      | \Drafts     |
+    And the server is configured with single caller:
+      | caller_id     | auth_type     | policy         |
+      | invoice-agent | stdio_trusted | invoice-policy |
+    And policy "invoice-policy" grants account "gupta-scaratec"
+    And policy "invoice-policy" grants the following folder policies:
+      | account        | folder | mode      | default  | draft_append |
+      | gupta-scaratec | INBOX  | blacklist | ENVELOPE | false        |
+      | gupta-scaratec | Drafts | blacklist | FULL     | true         |
 
   Scenario: A running instance keeps auditing after another instance has sealed the previous day
-    Given the server is started with a minimal configuration
-    And server instance "A" is running
-    And instance "A" has called list_accounts
-    When the audit clock advances to "2026-10-16T03:59:00Z"
-    And server instance "B" starts
+    Given server instance "A" is running
+    And instance "A" calls list_accounts
+    When the shared fake clock file advances to "2026-10-16T03:59:00Z"
+    And server instance "B" starts and calls list_accounts
     And instance "A" calls get_caller_identity
     Then the call by instance "A" succeeds
-    And file "2026-10-16.jsonl" contains a record with tool "get_caller_identity" written by instance "A"
+    And file "2026-10-16.jsonl" contains a record with tool "get_caller_identity"
     And file "2026-10-15.jsonl" ends with a record of tool "eof_day" carrying field final_hash
     And file "2026-10-16.jsonl" begins with a record whose prev_hash equals that final_hash
     And the audit file "2026-10-15.jsonl" has mode 0400
 
-  Scenario: Starting further instances leaves an already sealed day file untouched
-    Given the server is started with a minimal configuration
-    And server instance "A" is running
-    And instance "A" has called list_accounts
-    And the audit clock advances to "2026-10-16T08:00:00Z"
-    And instance "A" has called list_accounts
-    And the content of audit file "2026-10-15.jsonl" is remembered
-    When server instance "B" starts
-    And server instance "C" starts
-    And instance "B" calls list_accounts
-    Then the audit file "2026-10-15.jsonl" is byte-for-byte unchanged
+  Scenario: Starting further instances leaves an already sealed day file byte-for-byte untouched
+    Given server instance "A" is running
+    And instance "A" calls list_accounts
+    And the shared fake clock file advances to "2026-10-16T08:00:00Z"
+    And instance "A" calls list_accounts
+    And the exact bytes of audit file "2026-10-15.jsonl" are remembered
+    When server instance "B" starts and calls list_accounts
+    And server instance "C" starts and calls list_accounts
+    Then the audit file "2026-10-15.jsonl" equals the remembered bytes
     And file "2026-10-15.jsonl" contains exactly 1 record with tool "eof_day"
 
-  Scenario: Interleaved calls of two running instances form one hash chain
-    Given the server is started with a minimal configuration
-    And server instance "A" is running
+  Scenario: Interleaved calls of two running instances form one continuous hash chain
+    Given server instance "A" is running
     And server instance "B" is running
     When instance "A" calls list_accounts
     And instance "B" calls list_accounts
     And instance "A" calls list_accounts
     And instance "B" calls list_accounts
-    Then file "2026-10-15.jsonl" contains exactly 4 records with tool "list_accounts"
-    And the records of file "2026-10-15.jsonl" form one hash chain with consecutive seq numbers starting at 0
+    Then file "2026-10-15.jsonl" contains 4 records with tool "list_accounts"
+    And all records of file "2026-10-15.jsonl" form a valid hash chain with consecutive seq numbers starting at 0
 
-  Scenario: Simultaneous calls of two running instances form one hash chain
-    Given the server is started with a minimal configuration
-    And server instance "A" is running
+  Scenario: Simultaneous burst calls of two running instances form one continuous hash chain
+    Given server instance "A" is running
     And server instance "B" is running
-    When instances "A" and "B" each call list_accounts 15 times at the same time
-    Then file "2026-10-15.jsonl" contains exactly 30 records with tool "list_accounts"
-    And the records of file "2026-10-15.jsonl" form one hash chain with consecutive seq numbers starting at 0
+    When instances "A" and "B" each call list_accounts 15 times concurrently
+    Then file "2026-10-15.jsonl" contains 30 records with tool "list_accounts"
+    And all records of file "2026-10-15.jsonl" form a valid hash chain with consecutive seq numbers starting at 0
 
-  Scenario: An instance restarted within the same day continues the day's chain
-    Given the server is started with a minimal configuration
-    And server instance "A" is running
-    And instance "A" has called list_accounts
-    And instance "A" has called list_accounts
-    When server instance "A" stops
-    And server instance "B" starts
-    And instance "B" calls list_accounts
-    Then the call by instance "B" succeeds
-    And the records of file "2026-10-15.jsonl" form one hash chain with consecutive seq numbers starting at 0
+  Scenario: An instance started after another exits within the same day continues the day's chain
+    Given server instance "A" is running
+    And instance "A" calls list_accounts
+    And instance "A" calls list_accounts
+    When server instance "A" stops cleanly
+    And server instance "B" starts and calls list_accounts
+    Then all records of file "2026-10-15.jsonl" form a valid hash chain with consecutive seq numbers starting at 0
 
-  Scenario: A token refresh is recorded in the hash chain of the day it belongs to
-    Given the secret store "file_dir" is configured at path $TMPDIR/secrets
-    And the server is configured with account:
-      | id            | provider    | host                | oauth_scope              | token_cache |
-      | gmail-archive | google-mock | imap.localhost-mock | https://mail.google.com/ | memory_only |
+  Scenario: An OAuth token refresh event is chained into the active UTC day file
+    Given the mock OAuth2 server is reset and healthy
+    And account "gmail-archive" is configured for OAuth2 against the mock OAuth2 server and mock-gmail with scope "https://mail.google.com/" and token_cache "memory_only"
     And the secret store contains a refresh token for "gmail-archive"
-    And the mock OAuth2 provider responds to the next token-exchange request with error "invalid_grant"
-    When the server attempts to open an IMAP connection to "gmail-archive"
-    And invoice-agent calls list_accounts
-    Then file "2026-10-15.jsonl" contains exactly 1 record with tool "token_refresh"
-    And the records of file "2026-10-15.jsonl" form one hash chain with consecutive seq numbers starting at 0
+    And the mock OAuth2 server is primed to reject the next refresh_token exchange with OAuth error "invalid_grant"
+    And policy "invoice-policy" grants account "gmail-archive"
+    And policy "invoice-policy" grants folder on account "gmail-archive":
+      | folder | mode      | default  | rules |
+      | INBOX  | blacklist | ENVELOPE | []    |
+    When server instance "A" starts and calls list_folders with account "gmail-archive"
+    And instance "A" calls list_accounts
+    Then file "2026-10-15.jsonl" contains 1 record with tool "token_refresh"
+    And all records of file "2026-10-15.jsonl" form a valid hash chain with consecutive seq numbers starting at 0
 
-  Scenario: An audit trail that cannot be written is reported as such
-    Given the server is started with a minimal configuration
+  Scenario: An unwritable audit trail fails read calls closed with an explicit error
+    Given the test runner is not executing as root
     And server instance "A" is running
-    And instance "A" has called list_accounts
-    And the audit trail has been made unwritable
+    And instance "A" calls list_accounts
+    And the audit directory and current day file are made read-only
     When instance "A" calls get_caller_identity
     Then the call by instance "A" fails with an error containing "audit trail not writable"
+
+  Scenario: An unwritable audit trail aborts create_draft at the intent stage before any IMAP APPEND occurs
+    Given the test runner is not executing as root
+    And the IMAP traffic for "gupta-scaratec" is captured through a proxy
+    And server instance "A" is running
+    And instance "A" calls list_accounts
+    And the audit directory and current day file are made read-only
+    When instance "A" calls create_draft with account "gupta-scaratec", folder "Drafts", fields:
+      """
+      {"to": ["client@example.org"],
+       "subject": "Darf ohne Audit nicht landen",
+       "body_text": "Kein ungeloggter Seiteneffekt."}
+      """
+    Then the call by instance "A" fails with an error containing "audit trail not writable"
+    And the IMAP command log for "gupta-scaratec" contains no APPEND command
+    And the IMAP folder "Drafts" contains no message with subject "Darf ohne Audit nicht landen"

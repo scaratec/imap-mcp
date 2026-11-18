@@ -94,9 +94,13 @@ def _ensure_mcp_client(context: Context, caller_id: str) -> MCPClient:
 
     flush_staged_messages(context)
 
-    client = getattr(context, "mcp", None)
-    if client is not None:
-        return client
+    clients = getattr(context, "mcp_clients", None)
+    if clients is None:
+        clients = {}
+        context.mcp_clients = clients
+    if caller_id in clients:
+        context.mcp = clients[caller_id]
+        return clients[caller_id]
 
     capture_witnessed_command_logs(context)
 
@@ -112,8 +116,21 @@ def _ensure_mcp_client(context: Context, caller_id: str) -> MCPClient:
             context.bdd_root.parent / "server" / ".venv" / "bin" / "imap-mcp",
         )
     )
-    extra_env = getattr(context, "mcp_extra_env", None) or {}
-    extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
+    extra_env = dict(getattr(context, "mcp_extra_env", None) or {})
+    needs_test_mode = (
+        getattr(context, "is_test_hooks", False)
+        or getattr(context, "needs_test_mode", False)
+        or "IMAP_MCP_FAKE_NOW_UTC" in extra_env
+        or "IMAP_MCP_FAKE_NOW_FILE" in extra_env
+        or "IMAP_MCP_CRASH_AT" in extra_env
+        or "IMAP_MCP_SAGA_PAUSE_AT" in extra_env
+        or "IMAP_MCP_TEST_INJECT_INTERNAL_ERROR" in extra_env
+        or extra_env.get("IMAP_MCP_TEST_MODE") == "1"
+    )
+    if needs_test_mode and not getattr(context, "without_test_mode", False):
+        extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    else:
+        extra_env.pop("IMAP_MCP_TEST_MODE", None)
     context.mcp_extra_env = extra_env
     client = MCPClient(
         server_binary=server_binary,
@@ -124,6 +141,7 @@ def _ensure_mcp_client(context: Context, caller_id: str) -> MCPClient:
         **_client_info_kwargs(context),
     )
     client.start()
+    clients[caller_id] = client
     context.mcp = client
     # Remembered so that steps which restart the server on their own —
     # the recovery loop after a crash — can put the scenario's caller
@@ -160,6 +178,8 @@ def _store_result(context: Context, payload: dict[str, object]) -> None:
         )
     # The text exactly as received, for witnesses that measure what the
     # client had to read (ADR 0038 response size).
+    context.last_raw_payload = payload
+    context.last_content_blocks = content
     context.last_response_texts = [
         block["text"]
         for block in content
@@ -207,6 +227,7 @@ def step_caller_calls_list_tools(context: Context, caller_id: str) -> None:
     context.last_response = {"tools": tools}
 
 
+@given('{caller_id} calls list_accounts')
 @when('{caller_id} calls list_accounts')
 def step_caller_calls_list_accounts(context: Context, caller_id: str) -> None:
     client = _ensure_mcp_client(context, caller_id)
@@ -247,16 +268,6 @@ def step_caller_calls_describe_policy(context: Context, caller_id: str) -> None:
     _store_result(context, payload)
 
 
-@when("{caller_id} calls describe_policy with extra argument {extra_raw}")
-def step_caller_calls_describe_policy_with_extra(
-    context: Context, caller_id: str, extra_raw: str
-) -> None:
-    import json as _json
-
-    client = _ensure_mcp_client(context, caller_id)
-    extras = _json.loads(extra_raw)
-    payload = client.call_tool("describe_policy", extras)
-    _store_result(context, payload)
 
 
 @when("{caller_id} calls get_caller_identity")
@@ -281,6 +292,12 @@ def step_caller_calls_list_folders(
     _store_result(context, payload)
 
 
+def _res_uid(context: Context, account: str, folder: str, uid: int) -> int:
+    from support.imap_fixture import resolve_uid
+
+    return resolve_uid(context, account, folder, uid, allow_unseeded_probe=True)
+
+
 @when(
     '{caller_id} calls mark_seen with account "{account}", '
     'folder "{folder}", uid {uid:d}, seen {seen_raw}'
@@ -289,8 +306,7 @@ def step_caller_calls_mark_seen(
     context: Context, caller_id: str, account: str, folder: str, uid: int, seen_raw: str
 ) -> None:
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
+    actual_uid = _res_uid(context, account, folder, uid)
     seen = seen_raw.strip().lower() == "true"
     payload = client.call_tool(
         "mark_seen",
@@ -308,9 +324,6 @@ def step_caller_calls_bulk_mark_seen(
 ) -> None:
     import json as _json
 
-    gmail_state = getattr(context, "gmail_state", None)
-    if gmail_state is not None:
-        gmail_state.total_connections = 0
     criteria_str, extras = _parse_query_tail(tail)
     if "seen" not in extras:
         raise AssertionError(
@@ -346,8 +359,7 @@ def step_caller_calls_mark_tagged(
     import json as _json
 
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
+    actual_uid = _res_uid(context, account, folder, uid)
     try:
         tags = _json.loads(tags_raw)
     except _json.JSONDecodeError:
@@ -368,15 +380,11 @@ def step_caller_calls_mark_tagged(
     _store_result(context, payload)
 
 
-@when(
-    '{caller_id} starts a new move with source {src_raw}, target {dst_raw}'
+
+
+@given(
+    '{caller_id} calls move with source {src_raw}, target {dst_raw}'
 )
-def step_caller_starts_new_move(
-    context: Context, caller_id: str, src_raw: str, dst_raw: str
-) -> None:
-    step_caller_calls_move_structured(context, caller_id, src_raw, dst_raw)
-
-
 @when(
     '{caller_id} calls move with source {src_raw}, target {dst_raw}'
 )
@@ -388,10 +396,9 @@ def step_caller_calls_move_structured(
     client = _ensure_mcp_client(context, caller_id)
     src = _json.loads(src_raw)
     dst = _json.loads(dst_raw)
-    lookup = getattr(context, "message_uids", {})
     uid_hint = src.get("uid")
     if uid_hint is not None:
-        src["uid"] = lookup.get((src["account"], src["folder"], uid_hint), uid_hint)
+        src["uid"] = _res_uid(context, src["account"], src["folder"], int(uid_hint))
     try:
         payload = client.call_tool("move", {"source": src, "target": dst})
     except Exception:
@@ -425,78 +432,20 @@ def step_caller_calls_copy_structured(
     client = _ensure_mcp_client(context, caller_id)
     src = _json.loads(src_raw)
     dst = _json.loads(dst_raw)
-    lookup = getattr(context, "message_uids", {})
     uid_hint = src.get("uid")
     if uid_hint is not None:
-        src["uid"] = lookup.get((src["account"], src["folder"], uid_hint), uid_hint)
+        src["uid"] = _res_uid(context, src["account"], src["folder"], int(uid_hint))
     payload = client.call_tool("copy", {"source": src, "target": dst})
     _store_result(context, payload)
 
 
-@when(
-    '{caller_id} triggers a DENY with reason sender_blacklisted for a message from "{address}"'
-)
-def step_caller_triggers_sender_blacklist(
-    context: Context, caller_id: str, address: str
-) -> None:
-    """Seed a message matching a blacklist rule and fetch its envelope.
-    The server's PDP denies with `sender_blacklisted` and the audit
-    writer hashes the from-domain into `from_domain_sha256`."""
-    from features.steps.policy_steps import (
-        _ensure_builder,
-        flush_staged_messages,
-    )
-    from support.policy_builder import SenderRule
-
-    builder = _ensure_builder(context)
-    # Switch the default folder to blacklist mode with a rule matching
-    # the provided address.
-    policy = builder.policies[0]
-    account_id = next(iter(policy.accounts.keys()))
-    folder = policy.accounts[account_id][0]
-    folder.mode = "blacklist"
-    folder.default = "ENVELOPE"
-    # In blacklist mode rules must be cap-only; drop pre-existing
-    # grant-style rules (background leaves a grant rule in place).
-    folder.rules = [
-        SenderRule(match={"from": address}, cap="NONE")
-    ]
-    builder.write()
-
-    context.staged_messages = getattr(context, "staged_messages", [])
-    context.staged_messages.append(
-        {
-            "_account_id": account_id,
-            "_folder": folder.path,
-            "uid_hint": 999,
-            "from": address,
-            "to": None,
-            "subject": "Ping",
-            "message_id_override": None,
-            "has_attachment": False,
-            "size_hint": 0,
-            "date": None,
-            "extra_attachments": [],
-            "extra_headers": [],
-            "body_override": None,
-        }
-    )
-    flush_staged_messages(context)
-
-    client = _ensure_mcp_client(context, caller_id)
-    uid_lookup = getattr(context, "message_uids", {})
-    actual_uid = uid_lookup.get((account_id, folder.path, 999), 999)
-    payload = client.call_tool(
-        "fetch_envelope",
-        {"account": account_id, "folder": folder.path, "uid": actual_uid},
-    )
-    _store_result(context, payload)
-
-
+@given('the server process is started with transport "http" on 127.0.0.1 and a random port')
 @given('the server process is started with transport "http" on a random port')
 @given('the server is started with transport "http" on a random port')
 @given('the server process is started with transport "http"')
 @given('the server is started with transport "http"')
+@when('the server process is started with transport "http"')
+@when('the server is started with transport "http"')
 def step_server_started_http(context: Context) -> None:
     _start_http_server_for_test(context)
 
@@ -523,32 +472,11 @@ def _start_http_server_for_test(context: Context) -> None:
 
     flush_staged_messages(context)
     builder = getattr(context, "policy_builder", None)
-    if builder is not None:
-        # ADR-0015 forbids stdio_trusted callers on non-stdio transport.
-        # If the caller-set was set up purely via the inline
-        # `using policy` step (which defaults to stdio_trusted) and
-        # the scenario then starts HTTP, auto-promote those callers
-        # to shared_token with a placeholder token_secret_ref so the
-        # ADR-0015 startup guard does not trip. Scenarios that
-        # explicitly exercise the ADR-0015 fatal path use an explicit
-        # `the server is configured with caller:` table that includes
-        # at least one shared_token entry alongside the stdio_trusted —
-        # in that case we leave the stdio_trusted caller alone.
-        has_shared_token = any(
-            getattr(c, "auth_type", None) == "shared_token"
-            for c in builder.callers
-        )
-        if not has_shared_token:
-            for caller in builder.callers:
-                if getattr(caller, "auth_type", None) == "stdio_trusted":
-                    caller.auth_type = "shared_token"
-                    if not getattr(caller, "token_secret_ref", None):
-                        caller.token_secret_ref = (
-                            f"secret://callers/{caller.id}/token"
-                        )
+    if builder is not None and not getattr(context, "custom_callers_yaml", False):
         builder.write()
     extra_env = getattr(context, "mcp_extra_env", None) or {}
-    extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
+    if getattr(context, "is_test_hooks", False) and not getattr(context, "without_test_mode", False):
+        extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
     context.mcp_extra_env = extra_env
     client = MCPHttpClient(
         server_binary=_server_binary(context),
@@ -576,10 +504,13 @@ def _start_http_server_for_test(context: Context) -> None:
 
 from behave import use_step_matcher as _use_step_matcher
 
-
 _use_step_matcher("re")
 
 
+@given(
+    r'the MCP client performs an Initialize handshake with caller_id '
+    r'"(?P<caller_id>[^"]+)" and bearer token "(?P<token>[^"]*)"'
+)
 @when(
     r'the MCP client performs an Initialize handshake with caller_id '
     r'"(?P<caller_id>[^"]+)" and bearer token "(?P<token>[^"]*)"'
@@ -592,172 +523,44 @@ def step_mcp_client_init_with_token(
     try:
         client.initialize(caller_id, token)
         context.last_handshake_succeeded = True
-    except MCPRPCError as exc:
+    except (MCPRPCError, MCPClientError, Exception) as exc:
         context.last_handshake_succeeded = False
-        context.last_handshake_error = exc.message
+        msg = getattr(exc, "message", None) or str(exc)
+        if "auth_failed" in msg:
+            context.last_handshake_error = "auth_failed"
+        else:
+            context.last_handshake_error = msg
 
 
-@when(
-    r'a client sends an Initialize with caller_id "(?P<caller_id>[^"]+)" '
-    r'and bearer token "(?P<token>[^"]*)"'
-)
-def step_client_send_initialize(
-    context: Context, caller_id: str, token: str
-) -> None:
-    step_mcp_client_init_with_token(context, caller_id, token)
 
 
 _use_step_matcher("parse")
 
 
-@when("an HTTP client makes GET /admin against the server")
-def step_http_client_get_admin(context: Context) -> None:
-    import httpx
-
-    client = context.mcp_http
-    response = httpx.get(
-        f"http://{client.host}:{client.port}/admin", timeout=2.0
-    )
-    context.last_http_response = response
 
 
-@when("an HTTP client makes POST /admin/reload-policy against the server")
-def step_http_client_post_admin_reload(context: Context) -> None:
-    import httpx
-
-    client = context.mcp_http
-    response = httpx.post(
-        f"http://{client.host}:{client.port}/admin/reload-policy", timeout=2.0
-    )
-    context.last_http_response = response
 
 
-@when("the audit rotation task runs")
-def step_audit_rotation_runs(context: Context) -> None:
-    """Trigger AuditWriter.rotate() via the test-only MCP tool.
-
-    Lazy-starts the stdio MCPClient if no server is running."""
-    if (
-        getattr(context, "mcp", None) is None
-        and getattr(context, "mcp_http", None) is None
-    ):
-        _ensure_mcp_client(context, "invoice-agent")
-    client = getattr(context, "mcp", None) or getattr(context, "mcp_http")
-    payload = client.raw_call(
-        "tools/call",
-        {"name": "_test_run_audit_rotation", "arguments": {}},
-    )
-    context.last_rotation_result = payload
 
 
-@when('the audit rotation task compresses it to "{gz_filename}"')
-def step_audit_rotation_compresses_to(
-    context: Context, gz_filename: str
-) -> None:
-    """Bridge alias of the rotation step — the gz target name is
-    derived from the source name so this is a no-op convenience."""
-    _ = gz_filename
-    step_audit_rotation_runs(context)
 
 
-@when("the UTC day rolls")
-def step_utc_day_rolls(context: Context) -> None:
-    """Advance the server's fake clock by one day and trigger a
-    rotation pass. Combined effect: the prior day's file gets an
-    eof_day record + 0400 mode, today's file becomes the active one.
-    """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-
-    extra_env = getattr(context, "mcp_extra_env", None) or {}
-    raw = extra_env.get("IMAP_MCP_FAKE_NOW_UTC")
-    if raw:
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        base = _dt.fromisoformat(raw).astimezone(_tz.utc)
-    else:
-        base = _dt.now(tz=_tz.utc)
-    next_day = (base + _td(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    new_fake_now = next_day.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    extra_env["IMAP_MCP_FAKE_NOW_UTC"] = new_fake_now
-    context.mcp_extra_env = extra_env
-    # The server reads env on demand via audit._now_utc(), so we need
-    # the server's environ to reflect the change. Restart so the new
-    # value is picked up. Keep WAL/audit dirs intact.
-    if getattr(context, "mcp", None) is not None:
-        context.mcp.close()
-        context.mcp = None
-    if getattr(context, "mcp_http", None) is not None:
-        context.mcp_http.close()
-        context.mcp_http = None
-    client = _ensure_mcp_client(context, "invoice-agent")
-    # Force a rotation pass on the new fake-now so the prior day's
-    # file is closed with its eof_day record.
-    client.raw_call(
-        "tools/call",
-        {"name": "_test_run_audit_rotation", "arguments": {}},
-    )
-
-
-@when("the clock crosses midnight UTC")
-def step_clock_crosses_midnight(context: Context) -> None:
-    step_utc_day_rolls(context)
-
-
-@when(
-    "invoice-agent calls any of the tools list_accounts, "
-    "describe_policy, get_transaction_status"
-)
-def step_caller_calls_any_of_three(context: Context) -> None:
-    client = _ensure_mcp_client(context, "invoice-agent")
-    context.no_audit_leak_responses = []
-    for name, args in (
-        ("list_accounts", {}),
-        ("describe_policy", {}),
-        ("get_transaction_status", {"tx_id": "tx-fake"}),
-    ):
-        try:
-            payload = client.call_tool(name, args)
-            context.no_audit_leak_responses.append(payload)
-        except Exception:
-            pass
 
 
 @when('the file "{filename}" is deleted out-of-band')
 def step_file_deleted_out_of_band(context: Context, filename: str) -> None:
-    path = context.audit_dir / filename
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, filename)
+    path = Path(resolved)
+    if not path.is_absolute():
+        path = context.audit_dir / filename
     if path.exists():
         path.unlink()
 
 
-@given('the server is actively writing to "{filename}"')
-def step_server_actively_writing_to(context: Context, filename: str) -> None:
-    """Pin fake-now to the date encoded in `filename` and prime the
-    file by driving one tool call so the writer has the file open."""
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    day = filename.replace(".jsonl", "")
-    extra = getattr(context, "mcp_extra_env", None) or {}
-    extra["IMAP_MCP_FAKE_NOW_UTC"] = f"{day}T12:00:00+00:00"
-    context.mcp_extra_env = extra
-    builder = getattr(context, "policy_builder", None)
-    if builder is None or not builder.callers:
-        step_server_minimal_configuration(context)
-    client = _ensure_mcp_client(context, "invoice-agent")
-    client.call_tool("list_accounts", {})
 
 
-@given("the audit writer creates the file for today")
-def step_audit_writer_creates_file_for_today(context: Context) -> None:
-    """Drive one ALLOW call so the audit writer creates today's file."""
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    builder = getattr(context, "policy_builder", None)
-    if builder is None or not builder.callers:
-        step_server_minimal_configuration(context)
-    client = _ensure_mcp_client(context, "invoice-agent")
-    client.call_tool("list_accounts", {})
 
 
 @when("the server receives SIGHUP")
@@ -787,78 +590,265 @@ def step_server_receives_sighup(context: Context) -> None:
     if proc is None or proc.poll() is not None:
         raise AssertionError("No running server to signal")
     proc.send_signal(_signal.SIGHUP)
-    _time.sleep(0.4)
+    deadline = _time.time() + 2.0
+    from support.audit_reader import AuditReader
+
+    while _time.time() < deadline:
+        try:
+            reader = AuditReader(context.audit_dir)
+            if reader.find(tool="policy_reload"):
+                break
+        except Exception:
+            pass
+        _time.sleep(0.02)
 
 
-@when("the server's background recovery loop runs {passes:d} times")
-def step_recovery_loop_runs(context: Context, passes: int) -> None:
-    """Invoke the test-only `_test_run_recovery` tool via raw_call.
-
-    Not part of the production tool surface; exposed only when the
-    server runs with IMAP_MCP_TEST_MODE=1 (set by the retry-limit step).
-    """
-    client = context.mcp
-    if client is None:
-        # Client not yet started — crash-recovery scenarios may have
-        # reached this step without an active server. Start one now,
-        # under the caller the scenario has been using, so the steps
-        # after recovery still speak with the identity they were
-        # granted a policy for.
-        caller_id = getattr(context, "mcp_caller_id", None) or "invoice-agent"
-        client = _ensure_mcp_client(context, caller_id)
-    payload = client.raw_call(
-        "tools/call",
-        {"name": "_test_run_recovery", "arguments": {"passes": passes}},
-    )
-    context.last_recovery_result = payload
 
 
-@when("the server's background recovery loop runs once")
-def step_recovery_loop_runs_once(context: Context) -> None:
-    step_recovery_loop_runs(context, 1)
 
 
-@when("the server terminates ungracefully")
-def step_server_terminates_ungracefully(context: Context) -> None:
-    """Consume the checkpoint step. The preceding move step is
-    expected to have crashed the server (IMAP_MCP_CRASH_AT). If the
-    client is still alive, force-close it."""
-    client = context.mcp
-    if client is not None:
-        # Server may already be dead; MCPClient.close tolerates that.
-        client.close()
-    context.mcp = None
 
 
 @when("the server is restarted")
+@when("the server is restarted without crash hooks")
 def step_server_restarted(context: Context) -> None:
     """Start a fresh MCP subprocess pointing at the same config/WAL,
     without the CRASH_AT env var."""
     if context.mcp is not None:
         context.mcp.close()
         context.mcp = None
+    if getattr(context, "mcp_clients", None):
+        for c in context.mcp_clients.values():
+            c.close()
+        context.mcp_clients.clear()
     env = getattr(context, "mcp_extra_env", None) or {}
     env.pop("IMAP_MCP_CRASH_AT", None)
-    env["IMAP_MCP_TEST_MODE"] = "1"
     context.mcp_extra_env = env
-    # Don't start the client yet — the next step will, via
-    # _ensure_mcp_client, which picks up mcp_extra_env.
     context.crash_expected = False
+    caller_id = (
+        getattr(context, "last_caller_id", None)
+        or (
+            context.policy_builder.callers[0].id
+            if getattr(context, "policy_builder", None) and context.policy_builder.callers
+            else None
+        )
+    )
+    if not caller_id:
+        raise AssertionError("No caller configured in scenario")
+    client = _spawn_mcp_client_for(context, caller_id)
+    context.mcp = client
+    clients = getattr(context, "mcp_clients", None)
+    if clients is None:
+        clients = {}
+        context.mcp_clients = clients
+    clients[caller_id] = client
 
 
-@when('the server is restarted with fake date "{date}"')
-def step_server_restarted_with_fake_date(
-    context: Context, date: str
-) -> None:
-    if context.mcp is not None:
+def _spawn_mcp_client_for(context: Context, caller_id: str) -> MCPClient:
+    server_binary = _server_binary(context)
+    extra_env = dict(getattr(context, "mcp_extra_env", None) or {})
+    needs_test_mode = (
+        getattr(context, "is_test_hooks", False)
+        or getattr(context, "needs_test_mode", False)
+        or any(
+            k.startswith(("IMAP_MCP_TEST_", "IMAP_MCP_CRASH_", "IMAP_MCP_SAGA_"))
+            or k in ("IMAP_MCP_FAKE_NOW_UTC", "IMAP_MCP_FAKE_NOW_FILE")
+            for k in extra_env
+        )
+        or extra_env.get("IMAP_MCP_TEST_MODE") == "1"
+    )
+    if needs_test_mode and not getattr(context, "without_test_mode", False):
+        extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    else:
+        extra_env.pop("IMAP_MCP_TEST_MODE", None)
+    client = MCPClient(
+        server_binary=server_binary,
+        config_dir=context.config_dir,
+        caller_id=caller_id,
+        extra_env=extra_env,
+        unset_env=tuple(getattr(context, "mcp_unset_env", ())),
+        **_client_info_kwargs(context),
+    )
+    client.start()
+    return client
+
+
+@when("two server instances start concurrently sharing the same wal.db and config")
+def step_two_server_instances_start_concurrently(context: Context) -> None:
+    if getattr(context, "mcp", None) is not None:
         context.mcp.close()
         context.mcp = None
+    if getattr(context, "mcp_clients", None):
+        for c in context.mcp_clients.values():
+            c.close()
+        context.mcp_clients.clear()
     env = getattr(context, "mcp_extra_env", None) or {}
     env.pop("IMAP_MCP_CRASH_AT", None)
-    env["IMAP_MCP_TEST_MODE"] = "1"
-    env["IMAP_MCP_FAKE_NOW_UTC"] = f"{date}T12:00:00+00:00"
     context.mcp_extra_env = env
     context.crash_expected = False
+
+    caller = next(iter(context.policy_builder.callers), None) if getattr(context, "policy_builder", None) else None
+    caller_id = getattr(context, "last_caller_id", None) or (caller.id if caller else None)
+    if not caller_id:
+        raise AssertionError("No caller configured in scenario")
+    c1 = _spawn_mcp_client_for(context, caller_id)
+    c2 = _spawn_mcp_client_for(context, caller_id)
+    context.mcp = c1
+    context.mcp_secondary = c2
+
+
+@given("the WAL database file is removed before startup")
+def step_wal_db_removed_before_startup(context: Context) -> None:
+    if context.wal_path.exists():
+        context.wal_path.unlink()
+    shm = context.wal_path.with_name(context.wal_path.name + "-shm")
+    wal_file = context.wal_path.with_name(context.wal_path.name + "-wal")
+    if shm.exists():
+        shm.unlink()
+    if wal_file.exists():
+        wal_file.unlink()
+
+
+@given('the server is armed with IMAP_MCP_CRASH_AT="{crash_at}"')
+def step_server_armed_with_crash_at(context: Context, crash_at: str) -> None:
+    env = getattr(context, "mcp_extra_env", None) or {}
+    env["IMAP_MCP_CRASH_AT"] = crash_at
+    env["IMAP_MCP_TEST_MODE"] = "1"
+    context.mcp_extra_env = env
+    context.is_test_hooks = True
+    context.crash_expected = True
+    clients = getattr(context, "mcp_clients", None) or {}
+    for c in list(clients.values()):
+        c.close()
+    clients.clear()
+    context.mcp = None
+
+
+@when(
+    '{caller_id} invokes move expecting crash for uid {uid:d} from "{src_box}" to "{dst_box}"'
+)
+def step_caller_invokes_move_expecting_crash(
+    context: Context, caller_id: str, uid: int, src_box: str, dst_box: str
+) -> None:
+    import time
+
+    from support.imap_fixture import resolve_uid
+    from support.mcp_client import MCPClientError
+
+    src_acc, _, src_folder = src_box.partition(":")
+    dst_acc, _, dst_folder = dst_box.partition(":")
+    context.crash_expected = True
+    client = _ensure_mcp_client(context, caller_id)
+    actual_uid = resolve_uid(context, src_acc, src_folder, uid, allow_unseeded_probe=True)
+
+    call_failed = False
+    try:
+        client.call_tool(
+            "move",
+            {
+                "source": {"account": src_acc, "folder": src_folder, "uid": actual_uid},
+                "target": {"account": dst_acc, "folder": dst_folder},
+            },
+        )
+    except (MCPClientError, BrokenPipeError, EOFError, OSError):
+        call_failed = True
+
+    if not call_failed:
+        raise AssertionError("Expected call_tool to crash but it succeeded")
+
+    deadline = time.time() + 3.0
+    exit_code = None
+    while time.time() < deadline:
+        exit_code = client.poll_exit()
+        if exit_code is not None:
+            break
+        time.sleep(0.05)
+
+    if exit_code is None:
+        raise AssertionError("Crash hook did not terminate server process within 3 seconds")
+
+    client.close()
+    context.mcp = None
+    clients = getattr(context, "mcp_clients", None)
+    if clients:
+        clients.pop(caller_id, None)
+    from support.wal_reader import WALReader
+
+    reader = WALReader(context.wal_path)
+    txs = reader.all_transactions()
+    if txs:
+        context.crashed_tx_id = txs[-1].tx_id
+        context.last_tx_id = txs[-1].tx_id
+
+
+@when(
+    '{caller_id} invokes update_draft expecting crash on "{box}" '
+    'for the returned draft_id, base_revision {base_revision:d}, changes {changes_raw}'
+)
+def step_caller_invokes_update_draft_expecting_crash(
+    context: Context,
+    caller_id: str,
+    box: str,
+    base_revision: int,
+    changes_raw: str,
+) -> None:
+    import json as _json
+    import time
+
+    from support.mcp_client import MCPClientError
+
+    account, _, folder = box.partition(":")
+    draft_id = getattr(context, "last_draft_id", None)
+    if not draft_id:
+        raise AssertionError("No returned draft_id found in context")
+    changes = _json.loads(changes_raw)
+    context.crash_expected = True
+    client = _ensure_mcp_client(context, caller_id)
+
+    call_failed = False
+    res = None
+    try:
+        res = client.call_tool(
+            "update_draft",
+            {
+                "account": account,
+                "folder": folder,
+                "draft_id": draft_id,
+                "base_revision": base_revision,
+                "changes": changes,
+            },
+        )
+    except (MCPClientError, BrokenPipeError, EOFError, OSError):
+        call_failed = True
+
+    if not call_failed:
+        raise AssertionError(f"Expected update_draft to crash but it succeeded: {res!r}")
+
+    deadline = time.time() + 3.0
+    exit_code = None
+    while time.time() < deadline:
+        exit_code = client.poll_exit()
+        if exit_code is not None:
+            break
+        time.sleep(0.05)
+
+    if exit_code is None:
+        raise AssertionError("Crash hook did not terminate server process within 3 seconds")
+
+    client.close()
+    context.mcp = None
+    clients = getattr(context, "mcp_clients", None)
+    if clients:
+        clients.pop(caller_id, None)
+    from support.wal_reader import WALReader
+
+    reader = WALReader(context.wal_path)
+    txs = reader.all_transactions()
+    if txs:
+        context.crashed_tx_id = txs[-1].tx_id
+        context.last_tx_id = txs[-1].tx_id
+
+
 
 
 @when("{caller_id} calls get_transaction_status with the returned tx_id")
@@ -872,9 +862,89 @@ def step_caller_calls_get_transaction_status(
     _store_result(context, payload)
 
 
+@when('{caller_id} calls get_transaction_status with the tx_id created by {creator}')
+def step_caller_calls_get_tx_status_by_creator(
+    context: Context, caller_id: str, creator: str
+) -> None:
+    tx_id = getattr(context, "last_tx_id", None) or (context.last_response or {}).get("tx_id")
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("get_transaction_status", {"tx_id": tx_id})
+    _store_result(context, payload)
+
+
+@when('{caller_id} calls get_transaction_status with tx_id "{tx_id}"')
+def step_caller_calls_get_tx_status_literal(
+    context: Context, caller_id: str, tx_id: str
+) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("get_transaction_status", {"tx_id": tx_id})
+    _store_result(context, payload)
+
+
+@given('a second server instance is started sharing wal.db for caller "{caller_id}" with an empty policy')
+def step_second_server_instance_started(context: Context, caller_id: str) -> None:
+    import os
+    import shutil
+
+    import yaml
+
+    from support.mcp_client import MCPClient
+
+    second_config_dir = context.scratch_dir / f"config-{caller_id}"
+    second_config_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(context.config_dir / "accounts.yaml", second_config_dir / "accounts.yaml")
+    callers_data = {
+        "callers": [
+            {
+                "id": caller_id,
+                "policy": f"{caller_id}-policy",
+                "auth": {"type": "stdio_trusted"},
+            }
+        ]
+    }
+    (second_config_dir / "callers.yaml").write_text(yaml.safe_dump(callers_data), encoding="utf-8")
+    policies_dir = second_config_dir / "policies"
+    policies_dir.mkdir(exist_ok=True)
+    policy_data = {
+        "name": f"{caller_id}-policy",
+        "accounts": {},
+    }
+    (policies_dir / f"{caller_id}-policy.yaml").write_text(yaml.safe_dump(policy_data), encoding="utf-8")
+
+    server_binary = Path(
+        os.environ.get(
+            SERVER_BINARY_ENV,
+            context.bdd_root.parent / "server" / ".venv" / "bin" / "imap-mcp",
+        )
+    )
+    extra_env = dict(getattr(context, "mcp_extra_env", None) or {})
+    needs_test_mode = (
+        getattr(context, "is_test_hooks", False)
+        or any(k.startswith("IMAP_MCP_") for k in extra_env)
+        or extra_env.get("IMAP_MCP_TEST_MODE") == "1"
+    )
+    if needs_test_mode and not getattr(context, "without_test_mode", False):
+        extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    else:
+        extra_env.pop("IMAP_MCP_TEST_MODE", None)
+    client2 = MCPClient(
+        server_binary=server_binary,
+        config_dir=second_config_dir,
+        caller_id=caller_id,
+        extra_env=extra_env,
+        **_client_info_kwargs(context),
+    )
+    client2.start()
+    clients = getattr(context, "mcp_clients", None)
+    if clients is None:
+        clients = {}
+        context.mcp_clients = clients
+    clients[caller_id] = client2
+
+
 # behave treats "Then ... calls ..." as a Then-step; register the same
 # handler under @then so Then-line invocations of status polling work.
-from behave import then as _behave_then  # noqa: E402
+from behave import then as _behave_then
 
 
 @given('the server process is started with transport "stdio" and environment IMAP_MCP_CALLER_ID="{caller_id}"')
@@ -890,21 +960,37 @@ def step_server_started_stdio_no_caller(context: Context) -> None:
     _spawn_stdio_unhandshaked(context, caller_id=None)
 
 
-def _spawn_stdio_unhandshaked(context: Context, *, caller_id: str | None) -> None:
+@given('the server process is started without IMAP_MCP_TEST_MODE on transport "stdio" with IMAP_MCP_CALLER_ID="{caller_id}"')
+def step_server_started_stdio_without_test_mode(context: Context, caller_id: str) -> None:
+    _spawn_stdio_unhandshaked(context, caller_id=caller_id, without_test_mode=True)
+
+
+def _spawn_stdio_unhandshaked(
+    context: Context, *, caller_id: str | None, without_test_mode: bool = False
+) -> None:
     builder = getattr(context, "policy_builder", None)
     if builder is not None:
         builder.write()
     extra_env = getattr(context, "mcp_extra_env", None) or {}
     context.mcp_extra_env = extra_env
+    unset = [
+        "IMAP_MCP_TEST_MODE",
+        "IMAP_MCP_FAKE_NOW_UTC",
+        "IMAP_MCP_FAKE_NOW_FILE",
+        "IMAP_MCP_SAGA_CRASH_AT",
+        "IMAP_MCP_SAGA_PAUSE_MARKER",
+        "IMAP_MCP_SAGA_RESUME_FILE",
+        "IMAP_MCP_TEST_INJECT_INTERNAL_ERROR",
+    ] if without_test_mode else []
     client = MCPClient(
         server_binary=_server_binary(context),
         config_dir=context.config_dir,
         caller_id=caller_id or "",
         extra_env=extra_env,
+        unset_env=tuple(unset),
     )
     # Bypass the auto-Initialize that the regular `start()` performs.
     # The Initialize is performed explicitly in the next When-step.
-    import io as _io
     import os as _os
     import subprocess as _subprocess
     import threading as _threading
@@ -915,8 +1001,13 @@ def _spawn_stdio_unhandshaked(context: Context, *, caller_id: str | None) -> Non
         env["IMAP_MCP_CALLER_ID"] = caller_id
     else:
         env.pop("IMAP_MCP_CALLER_ID", None)
+    if without_test_mode:
+        for u in unset:
+            env.pop(u, None)
     if extra_env:
-        env.update(extra_env)
+        for k, v in extra_env.items():
+            if not without_test_mode or k not in unset:
+                env[k] = v
     proc = _subprocess.Popen(
         [str(client.server_binary), "--transport", "stdio"],
         stdin=_subprocess.PIPE,
@@ -928,76 +1019,24 @@ def _spawn_stdio_unhandshaked(context: Context, *, caller_id: str | None) -> Non
     client._proc = proc
     client._stdin = proc.stdin
     client._stdout = proc.stdout
+    client._stdout_thread = _threading.Thread(
+        target=client._drain_stdout, args=(proc.stdout,), daemon=True
+    )
+    client._stdout_thread.start()
     client._stderr_thread = _threading.Thread(
         target=client._drain_stderr, args=(proc.stderr,), daemon=True
     )
     client._stderr_thread.start()
     context.mcp = client
+    if caller_id:
+        if not hasattr(context, "mcp_clients") or context.mcp_clients is None:
+            context.mcp_clients = {}
+        context.mcp_clients[caller_id] = client
+        context.mcp_caller_id = caller_id
 
 
-@given('the MCP client completes an Initialize handshake as "{caller_id}" with the correct token')
-def step_mcp_initial_handshake(context: Context, caller_id: str) -> None:
-    """Establish a successful HTTP Initialize handshake. Uses the
-    bearer token from the secret store (set up via the file_dir
-    backend in the Background's `the secret store contains value`
-    step)."""
-    secrets_dir = getattr(context, "secrets_dir", None)
-    token = ""
-    if secrets_dir is not None:
-        f = secrets_dir / "callers" / caller_id / "token"
-        if f.is_file():
-            token = f.read_text(encoding="utf-8").rstrip("\n")
-    client = context.mcp_http
-    client.initialize(caller_id, token)
-    context.last_handshake_succeeded = True
-    context._initial_caller_id = caller_id
-    context._initial_bearer = token
 
 
-@when('the MCP client sends an Initialize-like message claiming caller_id "{claim}"')
-def step_mcp_initialize_like(context: Context, claim: str) -> None:
-    """Send a SECOND Initialize JSON-RPC against the same HTTP server
-    with the same bearer but a different `caller_id_claim` header.
-    Captures the response error string in `context.last_handshake_error`."""
-    import httpx
-    import json as _json
-    import uuid as _uuid
-
-    client = context.mcp_http
-    bearer = getattr(context, "_initial_bearer", "")
-    body = {
-        "jsonrpc": "2.0",
-        "id": str(_uuid.uuid4()),
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "imap-mcp-bdd", "version": "0.1.0"},
-        },
-    }
-    response = httpx.post(
-        f"http://{client.host}:{client.port}/mcp",
-        json=body,
-        headers={
-            "Authorization": f"Bearer {bearer}",
-            "X-MCP-Caller-Id": claim,
-            "Accept": "application/json, text/event-stream",
-        },
-        timeout=5.0,
-    )
-    context._last_initlike_response = response
-    if response.status_code in (200, 202):
-        context.last_handshake_succeeded = True
-        context.last_handshake_error = None
-    else:
-        context.last_handshake_succeeded = False
-        try:
-            payload = response.json()
-            context.last_handshake_error = payload.get("error") or payload.get(
-                "message", ""
-            )
-        except Exception:
-            context.last_handshake_error = response.text
 
 
 @_behave_then('the server responds with error "{expected}"')
@@ -1006,28 +1045,6 @@ def step_server_responds_with_error(context: Context, expected: str) -> None:
     if err != expected:
         raise AssertionError(
             f"Server response error: expected {expected!r}, got {err!r}"
-        )
-
-
-@_behave_then('a subsequent get_caller_identity still returns caller_id "{caller_id}"')
-def step_subsequent_caller_identity_still(context: Context, caller_id: str) -> None:
-    """After an identity-immutability rejection, the original session
-    must still be usable. We re-initialize with the original
-    credentials and verify the caller stays as it was before."""
-    client = context.mcp_http
-    bearer = getattr(context, "_initial_bearer", "")
-    initial_caller = getattr(context, "_initial_caller_id", caller_id)
-    # Stateless HTTP — re-handshake to re-establish per-request caller.
-    client.initialize(initial_caller, bearer)
-    payload = client.call_tool("get_caller_identity", {})
-    import json as _json
-    content = payload.get("content") or []
-    text = content[0]["text"] if content else "{}"
-    data = _json.loads(text)
-    actual = data.get("caller_id")
-    if actual != caller_id:
-        raise AssertionError(
-            f"caller_id (post-immutable-rejection): expected {caller_id!r}, got {actual!r}"
         )
 
 
@@ -1056,29 +1073,6 @@ def step_then_caller_calls_get_transaction_status(
     step_caller_calls_get_transaction_status(context, caller_id)
 
 
-@when(
-    '{caller_id} calls move with account "{account}", source folder '
-    '"{src_folder}" uid {uid:d}, target folder "{dst_folder}"'
-)
-def step_caller_calls_move_intra(
-    context: Context,
-    caller_id: str,
-    account: str,
-    src_folder: str,
-    uid: int,
-    dst_folder: str,
-) -> None:
-    client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, src_folder, uid), uid)
-    payload = client.call_tool(
-        "move",
-        {
-            "source": {"account": account, "folder": src_folder, "uid": actual_uid},
-            "target": {"account": account, "folder": dst_folder},
-        },
-    )
-    _store_result(context, payload)
 
 
 @when('{caller_id} calls create_draft with account "{account}", folder "{folder}", rfc822 payload:')
@@ -1115,6 +1109,7 @@ def _call_create_draft_keeping_rpc_error(
     _store_result(context, payload)
 
 
+@given('{caller_id} calls create_draft with account "{account}", folder "{folder}", fields:')
 @when('{caller_id} calls create_draft with account "{account}", folder "{folder}", fields:')
 def step_caller_calls_create_draft_fields(
     context: Context, caller_id: str, account: str, folder: str
@@ -1129,31 +1124,34 @@ def step_caller_calls_create_draft_fields(
     )
 
 
+
+
 @when(
     '{caller_id} calls create_draft with account "{account}", folder "{folder}", '
-    'rfc822 "{rfc822}" and fields {fields_raw}'
+    'fields {fields_raw}'
 )
-def step_caller_calls_create_draft_rfc822_and_fields(
-    context: Context,
-    caller_id: str,
-    account: str,
-    folder: str,
-    rfc822: str,
-    fields_raw: str,
+def step_caller_calls_create_draft_fields_inline(
+    context: Context, caller_id: str, account: str, folder: str, fields_raw: str
 ) -> None:
-    """Both input modes in one call. The quoted rfc822 value is read as
-    a JSON string literal, so the `\\r\\n` written in the step are the
-    line breaks they denote; `fields_raw` is a JSON object."""
     fields = json.loads(fields_raw)
     if not isinstance(fields, dict):
         raise AssertionError(f"fields must be a JSON object, got {fields!r}")
-    arguments: dict[str, object] = {
-        "account": account,
-        "folder": folder,
-        "rfc822": json.loads(f'"{rfc822}"'),
-        **fields,
-    }
-    _call_create_draft_keeping_rpc_error(context, caller_id, arguments)
+    _call_create_draft_keeping_rpc_error(
+        context, caller_id, {"account": account, "folder": folder, **fields}
+    )
+
+
+@when(
+    '{caller_id} calls create_draft with account "{account}", folder "{folder}", '
+    'rfc822 "{rfc822}"'
+)
+def step_caller_calls_create_draft_rfc822_inline(
+    context: Context, caller_id: str, account: str, folder: str, rfc822: str
+) -> None:
+    decoded = json.loads(f'"{rfc822}"')
+    _call_create_draft_keeping_rpc_error(
+        context, caller_id, {"account": account, "folder": folder, "rfc822": decoded}
+    )
 
 
 @when(
@@ -1164,8 +1162,7 @@ def step_caller_calls_fetch_headers(
     context: Context, caller_id: str, account: str, folder: str, uid: int
 ) -> None:
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
+    actual_uid = _res_uid(context, account, folder, uid)
     payload = client.call_tool(
         "fetch_headers",
         {"account": account, "folder": folder, "uid": actual_uid},
@@ -1186,8 +1183,7 @@ def step_caller_calls_fetch_attachment_with_part(
     part_id: int,
 ) -> None:
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
+    actual_uid = _res_uid(context, account, folder, uid)
     payload = client.call_tool(
         "fetch_attachment",
         {
@@ -1200,35 +1196,6 @@ def step_caller_calls_fetch_attachment_with_part(
     _store_result(context, payload)
 
 
-@when(
-    '{caller_id} calls fetch_attachment with account "{account}", '
-    'folder "{folder}", uid {uid:d}'
-)
-def step_caller_calls_fetch_attachment_no_part(
-    context: Context, caller_id: str, account: str, folder: str, uid: int
-) -> None:
-    """fetch_attachment without part_id: after ADR 0026 the call is a
-    schema reject. We expect the MCP layer to surface JSON-RPC -32602;
-    the assertion side picks it up via `the server responds with JSON-RPC
-    error code -32602`. Listing-style discovery moved to list_attachments.
-    """
-    client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
-    context.last_response = None
-    context.last_rpc_error = None
-    try:
-        payload = client.call_tool(
-            "fetch_attachment",
-            {"account": account, "folder": folder, "uid": actual_uid},
-        )
-        _store_result(context, payload)
-    except MCPRPCError as exc:
-        context.last_rpc_error = {
-            "code": exc.code,
-            "message": exc.message,
-            "data": exc.data,
-        }
 
 
 @when(
@@ -1239,8 +1206,7 @@ def step_caller_calls_list_attachments(
     context: Context, caller_id: str, account: str, folder: str, uid: int
 ) -> None:
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
+    actual_uid = _res_uid(context, account, folder, uid)
     payload = client.call_tool(
         "list_attachments",
         {"account": account, "folder": folder, "uid": actual_uid},
@@ -1260,9 +1226,6 @@ def step_caller_calls_bulk_mark_tagged(
     """
     import json as _json
 
-    gmail_state = getattr(context, "gmail_state", None)
-    if gmail_state is not None:
-        gmail_state.total_connections = 0
     criteria_str, extras = _parse_query_tail(tail)
     if "tags" not in extras or "mode" not in extras:
         raise AssertionError(
@@ -1297,121 +1260,12 @@ def step_caller_calls_fetch_body(
     context: Context, caller_id: str, account: str, folder: str, uid: int
 ) -> None:
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
+    actual_uid = _res_uid(context, account, folder, uid)
     payload = client.call_tool(
         "fetch_body",
         {"account": account, "folder": folder, "uid": actual_uid},
     )
     _store_result(context, payload)
-
-
-@when(
-    '{caller_id} calls add_attachment with account "{account}", '
-    'folder "{folder}", uid {uid:d}, filename "{filename}", '
-    'mime_type "{mime_type}", content "{content}"'
-)
-def step_caller_calls_add_attachment(
-    context: Context,
-    caller_id: str,
-    account: str,
-    folder: str,
-    uid: int,
-    filename: str,
-    mime_type: str,
-    content: str,
-) -> None:
-    client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
-    payload = client.call_tool(
-        "add_attachment",
-        {
-            "account": account,
-            "folder": folder,
-            "uid": actual_uid,
-            "filename": filename,
-            "mime_type": mime_type,
-            "content": content,
-        },
-    )
-    _store_result(context, payload)
-    _update_uid_after_rewrite(context, account, folder, uid)
-
-
-@when(
-    '{caller_id} calls replace_attachment with account "{account}", '
-    'folder "{folder}", uid {uid:d}, filename "{filename}", '
-    'new_content "{new_content}"'
-)
-def step_caller_calls_replace_attachment(
-    context: Context,
-    caller_id: str,
-    account: str,
-    folder: str,
-    uid: int,
-    filename: str,
-    new_content: str,
-) -> None:
-    client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
-    payload = client.call_tool(
-        "replace_attachment",
-        {
-            "account": account,
-            "folder": folder,
-            "uid": actual_uid,
-            "filename": filename,
-            "new_content": new_content,
-        },
-    )
-    _store_result(context, payload)
-    _update_uid_after_rewrite(context, account, folder, uid)
-
-
-@when(
-    '{caller_id} calls delete_attachment with account "{account}", '
-    'folder "{folder}", uid {uid:d}, filename "{filename}"'
-)
-def step_caller_calls_delete_attachment(
-    context: Context,
-    caller_id: str,
-    account: str,
-    folder: str,
-    uid: int,
-    filename: str,
-) -> None:
-    client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
-    payload = client.call_tool(
-        "delete_attachment",
-        {
-            "account": account,
-            "folder": folder,
-            "uid": actual_uid,
-            "filename": filename,
-        },
-    )
-    _store_result(context, payload)
-    _update_uid_after_rewrite(context, account, folder, uid)
-
-
-def _update_uid_after_rewrite(
-    context: Context, account: str, folder: str, uid_hint: int
-) -> None:
-    """After a message rewrite the old UID is gone and a new one exists.
-
-    Update the UID lookup so subsequent steps (fetch_attachment,
-    fetch_envelope) that reference the original hint-UID resolve to
-    the new server-side UID.
-    """
-    result = getattr(context, "last_response", None) or {}
-    new_uid = result.get("new_uid")
-    if new_uid is not None:
-        context.message_uids = getattr(context, "message_uids", {})
-        context.message_uids[(account, folder, uid_hint)] = new_uid
 
 
 @when(
@@ -1427,31 +1281,11 @@ def step_caller_calls_folder_stats(
     _store_result(context, payload)
 
 
-@when("{caller_id} calls search with criteria {criteria_raw}")
-def step_caller_calls_search_shortcut(
-    context: Context, caller_id: str, criteria_raw: str
-) -> None:
-    """Shortcut used by audit-log-format: no account/folder given; the
-    scenario only cares about the audit-side behaviour. Use the
-    default minimal account+folder."""
-    import json as _json
-
-    client = _ensure_mcp_client(context, caller_id)
-    criteria = _json.loads(criteria_raw)
-    context.last_search_criteria = criteria
-    context.last_call_account = "gupta-scaratec"
-    context.last_call_folder = "INBOX/Rechnungen"
-    payload = client.call_tool(
-        "search",
-        {
-            "account": context.last_call_account,
-            "folder": context.last_call_folder,
-            "criteria": criteria,
-        },
-    )
-    _store_result(context, payload)
 
 
+@given(
+    '{caller_id} calls search with account "{account}", folder "{folder}", criteria {tail}'
+)
 @when(
     '{caller_id} calls search with account "{account}", folder "{folder}", criteria {tail}'
 )
@@ -1487,6 +1321,38 @@ def step_caller_calls_search(
             "message": exc.message,
             "data": exc.data,
         }
+
+
+@when(
+    '{caller_id} calls create_reply_draft on the only visible message in "{src_box}" '
+    'into "{dst_folder}" with reply_text "{reply_text}"'
+)
+def step_caller_calls_create_reply_draft_only_visible(
+    context: Context, caller_id: str, src_box: str, dst_folder: str, reply_text: str
+) -> None:
+    src_acc, _, src_folder = src_box.partition(":")
+    client = _ensure_mcp_client(context, caller_id)
+    search_res = client.call_tool(
+        "search",
+        {"account": src_acc, "folder": src_folder, "criteria": {}, "scope": "all"},
+    )
+    content = search_res.get("content", [{}])[0].get("text", "{}")
+    search_data = json.loads(content)
+    uids = search_data.get("uids", [])
+    if len(uids) != 1:
+        raise AssertionError(f"Expected 1 visible message in {src_box}, found {len(uids)}: {uids}")
+    uid = uids[0]
+    payload = client.call_tool(
+        "create_reply_draft",
+        {
+            "account": src_acc,
+            "source_folder": src_folder,
+            "uid": uid,
+            "drafts_folder": dst_folder,
+            "reply_text": reply_text,
+        },
+    )
+    _store_result(context, payload)
 
 
 _use_step_matcher("re")
@@ -1584,21 +1450,12 @@ def step_caller_calls_list_messages_no_criteria(
     _store_result(context, payload)
 
 
-@when(
-    '{caller_id} calls list_messages with account "{account:S}", folder "{folder:S}", scope "{scope:S}"'
+
+
+@given(
+    '{caller_id} calls fetch_envelope with account "{account}", '
+    'folder "{folder}", uid {uid:d}'
 )
-def step_caller_calls_list_messages_scope_only(
-    context: Context, caller_id: str, account: str, folder: str, scope: str
-) -> None:
-    """list_messages without criteria but with explicit scope."""
-    client = _ensure_mcp_client(context, caller_id)
-    payload = client.call_tool(
-        "list_messages",
-        {"account": account, "folder": folder, "scope": scope},
-    )
-    _store_result(context, payload)
-
-
 @when(
     '{caller_id} calls fetch_envelope with account "{account}", '
     'folder "{folder}", uid {uid:d}'
@@ -1615,8 +1472,7 @@ def step_caller_calls_fetch_envelope(
     through for DENY-path scenarios that never reach IMAP.
     """
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, folder, uid), uid)
+    actual_uid = _res_uid(context, account, folder, uid)
     payload = client.call_tool(
         "fetch_envelope",
         {"account": account, "folder": folder, "uid": actual_uid},
@@ -1639,8 +1495,7 @@ def step_caller_calls_create_reply_draft_docstring(
 ) -> None:
     """DocString form: reply_text body lives in `context.text`."""
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, src_folder, uid), uid)
+    actual_uid = _res_uid(context, account, src_folder, uid)
     payload = client.call_tool(
         "create_reply_draft",
         {
@@ -1649,6 +1504,35 @@ def step_caller_calls_create_reply_draft_docstring(
             "uid": actual_uid,
             "drafts_folder": drafts_folder,
             "reply_text": context.text or "",
+        },
+    )
+    _store_result(context, payload)
+
+
+@when(
+    '{caller_id} calls create_reply_draft with account "{account}", '
+    'source_folder "{src_folder}", uid {uid:d}, '
+    'drafts_folder "{drafts_folder}", reply_html "{reply_html}"'
+)
+def step_caller_calls_create_reply_draft_reply_html(
+    context: Context,
+    caller_id: str,
+    account: str,
+    src_folder: str,
+    uid: int,
+    drafts_folder: str,
+    reply_html: str,
+) -> None:
+    client = _ensure_mcp_client(context, caller_id)
+    actual_uid = _res_uid(context, account, src_folder, uid)
+    payload = client.call_tool(
+        "create_reply_draft",
+        {
+            "account": account,
+            "source_folder": src_folder,
+            "uid": actual_uid,
+            "drafts_folder": drafts_folder,
+            "reply_html": reply_html,
         },
     )
     _store_result(context, payload)
@@ -1669,8 +1553,7 @@ def step_caller_calls_create_reply_draft_empty(
 ) -> None:
     """Inline empty-string form for the empty_reply_text validation path."""
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, src_folder, uid), uid)
+    actual_uid = _res_uid(context, account, src_folder, uid)
     payload = client.call_tool(
         "create_reply_draft",
         {
@@ -1700,8 +1583,7 @@ def step_caller_calls_create_reply_draft_inline(
 ) -> None:
     """Inline form for a one-line reply body."""
     client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, src_folder, uid), uid)
+    actual_uid = _res_uid(context, account, src_folder, uid)
     payload = client.call_tool(
         "create_reply_draft",
         {
@@ -1715,35 +1597,6 @@ def step_caller_calls_create_reply_draft_inline(
     _store_result(context, payload)
 
 
-@when(
-    '{caller_id} calls create_reply_draft with account "{account}", '
-    'source folder "{src_folder}", uid {uid:d}, '
-    'drafts folder "{drafts_folder}", reply_html "{reply_html}"'
-)
-def step_caller_calls_create_reply_draft_html(
-    context: Context,
-    caller_id: str,
-    account: str,
-    src_folder: str,
-    uid: int,
-    drafts_folder: str,
-    reply_html: str,
-) -> None:
-    """HTML-only reply (ADR 0035): reply_html is passed, reply_text is not."""
-    client = _ensure_mcp_client(context, caller_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account, src_folder, uid), uid)
-    payload = client.call_tool(
-        "create_reply_draft",
-        {
-            "account": account,
-            "source_folder": src_folder,
-            "uid": actual_uid,
-            "drafts_folder": drafts_folder,
-            "reply_html": reply_html,
-        },
-    )
-    _store_result(context, payload)
 
 
 @when(
@@ -1830,38 +1683,6 @@ def step_caller_calls_list_drafts(
     _store_result(context, payload)
 
 
-@when('{caller_id} calls fetch_body on the only message in folder "{folder}"')
-def step_caller_calls_fetch_body_on_only_message(
-    context: Context, caller_id: str, folder: str
-) -> None:
-    """Convenience: list_messages on the folder, assert exactly one
-    visible message, then fetch_body on that uid. Used by reply-builder
-    body assertions where the scenario already proved persistence via a
-    prior list_messages and just needs the body content."""
-    client = _ensure_mcp_client(context, caller_id)
-    from features.steps.policy_steps import _find_account_for_folder
-
-    account = _find_account_for_folder(context, folder)
-    list_payload = client.call_tool(
-        "list_messages",
-        {"account": account, "folder": folder},
-    )
-    _store_result(context, list_payload)
-    response = context.last_response
-    messages = response.get("messages") or []
-    if len(messages) != 1:
-        raise AssertionError(
-            f"Expected exactly one visible message in {folder!r}, "
-            f"got {len(messages)}: {messages!r}"
-        )
-    uid = messages[0].get("uid")
-    if uid is None:
-        raise AssertionError(f"Message entry has no uid: {messages[0]!r}")
-    body_payload = client.call_tool(
-        "fetch_body",
-        {"account": account, "folder": folder, "uid": uid},
-    )
-    _store_result(context, body_payload)
 
 
 # --------------------------------------------------------- update_draft
@@ -1902,10 +1723,6 @@ def _call_update_draft(
             "data": exc.data,
         }
     except Exception:
-        # A crash-recovery scenario has primed IMAP_MCP_CRASH_AT; the
-        # revision saga terminates the subprocess mid-flight and there
-        # is no response to read. Pick the tx_id out of the WAL so the
-        # recovery steps that follow can reference it.
         if not getattr(context, "crash_expected", False):
             raise
         from support.wal_reader import WALReader
@@ -1941,6 +1758,48 @@ def step_caller_calls_update_draft_returned_handle(
 
 @when(
     '{caller_id} calls update_draft with account "{account}", folder "{folder}", '
+    'the returned draft_id, base_revision {base_revision:d}, changes {changes_raw}'
+)
+def step_caller_calls_update_draft_returned_handle_inline(
+    context: Context,
+    caller_id: str,
+    account: str,
+    folder: str,
+    base_revision: int,
+    changes_raw: str,
+) -> None:
+    draft_id = getattr(context, "last_draft_id", None)
+    if not draft_id:
+        raise AssertionError(
+            "No draft_id has been returned in this scenario yet; "
+            "the step needs a preceding create_draft or create_reply_draft."
+        )
+    client = _ensure_mcp_client(context, caller_id)
+    changes = json.loads(changes_raw)
+    context.last_response = None
+    context.last_rpc_error = None
+    try:
+        payload = client.call_tool(
+            "update_draft",
+            {
+                "account": account,
+                "folder": folder,
+                "draft_id": draft_id,
+                "base_revision": base_revision,
+                "changes": changes,
+            },
+        )
+        _store_result(context, payload)
+    except MCPRPCError as exc:
+        context.last_rpc_error = {
+            "code": exc.code,
+            "message": exc.message,
+            "data": exc.data,
+        }
+
+
+@when(
+    '{caller_id} calls update_draft with account "{account}", folder "{folder}", '
     'draft_id "{draft_id}", base_revision {base_revision:d}, changes:'
 )
 def step_caller_calls_update_draft_literal_handle(
@@ -1952,6 +1811,15 @@ def step_caller_calls_update_draft_literal_handle(
     base_revision: int,
 ) -> None:
     _call_update_draft(context, caller_id, account, folder, draft_id, base_revision)
+
+
+@when("the MCP client calls get_caller_identity on the established stdio session")
+def step_caller_calls_get_caller_identity_stdio(context: Context) -> None:
+    client = getattr(context, "mcp", None)
+    if client is None:
+        raise AssertionError("No established stdio MCP client found on context")
+    payload = client.call_tool("get_caller_identity", {})
+    _store_result(context, payload)
 
 
 # create_draft is also a precondition: the revision scenarios set up the
@@ -2005,6 +1873,20 @@ def step_mcp_client_identifies_itself(context: Context, name: str, version: str)
     context.mcp_client_info = (name, version)
 
 
+@given(
+    'the MCP test client reconnects with client name consisting of {count:d} "{char}" characters plus "\\n\\t" and version "{version}"'
+)
+def step_mcp_client_reconnects_custom(
+    context: Context, count: int, char: str, version: str
+) -> None:
+    client = getattr(context, "mcp", None)
+    if client is not None:
+        client.close()
+        context.mcp = None
+    client_name = char * count + "\n\t"
+    context.mcp_client_info = (client_name, version)
+
+
 @when('the server process is started with transport "stdio"')
 def step_server_process_started_stdio(context: Context) -> None:
     """Start the server with the scenario's configuration and environment,
@@ -2019,7 +1901,15 @@ def step_server_process_started_stdio(context: Context) -> None:
         builder.write()
     caller = next(iter(builder.callers), None) if builder is not None else None
     extra_env = dict(getattr(context, "mcp_extra_env", None) or {})
-    extra_env.setdefault("IMAP_MCP_TEST_MODE", "1")
+    needs_test_mode = (
+        getattr(context, "is_test_hooks", False)
+        or any(k.startswith("IMAP_MCP_") for k in extra_env)
+        or extra_env.get("IMAP_MCP_TEST_MODE") == "1"
+    )
+    if needs_test_mode and not getattr(context, "without_test_mode", False):
+        extra_env["IMAP_MCP_TEST_MODE"] = "1"
+    else:
+        extra_env.pop("IMAP_MCP_TEST_MODE", None)
     result = try_bootstrap_server(
         _server_binary(context),
         context.config_dir,

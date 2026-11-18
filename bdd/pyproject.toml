@@ -45,6 +45,13 @@ py-modules = []
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+ignore = [
+    "TRY004",  # BDD step assertions raise AssertionError on type mismatch per §13.2
+    "S110",    # Handled pass in cleanup/polling loops
+    "BLE001",  # Broad exception catches in test process management
+]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true

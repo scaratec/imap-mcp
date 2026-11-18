@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -35,19 +34,12 @@ def server_info() -> ServerInfo:
 
     if not SERVER_BINARY.exists():
         raise FileNotFoundError(f"server binary not found: {SERVER_BINARY}")
-    python = SERVER_BINARY.parent / "python"
-    version = None
-    if python.exists():
-        out = subprocess.run(
-            [str(python), "-c", "import importlib.metadata as m; print(m.version('sc-imap-mcp'))"],
-            capture_output=True, text=True, timeout=30,
-        )
-        version = out.stdout.strip() or None
+
     with tempfile.TemporaryDirectory(prefix="imap-mcp-usability-probe-") as tmp:
         config = Path(tmp)
         (config / "policies").mkdir()
         (config / "accounts.yaml").write_text(
-            "accounts: []\nsecret_store: {backend: file_dir, path: " + json.dumps(str(config)) + "}\n"
+            "accounts: []\nsecret_store: {backend: file_dir, path: " + json.dumps(str(config)) + ", acknowledge_plaintext: true}\n"
             "audit: {directory: " + json.dumps(str(config / "audit")) + "}\n"
             "wal: {path: " + json.dumps(str(config / "wal.db")) + "}\n",
             encoding="utf-8",
@@ -61,12 +53,18 @@ def server_info() -> ServerInfo:
         try:
             tools = sorted(t["name"] for t in client.list_tools())
             tool_set = None
+            version = None
+            # ADR 0038 / R-15: Read package and tool set versions via tool_surface_info or initialize server_info
             try:
                 info = client.call_tool("tool_surface_info", {})
                 text = info.get("content", [{}])[0].get("text", "{}")
-                tool_set = json.loads(text).get("tool_set_version")
+                payload = json.loads(text)
+                tool_set = payload.get("tool_set_version")
+                version = payload.get("package_version")
             except Exception:  # noqa: BLE001 - optional
                 tool_set = None
+            if not version and hasattr(client, "server_info") and isinstance(client.server_info, dict):
+                version = client.server_info.get("version")
         finally:
             client.close()
     return ServerInfo(SERVER_BINARY, version, tool_set, tools)

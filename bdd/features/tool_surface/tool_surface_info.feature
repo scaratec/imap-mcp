@@ -1,50 +1,57 @@
-Feature: tool_surface_info exposes the contract version a caller can pin
+Feature: tool_surface_info exposes the 3.0.0 contract version and breaking-change history
 
-  ADR 0027 introduces tool_surface_info as the explicit, callable
-  meta-tool that returns the surface version. Callers (and a human
-  at a prompt) can ask "what server am I talking to" without
-  inferring from list_tools output, and a 2.x client can refuse to
-  proceed against a 3.x server before issuing any business call.
+  ADR 0044 and ADR 0052 define tool_surface_info as an authenticated
+  meta-tool (reason="authenticated") returning tool_set_version,
+  package_version, protocol_revision, and breaking_changes_since so
+  clients can pin 3.0.0 before issuing mailbox operations.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Happy path: returns version + protocol + change log : 1
-    - Version is SemVer 2.x.y                              : 1
-    - tool_set_version matches serverInfo metadata         : 1
-    - breaking_changes_since is non-empty for 2.0          : 1
-    - Available without policy grants (meta tool)          : 1
-    Total enumerated                                        : 5   covered by this feature: 5
+    - Contract block shape and reason="authenticated"           : 1
+    - SemVer 3.0.0 agreement with Initialize serverInfo         : 1
+    - breaking_changes_since documents 2.0.0 and 3.0.0 cuts     : 1
+    - Reachable with zero account grants                        : 1
+    - Rejects unexpected arguments with JSON-RPC -32602         : 1
+    Total enumerated                                            : 5   covered by this feature: 5
 
   Background:
-    Given the server is started with a minimal caller configuration
+    Given secret_store configuration is:
+      """
+      backend: file_dir
+      path: $TMPDIR/secrets
+      acknowledge_plaintext: true
+      """
+    And the server is configured with single caller:
+      | caller_id     | auth_type     | policy         |
+      | invoice-agent | stdio_trusted | invoice-policy |
+    And policy "invoice-policy" grants no accounts
+    And the server process is started without IMAP_MCP_TEST_MODE on transport "stdio" with IMAP_MCP_CALLER_ID="invoice-agent"
     And invoice-agent completes an Initialize handshake successfully
 
-  Scenario: tool_surface_info returns the contract block
+  Scenario: tool_surface_info returns the complete contract block with reason authenticated
     When invoice-agent calls tool_surface_info
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    And the response field tool_set_version is a string
-    And the response field package_version is a string
-    And the response field protocol_revision is a string
-    And the response field breaking_changes_since is an array
+    And the response field reason equals "authenticated"
+    And the response field tool_set_version equals "3.0.0"
+    And the response field package_version equals "3.0.0"
+    And the response field protocol_revision is a non-empty string
+    And the response field breaking_changes_since is a non-empty array
 
-  Scenario: tool_set_version is SemVer 2.x.y
-    When invoice-agent calls tool_surface_info
-    Then the response field tool_set_version matches the regex "^2\.\d+\.\d+$"
-
-  Scenario: tool_surface_info agrees with serverInfo metadata
+  Scenario: tool_surface_info agrees with Initialize serverInfo metadata
     When invoice-agent calls tool_surface_info
     Then the response field tool_set_version matches the serverInfo tool_set_version
     And the response field package_version matches the serverInfo package_version
 
-  Scenario: breaking_changes_since enumerates the 2.0 hard cut
+  Scenario: breaking_changes_since records both the 2.0.0 and 3.0.0 major breaks
     When invoice-agent calls tool_surface_info
-    Then the breaking_changes_since field has at least one entry
-    And one entry has field "version" equal to "2.0.0"
-    And one entry has field "summary" matching the regex "ADR 0028"
+    Then breaking_changes_since contains an entry with version "2.0.0" mentioning "ADR 0028"
+    And breaking_changes_since contains an entry with version "3.0.0" mentioning "ADR 0040"
 
-  Scenario: tool_surface_info is reachable without any policy grant
-    Given the server is configured with caller "no-grants-agent" using policy "empty-policy"
-    And policy "empty-policy" grants no accounts
-    When no-grants-agent calls tool_surface_info
+  Scenario: tool_surface_info succeeds for a caller whose policy grants zero accounts
+    When invoice-agent calls tool_surface_info
     Then the response decision is ALLOW
     And the response field result equals "OK"
+
+  Scenario: tool_surface_info rejects undeclared arguments with JSON-RPC -32602
+    When invoice-agent calls tool_surface_info with the arguments {"unexpected": true}
+    Then the server responds with JSON-RPC error code -32602

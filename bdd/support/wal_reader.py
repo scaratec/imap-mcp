@@ -28,9 +28,12 @@ class Transaction:
     content_hash: str | None
     target_uid: int | None
     last_error: str | None
+    caller_id: str | None = None
+    staged_rfc822: bytes | str | None = None
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Transaction":
+    def from_row(cls, row: sqlite3.Row) -> Transaction:
+        row_keys = set(row.keys())
         return cls(
             tx_id=row["tx_id"],
             status=row["status"],
@@ -44,6 +47,8 @@ class Transaction:
             content_hash=row["content_hash"],
             target_uid=row["target_uid"],
             last_error=row["last_error"],
+            caller_id=row["caller_id"] if "caller_id" in row_keys else None,
+            staged_rfc822=row["staged_rfc822"] if "staged_rfc822" in row_keys else None,
         )
 
 

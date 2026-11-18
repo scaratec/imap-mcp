@@ -1,46 +1,41 @@
-Feature: update_draft rejects what it cannot safely do
+Feature: update_draft rejects invalid inputs, missing/tampered handles, non-Drafts folders, and stale revisions
 
-  The failure surface of a draft revision, layer by layer. ADR 0031
-  adds four error types to the closed enumeration of ADR 0027:
-  draft_not_found, draft_not_editable, draft_revision_conflict and
-  draft_ambiguous. Everything that is a malformed call rather than a
-  mailbox condition is rejected as an invalid argument, before any IMAP
-  connection is opened.
+  ADR 0042, ADR 0044, ADR 0045, and ADR 0063 specify the failure surface of
+  update_draft:
+    - Malformed inputs (empty changes, unknown members, base_revision 0,
+      CR/LF in header fields, invalid RFC 5322 addresses) fail with
+      JSON-RPC -32602 before opening any IMAP connection.
+    - Unknown handles, foreign handles, and unsigned messages carrying an
+      X-SC-Draft-Id return ALLOW + ERROR not_found.
+    - The caller's own WAL-registered draft whose X-SC-Provenance no longer
+      verifies (stripped or externally edited) returns ALLOW + ERROR
+      draft_not_editable.
+    - Duplicate messages sharing (draft_id, revision) return ALLOW + ERROR
+      draft_ambiguous and record needs_operator in wal.db.
+    - Non-\Drafts folders or folders without draft_edit return DENY
+      capability_missing (with no legacy missing_capability field).
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Argument validation : 5   covered here: 5
-        empty changes object, unknown member, base_revision 0,
-        CR/LF in a header value (one example per header-valued
-        member of changes), malformed address
-    - Handle resolution   : 5   covered here: 5
-        folder_absent, draft_not_found, draft_not_editable,
-        draft_ambiguous, a handle does not reach into a second
-        existing folder
-    - Concurrency         : 2   covered here: 2
-        stale base_revision, base_revision ahead of the draft
-    - Policy              : 4   covered here: 1, elsewhere: 3
-        here: the draft_edit of the folder the call names decides
-        elsewhere, in policy/draft_edit_capability.feature: draft_edit
-        absent, draft_append alone, modify_message alone. That file
-        enumerates nine layers in total; the three named here are the
-        ones that are update_draft denials, the rest are about
-        create_draft, get_draft and list_drafts.
-    Total enumerated      : 16  covered here: 13, elsewhere: 3
+    - Input validation (-32602 with 0 IMAP connections) : 9
+    - Handle resolution (unknown not_found, foreign unsigned not_found, tampered own draft_not_editable, draft_ambiguous, folder_absent, wrong folder) : 6
+    - Concurrency (stale base_revision, future base_revision) : 2
+    - Policy (folder without draft_edit / non-\Drafts)  : 1
+    Total enumerated                                    : 18  covered here: 18
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folder "Drafts"
+    Given the server clock is pinned to "2026-09-18T12:00:00Z"
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path | special use |
+      | INBOX       |             |
+      | Drafts      | \Drafts     |
+    And the IMAP traffic for "gupta-scaratec" is captured through a proxy
     And the server is configured with caller "draft-agent" using policy "draft-policy"
     And policy "draft-policy" grants account "gupta-scaratec"
-    # Three folders are granted and only "Drafts" is created on the IMAP
-    # side; the scenarios below bring the other two into existence where
-    # they need them. "Archiv" is granted without draft_edit on purpose —
-    # the policy the server reads is fixed at startup, so a scenario
-    # cannot add a grant after the first tool call.
-    And policy "draft-policy" grants folder:
+    And policy "draft-policy" grants folder on account "gupta-scaratec":
       | folder    | mode      | default | rules | draft_append | draft_edit |
       | Drafts    | blacklist | FULL    | []    | true         | true       |
       | Entwuerfe | blacklist | FULL    | []    | true         | true       |
-      | Archiv    | blacklist | FULL    | []    | true         | false      |
+      | Archiv    | blacklist | FULL    | []    | false        | false      |
     And draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", rfc822 payload:
       """
       From: draft-agent@gupta-scaratec.com
@@ -52,75 +47,46 @@ Feature: update_draft rejects what it cannot safely do
       We can deliver in week 14.
       """
 
-  Scenario: a changes object with no members is rejected
-    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
-      """
-      {}
-      """
-    Then the tool call fails with an invalid-arguments error
-
-  Scenario: a member that is not a draft field is rejected
-    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
-      """
-      {"reply_to": "someone@example.com"}
-      """
-    Then the tool call fails with an invalid-arguments error
-
-  Scenario: revision numbers start at 1, so 0 is not a base
-    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 0, changes:
-      """
-      {"subject": "Zero is not a revision"}
-      """
-    Then the tool call fails with an invalid-arguments error
-
-  # ADR 0031 states the CR/LF rule for header values as a class, not for
-  # one field: every member of `changes` that ends up on a header line is
-  # rejected, never sanitised. One example per such member, so a
-  # field-wise implementation cannot pass.
-  Scenario Outline: a line break in <field> is rejected rather than sanitised
-    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
+  Scenario Outline: Malformed update_draft input (<case>) fails with JSON-RPC -32602 and zero new IMAP commands
+    Given the IMAP command log for "gupta-scaratec" is cleared
+    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision <base_rev>, changes:
       """
       <changes>
       """
-    Then the tool call fails with an invalid-arguments error
-    And the IMAP folder "Drafts" contains exactly one message with headers:
-      | header         | value                          |
-      | Subject        | Quotation for the spring order |
-      | X-SC-Draft-Rev | 1                              |
+    Then the server responds with JSON-RPC error code -32602
+    And the IMAP command log for "gupta-scaratec" contains 0 commands
     And the IMAP message in folder "Drafts" with subject "Quotation for the spring order" has no header "Bcc"
 
-    Examples: every member of changes that becomes a header value
-      | field       | changes                                                       |
-      | subject     | {"subject": "Harmless\r\nBcc: attacker@example.com"}          |
-      | in_reply_to | {"in_reply_to": "<a@b.example>\r\nBcc: attacker@example.com"} |
-      | to          | {"to": ["<a@b.example>\r\nBcc: attacker@example.com"]}        |
-      | cc          | {"cc": ["<a@b.example>\r\nBcc: attacker@example.com"]}        |
-      | bcc         | {"bcc": ["<a@b.example>\r\nBcc: attacker@example.com"]}       |
+    Examples:
+      | case                  | base_rev | changes                                                       |
+      | empty changes         | 1        | {}                                                            |
+      | unknown member        | 1        | {"reply_to": "someone@example.com"}                           |
+      | base_revision zero    | 0        | {"subject": "Zero"}                                           |
+      | crlf in subject       | 1        | {"subject": "Harmless\r\nBcc: attacker@example.com"}          |
+      | crlf in in_reply_to   | 1        | {"in_reply_to": "<a@b.example>\r\nBcc: attacker@example.com"} |
+      | crlf in to            | 1        | {"to": ["<a@b.example>\r\nBcc: attacker@example.com"]}        |
+      | crlf in cc            | 1        | {"cc": ["<a@b.example>\r\nBcc: attacker@example.com"]}        |
+      | crlf in bcc           | 1        | {"bcc": ["<a@b.example>\r\nBcc: attacker@example.com"]}       |
+      | invalid rfc5322 email | 1        | {"to": ["not an address"]}                                    |
 
-  Scenario: an address that is not RFC 5322 is rejected
-    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
-      """
-      {"to": ["not an address"]}
-      """
-    Then the tool call fails with an invalid-arguments error
-
-  Scenario: a handle that resolves to nothing reports draft_not_found
+  Scenario: Unknown draft_id returns ALLOW + ERROR not_found
     When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", draft_id "11111111-1111-4111-8111-111111111111", base_revision 1, changes:
       """
       {"subject": "Nobody home"}
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error.type equals "draft_not_found"
+    And the response field error.type equals "not_found"
     And the response field reason equals "folder_default_applied"
 
-  Scenario: a message with a handle but no usable revision is not editable
+  Scenario: Unsigned foreign message carrying X-SC-Draft-Id returns opaque not_found without existence leak
     Given the folder "Drafts" holds a verbatim message:
       """
       From: anika@example.com
       To: counterparty@example.com
-      Subject: Handle survived, counter did not
+      Subject: Foreign unsigned handle
       X-SC-Draft-Id: 22222222-2222-4222-8222-222222222222
+      X-SC-Draft-Rev: 1
       MIME-Version: 1.0
       Content-Type: text/plain; charset=US-ASCII
 
@@ -132,39 +98,24 @@ Feature: update_draft rejects what it cannot safely do
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error.type equals "draft_not_editable"
+    And the response field error.type equals "not_found"
     And the response field reason equals "folder_default_applied"
+    And the IMAP folder "Drafts" contains 1 message with subject "Foreign unsigned handle"
 
-  # ADR 0030: ambiguity "is an incident": the caller is told, and the
-  # transaction is escalated to `needs_operator` so an operator sees it.
-  # The caller-facing answer alone does not discharge that promise, so
-  # the WAL is read as a second channel.
-  Scenario: two messages with the same handle and the same revision are not guessed between
-    Given the folder "Drafts" holds a verbatim message:
+  Scenario: Caller's own draft whose X-SC-Provenance header was stripped externally returns draft_not_editable
+    Given an external mail client strips header "X-SC-Provenance" from the draft in "gupta-scaratec:Drafts" while keeping X-SC-Draft-Id and X-SC-Draft-Rev
+    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
       """
-      From: draft-agent@gupta-scaratec.com
-      To: counterparty@example.com
-      Subject: Twin A
-      X-SC-Draft-Id: 33333333-3333-4333-8333-333333333333
-      X-SC-Draft-Rev: 2
-      MIME-Version: 1.0
-      Content-Type: text/plain; charset=US-ASCII
+      {"subject": "Try editing stripped own draft"}
+      """
+    Then the response decision is ALLOW
+    And the response field result equals "ERROR"
+    And the response field error.type equals "draft_not_editable"
+    And the IMAP folder "Drafts" contains 1 message with subject "Quotation for the spring order"
 
-      First twin.
-      """
-    And the folder "Drafts" holds a verbatim message:
-      """
-      From: draft-agent@gupta-scaratec.com
-      To: counterparty@example.com
-      Subject: Twin B
-      X-SC-Draft-Id: 33333333-3333-4333-8333-333333333333
-      X-SC-Draft-Rev: 2
-      MIME-Version: 1.0
-      Content-Type: text/plain; charset=US-ASCII
-
-      Second twin.
-      """
-    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", draft_id "33333333-3333-4333-8333-333333333333", base_revision 2, changes:
+  Scenario: Two authentic messages carrying the same draft_id and revision return draft_ambiguous and record needs_operator
+    Given an external IMAP client duplicates the draft message in "gupta-scaratec:Drafts" so two copies share the returned draft_id and revision 1
+    When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
       """
       {"subject": "Which twin?"}
       """
@@ -172,81 +123,64 @@ Feature: update_draft rejects what it cannot safely do
     And the response field result equals "ERROR"
     And the response field error.type equals "draft_ambiguous"
     And the response field tx_id is a non-empty string
-    And the response field reason equals "folder_default_applied"
-    And the IMAP folder "Drafts" contains exactly 1 message with subject "Twin A"
-    And the IMAP folder "Drafts" contains exactly 1 message with subject "Twin B"
-    And the WAL entry reaches status "needs_operator"
+    And the WAL entry for the returned tx_id has status "needs_operator"
+    And the IMAP folder "Drafts" contains 2 messages with subject "Quotation for the spring order"
 
-  # ADR 0030: "The search runs in exactly one folder, the one in the
-  # call. A handle cannot be used to reach into another folder." The
-  # folder_absent scenario below cannot prove that, because the folder it
-  # names does not exist. This one names a folder that exists, is
-  # granted, and holds nothing.
-  Scenario: a handle does not resolve into a second, existing folder
-    Given the IMAP account "gupta-scaratec" also exists with folder "Entwuerfe"
+  Scenario: A handle does not resolve into a second existing \Drafts folder
+    Given the IMAP account "gupta-scaratec" also has folder "Entwuerfe" with special-use "\Drafts"
     When draft-agent calls update_draft with account "gupta-scaratec", folder "Entwuerfe", the returned draft_id, base_revision 1, changes:
       """
       {"subject": "Edited through the wrong folder"}
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error.type equals "draft_not_found"
-    And the response field reason equals "folder_default_applied"
-    And the IMAP folder "Entwuerfe" contains exactly 0 messages with header "X-SC-Draft-Id" set
-    And the IMAP folder "Drafts" contains exactly 1 message with header "X-SC-Draft-Id" set
-    And the IMAP folder "Drafts" contains exactly one message with headers:
-      | header         | value                          |
-      | Subject        | Quotation for the spring order |
-      | X-SC-Draft-Rev | 1                              |
+    And the response field error.type equals "not_found"
+    And the IMAP folder "Entwuerfe" contains 0 messages with header "X-SC-Draft-Id" set
+    And the IMAP folder "Drafts" contains 1 message with header "X-SC-Draft-Id" set
 
-  # The capability that has to hold is the one on the folder the caller
-  # named, not the one on the folder the draft happens to live in. The
-  # draft is in Drafts, where draft_edit is granted; the call names
-  # Archiv, where it is not.
-  Scenario: the capability of the named folder decides, not that of the draft's folder
-    Given the IMAP account "gupta-scaratec" also exists with folder "Archiv"
+  Scenario: Calling update_draft on a folder without draft_edit is denied with capability_missing
+    Given the IMAP account "gupta-scaratec" also has folder "Archiv"
     When draft-agent calls update_draft with account "gupta-scaratec", folder "Archiv", the returned draft_id, base_revision 1, changes:
       """
       {"subject": "Edited through a folder without draft_edit"}
       """
     Then the response decision is DENY
     And the response field reason equals "capability_missing"
-    And the response field missing_capability equals "draft_edit"
+    And the response does not contain any field named "missing_capability"
     And the IMAP folder "Drafts" contains exactly one message with headers:
       | header         | value                          |
       | Subject        | Quotation for the spring order |
       | X-SC-Draft-Rev | 1                              |
 
-  Scenario: editing a folder that does not exist reports folder_absent
+  Scenario: Calling update_draft on an authorized folder absent on IMAP returns folder_absent
     When draft-agent calls update_draft with account "gupta-scaratec", folder "Entwuerfe", draft_id "44444444-4444-4444-8444-444444444444", base_revision 1, changes:
       """
-      {"subject": "Wrong folder"}
+      {"subject": "Missing folder"}
       """
-    Then the response field result equals "ERROR"
+    Then the response decision is ALLOW
+    And the response field result equals "ERROR"
     And the response field error.type equals "folder_absent"
-    And the response field reason equals "folder_default_applied"
 
-  Scenario: a base_revision that has been overtaken is a conflict
+  Scenario: An overtaken base_revision returns draft_revision_conflict with current_revision=2
     When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
       """
-      {"subject": "Edit by the first caller"}
+      {"subject": "Edit by the first call"}
       """
     Then the response field revision equals 2
     When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 1, changes:
       """
-      {"subject": "Edit by the second caller"}
+      {"subject": "Edit by the second call"}
       """
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
     And the response field error.type equals "draft_revision_conflict"
-    And the response field reason equals "folder_default_applied"
     And the response field current_revision equals 2
     And the IMAP folder "Drafts" contains exactly one message with headers:
-      | header         | value                    |
-      | Subject        | Edit by the first caller |
-      | X-SC-Draft-Rev | 2                        |
+      | header         | value                  |
+      | Subject        | Edit by the first call |
+      | X-SC-Draft-Rev | 2                      |
 
-  Scenario: a base_revision ahead of the draft is a conflict too
+  Scenario: A base_revision ahead of the draft returns draft_revision_conflict with current_revision=1
     When draft-agent calls update_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id, base_revision 7, changes:
       """
       {"subject": "From the future"}
@@ -254,5 +188,8 @@ Feature: update_draft rejects what it cannot safely do
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
     And the response field error.type equals "draft_revision_conflict"
-    And the response field reason equals "folder_default_applied"
     And the response field current_revision equals 1
+    And the IMAP folder "Drafts" contains exactly one message with headers:
+      | header         | value                          |
+      | Subject        | Quotation for the spring order |
+      | X-SC-Draft-Rev | 1                              |

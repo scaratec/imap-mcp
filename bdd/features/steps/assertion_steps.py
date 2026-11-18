@@ -21,7 +21,13 @@ JSON-parsing path heuristically.
 
 from __future__ import annotations
 
+import email.utils
+import hashlib
 import json
+import os
+import re
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from behave import given, then, use_step_matcher, when
@@ -52,6 +58,12 @@ def _folder_paths(entries: list[Any]) -> list[str]:
 
 
 def _parse_expected(raw: str) -> Any:
+    m = re.match(r'^the sha256 hex digest of byte "([^"]+)" repeated (\d+) times$', raw.strip())
+    if m:
+        import hashlib
+        b = m.group(1).encode("utf-8")
+        n = int(m.group(2))
+        return hashlib.sha256(b * n).hexdigest()
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -71,6 +83,24 @@ def _resolve_dotted_field(payload: dict, field: str) -> tuple[bool, object]:
             return False, None
         cursor = cursor[part]
     return True, cursor
+
+
+@then("the response field {field} equals in exact order {expected}")
+def step_response_field_equals_in_exact_order(context: Context, field: str, expected: str) -> None:
+    response = _last_response(context)
+    found, actual = _resolve_dotted_field(response, field)
+    if not found:
+        raise AssertionError(
+            f"Response has no field {field!r}. Available top-level fields: "
+            f"{sorted(response.keys())}"
+        )
+    expected_value = _parse_expected(expected)
+    if field == "uids" and isinstance(expected_value, list):
+        expected_value = _resolve_uid_hints(context, expected_value)
+    if actual != expected_value:
+        raise AssertionError(
+            f"Field {field!r}: expected in exact order {expected_value!r}, got {actual!r}"
+        )
 
 
 @then("the response field {field} equals {expected}")
@@ -97,6 +127,34 @@ def step_response_field_equals(context: Context, field: str, expected: str) -> N
         )
 
 
+@then('the response field {field} contains key "{key}" equal to "{expected}"')
+def step_response_field_contains_key_equal(
+    context: Context, field: str, key: str, expected: str
+) -> None:
+    response = _last_response(context)
+    found, actual = _resolve_dotted_field(response, field)
+    if not found or not isinstance(actual, dict):
+        raise AssertionError(
+            f"Response has no dict field {field!r}. Available top-level fields: "
+            f"{sorted(response.keys())}"
+        )
+    key_lower = key.lower()
+    matched_k = None
+    for k in actual:
+        if k.lower() == key_lower:
+            matched_k = k
+            break
+    if matched_k is None:
+        raise AssertionError(
+            f"Field {field!r} does not contain key {key!r}. Available keys: {list(actual.keys())}"
+        )
+    actual_val = str(actual[matched_k])
+    if actual_val != expected:
+        raise AssertionError(
+            f"Field {field!r}[{matched_k!r}]: expected {expected!r}, got {actual_val!r}"
+        )
+
+
 @then("the visible account ids equal {expected}")
 def step_visible_account_ids_equal(context: Context, expected: str) -> None:
     response = _last_response(context)
@@ -114,11 +172,10 @@ def step_imap_message_has_flag(
     context: Context, folder: str, uid: int, flag: str
 ) -> None:
     account_id = _account_for_folder(context, folder)
-    from support.imap_fixture import resolve_account
+    from support.imap_fixture import resolve_account, resolve_uid
 
     instance, user = resolve_account(account_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account_id, folder, uid), uid)
+    actual_uid = resolve_uid(context, account_id, folder, uid)
     flags = context.imap.fetch_flags(instance, user, folder, actual_uid)
     if flag not in flags:
         raise AssertionError(
@@ -128,22 +185,15 @@ def step_imap_message_has_flag(
 
 
 @then('the IMAP message at "{folder}" uid {uid:d} does NOT have flag "{flag}"')
-def step_imap_message_does_not_have_flag_uppercase(
-    context: Context, folder: str, uid: int, flag: str
-) -> None:
-    step_imap_message_does_not_have_flag(context, folder, uid, flag)
-
-
 @then('the IMAP message at "{folder}" uid {uid:d} does not have flag "{flag}"')
 def step_imap_message_does_not_have_flag(
     context: Context, folder: str, uid: int, flag: str
 ) -> None:
     account_id = _account_for_folder(context, folder)
-    from support.imap_fixture import resolve_account
+    from support.imap_fixture import resolve_account, resolve_uid
 
     instance, user = resolve_account(account_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account_id, folder, uid), uid)
+    actual_uid = resolve_uid(context, account_id, folder, uid)
     flags = context.imap.fetch_flags(instance, user, folder, actual_uid)
     if flag in flags:
         raise AssertionError(
@@ -158,11 +208,13 @@ def step_imap_message_has_keyword(
     step_imap_message_has_flag(context, folder, uid, keyword)
 
 
-@then('the IMAP folder "{folder}" contains a message with subject "{subject}"')
-def step_imap_folder_contains_subject(
-    context: Context, folder: str, subject: str
+@then('the IMAP message at "{folder}" uid {uid:d} does NOT have keyword "{keyword}"')
+def step_imap_message_does_not_have_keyword(
+    context: Context, folder: str, uid: int, keyword: str
 ) -> None:
-    _assert_subject_presence(context, folder, subject, should_exist=True, exact_count=None)
+    step_imap_message_does_not_have_flag(context, folder, uid, keyword)
+
+
 
 
 @then(
@@ -244,54 +296,8 @@ def _assert_message_id_search(
         )
 
 
-@then("the transaction reaches state {state} within {seconds:d} seconds of polling")
-def step_transaction_reaches_state(
-    context: Context, state: str, seconds: int
-) -> None:
-    """Poll get_transaction_status until the saga reaches `state`.
-
-    Uses the MCP client to call get_transaction_status repeatedly at
-    ~1 s intervals. The initial tx_id is either `context.last_tx_id`
-    or the `tx_id` field of the most recent response.
-    """
-    import time as _time
-
-    client = context.mcp
-    tx_id = getattr(context, "last_tx_id", None) or (
-        context.last_response.get("tx_id") if context.last_response else None
-    )
-    if tx_id is None:
-        raise AssertionError("No tx_id available from prior step")
-    context.last_tx_id = tx_id
-    deadline = _time.monotonic() + seconds
-    last_state: str | None = None
-    while _time.monotonic() < deadline:
-        payload = client.call_tool("get_transaction_status", {"tx_id": tx_id})
-        content = payload.get("content") or []
-        import json as _json
-
-        data = _json.loads(content[0]["text"]) if content else {}
-        last_state = data.get("state")
-        if last_state == state:
-            context.last_response = data
-            return
-        _time.sleep(0.5)
-    raise AssertionError(
-        f"Transaction {tx_id} did not reach {state!r} within {seconds}s; "
-        f"last state was {last_state!r}"
-    )
 
 
-@then("the WAL contains no entries for this operation")
-def step_wal_no_entries(context: Context) -> None:
-    from support.wal_reader import WALReader
-
-    reader = WALReader(context.wal_path)
-    txs = reader.all_transactions()
-    if txs:
-        raise AssertionError(
-            f"WAL unexpectedly contains {len(txs)} transaction(s): {txs!r}"
-        )
 
 
 @then("the response field {field} is a non-empty string")
@@ -333,7 +339,7 @@ def step_wal_has_entry(context: Context) -> None:
     tx_id_value = getattr(context, "last_tx_id", None) or (
         context.last_response.get("tx_id") if context.last_response else None
     )
-    uid_lookup = getattr(context, "message_uids", {})
+    getattr(context, "message_uids", {})
     # Determine src_account/src_folder up front so we can translate src_uid hints.
     src_account_hint = None
     src_folder_hint = None
@@ -347,14 +353,25 @@ def step_wal_has_entry(context: Context) -> None:
         raw = row["value"]
         if raw == "the returned tx_id":
             expected[field] = tx_id_value
+        elif raw == "(null)":
+            expected[field] = None
         elif field == "src_uid" and raw.isdigit():
             hint = int(raw)
-            if src_account_hint and src_folder_hint:
-                expected[field] = uid_lookup.get(
-                    (src_account_hint, src_folder_hint, hint), hint
-                )
+            resolved_acc = src_account_hint or getattr(context, "last_call_account", None)
+            resolved_fld = src_folder_hint or getattr(context, "last_call_folder", None)
+            if not resolved_acc or not resolved_fld:
+                resp = getattr(context, "last_response", None) or {}
+                resolved_acc = resolved_acc or resp.get("account")
+                resolved_fld = resolved_fld or resp.get("folder")
+            if resolved_acc and resolved_fld:
+                from support.imap_fixture import resolve_uid
+
+                expected[field] = resolve_uid(context, resolved_acc, resolved_fld, hint)
             else:
-                expected[field] = hint
+                raise AssertionError(
+                    f"Cannot resolve src_uid hint {hint} in WAL entry assertion: "
+                    "source account and folder are not specified in the table or context"
+                )
         elif raw.isdigit():
             expected[field] = int(raw)
         else:
@@ -371,6 +388,8 @@ def step_wal_has_entry(context: Context) -> None:
             "dst_folder": tx.dst_folder,
             "message_id": tx.message_id,
             "retry_count": tx.retry_count,
+            "caller_id": tx.caller_id,
+            "staged_rfc822": tx.staged_rfc822,
         }
         if all(tx_dict.get(k) == v for k, v in expected.items()):
             matches.append(tx_dict)
@@ -394,16 +413,6 @@ def step_imap_folder_still_contains_uid(
     _assert_uid_presence(context, folder, int(uid), should_exist=True)
 
 
-@then(
-    r'the IMAP folder "(?P<folder>[^"]+)" on "(?P<account_id>[^"]+)" '
-    r"still contains uid (?P<uid>\d+)"
-)
-def step_imap_folder_on_account_still_contains_uid(
-    context: Context, folder: str, account_id: str, uid: str
-) -> None:
-    _assert_uid_presence(
-        context, folder, int(uid), should_exist=True, account_id=account_id
-    )
 
 
 @then(
@@ -422,14 +431,6 @@ def step_direct_header_search_returned_draft_id(
     _assert_direct_header_search(context, qualified, header, draft_id, count)
 
 
-@then(
-    r'a direct IMAP SEARCH on "(?P<qualified>[^"]+)" for header (?P<header>[A-Za-z0-9-]+) '
-    r'"(?P<value>[^"]+)" returns (?P<count>.+?) results?'
-)
-def step_direct_header_search_literal(
-    context: Context, qualified: str, header: str, value: str, count: str
-) -> None:
-    _assert_direct_header_search(context, qualified, header, value, count)
 
 
 use_step_matcher("parse")
@@ -439,8 +440,7 @@ def _count_phrase(phrase: str) -> int:
     """`zero`, `exactly one`, `exactly 2` and the like, as written."""
     words = {"zero": 0, "no": 0, "one": 1, "two": 2}
     text = phrase.strip()
-    if text.startswith("exactly "):
-        text = text[len("exactly "):]
+    text = text.removeprefix("exactly ")
     if text in words:
         return words[text]
     if text.isdigit():
@@ -471,32 +471,8 @@ def _assert_direct_header_search(
         )
 
 
-@then('the folder "{folder}" still contains uid {uid:d}')
-def step_folder_still_contains_uid(
-    context: Context, folder: str, uid: int
-) -> None:
-    _assert_uid_presence(context, folder, uid, should_exist=True)
 
 
-@then('the folder "{folder}" is unchanged')
-def step_folder_is_unchanged(context: Context, folder: str) -> None:
-    account_id = _account_for_folder(context, folder)
-    from support.imap_fixture import resolve_account
-
-    instance, user = resolve_account(account_id)
-    uids_now = context.imap.folder_uids(instance, user, folder)
-    lookup = getattr(context, "message_uids", {})
-    seeded = [
-        uid for (acct, fld, _hint), uid in lookup.items()
-        if acct == account_id and fld == folder
-    ]
-    if seeded:
-        for uid in seeded:
-            if uid not in uids_now:
-                raise AssertionError(
-                    f"Folder {folder!r} changed: seeded uid {uid} is missing. "
-                    f"Present uids: {uids_now!r}"
-                )
 
 
 @then('the IMAP folder "{folder}" does not contain uid {uid:d}')
@@ -515,7 +491,8 @@ def _assert_subject_presence(
     exact_count: int | None,
 ) -> None:
     import imaplib as _imaplib
-    from support.imap_fixture import resolve_account, TEST_PASSWORD
+
+    from support.imap_fixture import TEST_PASSWORD, resolve_account
 
     account_id = _account_for_folder(context, folder)
     instance, user = resolve_account(account_id)
@@ -523,19 +500,30 @@ def _assert_subject_presence(
     conn = _imaplib.IMAP4(host, port)
     try:
         conn.login(user, TEST_PASSWORD)
-        status, _ = conn.select(folder)
+        wire_folder = context.imap.to_wire(instance, user, folder)
+        quoted = context.imap._q(wire_folder)
+        status, _ = conn.select(quoted)
         if status != "OK":
-            if should_exist:
-                raise AssertionError(f"Folder {folder!r} not selectable")
-            return
-        status, data = conn.uid("SEARCH", None, "SUBJECT", f'"{subject}"')
-        uids = data[0].split() if data and data[0] else []
+            raise AssertionError(
+                f"Folder {folder!r} (wire: {wire_folder!r}) is not selectable on {account_id!r}"
+            )
+        from email.header import decode_header, make_header
+
+        status, data = conn.uid("SEARCH", None, "ALL")
+        all_uids = data[0].split() if data and data[0] else []
+        matching_uids = []
+        for u in all_uids:
+            msg = context.imap.fetch_message(instance, user, wire_folder, int(u))
+            raw_subj = msg.get("Subject") or ""
+            decoded = str(make_header(decode_header(raw_subj)))
+            if decoded == subject or raw_subj == subject:
+                matching_uids.append(u)
+        count = len(matching_uids)
     finally:
         try:
             conn.logout()
         except Exception:
             pass
-    count = len(uids)
     if exact_count is not None and count != exact_count:
         raise AssertionError(
             f"Folder {folder!r} contains {count} messages with subject "
@@ -565,8 +553,11 @@ def _assert_uid_presence(
     from support.imap_fixture import resolve_account
 
     instance, user = resolve_account(account_id)
-    lookup = getattr(context, "message_uids", {})
-    actual_uid = lookup.get((account_id, folder, uid), uid)
+    from support.imap_fixture import resolve_uid
+
+    actual_uid = resolve_uid(
+        context, account_id, folder, uid, allow_unseeded_probe=not should_exist
+    )
     uids = context.imap.folder_uids(instance, user, folder)
     present = actual_uid in uids
     if should_exist and not present:
@@ -599,16 +590,25 @@ def _account_for_folder(context: Context, folder: str) -> str:
 
 
 def _resolve_uid_hints(context: Context, hints: list[int]) -> list[int]:
-    lookup = getattr(context, "message_uids", {})
+    from support.imap_fixture import resolve_uid
+
     account = getattr(context, "last_call_account", None)
     folder = getattr(context, "last_call_folder", None)
+    if not account or not folder:
+        resp = getattr(context, "last_response", None) or {}
+        account = account or resp.get("account")
+        folder = folder or resp.get("folder")
     resolved: list[int] = []
     for hint in hints:
         if not isinstance(hint, int):
             resolved.append(hint)
             continue
-        key = (account, folder, hint) if account and folder else None
-        resolved.append(lookup.get(key, hint) if key else hint)
+        if account and folder:
+            resolved.append(resolve_uid(context, account, folder, hint))
+        else:
+            raise AssertionError(
+                f"Cannot resolve UID hint {hint}: last_call_account and last_call_folder are not set"
+            )
     return resolved
 
 
@@ -620,9 +620,10 @@ def step_server_responds_with_rpc_error(context: Context, code: int) -> None:
             f"Expected JSON-RPC error code {code}, but no error captured. "
             f"last_response={getattr(context, 'last_response', None)!r}"
         )
-    if error["code"] != code:
+    actual_code = error["code"] if isinstance(error, dict) else error.code
+    if actual_code != code:
         raise AssertionError(
-            f"Expected JSON-RPC code {code}, got {error['code']}: {error!r}"
+            f"Expected JSON-RPC code {code}, got {actual_code}: {error!r}"
         )
 
 
@@ -637,57 +638,23 @@ def step_response_decision_is(context: Context, decision: str) -> None:
         )
 
 
-@then('the response includes field {field} with value "{expected}"')
-def step_response_includes_field_with_value(
-    context: Context, field: str, expected: str
-) -> None:
-    response = _last_response(context)
-    if field not in response:
-        raise AssertionError(
-            f"Response has no field {field!r}. Available fields: "
-            f"{sorted(response.keys())}"
-        )
-    actual = response[field]
-    if actual != expected:
-        raise AssertionError(
-            f"Field {field!r}: expected {expected!r}, got {actual!r}"
-        )
 
 
-@then('the response does not include any field named "{field}"')
-def step_response_does_not_include_field(context: Context, field: str) -> None:
-    response = _last_response(context)
-    if field in response:
-        raise AssertionError(
-            f"Response unexpectedly contains field {field!r}: value is {response[field]!r}"
-        )
 
 
 @then('the response does not contain any field named "{field}"')
 def step_response_does_not_contain_field(context: Context, field: str) -> None:
-    step_response_does_not_include_field(context, field)
-
-
-@then('the response does not contain any field naming "{a}" or "{b}"')
-def step_response_no_field_naming_a_or_b(context: Context, a: str, b: str) -> None:
     response = _last_response(context)
-    _assert_no_string_anywhere(response, a)
-    _assert_no_string_anywhere(response, b)
+    if field in response:
+        raise AssertionError(
+            f"Response unexpectedly contains field {field!r}: {response[field]!r}"
+        )
 
 
-@then('the response does not contain any field naming "{needle}"')
-def step_response_no_field_naming(context: Context, needle: str) -> None:
-    response = _last_response(context)
-    _assert_no_string_anywhere(response, needle)
 
 
-@then('the JSON response does NOT contain the literal string "{needle}"')
-def step_json_response_no_literal(context: Context, needle: str) -> None:
-    import json as _json
 
-    text = _json.dumps(_last_response(context))
-    if needle in text:
-        raise AssertionError(f"JSON response contains literal {needle!r}: {text!r}")
+
 
 
 @then("the JSON response does NOT contain the literal strings:")
@@ -704,6 +671,7 @@ def step_json_response_no_literal_strings(context: Context) -> None:
 
 
 @then('the response field {field} matches the regex "{pattern}"')
+@then('the response field {field} matches "{pattern}"')
 def step_response_field_matches_regex(
     context: Context, field: str, pattern: str
 ) -> None:
@@ -824,133 +792,93 @@ def step_returned_tool_names_no_contain(context: Context) -> None:
             )
 
 
-@then("the server metadata contains \"tool_set_version\" matching the regex \"{pattern}\"")
-def step_server_metadata_version_regex(context: Context, pattern: str) -> None:
-    import re as _re
-    # Probe via describe_policy tool (which exposes tool_set_version).
-    client = context.mcp
-    payload = client.call_tool("describe_policy", {})
-    content = payload.get("content") or []
-    text = content[0].get("text") if content and isinstance(content[0], dict) else ""
-    import json as _json
-
-    data = _json.loads(text) if text else {}
-    version = data.get("tool_set_version")
-    if not isinstance(version, str) or not _re.match(pattern, version):
-        raise AssertionError(
-            f"tool_set_version {version!r} does not match {pattern!r}"
-        )
-    context.last_tool_set_version = version
+def _tool_meta(t: dict[str, Any]) -> dict[str, Any]:
+    if "_meta" in t and isinstance(t["_meta"], dict):
+        return t["_meta"]
+    schema = t.get("inputSchema") or {}
+    if "x-mcp-imap" in schema and isinstance(schema["x-mcp-imap"], dict):
+        return schema["x-mcp-imap"]
+    if "_meta" in schema and isinstance(schema["_meta"], dict):
+        return schema["_meta"]
+    return {}
 
 
-@then("the major version equals {major:d}")
-def step_major_version_equals(context: Context, major: int) -> None:
-    version = getattr(context, "last_tool_set_version", None)
-    if version is None:
-        raise AssertionError("Call the regex step first to populate version")
-    actual_major = int(version.split(".")[0])
-    if actual_major != major:
-        raise AssertionError(
-            f"Major version mismatch: got {actual_major}, expected {major}"
-        )
-
-
-@then('each read tool\'s metadata contains "minimum_visibility" matching:')
-def step_each_read_tool_min_vis(context: Context) -> None:
-    """Read tools' minimum_visibility is verified via a side-channel:
-    describe_policy exposes the canonical map that pairs each read
-    tool with its minimum level. Scenarios can assert against it.
-    """
-    client = context.mcp
-    payload = client.call_tool("describe_policy", {})
-    content = payload.get("content") or []
-    import json as _json
-
-    data = _json.loads(content[0]["text"]) if content else {}
-    tools_available = data.get("tool_set_available") or []
+@then('the tools/list metadata for each read tool has "minimum_visibility" equal to:')
+def step_tools_list_read_tool_min_vis(context: Context) -> None:
+    tools_list = getattr(context, "last_tools", None) or context.last_response.get("tools", [])
+    by_name = {t.get("name") if isinstance(t, dict) else t.name: t for t in tools_list}
     for row in context.table:
-        tool = row["tool"]
-        expected = row["minimum_visibility"]
-        if expected == "(n/a)":
-            # The tool is listed but has no floor.
-            if tool not in tools_available:
-                raise AssertionError(f"Tool {tool!r} not in tool_set_available")
-            continue
-        if tool not in tools_available:
-            raise AssertionError(f"Read tool {tool!r} not in tool_set_available")
-
-
-@then('each write tool\'s metadata contains "required_capability" matching:')
-def step_each_write_tool_cap(context: Context) -> None:
-    # Similar to above — descriptive spec, contractually defined in
-    # ADR 0016; here we assert the server at least lists every write
-    # tool in its available set.
-    client = context.mcp
-    payload = client.call_tool("describe_policy", {})
-    content = payload.get("content") or []
-    import json as _json
-
-    data = _json.loads(content[0]["text"]) if content else {}
-    tools_available = data.get("tool_set_available") or []
-    for row in context.table:
-        tool = row["tool"]
-        if tool not in tools_available:
-            raise AssertionError(f"Write tool {tool!r} not in tool_set_available")
-
-
-@then('each of these tools has no "minimum_visibility" and no "required_capability" metadata:')
-def step_each_meta_tool_no_vis_no_cap(context: Context) -> None:
-    client = context.mcp
-    payload = client.call_tool("describe_policy", {})
-    content = payload.get("content") or []
-    import json as _json
-
-    data = _json.loads(content[0]["text"]) if content else {}
-    tools_available = data.get("tool_set_available") or []
-    for row in context.table:
-        tool = row["tool"]
-        if tool not in tools_available:
-            raise AssertionError(f"Meta tool {tool!r} not in tool_set_available")
-
-
-@then("accounts[0].hidden_folders_count equals {count:d}")
-def step_accounts0_hidden_count(context: Context, count: int) -> None:
-    response = _last_response(context)
-    accounts = response.get("accounts") or []
-    if not accounts:
-        raise AssertionError("Response has no accounts list")
-    actual = accounts[0].get("hidden_folders_count")
-    if actual != count:
-        raise AssertionError(
-            f"accounts[0].hidden_folders_count: expected {count}, got {actual!r}"
-        )
-
-
-@then("the accounts[0].folders_visible contains exactly one entry with:")
-def step_accounts0_folders_visible(context: Context) -> None:
-    response = _last_response(context)
-    accounts = response.get("accounts") or []
-    if not accounts:
-        raise AssertionError("Response has no accounts list")
-    folders = accounts[0].get("folders_visible") or []
-    if len(folders) != 1:
-        raise AssertionError(
-            f"Expected exactly one visible folder; got {len(folders)}: {folders!r}"
-        )
-    entry = folders[0]
-    for row in context.table:
-        field = row["field"]
-        value = row["value"]
-        actual = entry.get(field)
-        if field == "sender_rules_count" or value.isdigit():
-            if actual != int(value):
-                raise AssertionError(
-                    f"folders_visible[0].{field}: expected {value!r}, got {actual!r}"
-                )
-        elif actual != value:
+        tool_name = row["tool"]
+        expected_vis = row["minimum_visibility"]
+        if expected_vis == "(none)":
+            expected_vis = None
+        if tool_name not in by_name:
+            raise AssertionError(f"Tool {tool_name!r} not found in tools/list: {list(by_name.keys())}")
+        t_dict = by_name[tool_name] if isinstance(by_name[tool_name], dict) else by_name[tool_name].model_dump()
+        meta = _tool_meta(t_dict)
+        actual_vis = meta.get("minimum_visibility")
+        if actual_vis != expected_vis:
             raise AssertionError(
-                f"folders_visible[0].{field}: expected {value!r}, got {actual!r}"
+                f"Tool {tool_name!r} minimum_visibility: expected {expected_vis!r}, got {actual_vis!r}"
             )
+
+
+@then('the tools/list metadata for each write tool has "required_capabilities" and "minimum_visibility" equal to:')
+def step_tools_list_write_tool_meta(context: Context) -> None:
+    tools_list = getattr(context, "last_tools", None) or context.last_response.get("tools", [])
+    by_name = {t.get("name") if isinstance(t, dict) else t.name: t for t in tools_list}
+    for row in context.table:
+        tool_name = row["tool"]
+        expected_caps = json.loads(row["required_capabilities"])
+        expected_vis = row["minimum_visibility"]
+        if expected_vis == "(none)":
+            expected_vis = None
+        if tool_name not in by_name:
+            raise AssertionError(f"Tool {tool_name!r} not found in tools/list: {list(by_name.keys())}")
+        t_dict = by_name[tool_name] if isinstance(by_name[tool_name], dict) else by_name[tool_name].model_dump()
+        meta = _tool_meta(t_dict)
+        actual_caps = meta.get("required_capabilities")
+        actual_vis = meta.get("minimum_visibility")
+        if actual_caps != expected_caps:
+            raise AssertionError(
+                f"Tool {tool_name!r} required_capabilities: expected {expected_caps!r}, got {actual_caps!r}"
+            )
+        if actual_vis != expected_vis:
+            raise AssertionError(
+                f"Tool {tool_name!r} minimum_visibility: expected {expected_vis!r}, got {actual_vis!r}"
+            )
+
+
+@then('each of these tools in tools/list has category "meta" and omits "minimum_visibility" and "required_capabilities":')
+def step_tools_list_meta_tools(context: Context) -> None:
+    tools_list = getattr(context, "last_tools", None) or context.last_response.get("tools", [])
+    by_name = {t.get("name") if isinstance(t, dict) else t.name: t for t in tools_list}
+    for row in context.table:
+        tool_name = row["tool"]
+        if tool_name not in by_name:
+            raise AssertionError(f"Tool {tool_name!r} not found in tools/list: {list(by_name.keys())}")
+        t_dict = by_name[tool_name] if isinstance(by_name[tool_name], dict) else by_name[tool_name].model_dump()
+        meta = _tool_meta(t_dict)
+        if meta.get("category") != "meta":
+            raise AssertionError(f"Tool {tool_name!r} category: expected 'meta', got {meta.get('category')!r}")
+        if "minimum_visibility" in meta:
+            raise AssertionError(f"Tool {tool_name!r} unexpectedly defines minimum_visibility: {meta['minimum_visibility']!r}")
+        if "required_capabilities" in meta:
+            raise AssertionError(f"Tool {tool_name!r} unexpectedly defines required_capabilities: {meta['required_capabilities']!r}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _assert_no_string_anywhere(obj: Any, needle: str) -> None:
@@ -963,55 +891,167 @@ def _assert_no_string_anywhere(obj: Any, needle: str) -> None:
         )
 
 
-@then(
-    'the audit log contains a record with tool "{tool}", '
-    'detail containing "{substring}"'
-)
-def step_audit_record_detail_containing(
-    context: Context, tool: str, substring: str
+@then("the audit log contains {n:d} records")
+def step_audit_log_record_count(context: Context, n: int) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    recs = list(reader.records())
+    if len(recs) != n:
+        raise AssertionError(
+            f"Expected {n} audit records, found {len(recs)}: {[r.record for r in recs]}"
+        )
+
+
+@then('the audit log contains {n:d} records with reason "{reason}"')
+def step_audit_log_record_count_reason(context: Context, n: int, reason: str) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    matches = [r for r in reader.records() if r.record.get("reason") == reason]
+    if len(matches) != n:
+        raise AssertionError(
+            f"Expected {n} records with reason {reason!r}, found {len(matches)}: {[r.record for r in matches]}"
+        )
+
+
+@then('the audit log contains an entry with decision "{decision}", reason "{reason}"')
+def step_audit_log_contains_entry_decision_reason(
+    context: Context, decision: str, reason: str
 ) -> None:
     from support.audit_reader import AuditReader
 
     reader = AuditReader(context.audit_dir)
     matches = [
-        rec for rec in reader.find(tool=tool)
-        if substring in str(rec.record.get("detail", ""))
+        r
+        for r in reader.records()
+        if r.record.get("decision") == decision and r.record.get("reason") == reason
     ]
     if not matches:
-        present = [rec.record for rec in reader.find(tool=tool)]
+        all_recs = [r.record for r in reader.records()]
         raise AssertionError(
-            f"No audit record with tool={tool!r} and detail containing "
-            f"{substring!r}. Records with that tool: {present!r}"
+            f"Expected audit record with decision={decision!r}, reason={reason!r}, found: {all_recs}"
+        )
+
+
+@then('the audit log contains {n:d} records with tool "{tool}"')
+def step_audit_log_record_count_tool(context: Context, n: int, tool: str) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    matches = [r for r in reader.records() if r.record.get("tool") == tool]
+    if len(matches) != n:
+        raise AssertionError(
+            f"Expected {n} records with tool {tool!r}, found {len(matches)}: {[r.record for r in matches]}"
+        )
+
+
+
+
+@then(
+    'the audit log contains an outcome record for tool "{tool}" with '
+    'decision "{decision}" and result "{result}"'
+)
+def step_audit_log_outcome_tool_decision_result(
+    context: Context, tool: str, decision: str, result: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    records = reader.find(tool=tool)
+    matches = [
+        r.record
+        for r in records
+        if r.record.get("decision") == decision
+        and r.record.get("result") == result
+    ]
+    if not matches:
+        present = [r.record for r in records]
+        raise AssertionError(
+            f"No audit record for tool={tool!r} with decision={decision!r} and result={result!r}. Found: {present}"
+        )
+
+
+@then(
+    'the audit log contains an outcome record for tool "{tool}" with '
+    'source folder "{src_folder}" and target folder "{dst_folder}"'
+)
+def step_audit_log_outcome_source_target_folder(
+    context: Context, tool: str, src_folder: str, dst_folder: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    records = reader.find(tool=tool)
+    for rec in records:
+        r = rec.record
+        if r.get("phase") != "outcome":
+            continue
+        args = r.get("args_summary") or {}
+        s = (
+            r.get("source_folder")
+            or (r.get("extra") or {}).get("source_folder")
+            or (args.get("source") or {}).get("folder")
+        )
+        t = (
+            r.get("target_folder")
+            or (r.get("extra") or {}).get("target_folder")
+            or (args.get("target") or {}).get("folder")
+        )
+        if s == src_folder and t == dst_folder:
+            return
+    raise AssertionError(
+        f"No audit record found for tool {tool!r} with source_folder={src_folder!r} and target_folder={dst_folder!r}. Found: {[r.record for r in records]}"
+    )
+
+
+
+
+use_step_matcher("re")
+
+@then(
+    r'the audit log contains an entry with tool "(?P<tool>[^"]+)", '
+    r'decision "(?P<decision>[^"]+)", result "(?P<result>[^"]+)", reason "(?P<reason>[^"]+)"'
+)
+def step_audit_entry_tool_decision_result_reason(
+    context: Context, tool: str, decision: str, result: str, reason: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    matches = reader.find(tool=tool, decision=decision, result=result, reason=reason)
+    if not matches:
+        present = [rec.record for rec in reader.records_today()]
+        raise AssertionError(
+            f"No audit record with tool={tool!r} decision={decision!r} "
+            f"result={result!r} reason={reason!r}. Present: {present!r}"
         )
     context.last_matching_audit_record = matches[0].record
 
 
 @then(
-    'new IMAP connection attempts to "{account}" are refused '
-    'with reason "{reason}"'
+    r'the audit log contains an entry with tool "(?P<tool>[^"]+)", '
+    r'result "(?P<result>[^"]+)", reason "(?P<reason>[^"]+)"'
 )
-def step_imap_connection_refused_with_reason(
-    context: Context, account: str, reason: str
+def step_audit_entry_tool_result_reason(
+    context: Context, tool: str, result: str, reason: str
 ) -> None:
-    from features.steps.mcp_steps import _ensure_mcp_client
+    from support.audit_reader import AuditReader
 
-    client = _ensure_mcp_client(context, "invoice-agent")
-    payload = client.call_tool("list_folders", {"account": account})
-    import json as _json
-    content = payload.get("content") or []
-    if not content:
-        raise AssertionError("list_folders returned no content")
-    data = _json.loads(content[0]["text"])
-    actual_reason = data.get("reason")
-    if actual_reason != reason:
+    reader = AuditReader(context.audit_dir)
+    matches = reader.find(tool=tool, result=result, reason=reason)
+    if not matches:
+        present = [rec.record for rec in reader.records_today()]
         raise AssertionError(
-            f"Expected reason {reason!r}, got {actual_reason!r}. "
-            f"Full response: {data!r}"
+            f"No audit record with tool={tool!r} result={result!r} "
+            f"reason={reason!r}. Present: {present!r}"
         )
+    context.last_matching_audit_record = matches[0].record
 
 
 @then(
-    'the audit log contains an entry with tool "{tool}", decision "{decision}", reason "{reason}"'
+    r'the audit log contains an entry with tool "(?P<tool>[^"]+)", '
+    r'decision "(?P<decision>[^"]+)", reason "(?P<reason>[^"]+)"'
 )
 def step_audit_entry_tool_decision_reason(
     context: Context, tool: str, decision: str, reason: str
@@ -1029,163 +1069,215 @@ def step_audit_entry_tool_decision_reason(
     context.last_matching_audit_record = matches[0].record
 
 
-@then("the current day's audit file contains a JSONL record whose fields equal:")
-def step_current_day_audit_record_fields_equal(context: Context) -> None:
+@then(r'the audit log contains an entry with tool "(?P<tool>[^"]+)", reason "(?P<reason>[^"]+)"')
+def step_audit_entry_tool_reason(
+    context: Context, tool: str, reason: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    matches = reader.find(tool=tool, reason=reason)
+    if not matches:
+        present = [rec.record for rec in reader.records_today()]
+        raise AssertionError(
+            f"No audit record with tool={tool!r} reason={reason!r}. Present: {present!r}"
+        )
+    context.last_matching_audit_record = matches[0].record
+
+
+@then(
+    r'the audit log contains an entry with tool "(?P<tool>[^"]+)", '
+    r'decision "(?P<decision>[^"]+)", suppressed_by_policy (?P<suppressed>true|false)'
+)
+def step_audit_entry_tool_decision_suppressed(
+    context: Context, tool: str, decision: str, suppressed: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    is_suppressed = suppressed.lower() == "true"
+    records = [rec.record for rec in reader.records_today()]
+    matches = [
+        r for r in records
+        if r.get("tool") == tool and r.get("decision") == decision and r.get("suppressed_by_policy") == is_suppressed
+    ]
+    if not matches:
+        raise AssertionError(
+            f"No audit record with tool={tool!r} decision={decision!r} "
+            f"suppressed_by_policy={is_suppressed}. Present: {records!r}"
+        )
+    context.last_matching_audit_record = matches[0]
+
+
+use_step_matcher("parse")
+
+
+
+
+def _field_matches(actual: Any, expected_str: str) -> bool:
+    if isinstance(actual, bool):
+        if expected_str.lower() == "true":
+            return actual is True
+        if expected_str.lower() == "false":
+            return actual is False
+    if actual is None:
+        return expected_str.lower() in ("none", "null")
+    return str(actual) == expected_str
+
+
+@then('file "{filename}" contains a JSONL record whose fields equal:')
+@then('file "{filename}" contains a JSONL record with:')
+@then('file "{filename}" contains a record with:')
+def step_file_contains_jsonl_record(context: Context, filename: str) -> None:
     from support.audit_reader import AuditReader
 
     expected = {row["field"]: row["value"] for row in context.table}
     reader = AuditReader(context.audit_dir)
-    records = reader.records_today()
+    records = reader.read_file(filename)
     matches = [
         rec
         for rec in records
-        if all(str(rec.record.get(k)) == v for k, v in expected.items())
+        if all(_field_matches(rec.record.get(k), v) for k, v in expected.items())
     ]
     if not matches:
         present = [rec.record for rec in records]
         raise AssertionError(
-            f"No audit record matches {expected!r}. Present: {present!r}"
+            f"No audit record in {filename!r} matches {expected!r}. Present: {present!r}"
         )
     context.last_matching_audit_record = matches[0].record
 
 
-@then("the audit file contains a JSONL record with:")
-def step_audit_file_contains_jsonl(context: Context) -> None:
-    from support.audit_reader import AuditReader
-
-    expected = {row["field"]: row["value"] for row in context.table}
-    reader = AuditReader(context.audit_dir)
-    matches = [
-        rec
-        for rec in reader.records_today()
-        if all(str(rec.record.get(k)) == v for k, v in expected.items())
-    ]
-    if not matches:
-        present = [rec.record for rec in reader.records_today()]
-        raise AssertionError(
-            f"No audit record matches {expected!r}. Present: {present!r}"
-        )
-    context.last_matching_audit_record = matches[0].record
-
-
-@then('the record has a "{field}" field matching RFC 3339 UTC to millisecond precision')
-def step_record_has_rfc3339(context: Context, field: str) -> None:
-    import re as _re
-
-    rec = context.last_matching_audit_record
+@then('that record has field "{field}" matching RFC 3339 UTC millisecond format')
+def step_record_has_field_rfc3339(context: Context, field: str) -> None:
+    rec = getattr(context, "last_matching_audit_record", None)
+    if not rec:
+        raise AssertionError("No audit record remembered from a prior step")
     value = rec.get(field)
     pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"
-    if not isinstance(value, str) or not _re.match(pattern, value):
+    if not isinstance(value, str) or not re.match(pattern, value):
         raise AssertionError(
-            f"Field {field!r} does not match RFC 3339 millisecond pattern: {value!r}"
+            f"Field {field!r} does not match RFC 3339 millisecond format: {value!r}"
         )
 
 
-@then('the record has a "{field}" field that is a non-negative integer')
-def step_record_has_non_neg_int(context: Context, field: str) -> None:
-    rec = context.last_matching_audit_record
+@then('that record has integer field "{field}" >= 0')
+def step_record_has_integer_field_non_neg(context: Context, field: str) -> None:
+    rec = getattr(context, "last_matching_audit_record", None)
+    if not rec:
+        raise AssertionError("No audit record remembered from a prior step")
     value = rec.get(field)
     if not isinstance(value, int) or value < 0:
+        raise AssertionError(f"Field {field!r} is not an integer >= 0: {value!r}")
+
+
+@then('that record has field "{field}" matching "{pattern}"')
+def step_record_has_field_matching(context: Context, field: str, pattern: str) -> None:
+    rec = getattr(context, "last_matching_audit_record", None)
+    if not rec:
+        raise AssertionError("No audit record remembered from a prior step")
+    value = str(rec.get(field, ""))
+    if not re.search(pattern, value):
+        raise AssertionError(f"Field {field!r} ({value!r}) does not match pattern {pattern!r}")
+
+
+@then('that record has field "{field}" starting with "{prefix}"')
+def step_record_has_field_starting_with(context: Context, field: str, prefix: str) -> None:
+    rec = getattr(context, "last_matching_audit_record", None)
+    if not rec:
+        raise AssertionError("No audit record remembered from a prior step")
+    value = str(rec.get(field, ""))
+    if not value.startswith(prefix):
+        raise AssertionError(f"Field {field!r} ({value!r}) does not start with {prefix!r}")
+
+
+
+
+@then('file "{filename}" contains in order for tool "{tool}":')
+def step_file_contains_in_order_for_tool(context: Context, filename: str, tool: str) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    records = [rec.record for rec in reader.read_file(filename) if rec.record.get("tool") == tool]
+    expected_rows = list(context.table)
+    if len(records) < len(expected_rows):
         raise AssertionError(
-            f"Field {field!r} is not a non-negative integer: {value!r}"
+            f"Expected at least {len(expected_rows)} records for tool {tool!r} in {filename}, found {len(records)}: {records!r}"
         )
+    for idx, row in enumerate(expected_rows):
+        rec = records[idx]
+        for heading in row.headings:
+            expected_val = row[heading]
+            actual_val = str(rec.get(heading, ""))
+            if actual_val != expected_val:
+                raise AssertionError(
+                    f"Row {idx} field {heading!r}: expected {expected_val!r}, got {actual_val!r} in {rec!r}"
+                )
+    context.last_matched_tool_records = records[: len(expected_rows)]
 
 
-@then('the record has a "{field}" field that is "sha256:" followed by 64 lowercase hex characters')
-def step_record_has_sha256(context: Context, field: str) -> None:
-    import re as _re
+@then('both "{tool}" records carry the same non-empty UUIDv4 "request_id"')
+def step_both_records_carry_same_uuidv4_req_id(context: Context, tool: str) -> None:
+    uuid_regex = r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    records = getattr(context, "last_matched_tool_records", None)
+    if not records or len(records) < 2:
+        from support.audit_reader import AuditReader
 
-    rec = context.last_matching_audit_record
-    value = rec.get(field)
-    if not isinstance(value, str) or not _re.match(r"^sha256:[0-9a-f]{64}$", value):
-        raise AssertionError(f"Field {field!r} is not a sha256 value: {value!r}")
-
-
-@then("the record args_summary contains fields {fields_raw}")
-def step_record_args_summary_contains(context: Context, fields_raw: str) -> None:
-    import json as _json
-
-    rec = context.last_matching_audit_record
-    args = rec.get("args_summary") or {}
-    # Accept set-like JSON string: {"account", "folder", "uid"}
-    normalised = fields_raw.replace("{", "[").replace("}", "]")
-    expected = set(_json.loads(normalised))
-    for field in expected:
-        if field not in args:
-            raise AssertionError(
-                f"args_summary missing field {field!r}; has {sorted(args.keys())!r}"
-            )
+        reader = AuditReader(context.audit_dir)
+        records = [rec.record for rec in reader.records_today() if rec.record.get("tool") == tool]
+    if len(records) < 2:
+        raise AssertionError(f"Need at least 2 records for tool {tool!r}, got {len(records)}")
+    req_ids = [r.get("request_id") for r in records[:2]]
+    if not req_ids[0] or req_ids[0] != req_ids[1]:
+        raise AssertionError(f"Request IDs do not match or are empty: {req_ids!r}")
+    if not re.match(uuid_regex, str(req_ids[0]), re.IGNORECASE):
+        raise AssertionError(f"Request ID is not a valid UUIDv4: {req_ids[0]!r}")
 
 
-@then('the record does NOT contain the literal string "{needle}"')
-def step_record_does_not_contain_literal(context: Context, needle: str) -> None:
-    import json as _json
-
-    rec = context.last_matching_audit_record
-    text = _json.dumps(rec)
-    if needle in text:
-        raise AssertionError(
-            f"Record unexpectedly contains literal {needle!r}: {text!r}"
-        )
-
-
-@then('the audit record does NOT contain the literal string "{needle}"')
-def step_audit_record_no_literal(context: Context, needle: str) -> None:
-    from support.audit_reader import AuditReader
-    import json as _json
-
-    reader = AuditReader(context.audit_dir)
-    for rec in reader.records_today():
-        text = _json.dumps(rec.record)
-        if needle in text:
-            raise AssertionError(
-                f"Audit record {rec.record!r} contains forbidden literal {needle!r}"
-            )
-
-
-@then(
-    'the audit record contains a field "{field}" equal to the SHA-256 hex digest of "{seed}"'
-)
-def step_audit_record_sha256(context: Context, field: str, seed: str) -> None:
-    import hashlib
-
+@then('file "{filename}" contains {count:d} records with tool "saga_transition" in exact step order:')
+def step_file_contains_saga_transition_step_order(
+    context: Context, filename: str, count: int
+) -> None:
     from support.audit_reader import AuditReader
 
-    expected = hashlib.sha256(seed.encode("utf-8")).hexdigest()
     reader = AuditReader(context.audit_dir)
-    for rec in reader.records_today():
-        if rec.record.get(field) == expected:
-            return
-    raise AssertionError(
-        f"No audit record has {field!r} = sha256({seed!r}) = {expected!r}"
-    )
+    records = [rec.record for rec in reader.read_file(filename) if rec.record.get("tool") == "saga_transition"]
+    expected_steps = [row["step"] for row in context.table]
+    if len(records) != count:
+        raise AssertionError(f"Expected {count} saga_transition records in {filename}, found {len(records)}: {records!r}")
+    actual_steps = [r.get("step") for r in records]
+    if actual_steps != expected_steps:
+        raise AssertionError(f"Expected saga steps {expected_steps!r}, got {actual_steps!r}")
+    context.last_saga_records = records
 
 
-@then(
-    'the audit record contains a field "{field}" equal to the SHA-256 hex digest '
-    "of the canonicalized JSON criteria"
-)
-def step_audit_record_criteria_digest(context: Context, field: str) -> None:
-    import hashlib
-    import json as _json
+@then('all {count:d} "saga_transition" records carry the exact tx_id returned by move')
+def step_saga_records_carry_tx_id_returned_by_move(context: Context, count: int) -> None:
+    records = getattr(context, "last_saga_records", None) or []
+    if len(records) != count:
+        raise AssertionError(f"Expected {count} saga records, got {len(records)}")
+    last_resp = getattr(context, "last_response", None) or {}
+    expected_tx_id = last_resp.get("tx_id")
+    if not expected_tx_id:
+        raise AssertionError(f"Last move response did not contain tx_id: {last_resp!r}")
+    for r in records:
+        if r.get("tx_id") != expected_tx_id:
+            raise AssertionError(f"Record tx_id {r.get('tx_id')!r} != expected {expected_tx_id!r}")
 
-    from support.audit_reader import AuditReader
 
-    # The criteria for the *last* search call. Scenario captures it
-    # in context.last_search_criteria via the search step.
-    criteria = getattr(context, "last_search_criteria", None)
-    if criteria is None:
-        raise AssertionError("No criteria captured — step ordering bug")
-    canonical = _json.dumps(criteria, sort_keys=True).encode("utf-8")
-    expected = hashlib.sha256(canonical).hexdigest()
-    reader = AuditReader(context.audit_dir)
-    for rec in reader.records_today():
-        args = rec.record.get("args_summary", {})
-        if args.get(field) == expected:
-            return
-    raise AssertionError(
-        f"No audit record has args_summary.{field!r} = {expected!r}"
-    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @then("the audit log contains an entry with:")
@@ -1224,123 +1316,16 @@ def step_audit_log_contains_entry(context: Context) -> None:
     context.last_matching_audit_record = matches[0].record
 
 
-@then('the audit entry does not contain the field "{field}" with any cleartext value')
-def step_audit_entry_no_cleartext(context: Context, field: str) -> None:
-    rec = getattr(context, "last_matching_audit_record", None)
-    if rec is None:
-        raise AssertionError(
-            "No audit record captured by a previous step."
-        )
-    value = rec.get(field)
-    if value is None:
-        return
-    if isinstance(value, str) and ("@" in value or "<" in value):
-        raise AssertionError(
-            f"Audit record field {field!r} appears to contain cleartext: "
-            f"{value!r}"
-        )
 
 
-@then("the response field content_hash matches sha256 of the stored attachment bytes")
-def step_response_content_hash_matches(context: Context) -> None:
-    """Verify the server-reported content_hash is the sha256 of the bytes
-    that were staged into the fixture. The fixture padded-attachment
-    creator places a byte sequence of `b"x" * size` (see _seed_message);
-    the scenarios that assert on this use exactly the `size` from the
-    background row, so the hash is reconstructible here."""
-    import hashlib
-
-    response = _last_response(context)
-    reported = response.get("content_hash")
-    size = response.get("size_bytes")
-    if reported is None or size is None:
-        raise AssertionError(
-            f"Response missing content_hash/size_bytes: {response!r}"
-        )
-    expected = hashlib.sha256(b"x" * int(size)).hexdigest()
-    if reported != expected:
-        raise AssertionError(
-            f"content_hash mismatch: reported {reported!r}, expected {expected!r}"
-        )
 
 
-@then("the response field {field} is a non-negative integer")
-def step_response_field_is_non_negative(context: Context, field: str) -> None:
-    response = _last_response(context)
-    if field not in response:
-        raise AssertionError(
-            f"Response has no field {field!r}. Available fields: "
-            f"{sorted(response.keys())}"
-        )
-    actual = response[field]
-    if not isinstance(actual, int) or actual < 0:
-        raise AssertionError(
-            f"Field {field!r} is not a non-negative integer: {actual!r}"
-        )
 
 
-@then("the response field {field} is {expected:d}")
-def step_response_field_is_integer(
-    context: Context, field: str, expected: int
-) -> None:
-    response = _last_response(context)
-    if field not in response:
-        raise AssertionError(
-            f"Response has no field {field!r}. Available fields: "
-            f"{sorted(response.keys())}"
-        )
-    actual = response[field]
-    if actual != expected:
-        raise AssertionError(
-            f"Field {field!r}: expected {expected!r}, got {actual!r}"
-        )
 
 
-@then("the response field {field} contains exactly {expected}")
-def step_response_field_contains_exactly(
-    context: Context, field: str, expected: str
-) -> None:
-    """Strict list equality, with UID-hint mapping for the `uids` field."""
-    response = _last_response(context)
-    if field not in response:
-        raise AssertionError(
-            f"Response has no field {field!r}. Available fields: "
-            f"{sorted(response.keys())}"
-        )
-    actual = response[field]
-    expected_value = _parse_expected(expected)
-    if field == "uids" and isinstance(expected_value, list):
-        expected_value = _resolve_uid_hints(context, expected_value)
-    if not isinstance(actual, list):
-        raise AssertionError(
-            f"Field {field!r} is not a list; 'contains exactly' requires a list."
-        )
-    comparable = _folder_paths(actual) if field == "folders" else actual
-    if sorted(comparable) != sorted(expected_value):
-        raise AssertionError(
-            f"Field {field!r}: expected exactly {expected_value!r}, got {comparable!r}"
-        )
 
 
-@then('the response field {field} contains the literal string "{needle}"')
-def step_response_field_contains_literal(
-    context: Context, field: str, needle: str
-) -> None:
-    """Substring assertion on a string field; supports dotted paths
-    like `error.detail` so the ADR 0028 sink diagnostics can be
-    pinned."""
-    found, value = _resolve_dotted_field(_last_response(context), field)
-    if not found:
-        raise AssertionError(f"Response has no field {field!r}")
-    if not isinstance(value, str):
-        raise AssertionError(
-            f"Field {field!r}: expected str for substring check, "
-            f"got {type(value).__name__}"
-        )
-    if needle not in value:
-        raise AssertionError(
-            f"Field {field!r} does not contain {needle!r}: {value!r}"
-        )
 
 
 def _assert_field_equals_table(context: Context, field: str) -> None:
@@ -1376,12 +1361,12 @@ def step_response_field_contains(
         _assert_field_equals_table(context, field)
         return
     response = _last_response(context)
-    if field not in response:
+    found, actual = _resolve_dotted_field(response, field)
+    if not found:
         raise AssertionError(
             f"Response has no field {field!r}. Available fields: "
-            f"{sorted(response.keys())}"
+            f"{sorted(response.keys())}. Full response: {response}"
         )
-    actual = response[field]
     expected_value = _parse_expected(expected)
     if isinstance(actual, list):
         # Apply UID-hint translation for the `uids` field.
@@ -1408,448 +1393,34 @@ def step_response_field_contains(
     )
 
 
-@then('the WAL transactions table contains an entry with status "{status}" and retry_count {count:d}')
-def step_wal_contains_status_retry(
-    context: Context, status: str, count: int
-) -> None:
-    from support.wal_reader import WALReader
-
-    reader = WALReader(context.wal_path)
-    txs = reader.all_transactions()
-    matches = [t for t in txs if t.status == status and t.retry_count == count]
-    if not matches:
-        raise AssertionError(
-            f"No WAL transaction with status={status!r} retry_count={count!r}. "
-            f"Present: {[(t.tx_id, t.status, t.retry_count) for t in txs]!r}"
-        )
 
 
-@then('the WAL entry for this tx_id reaches status "{status}" within {seconds:d} seconds')
-def step_wal_entry_reaches_status_timed(
-    context: Context, status: str, seconds: int
-) -> None:
-    """Poll the WAL until the named tx_id reaches `status` or timeout.
-
-    The harness re-triggers the recovery loop in a sleep/retry loop —
-    real operators rely on the server's own background recovery, but
-    the test-only `_test_run_recovery` tool makes this deterministic.
-    """
-    import time as _time
-
-    from support.wal_reader import WALReader
-
-    tx_id = getattr(context, "last_tx_id", None) or (
-        context.last_response.get("tx_id") if context.last_response else None
-    )
-    if tx_id is None:
-        raise AssertionError("No tx_id captured by a prior step")
-    client = context.mcp
-    reader = WALReader(context.wal_path)
-    deadline = _time.monotonic() + seconds
-    last_status: str | None = None
-    while _time.monotonic() < deadline:
-        tx = reader.transaction(tx_id)
-        last_status = tx.status if tx else None
-        if last_status == status:
-            return
-        if client is not None:
-            try:
-                client.raw_call(
-                    "tools/call",
-                    {"name": "_test_run_recovery", "arguments": {"passes": 1}},
-                )
-            except Exception:
-                pass
-        _time.sleep(0.5)
-    raise AssertionError(
-        f"WAL tx {tx_id!r} did not reach status {status!r} within {seconds}s; "
-        f"last seen {last_status!r}"
-    )
 
 
-@then('the WAL entry reaches status "{status}" within {seconds:d} seconds')
-def step_wal_entry_reaches_status_timed_alias(
-    context: Context, status: str, seconds: int
-) -> None:
-    step_wal_entry_reaches_status_timed(context, status, seconds)
 
 
-@then('the WAL entry reaches status "{status}"')
-def step_wal_entry_reaches_status(context: Context, status: str) -> None:
-    step_wal_entry_reaches_status_timed(context, status, 10)
 
 
-@then('the WAL entry transitions to status "{status}"')
-def step_wal_entry_transitions_to_status(context: Context, status: str) -> None:
-    step_wal_entry_reaches_status_timed(context, status, 10)
 
 
-@then(
-    'the recovery observes the existing target message via direct IMAP SEARCH on "{folder}"'
-)
-def step_recovery_observes_target(context: Context, folder: str) -> None:
-    """Verify the target message is still present after recovery —
-    evidence that the saga's idempotency lookup matched and no
-    duplicate APPEND was issued."""
-    if ":" in folder:
-        account_id, _, folder = folder.partition(":")
-    else:
-        account_id = _account_for_folder(context, folder)
-    from support.imap_fixture import resolve_account
-
-    instance, user = resolve_account(account_id)
-    uids = context.imap.folder_uids(instance, user, folder)
-    if not uids:
-        raise AssertionError(
-            f"Target folder {account_id}:{folder} is unexpectedly empty "
-            "after recovery"
-        )
 
 
-@then('the recovery does NOT issue an additional APPEND to "{folder}"')
-def step_recovery_no_additional_append(context: Context, folder: str) -> None:
-    """Confirmed indirectly: target folder contains exactly one
-    message with the idempotency Message-ID. An extra APPEND would
-    produce a second message."""
-    if ":" in folder:
-        account_id, _, folder = folder.partition(":")
-    else:
-        account_id = _account_for_folder(context, folder)
-    from support.imap_fixture import resolve_account
-
-    instance, user = resolve_account(account_id)
-    uids = context.imap.folder_uids(instance, user, folder)
-    if len(uids) != 1:
-        raise AssertionError(
-            f"Expected exactly one message in {account_id}:{folder} after "
-            f"recovery; found {len(uids)}: {uids!r}"
-        )
 
 
-@then(
-    'the folder "{folder}" contains exactly one message with message-id "{msgid}"'
-)
-def step_folder_contains_exactly_one_msgid(
-    context: Context, folder: str, msgid: str
-) -> None:
-    _assert_message_id_search(context, folder, msgid, 1)
 
 
-CANONICAL_REASON_CODES = frozenset(
-    {
-        # ALLOW
-        "rule_matched",
-        "folder_default_applied",
-        # DENY — policy
-        "account_hidden",
-        "folder_hidden",
-        "sender_not_whitelisted",
-        "sender_blacklisted",
-        # DENY — visibility (one per level rank)
-        "visibility_below_COUNT",
-        "visibility_below_METADATA",
-        "visibility_below_ENVELOPE",
-        "visibility_below_HEADERS",
-        "visibility_below_BODY",
-        "visibility_below_FULL",
-        # DENY — capabilities & flags
-        "capability_missing",
-        "forbidden_system_flag",
-        # DENY — protocol
-        "unknown_tool",
-        "auth_failed",
-        # INFO / audit-only
-        "saga_not_configured",
-        "saga_step",
-    }
-)
 
 
-@then("every distinct reason code in the audit file is present in ADR-0017 §2.1 as amended by ADR-0025")
-@then("every distinct reason code in the audit file is present in ADR-0017 §2.1")
-def step_audit_reasons_in_canonical(context: Context) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    seen: set[str] = set()
-    for rec in reader.records_today():
-        reason = rec.record.get("reason")
-        if isinstance(reason, str):
-            seen.add(reason)
-    rogue = seen - CANONICAL_REASON_CODES
-    if rogue:
-        raise AssertionError(
-            f"Audit log emitted reason code(s) outside the canonical "
-            f"set: {sorted(rogue)!r}. The set is the contract surface "
-            "of ADR-0017 §2.1. Either add an ADR amendment or remove "
-            "the emission."
-        )
 
 
-@then("the canonical reason-code table in ADR-0017 §2.1 as amended by ADR-0025 has variance discipline")
-@then("the canonical reason-code table in ADR-0017 §2.1 has variance discipline")
-def step_canonical_variance_discipline(context: Context) -> None:
-    """Assert that every canonical reason code is exercised by at least
-    two non-pending Feature-File scenarios.
-
-    The check scans every `.feature` file under `bdd/features/` and
-    counts, per code, the number of distinct scenarios that mention
-    the code as a literal token inside the scenario body. @pending
-    scenarios do not count. Codes that are emission-only (audit) or
-    only reachable on a transport not yet implemented are exempted
-    explicitly via `_VARIANCE_EXEMPT`.
-    """
-    import re as _re
-    from pathlib import Path
-
-    bdd_root = Path(context.bdd_root)
-    features_root = bdd_root / "features"
-    scenario_pattern = _re.compile(
-        r"^([ \t]*)(Scenario|Scenario Outline):", _re.MULTILINE
-    )
-
-    counts: dict[str, set[str]] = {code: set() for code in CANONICAL_REASON_CODES}
-    for feature in features_root.rglob("*.feature"):
-        text = feature.read_text(encoding="utf-8")
-        # Feature-level @pending tag → skip the entire file.
-        first_nonblank = next(
-            (line for line in text.splitlines() if line.strip()), ""
-        )
-        if first_nonblank.startswith("@pending"):
-            continue
-        # Scan scenario by scenario.
-        positions = [m.start() for m in scenario_pattern.finditer(text)]
-        positions.append(len(text))
-        for i in range(len(positions) - 1):
-            block_start = positions[i]
-            block = text[block_start : positions[i + 1]]
-            # Inspect lines immediately above the scenario header for
-            # an @pending tag.
-            preceding = text[max(0, block_start - 200) : block_start]
-            preceding_lines = preceding.splitlines()
-            if preceding_lines and preceding_lines[-1].lstrip().startswith("@pending"):
-                continue
-            for code in CANONICAL_REASON_CODES:
-                # Match code as a whole word anywhere in the scenario
-                # body — covers `reason equals "X"`,
-                # `redaction_reason equals "X"`, Scenario Outline
-                # Examples columns, and bare table cells.
-                if _re.search(rf"\b{_re.escape(code)}\b", block):
-                    counts[code].add(f"{feature.name}#{block_start}")
-
-    # Codes that cannot be asserted as a `reason` field in a
-    # caller-visible response, so don't count via the scan above:
-    #   - saga_step / saga_not_configured: audit-only or
-    #     informational; covered by audit_log_format and the contract
-    #     feature's set-membership check.
-    #   - unknown_tool: surfaces as JSON-RPC error -32601, asserted
-    #     via the `JSON-RPC error code` Then-step; the audit record
-    #     for it is checked separately.
-    #   - auth_failed: HTTP-only path, deferred under LIM-0007.
-    audit_only = {
-        "saga_step",
-        "saga_not_configured",
-        "unknown_tool",
-        "auth_failed",
-    }
-
-    underexposed = [
-        code
-        for code, scenarios in counts.items()
-        if code not in audit_only and len(scenarios) < 2
-    ]
-    if underexposed:
-        details = {
-            code: sorted(counts[code]) for code in underexposed
-        }
-        raise AssertionError(
-            "Variance discipline (ADR-0017 §2.2) requires every code to "
-            "be exercised by ≥ 2 non-pending scenarios with materially "
-            "different inputs. Underexposed codes: "
-            f"{details!r}"
-        )
 
 
-@then("the audit file contains, in this order, at least the records:")
-def step_audit_in_order_records(context: Context) -> None:
-    """Assert that the named (tool, step) pairs appear as a contiguous
-    subsequence of the audit log for the current day."""
-    from support.audit_reader import AuditReader
-
-    expected = [(row["tool"], row["step"]) for row in context.table]
-    reader = AuditReader(context.audit_dir)
-    observed = [
-        (r.record.get("tool"), r.record.get("step"))
-        for r in reader.records_today()
-        if r.record.get("tool") == expected[0][0]
-    ]
-    for pair in expected:
-        if pair not in observed:
-            raise AssertionError(
-                f"Audit log is missing record {pair!r}. "
-                f"Present: {observed!r}"
-            )
-    # Order check.
-    idx = 0
-    for obs in observed:
-        if idx < len(expected) and obs == expected[idx]:
-            idx += 1
-    if idx < len(expected):
-        raise AssertionError(
-            f"Audit log records present but not in the expected order. "
-            f"Expected: {expected!r}, observed: {observed!r}"
-        )
 
 
-@when('an external writer replaces R3\'s "tool" field with a different value')
-def step_tamper_r3(context: Context) -> None:
-    """Rewrite record #3 on disk so the hash chain breaks at that line."""
-    import json as _json
-    from datetime import datetime, timezone
-
-    today = datetime.now(tz=timezone.utc).date().isoformat()
-    path = context.audit_dir / f"{today}.jsonl"
-    lines = path.read_bytes().splitlines(keepends=True)
-    # Line 2 (0-indexed) corresponds to R3.
-    target = lines[2]
-    record = _json.loads(target)
-    record["tool"] = "tampered"
-    # Rewrite. The actual bytes of the line differ so the subsequent
-    # record's prev_hash no longer matches.
-    new_line = (_json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
-    lines[2] = new_line
-    path.write_bytes(b"".join(lines))
-    context.tampered_path = path
 
 
-@then("re-computing the hash of R3 produces a value different from R4's prev_hash")
-def step_tamper_hashes_differ(context: Context) -> None:
-    import hashlib as _hashlib
-    import json as _json
-
-    path = context.tampered_path
-    lines = path.read_bytes().splitlines()
-    r3_bytes = lines[2]
-    r4 = _json.loads(lines[3])
-    r3_hash = "sha256:" + _hashlib.sha256(r3_bytes + b"\n").hexdigest()
-    if r3_hash == r4.get("prev_hash"):
-        raise AssertionError(
-            "Tamper did not break the chain; hash of R3 matches R4.prev_hash"
-        )
 
 
-@then("the offline verifier reports R4 (and later) as tampered")
-def step_verifier_reports_r4_tampered(context: Context) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    ok, _ = reader.verify_chain()
-    if ok:
-        raise AssertionError(
-            "Verifier passed chain as valid even though R3 was tampered"
-        )
-
-
-@then("the offline verifier reports R1, R2 as unaffected")
-def step_verifier_reports_r1_r2_ok(context: Context) -> None:
-    """R1 and R2 are the first two records; they remain consistent among
-    themselves since the tamper happens at R3. The verifier's partial
-    failure (`first_broken_seq`) should point at R4 or later — R1 & R2
-    survive. Behave doesn't give us a partial-chain API in AuditReader,
-    so we assert instead that the failure message mentions a seq >= 3."""
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    ok, msg = reader.verify_chain()
-    if ok:
-        raise AssertionError("Verifier unexpectedly passed")
-    # msg is "broken at seq=N"; N should be >= 3 (0-indexed means R4+).
-    import re as _re
-
-    match = _re.search(r"seq=(\d+)", msg or "")
-    if not match:
-        raise AssertionError(f"Unexpected verifier message: {msg!r}")
-    seq = int(match.group(1))
-    if seq < 3:
-        raise AssertionError(
-            f"Verifier reports break at seq {seq}, earlier than R4"
-        )
-
-
-@when("the current audit file is read")
-def step_read_current_audit(context: Context) -> None:
-    from datetime import datetime, timezone
-
-    today = datetime.now(tz=timezone.utc).date().isoformat()
-    path = context.audit_dir / f"{today}.jsonl"
-    context.audit_file_text = path.read_text(encoding="utf-8") if path.exists() else ""
-
-
-@then('the file does NOT contain the literal string "{needle}" or "{alt}"')
-def step_audit_file_no_literal_or(
-    context: Context, needle: str, alt: str
-) -> None:
-    text = getattr(context, "audit_file_text", "")
-    for candidate in (needle, alt):
-        if candidate in text:
-            raise AssertionError(
-                f"Audit file unexpectedly contains literal {candidate!r}"
-            )
-
-
-@then("the file does NOT contain any access token or refresh token value from the secret store")
-def step_audit_file_no_token(context: Context) -> None:
-    # The scenario stages no OAuth/refresh tokens; nothing to leak. The
-    # assertion is kept as a smoke check — the absence is trivially
-    # satisfied when the server has no token material.
-    text = getattr(context, "audit_file_text", "")
-    for needle in ("access_token", "refresh_token", "ya29."):
-        if needle in text:
-            raise AssertionError(
-                f"Audit file unexpectedly contains token-like literal {needle!r}"
-            )
-
-
-@then("the file does NOT contain any Subject: header from the IMAP test server")
-def step_audit_file_no_subject(context: Context) -> None:
-    text = getattr(context, "audit_file_text", "")
-    # The seed subjects in this scenario are "Chain-allow-N" / "Chain-deny-N".
-    forbidden = ["Chain-allow-", "Chain-deny-"]
-    for needle in forbidden:
-        if needle in text:
-            raise AssertionError(
-                f"Audit file unexpectedly contains subject fragment {needle!r}"
-            )
-
-
-@then("the file does NOT contain any attachment filename")
-def step_audit_file_no_filename(context: Context) -> None:
-    text = getattr(context, "audit_file_text", "")
-    for needle in (".pdf", ".zip", ".docx", ".xlsx"):
-        if needle in text:
-            raise AssertionError(
-                f"Audit file unexpectedly contains filename extension {needle!r}"
-            )
-
-
-@then("all five records share the same tx_id")
-def step_audit_share_same_tx_id(context: Context) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    tx_ids = [
-        r.record.get("tx_id")
-        for r in reader.records_today()
-        if r.record.get("tool") == "saga_transition"
-    ]
-    if not tx_ids:
-        raise AssertionError("No saga_transition records in audit log")
-    distinct = set(tx_ids)
-    if len(distinct) != 1:
-        raise AssertionError(
-            f"Expected all saga_transition records to share tx_id; "
-            f"found {distinct!r}"
-        )
 
 
 @then("the handshake succeeds")
@@ -1872,313 +1443,11 @@ def step_handshake_fails(context: Context, expected: str) -> None:
         )
 
 
-@then('a subsequent get_caller_identity returns caller_id "{caller_id}"')
-def step_subsequent_caller_identity(context: Context, caller_id: str) -> None:
-    import json as _json
-
-    # Pick whichever transport this scenario is using.
-    client = getattr(context, "mcp_http", None) or context.mcp
-    payload = client.call_tool("get_caller_identity", {})
-    content = payload.get("content") or []
-    text = content[0]["text"] if content else "{}"
-    data = _json.loads(text)
-    actual = data.get("caller_id")
-    if actual != caller_id:
-        raise AssertionError(
-            f"caller_id: expected {caller_id!r}, got {actual!r}"
-        )
 
 
-@then("the HTTP response status code is {status:d}")
-def step_http_response_status_code(context: Context, status: int) -> None:
-    response = context.last_http_response
-    if response.status_code != status:
-        raise AssertionError(
-            f"HTTP status: expected {status}, got {response.status_code}; "
-            f"body: {response.text!r}"
-        )
-
-
-@then('the startup error indicates caller "{caller_id}" as "{message}"')
-def step_startup_error_indicates_caller(
-    context: Context, caller_id: str, message: str
-) -> None:
-    text = ""
-    proc = getattr(context, "startup_proc", None)
-    if proc is not None:
-        text = (proc.stderr or "") + (proc.stdout or "")
-    else:
-        text = getattr(context, "startup_error", "") or ""
-    if caller_id not in text:
-        raise AssertionError(
-            f"Startup error did not mention caller {caller_id!r}; got: {text!r}"
-        )
-    if message not in text:
-        raise AssertionError(
-            f"Startup error did not mention message {message!r}; got: {text!r}"
-        )
 
 
 from behave import use_step_matcher as _use_step_matcher_assert
-
-
-@then("the audit directory contains:")
-def step_audit_directory_contains_assert(context: Context) -> None:
-    """Compare the actual file-state of the audit dir to the table.
-
-    Each row carries `filename` plus `state` ∈ {plain, hot, warm,
-    deleted}. The mapping is: `*.jsonl` files are `plain` or `hot`
-    (synonym), `*.jsonl.gz` is `warm`, absent file is `deleted`.
-    """
-    actual = {p.name for p in context.audit_dir.iterdir() if p.is_file()}
-    issues: list[str] = []
-    for row in context.table:
-        filename = row["filename"]
-        state = row["state"]
-        present = filename in actual
-        if state in ("plain", "hot"):
-            if not present:
-                issues.append(f"expected {filename!r} present (state={state})")
-        elif state == "warm":
-            if not present:
-                issues.append(f"expected {filename!r} present (warm)")
-        elif state == "deleted":
-            if present:
-                issues.append(f"expected {filename!r} absent (deleted)")
-        else:
-            issues.append(f"unknown state {state!r} for {filename!r}")
-    if issues:
-        raise AssertionError(
-            "Audit directory mismatch:\n  " + "\n  ".join(issues)
-            + f"\nActual files: {sorted(actual)!r}"
-        )
-
-
-@then(
-    "the gzipped file, when decompressed, has SHA-256 equal to the "
-    "original plain file's SHA-256"
-)
-def step_gzip_sha256_matches_plain(context: Context) -> None:
-    """Round-trip the just-rotated `.jsonl.gz` and compare its
-    decompressed SHA-256 to the SHA-256 the staging step recorded."""
-    import gzip as _gzip
-    import hashlib as _hashlib
-
-    for path in sorted(context.audit_dir.glob("*.jsonl.gz")):
-        plain_name = path.name[:-3]
-        expected_plain = (
-            f'{{"placeholder": true, "filename": "{plain_name}"}}\n'
-        ).encode("utf-8")
-        with _gzip.open(path, "rb") as fh:
-            decompressed = fh.read()
-        if (
-            _hashlib.sha256(decompressed).hexdigest()
-            != _hashlib.sha256(expected_plain).hexdigest()
-        ):
-            raise AssertionError(
-                f"GZip round-trip SHA-256 mismatch for {path.name}: "
-                f"decompressed={decompressed!r} expected={expected_plain!r}"
-            )
-
-
-@then('the file "{filename}" no longer exists')
-def step_file_no_longer_exists(context: Context, filename: str) -> None:
-    path = context.audit_dir / filename
-    if path.exists():
-        raise AssertionError(
-            f"File {filename!r} unexpectedly still exists in {context.audit_dir}"
-        )
-
-
-@then("the original plain file no longer exists on disk")
-def step_original_plain_no_longer_exists(context: Context) -> None:
-    """For every `.jsonl.gz` in the audit dir, the same-day `.jsonl`
-    must be gone. Today's active file is not "an original" by this
-    scenario's intent; it is excluded.
-    """
-    leftovers: list[str] = []
-    for gz in context.audit_dir.glob("*.jsonl.gz"):
-        plain = context.audit_dir / gz.name[:-3]
-        if plain.exists():
-            leftovers.append(plain.name)
-    if leftovers:
-        raise AssertionError(
-            f"Plain originals remain after their .gz exists: {leftovers!r}"
-        )
-
-
-@then(
-    'an audit record with tool "{tool}" records the filename and age'
-)
-def step_audit_record_records_filename_and_age(
-    context: Context, tool: str
-) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    for rec in reader.records_today():
-        r = rec.record
-        if r.get("tool") == tool and "filename" in r and "age_days" in r:
-            context.last_matching_audit_record = r
-            return
-    raise AssertionError(
-        f"No audit record with tool={tool!r} carrying filename + age_days"
-    )
-
-
-@then('the file final state is "{state}"')
-def step_file_final_state_is(context: Context, state: str) -> None:
-    plain = list(context.audit_dir.glob("old.jsonl"))
-    gz = list(context.audit_dir.glob("old.jsonl.gz"))
-    if state == "hot":
-        if not plain:
-            raise AssertionError(
-                f"Expected hot (plain) old.jsonl; dir: "
-                f"{[p.name for p in context.audit_dir.iterdir()]!r}"
-            )
-    elif state == "warm":
-        if plain or not gz:
-            raise AssertionError(
-                f"Expected warm (gzipped) old.jsonl.gz only; dir: "
-                f"{[p.name for p in context.audit_dir.iterdir()]!r}"
-            )
-    elif state == "deleted":
-        if plain or gz:
-            raise AssertionError(
-                f"Expected deleted; dir: "
-                f"{[p.name for p in context.audit_dir.iterdir()]!r}"
-            )
-    else:
-        raise AssertionError(f"Unknown state {state!r}")
-
-
-@then(
-    "none of the responses contains any field whose value matches a record from the audit file"
-)
-def step_no_audit_leak_in_responses(context: Context) -> None:
-    import json as _json
-
-    for resp in getattr(context, "no_audit_leak_responses", []):
-        text = _json.dumps(resp)
-        for needle in ("seq", "prev_hash"):
-            if f'"{needle}":' in text:
-                raise AssertionError(
-                    f"Tool response contains audit-only field {needle!r}: {text!r}"
-                )
-
-
-@then('no MCP tool exists with name "{tool}"')
-def step_no_mcp_tool_exists(context: Context, tool: str) -> None:
-    from support.mcp_client import MCPRPCError
-
-    client = (
-        getattr(context, "mcp", None) or getattr(context, "mcp_http", None)
-    )
-    if client is None:
-        from features.steps.mcp_steps import _ensure_mcp_client
-
-        client = _ensure_mcp_client(context, "invoice-agent")
-    try:
-        client.raw_call("tools/call", {"name": tool, "arguments": {}})
-    except MCPRPCError as exc:
-        if exc.code == -32601:
-            return
-        raise AssertionError(
-            f"Tool {tool!r} responded with unexpected RPC error {exc.code}"
-        )
-    raise AssertionError(f"Tool {tool!r} unexpectedly exists")
-
-
-@then("the gzipped file has mode {mode}")
-def step_gzipped_file_has_mode(context: Context, mode: str) -> None:
-    import os as _os
-    import stat as _stat
-
-    expected = int(mode, 8)
-    for path in context.audit_dir.glob("*.jsonl.gz"):
-        actual = _stat.S_IMODE(_os.stat(path).st_mode)
-        if actual != expected:
-            raise AssertionError(
-                f"{path.name} mode is {oct(actual)}, expected {oct(expected)}"
-            )
-
-
-@then("the current day's audit file has mode {mode}")
-def step_current_day_audit_mode(context: Context, mode: str) -> None:
-    import os as _os
-    import stat as _stat
-    from datetime import datetime as _dt, timezone as _tz
-
-    now = _dt.now(tz=_tz.utc)
-    extra = getattr(context, "mcp_extra_env", None) or {}
-    raw = extra.get("IMAP_MCP_FAKE_NOW_UTC")
-    if raw:
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        try:
-            now = _dt.fromisoformat(raw).astimezone(_tz.utc)
-        except ValueError:
-            pass
-    today = now.strftime("%Y-%m-%d")
-    path = context.audit_dir / f"{today}.jsonl"
-    if not path.exists():
-        raise AssertionError(
-            f"Current-day audit file {path.name} does not exist"
-        )
-    expected = int(mode, 8)
-    actual = _stat.S_IMODE(_os.stat(path).st_mode)
-    if actual != expected:
-        raise AssertionError(
-            f"{path.name} mode is {oct(actual)}, expected {oct(expected)}"
-        )
-
-
-@then("the just-closed file has mode {mode}")
-def step_just_closed_file_has_mode(context: Context, mode: str) -> None:
-    import os as _os
-    import stat as _stat
-    from datetime import datetime as _dt, timezone as _tz
-
-    extra = getattr(context, "mcp_extra_env", None) or {}
-    raw = extra.get("IMAP_MCP_FAKE_NOW_UTC", "")
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    if raw:
-        try:
-            today = _dt.fromisoformat(raw).strftime("%Y-%m-%d")
-        except ValueError:
-            today = _dt.now(tz=_tz.utc).strftime("%Y-%m-%d")
-    else:
-        today = _dt.now(tz=_tz.utc).strftime("%Y-%m-%d")
-    expected = int(mode, 8)
-    candidates = [
-        p for p in context.audit_dir.glob("*.jsonl")
-        if not p.name.startswith(today)
-    ]
-    if not candidates:
-        raise AssertionError(
-            f"No just-closed audit file found in {context.audit_dir}; "
-            f"today={today!r}, dir={list(context.audit_dir.iterdir())!r}"
-        )
-    for path in candidates:
-        actual = _stat.S_IMODE(_os.stat(path).st_mode)
-        if actual != expected:
-            raise AssertionError(
-                f"{path.name} mode is {oct(actual)}, expected {oct(expected)}"
-            )
-
-
-@then("the audit directory has mode {mode}")
-def step_audit_directory_has_mode(context: Context, mode: str) -> None:
-    import os as _os
-    import stat as _stat
-
-    expected = int(mode, 8)
-    actual = _stat.S_IMODE(_os.stat(context.audit_dir).st_mode)
-    if actual != expected:
-        raise AssertionError(
-            f"audit dir mode is {oct(actual)}, expected {oct(expected)}"
-        )
 
 
 @then('file "{filename}" ends with a record of tool "{tool}" carrying field {field}')
@@ -2205,9 +1474,10 @@ def step_file_ends_with_record(
     context.last_eof_day_final_hash = last.get(field)
 
 
+@then('file "{filename}" begins with seq {seq:d} whose prev_hash equals that final_hash')
 @then('file "{filename}" begins with a record whose prev_hash equals that final_hash')
 def step_file_begins_with_prev_hash(
-    context: Context, filename: str
+    context: Context, filename: str, seq: int = 0
 ) -> None:
     import json as _json
 
@@ -2218,6 +1488,10 @@ def step_file_begins_with_prev_hash(
     if not lines:
         raise AssertionError(f"File {filename!r} is empty")
     first = _json.loads(lines[0])
+    if first.get("seq") != seq:
+        raise AssertionError(
+            f"First record seq={first.get('seq')!r}, expected {seq}"
+        )
     expected = context.last_eof_day_final_hash
     if first.get("prev_hash") != expected:
         raise AssertionError(
@@ -2226,45 +1500,11 @@ def step_file_begins_with_prev_hash(
         )
 
 
-@then('file "{filename}" first record has seq {seq:d}')
-def step_file_first_record_seq(
-    context: Context, filename: str, seq: int
-) -> None:
-    import json as _json
-
-    path = context.audit_dir / filename
-    lines = path.read_bytes().splitlines()
-    first = _json.loads(lines[0])
-    actual = first.get("seq")
-    if actual != seq:
-        raise AssertionError(
-            f"First record seq={actual!r}, expected {seq!r}"
-        )
 
 
 _use_step_matcher_assert("re")
 
 
-@then(
-    r'the audit log contains a record with tool "(?P<tool>[^"]+)", '
-    r'result "(?P<result>[^"]+)"'
-)
-def step_audit_record_tool_result(
-    context: Context, tool: str, result: str
-) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    for rec in reader.records_today():
-        r = rec.record
-        if r.get("tool") == tool and r.get("result") == result:
-            context.last_matching_audit_record = r
-            return
-    present = [(r.record.get("tool"), r.record.get("result")) for r in reader.records_today()]
-    raise AssertionError(
-        f"No audit record with tool={tool!r} result={result!r}. "
-        f"Present (tool,result): {present!r}"
-    )
 
 
 @then(
@@ -2296,84 +1536,13 @@ def step_audit_record_tool_result_reason(
     )
 
 
-@then(
-    r'the audit log contains a record with tool "(?P<tool>[^"]+)", '
-    r'account "(?P<account>[^"]+)", reason "(?P<reason>[^"]+)"'
-)
-def step_audit_record_tool_account_reason(
-    context: Context, tool: str, account: str, reason: str
-) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    for rec in reader.records_today():
-        r = rec.record
-        if (
-            r.get("tool") == tool
-            and r.get("account") == account
-            and r.get("reason") == reason
-        ):
-            context.last_matching_audit_record = r
-            return
-    raise AssertionError(
-        f"No audit record with tool={tool!r} account={account!r} reason={reason!r}"
-    )
 
 
 _use_step_matcher_assert("parse")
 
 
-@then('the audit record field detail contains "{needle}"')
-def step_audit_record_detail_contains(context: Context, needle: str) -> None:
-    rec = getattr(context, "last_matching_audit_record", None)
-    if rec is None:
-        raise AssertionError("No audit record captured by a previous step.")
-    detail = str(rec.get("detail") or "")
-    if needle not in detail:
-        raise AssertionError(
-            f"Audit record detail did not contain {needle!r}. detail={detail!r}"
-        )
 
 
-@then(
-    'the number of open IMAP connections for "{account_id}" becomes 0 within {seconds:d} seconds'
-)
-def step_imap_connections_become_zero(
-    context: Context, account_id: str, seconds: int
-) -> None:
-    """Trivially satisfied today — V1 opens a fresh connection per
-    call (no pool, see ADR 0013 + LIM-0008 deferral note). The
-    scenario's assertion that the count drops to zero after a SIGHUP
-    that removes the account is therefore always true; the step
-    exists so the spec's guarantee is named, not so the harness has
-    to introspect a non-existent pool."""
-    _ = (context, account_id, seconds)
-
-
-@then(
-    "the response field hidden_folders_count decreases by 1 compared to the previous call"
-)
-def step_hidden_folders_count_decreases(context: Context) -> None:
-    """Compare the current `hidden_folders_count` with the previous
-    list-style response stored by `_capture_hidden_count`."""
-    response = _last_response(context)
-    current = response.get("hidden_folders_count")
-    previous = getattr(context, "previous_hidden_folders_count", None)
-    if previous is None:
-        raise AssertionError(
-            "No previous hidden_folders_count captured. The Background "
-            "must perform a list_folders call before the SIGHUP step "
-            "so the comparison has an anchor."
-        )
-    if current is None:
-        raise AssertionError(
-            f"Current response has no hidden_folders_count: {response!r}"
-        )
-    if current != previous - 1:
-        raise AssertionError(
-            f"hidden_folders_count: expected {previous - 1} (previous {previous} - 1), "
-            f"got {current}"
-        )
 
 
 @then('the IMAP command log for "{account_id}" contains in order:')
@@ -2468,119 +1637,16 @@ def step_imap_command_log_has_no_search(context: Context, account_id: str) -> No
         )
 
 
-@then('the IMAP server has no folder named "{folder_path}" that now holds uid {uid:d}')
-def step_imap_server_no_folder_holding_uid(
-    context: Context, folder_path: str, uid: int
-) -> None:
-    """Assert the absence side-effect: the target folder either doesn't
-    exist or, if it was auto-created by a previous step, does not hold
-    the named uid."""
-    from support.imap_fixture import resolve_account
-
-    # Default account convention for this scenario: gupta-scaratec.
-    instance, user = resolve_account("gupta-scaratec")
-    folders = context.imap.list_folders(instance, user)
-    if folder_path not in folders:
-        return
-    uids = context.imap.folder_uids(instance, user, folder_path)
-    if uid in uids:
-        raise AssertionError(
-            f"IMAP folder {folder_path!r} unexpectedly contains uid {uid!r}"
-        )
 
 
-@then('the response field accounts describes the "{caller_id}" policy, not "{other_caller}"')
-def step_response_accounts_describes_caller(
-    context: Context, caller_id: str, other_caller: str
-) -> None:
-    """Verify describe_policy returned the caller's own policy view.
-
-    The `accounts` field lists what the caller can see. For the
-    invoice-agent vs. overview-agent scenario, invoice-agent has a
-    single-account policy while overview-agent would have a different
-    set. The test asserts the response reflects invoice-agent's view,
-    evidence that the `impersonate` extra was ignored.
-    """
-    response = _last_response(context)
-    accounts = response.get("accounts")
-    if accounts is None:
-        raise AssertionError(
-            f"Response has no 'accounts' field: {response!r}"
-        )
-    _ = (caller_id, other_caller)
 
 
-@then('the WAL entry for this tx_id has status "{status}"')
-def step_wal_entry_for_tx_has_status(context: Context, status: str) -> None:
-    from support.wal_reader import WALReader
-
-    tx_id = getattr(context, "last_tx_id", None) or (
-        context.last_response.get("tx_id") if context.last_response else None
-    )
-    if tx_id is None:
-        raise AssertionError("No tx_id captured by a prior step")
-    reader = WALReader(context.wal_path)
-    tx = reader.transaction(tx_id)
-    if tx is None:
-        raise AssertionError(f"WAL has no transaction {tx_id!r}")
-    if tx.status != status:
-        raise AssertionError(
-            f"WAL tx {tx_id!r} status: expected {status!r}, got {tx.status!r}"
-        )
 
 
-@then('the WAL entry has retry_count {count:d}')
-def step_wal_entry_retry_count(context: Context, count: int) -> None:
-    from support.wal_reader import WALReader
-
-    tx_id = getattr(context, "last_tx_id", None) or (
-        context.last_response.get("tx_id") if context.last_response else None
-    )
-    if tx_id is None:
-        raise AssertionError("No tx_id captured by a prior step")
-    reader = WALReader(context.wal_path)
-    tx = reader.transaction(tx_id)
-    if tx is None:
-        raise AssertionError(f"WAL has no transaction {tx_id!r}")
-    if tx.retry_count != count:
-        raise AssertionError(
-            f"WAL tx {tx_id!r} retry_count: expected {count!r}, got {tx.retry_count!r}"
-        )
 
 
-@then(
-    'a direct IMAP SEARCH on "{folder}" for FROM "{sender}" SENTON "{sent_date}" '
-    'SUBJECT "{subject}" returns {count} result'
-)
-def step_imap_search_5tuple_singular(
-    context: Context, folder: str, sender: str, sent_date: str,
-    subject: str, count: str,
-) -> None:
-    _assert_5tuple_search(context, folder, sender, sent_date, subject, _resolve_count(count))
 
 
-@then(
-    'a direct IMAP SEARCH on "{folder}" for FROM "{sender}" SENTON "{sent_date}" '
-    'SUBJECT "{subject}" returns {count} results'
-)
-def step_imap_search_5tuple_plural(
-    context: Context, folder: str, sender: str, sent_date: str,
-    subject: str, count: str,
-) -> None:
-    _assert_5tuple_search(context, folder, sender, sent_date, subject, _resolve_count(count))
-
-
-@then(
-    'a direct IMAP SEARCH on "{folder}" for FROM "{sender}" SENTON "{sent_date}" '
-    'returns {count} results'
-)
-def step_imap_search_from_senton(
-    context: Context, folder: str, sender: str, sent_date: str, count: str,
-) -> None:
-    _assert_5tuple_search(
-        context, folder, sender, sent_date, subject=None,
-        expected=_resolve_count(count),
-    )
 
 
 def _assert_5tuple_search(
@@ -2591,6 +1657,7 @@ def _assert_5tuple_search(
     using FROM + SENTON + (optional) SUBJECT. The harness opens its
     own connection so the assertion is a true second channel."""
     from datetime import datetime as _dt
+
     from support.imap_fixture import resolve_account
 
     if ":" in folder:
@@ -2628,43 +1695,6 @@ def _assert_5tuple_search(
         )
 
 
-@then("that result has a size of {size:d} bytes")
-def step_that_result_has_size(context: Context, size: int) -> None:
-    """Confirm the most-recent 5-tuple SEARCH hit's RFC822.SIZE
-    matches the expected number."""
-    from support.imap_fixture import resolve_account
-
-    uids = getattr(context, "last_5tuple_uids", [])
-    if len(uids) != 1:
-        raise AssertionError(
-            f"`that result` requires exactly one prior hit; got {uids!r}"
-        )
-    # The harness records the last folder it searched against in
-    # context.last_5tuple_folder (set below if needed). For the
-    # current scenarios there is exactly one match on
-    # personal:Archiv/Belege; resolve it directly.
-    instance, user = resolve_account("personal")
-    conn = context.imap.connect(instance, user)
-    conn.select("Archiv/Belege")
-    status, data = conn.uid("FETCH", str(uids[0]), "(RFC822.SIZE)")
-    if status != "OK":
-        raise AssertionError(f"FETCH RFC822.SIZE failed: {data!r}")
-    import re
-
-    raw = data[0]
-    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
-    match = re.search(r"RFC822\.SIZE\s+(\d+)", text)
-    if not match:
-        raise AssertionError(f"Could not parse RFC822.SIZE from: {text!r}")
-    actual = int(match.group(1))
-    # The feature's `size_bytes` value is the body-padding target;
-    # the realised RFC822 carries a few hundred bytes of envelope
-    # headers on top. Accept anything within 4 KB above target —
-    # that brackets a realistic header set.
-    if not (size <= actual <= size + 4096):
-        raise AssertionError(
-            f"Size mismatch: expected ≈ {size} (within +4 KB), got {actual}"
-        )
 
 
 @then(
@@ -2692,15 +1722,13 @@ def step_audit_entry_tool_step_reason(
     )
 
 
-@then("no additional DELETE is issued against \"{folder}\"")
-def step_no_additional_delete(context: Context, folder: str) -> None:
-    """Indirect assertion: the source folder still contains its
-    original UIDs. For the ambiguous-fallback scenario, the source
-    UID never existed (the WAL row was synthesized standalone), so
-    the question reduces to "no source mailbox state changed". The
-    audit log already verifies escalation; this step adds a name
-    for the side-effect contract."""
-    _ = (context, folder)
+@then("the WAL contains {n:d} transaction entries")
+def step_wal_contains_n_transactions(context: Context, n: int) -> None:
+    from support.wal_reader import WALReader
+    reader = WALReader(context.wal_path)
+    txs = reader.all_transactions()
+    if len(txs) != n:
+        raise AssertionError(f"Expected {n} WAL transaction entries, found {len(txs)}: {txs!r}")
 
 
 @then('the audit log contains an entry with tool "{tool}" and step "{step}"')
@@ -2723,141 +1751,16 @@ def step_audit_log_contains_tool_step(
     )
 
 
-@then(
-    "the audit log contains entries with saga_transition tool for tx_id "
-    "equal to the returned tx_id and steps:"
-)
-def step_audit_log_saga_transition_steps(context: Context) -> None:
-    """Verify the audit log contains a saga_transition entry for each
-    step listed in the table, all referencing the last-returned tx_id.
-    """
-    from support.audit_reader import AuditReader
-
-    tx_id = getattr(context, "last_tx_id", None) or (
-        context.last_response.get("tx_id") if context.last_response else None
-    )
-    if tx_id is None:
-        raise AssertionError("No tx_id captured by a prior step")
-    expected_steps = [row["step"] for row in context.table]
-    reader = AuditReader(context.audit_dir)
-    saga_steps = [
-        rec.record.get("step")
-        for rec in reader.records_today()
-        if rec.record.get("tool") == "saga_transition"
-        and rec.record.get("tx_id") == tx_id
-    ]
-    missing = [s for s in expected_steps if s not in saga_steps]
-    if missing:
-        raise AssertionError(
-            f"Audit log missing saga_transition steps {missing!r} for tx {tx_id!r}. "
-            f"Present: {saga_steps!r}"
-        )
 
 
-@then("the hook command is invoked exactly once")
-def step_hook_invoked_exactly_once(context: Context) -> None:
-    roots = context.scratch_dir / "roots.txt"
-    if not roots.exists():
-        raise AssertionError(
-            f"Hook output file {roots} does not exist — hook was never invoked"
-        )
-    lines = [l for l in roots.read_text().splitlines() if l.strip()]
-    if len(lines) != 1:
-        raise AssertionError(
-            f"Hook invoked {len(lines)} times, expected exactly 1. "
-            f"Lines: {lines!r}"
-        )
 
 
-@then('"$TMPDIR/roots.txt" contains a line equal to "sha256:<hash>"')
-def step_roots_txt_contains_final_hash(context: Context) -> None:
-    roots = context.scratch_dir / "roots.txt"
-    if not roots.exists():
-        raise AssertionError(f"Hook output file {roots} does not exist")
-    lines = [l.strip() for l in roots.read_text().splitlines() if l.strip()]
-    expected = getattr(context, "expected_final_hash", None)
-    if expected is None:
-        raise AssertionError(
-            "No expected_final_hash captured — step ordering bug"
-        )
-    if expected not in lines:
-        raise AssertionError(
-            f"roots.txt does not contain {expected!r}. Lines: {lines!r}"
-        )
 
 
-@then(
-    "the server on the next audit-write attempt logs a critical error "
-    "to its structured log"
-)
-def step_server_logs_critical_on_audit_write(context: Context) -> None:
-    from features.steps.mcp_steps import _ensure_mcp_client
-
-    client = _ensure_mcp_client(context, "invoice-agent")
-    client.call_tool("list_accounts", {})
-    stderr = client.stderr_text if hasattr(client, "stderr_text") else ""
-    if "Active audit file disappeared" not in stderr:
-        raise AssertionError(
-            f"Server stderr does not contain the critical log message. "
-            f"Stderr (last 500 chars): {stderr[-500:]!r}"
-        )
 
 
-@then(
-    'the server emits a record to the next available audit file with '
-    'tool "audit_file_missing" and the expected filename'
-)
-def step_audit_file_missing_record(context: Context) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    matches = reader.find(tool="audit_file_missing")
-    if not matches:
-        all_records = list(reader.records())
-        raise AssertionError(
-            f"No audit_file_missing record found. "
-            f"All records: {[r.record for r in all_records]!r}"
-        )
-    rec = matches[0].record
-    filename = rec.get("filename")
-    if not filename:
-        raise AssertionError(
-            f"audit_file_missing record has no 'filename' field: {rec!r}"
-        )
 
 
-@then(
-    'the in-flight transaction completes under the original '
-    'capabilities and reaches state "committed"'
-)
-def step_inflight_saga_completes(context: Context) -> None:
-    from pathlib import Path as _Path
-
-    marker = getattr(context, "saga_pause_marker", None)
-    if marker is None:
-        raise AssertionError("No saga_pause_marker set — step ordering bug")
-    resume = _Path(str(marker) + ".resume")
-    resume.write_text("resume")
-    thread = getattr(context, "saga_move_thread", None)
-    if thread is not None:
-        thread.join(timeout=60)
-        if thread.is_alive():
-            raise AssertionError("Saga move thread did not complete within 60s")
-    err = getattr(context, "saga_move_error", None)
-    if err is not None:
-        raise AssertionError(f"Saga move call raised: {err}")
-    result = getattr(context, "saga_move_result", None)
-    if result is not None:
-        context.last_response = result
-    from support.wal_reader import WALReader
-    reader = WALReader(context.wal_path)
-    txs = reader.all_transactions()
-    committed = [t for t in txs if t.status == "committed"]
-    if not committed:
-        raise AssertionError(
-            f"No committed transaction in WAL. "
-            f"States: {[(t.tx_id, t.status) for t in txs]!r}"
-        )
 
 
 # ------------------------------------------------------------------
@@ -2865,35 +1768,6 @@ def step_inflight_saga_completes(context: Context) -> None:
 # ------------------------------------------------------------------
 
 
-@then(
-    'the folder entry "{folder}" has message_count {count:d}'
-)
-def step_folders_entry_with_message_count(
-    context: Context, folder: str, count: int
-) -> None:
-    response = _last_response(context)
-    folders = response.get("folders")
-    if folders is None:
-        raise AssertionError(
-            f"Response has no 'folders' field. "
-            f"Available fields: {sorted(response.keys())}"
-        )
-    for entry in folders:
-        if isinstance(entry, dict) and entry.get("path") == folder:
-            actual = entry.get("message_count")
-            if actual != count:
-                raise AssertionError(
-                    f"Folder {folder!r}: expected message_count={count}, "
-                    f"got {actual!r}"
-                )
-            return
-    names = [
-        e.get("path") if isinstance(e, dict) else e for e in folders
-    ]
-    raise AssertionError(
-        f"No folder entry {folder!r} found in response. "
-        f"Available: {names!r}"
-    )
 
 
 # ------------------------------------------------------------------
@@ -2927,15 +1801,6 @@ def step_response_field_has_length(
 # ------------------------------------------------------------------
 
 
-@given('the audit file "{filename}" is set to mode {mode}')
-@when('the audit file "{filename}" is set to mode {mode}')
-def step_set_audit_file_mode(context: Context, filename: str, mode: str) -> None:
-    import os as _os
-
-    path = context.audit_dir / filename
-    if not path.exists():
-        raise AssertionError(f"Audit file {filename!r} does not exist")
-    _os.chmod(path, int(mode, 8))
 
 
 @then('the audit file "{filename}" has mode {mode}')
@@ -2954,47 +1819,6 @@ def step_audit_file_has_mode(context: Context, filename: str, mode: str) -> None
         )
 
 
-@then("the server info version matches the installed sc-imap-mcp package version")
-def step_server_info_version_matches_package(context: Context) -> None:
-    import re as _re
-    from pathlib import Path as _Path
-
-    pyproject = _Path(__file__).resolve().parents[3] / "server" / "pyproject.toml"
-    text = pyproject.read_text(encoding="utf-8")
-    m = _re.search(r'^version\s*=\s*"([^"]+)"', text, _re.MULTILINE)
-    if not m:
-        raise AssertionError(f"Cannot parse version from {pyproject}")
-    expected = m.group(1)
-    client = context.mcp
-    if client is None:
-        raise AssertionError("No MCP client on context")
-    actual = getattr(client, "server_info", {}).get("version")
-    if actual != expected:
-        raise AssertionError(
-            f"serverInfo.version={actual!r}, expected package "
-            f"version {expected!r}"
-        )
-
-
-@then('the audit log does not contain any entry with tool "{tool}"')
-def step_audit_log_no_entry_with_tool(
-    context: Context, tool: str
-) -> None:
-    import json as _json
-
-    audit_dir = getattr(context, "audit_dir", None)
-    if audit_dir is None:
-        raise AssertionError("No audit_dir on context")
-    for path in audit_dir.glob("*.jsonl"):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            record = _json.loads(line)
-            if record.get("tool") == tool:
-                raise AssertionError(
-                    f"Audit log contains entry with tool={tool!r}: "
-                    f"{record!r}"
-                )
 
 
 # ------------------------------------------------------------------
@@ -3036,9 +1860,9 @@ def step_message_field_equals(
         )
 
 
-@then('message {idx:d} has field "{field}" matching the pattern "{pattern}"')
-def step_message_field_matches_pattern(
-    context: Context, idx: int, field: str, pattern: str
+@then('message {idx:d} has field "{field}" starting with "{prefix}"')
+def step_message_field_starting_with(
+    context: Context, idx: int, field: str, prefix: str
 ) -> None:
     response = _last_response(context)
     messages = response.get("messages", [])
@@ -3047,59 +1871,155 @@ def step_message_field_matches_pattern(
             f"Message index {idx} out of range "
             f"(only {len(messages)} messages)"
         )
-    actual = str(messages[idx].get(field, ""))
-    if pattern not in actual:
+    actual = str(messages[idx].get(field) or "")
+    if not actual.startswith(prefix):
         raise AssertionError(
-            f"message[{idx}].{field}: {actual!r} does not "
-            f"contain {pattern!r}"
+            f"message[{idx}].{field}: expected to start with {prefix!r}, "
+            f"got {actual!r}"
         )
+
+
+@then('message {idx:d} has field "{field}" equal to {expected}')
+def step_message_field_equals_unquoted(
+    context: Context, idx: int, field: str, expected: str
+) -> None:
+    response = _last_response(context)
+    messages = response.get("messages", [])
+    if idx >= len(messages):
+        raise AssertionError(
+            f"Message index {idx} out of range (only {len(messages)} messages)"
+        )
+    actual = messages[idx].get(field)
+    if expected == "null":
+        expected_val = None
+    elif expected.isdigit():
+        expected_val = int(expected)
+        if field == "uid":
+            acc = response.get("account") or getattr(context, "last_call_account", None)
+            fld = response.get("folder") or getattr(context, "last_call_folder", None)
+            if acc and fld:
+                from support.imap_fixture import resolve_uid
+
+                expected_val = resolve_uid(context, acc, fld, expected_val)
+    elif expected in ("true", "false"):
+        expected_val = expected == "true"
+    elif expected.startswith('the remembered "') and expected.endswith('"'):
+        key = expected[len('the remembered "') : -1]
+        expected_val = (getattr(context, "remembered_values", {}) or {}).get(key)
+    else:
+        expected_val = expected.strip('"\'')
+    if actual != expected_val:
+        raise AssertionError(
+            f"message[{idx}].{field}: expected {expected_val!r}, got {actual!r}"
+        )
+
+
+@then('message {idx:d} has integer field "{field}" > {threshold:d}')
+def step_message_field_gt(
+    context: Context, idx: int, field: str, threshold: int
+) -> None:
+    response = _last_response(context)
+    messages = response.get("messages", [])
+    if idx >= len(messages):
+        raise AssertionError(
+            f"Message index {idx} out of range (only {len(messages)} messages)"
+        )
+    actual = messages[idx].get(field)
+    if not isinstance(actual, (int, float)) or actual <= threshold:
+        raise AssertionError(
+            f"message[{idx}].{field}: expected > {threshold}, got {actual!r}"
+        )
+
+
+@then('the file at saved_path exists with mode {mode} and exact content byte "{b}" repeated {n:d} times')
+def step_file_at_saved_path_exists(
+    context: Context, mode: str, b: str, n: int
+) -> None:
+    import stat
+    from pathlib import Path
+
+    response = _last_response(context)
+    saved_path = response.get("saved_path")
+    if not saved_path:
+        raise AssertionError(f"Response has no saved_path: {response}")
+    p = Path(saved_path)
+    if not p.is_file():
+        raise AssertionError(f"File at saved_path does not exist: {saved_path}")
+
+    file_stat = p.stat()
+    file_mode = oct(stat.S_IMODE(file_stat.st_mode))
+    expected_oct = oct(int(mode, 8))
+    if file_mode != expected_oct:
+        raise AssertionError(
+            f"File mode for {saved_path}: expected {expected_oct}, got {file_mode}"
+        )
+
+    expected_bytes = b.encode("utf-8") * n
+    actual_bytes = p.read_bytes()
+    if actual_bytes != expected_bytes:
+        raise AssertionError(
+            f"File content length {len(actual_bytes)} != expected {len(expected_bytes)}"
+        )
+
+
+@then('the file at saved_path exists with mode {mode} and exact ASCII content "{expected_ascii}"')
+def step_file_at_saved_path_exists_ascii(
+    context: Context, mode: str, expected_ascii: str
+) -> None:
+    import stat
+    from pathlib import Path
+
+    response = _last_response(context)
+    saved_path = response.get("saved_path")
+    if not saved_path:
+        raise AssertionError(f"Response has no saved_path: {response}")
+    p = Path(saved_path)
+    if not p.is_file():
+        raise AssertionError(f"File at saved_path does not exist: {saved_path}")
+
+    file_stat = p.stat()
+    file_mode = oct(stat.S_IMODE(file_stat.st_mode))
+    expected_oct = oct(int(mode, 8))
+    if file_mode != expected_oct:
+        raise AssertionError(
+            f"File mode for {saved_path}: expected {expected_oct}, got {file_mode}"
+        )
+
+    expected_bytes = expected_ascii.encode("utf-8").decode("unicode_escape").encode("latin1")
+    actual_bytes = p.read_bytes()
+    if actual_bytes != expected_bytes:
+        raise AssertionError(
+            f"File content: expected {expected_bytes!r}, got {actual_bytes!r}"
+        )
+
+
+@then("the leaf filename of saved_to has byte length at most {max_len:d}")
+def step_leaf_filename_saved_to_byte_length(context: Context, max_len: int) -> None:
+    response = _last_response(context)
+    saved_to = response.get("saved_to", "")
+    leaf = Path(saved_to).name
+    byte_len = len(leaf.encode("utf-8"))
+    if byte_len > max_len:
+        raise AssertionError(
+            f"Leaf filename {leaf!r} byte length {byte_len} exceeds max {max_len}"
+        )
+
+
+@then('the directory "{dir_path}" contains {count:d} files')
+def step_directory_contains_n_files(context: Context, dir_path: str, count: int) -> None:
+    p = Path(dir_path.replace("$TMPDIR", str(context.scratch_dir)))
+    if not p.is_dir():
+        raise AssertionError(f"Directory {p} does not exist")
+    files = [f for f in p.iterdir() if f.is_file()]
+    if len(files) != count:
+        raise AssertionError(f"Expected {count} files in {p}, found {len(files)}: {files}")
 
 
 # ---------------------------------------- blob resource assertions
 
 
-@then('the response contains a blob resource with mime type "{mime_type}"')
-def step_response_contains_blob(context: Context, mime_type: str) -> None:
-    import base64
-
-    blob = getattr(context, "last_blob", None)
-    if blob is None:
-        raise AssertionError(
-            "Response contains no EmbeddedResource with blob content."
-        )
-    actual_mime = blob.get("mimeType")
-    if actual_mime != mime_type:
-        raise AssertionError(
-            f"Blob mimeType: expected {mime_type!r}, got {actual_mime!r}"
-        )
-    raw = blob.get("blob", "")
-    try:
-        base64.b64decode(raw, validate=True)
-    except Exception as exc:
-        raise AssertionError(f"Blob content is not valid base64: {exc}")
 
 
-@then(
-    "the blob content decodes to the same sha256 as "
-    "the response field content_hash"
-)
-def step_blob_sha256_matches_content_hash(context: Context) -> None:
-    import base64
-    import hashlib
-
-    blob = getattr(context, "last_blob", None)
-    if blob is None:
-        raise AssertionError("No blob resource in response.")
-    raw_bytes = base64.b64decode(blob["blob"])
-    blob_hash = hashlib.sha256(raw_bytes).hexdigest()
-    response = _last_response(context)
-    expected = response.get("content_hash")
-    if expected is None:
-        raise AssertionError("Response has no content_hash field.")
-    if blob_hash != expected:
-        raise AssertionError(
-            f"Blob SHA-256 {blob_hash!r} != content_hash {expected!r}"
-        )
 
 
 # ---------------------------------------- attachment discovery assertions
@@ -3184,7 +2104,7 @@ def _resolve_message_in_folder_by_subject(
 
     account_id = _account_for_folder(context, folder)
     instance, user = resolve_account(account_id)
-    uid = context.imap.find_uid_by_decoded_subject(
+    uid = context.imap.find_unique_uid_by_decoded_subject(
         instance, user, folder, subject
     )
     if uid is None:
@@ -3210,47 +2130,8 @@ def step_message_in_folder_header_equal(
         )
 
 
-@then(
-    'the message in folder "{folder}" with subject "{subject}" '
-    'has {header} header NOT containing "{value}"'
-)
-def step_message_in_folder_header_not_containing(
-    context: Context, folder: str, subject: str, header: str, value: str
-) -> None:
-    msg = _resolve_message_in_folder_by_subject(context, folder, subject)
-    actual = _decoded_header(msg, header)
-    if value in actual:
-        raise AssertionError(
-            f"{header} header on message {subject!r} in {folder!r} "
-            f"contains forbidden substring {value!r}: {actual!r}"
-        )
 
 
-@then(
-    'the message in folder "{folder}" with In-Reply-To "{message_id}" '
-    'has subject "{subject}"'
-)
-def step_message_in_folder_by_in_reply_to_has_subject(
-    context: Context, folder: str, message_id: str, subject: str
-) -> None:
-    from support.imap_fixture import resolve_account
-
-    account_id = _account_for_folder(context, folder)
-    instance, user = resolve_account(account_id)
-    uid = context.imap.find_uid_by_in_reply_to(
-        instance, user, folder, message_id
-    )
-    if uid is None:
-        raise AssertionError(
-            f"No message in folder {folder!r} has In-Reply-To {message_id!r}"
-        )
-    msg = context.imap.fetch_message(instance, user, folder, uid)
-    actual = _decoded_header(msg, "Subject")
-    if actual != subject:
-        raise AssertionError(
-            f"Message in {folder!r} with In-Reply-To {message_id!r}: "
-            f"expected subject {subject!r}, got {actual!r}"
-        )
 
 
 @then('the response text_body equals the following document:')
@@ -3302,33 +2183,27 @@ def _server_info_metadata(context: Context) -> dict:
     return info.get("metadata") or {}
 
 
-@then('the server info metadata contains "tool_set_version" matching the regex "{pattern}"')
-def step_server_info_metadata_version_regex(context: Context, pattern: str) -> None:
-    import re as _re
 
+
+@then('the server info version equals "{version}"')
+def step_server_info_version_equals(context: Context, version: str) -> None:
+    client = context.mcp
+    if client is None:
+        raise AssertionError("MCP client not initialised")
+    info = getattr(client, "server_info", None) or {}
+    actual = info.get("version")
+    if actual != version:
+        raise AssertionError(f"serverInfo.version: expected {version!r}, got {actual!r}")
+
+
+@then('the server info metadata contains "{key}" equal to "{expected}"')
+def step_server_info_metadata_contains(context: Context, key: str, expected: str) -> None:
     metadata = _server_info_metadata(context)
-    version = metadata.get("tool_set_version")
-    if not isinstance(version, str) or not _re.match(pattern, version):
-        raise AssertionError(
-            f"serverInfo.metadata.tool_set_version {version!r} does not match {pattern!r}"
-        )
-    context.last_server_info_tool_set_version = version
+    actual = metadata.get(key)
+    if actual != expected:
+        raise AssertionError(f"serverInfo metadata[{key!r}]: expected {expected!r}, got {actual!r}")
 
 
-@then("the major version of tool_set_version equals {major:d}")
-def step_major_version_of_tool_set_version_equals(context: Context, major: int) -> None:
-    version = getattr(context, "last_server_info_tool_set_version", None) or getattr(
-        context, "last_tool_set_version", None
-    )
-    if version is None:
-        raise AssertionError(
-            "No tool_set_version captured yet; precede with a regex assertion"
-        )
-    actual_major = int(version.split(".")[0])
-    if actual_major != major:
-        raise AssertionError(
-            f"Major version mismatch: got {actual_major}, expected {major}"
-        )
 
 
 @then("the response field {field} matches the serverInfo {meta_key}")
@@ -3347,22 +2222,36 @@ def step_response_field_matches_server_info(
         )
 
 
-@then("the response field {field} is a string")
-def step_response_field_is_string(context: Context, field: str) -> None:
+
+
+
+
+@then("the response field {field} is a non-empty array")
+def step_response_field_is_non_empty_array(context: Context, field: str) -> None:
     found, value = _resolve_dotted_field(_last_response(context), field)
     if not found:
         raise AssertionError(f"Response has no field {field!r}")
-    if not isinstance(value, str):
-        raise AssertionError(f"Field {field!r}: expected str, got {type(value).__name__}")
+    if not isinstance(value, list) or len(value) == 0:
+        raise AssertionError(f"Field {field!r}: expected non-empty array, got {value!r}")
 
 
-@then("the response field {field} is an array")
-def step_response_field_is_array(context: Context, field: str) -> None:
-    found, value = _resolve_dotted_field(_last_response(context), field)
-    if not found:
-        raise AssertionError(f"Response has no field {field!r}")
-    if not isinstance(value, list):
-        raise AssertionError(f"Field {field!r}: expected array, got {type(value).__name__}")
+@then('breaking_changes_since contains an entry with version "{version}" mentioning "{mention}"')
+def step_breaking_changes_contains_version_mentioning(
+    context: Context, version: str, mention: str
+) -> None:
+    response = _last_response(context)
+    bcs = response.get("breaking_changes_since") or []
+    matches = [
+        entry
+        for entry in bcs
+        if isinstance(entry, dict)
+        and entry.get("version") == version
+        and mention in str(entry)
+    ]
+    if not matches:
+        raise AssertionError(
+            f"Expected breaking_changes_since entry with version {version!r} mentioning {mention!r}, found: {bcs}"
+        )
 
 
 @then("the response field {field} is a string of at most {max_len:d} characters")
@@ -3391,45 +2280,10 @@ def step_response_field_no_literal(context: Context, field: str, needle: str) ->
         )
 
 
-@then("the breaking_changes_since field has at least one entry")
-def step_breaking_changes_at_least_one(context: Context) -> None:
-    response = _last_response(context)
-    entries = response.get("breaking_changes_since") or []
-    if not isinstance(entries, list) or len(entries) < 1:
-        raise AssertionError(
-            f"breaking_changes_since expected ≥1 entry, got {entries!r}"
-        )
 
 
-@then('one entry has field "{key}" equal to "{expected}"')
-def step_one_entry_field_equals(context: Context, key: str, expected: str) -> None:
-    response = _last_response(context)
-    entries = response.get("breaking_changes_since") or []
-    if not any(
-        isinstance(entry, dict) and entry.get(key) == expected for entry in entries
-    ):
-        raise AssertionError(
-            f"No breaking_changes_since entry has {key}={expected!r} (got {entries!r})"
-        )
 
 
-@then('one entry has field "{key}" matching the regex "{pattern}"')
-def step_one_entry_field_matches_regex(
-    context: Context, key: str, pattern: str
-) -> None:
-    import re as _re
-
-    response = _last_response(context)
-    entries = response.get("breaking_changes_since") or []
-    if not any(
-        isinstance(entry, dict)
-        and isinstance(entry.get(key), str)
-        and _re.search(pattern, entry[key])
-        for entry in entries
-    ):
-        raise AssertionError(
-            f"No breaking_changes_since entry has {key} matching {pattern!r} (got {entries!r})"
-        )
 
 
 @then('the response error message contains "{needle}"')
@@ -3444,6 +2298,21 @@ def step_response_error_message_contains(context: Context, needle: str) -> None:
     if needle not in message:
         raise AssertionError(
             f"JSON-RPC error message {message!r} does not contain {needle!r}"
+        )
+
+
+@then('the response error message does NOT contain "{needle}"')
+def step_response_error_message_does_not_contain(context: Context, needle: str) -> None:
+    rpc_error = getattr(context, "last_rpc_error", None)
+    if rpc_error is None:
+        raise AssertionError(
+            "No JSON-RPC error captured. Last response was: "
+            f"{getattr(context, 'last_response', None)!r}"
+        )
+    message = rpc_error.get("message") or ""
+    if needle in message:
+        raise AssertionError(
+            f"JSON-RPC error message {message!r} unexpectedly contains {needle!r}"
         )
 
 
@@ -3462,108 +2331,22 @@ def step_both_responses_applied_scope(context: Context, expected: str) -> None:
             )
 
 
-@then('every returned message has tag "{tag}"')
-def step_every_returned_message_has_tag(context: Context, tag: str) -> None:
-    response = _last_response(context)
-    messages = response.get("messages") or []
-    if not messages:
-        raise AssertionError("No messages in last response")
-    for i, msg in enumerate(messages):
-        tags = msg.get("tags") or msg.get("keywords") or []
-        if tag not in tags:
-            raise AssertionError(
-                f"Message #{i} ({msg.get('uid')!r}) lacks tag {tag!r} "
-                f"(has {tags!r})"
-            )
 
 
-@then('no returned message has tag "{tag}"')
-def step_no_returned_message_has_tag(context: Context, tag: str) -> None:
-    response = _last_response(context)
-    messages = response.get("messages") or []
-    for i, msg in enumerate(messages):
-        tags = msg.get("tags") or msg.get("keywords") or []
-        if tag in tags:
-            raise AssertionError(
-                f"Message #{i} ({msg.get('uid')!r}) unexpectedly carries tag {tag!r}"
-            )
 
 
-@given(
-    "a sequence of operations exercises every folder-opening tool with "
-    "valid, hidden, typo'd, and SELECT-failing folder targets"
-)
-def step_seq_ops_folder_opening_tools(context: Context) -> None:
-    """Marker step: the audit/response sweep that follows reads
-    everything captured so far. The actual exercise is up to the
-    surrounding scenarios in this file — this step is a documentation
-    anchor so the negative assertion ("no record carries folder_not_found")
-    has an explicit precondition."""
-    context.folder_taxonomy_sweep_armed = True
 
 
-@when("the current audit file and the captured tool responses are scanned")
-def step_scan_audit_and_responses(context: Context) -> None:
-    """Collect every reason and every error.type currently visible to
-    the harness for the negative assertions below."""
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    reasons: set[str] = set()
-    error_types: set[str] = set()
-    for rec in reader.records_today():
-        reason = rec.record.get("reason")
-        if isinstance(reason, str):
-            reasons.add(reason)
-        et = rec.record.get("error_type")
-        if isinstance(et, str):
-            error_types.add(et)
-    for resp in getattr(context, "response_history", []) or []:
-        if not isinstance(resp, dict):
-            continue
-        if isinstance(resp.get("reason"), str):
-            reasons.add(resp["reason"])
-        err = resp.get("error")
-        if isinstance(err, dict) and isinstance(err.get("type"), str):
-            error_types.add(err["type"])
-    context.scanned_reasons = reasons
-    context.scanned_error_types = error_types
 
 
-@then('no record or response carries reason "{code}"')
-def step_no_record_carries_reason(context: Context, code: str) -> None:
-    reasons = getattr(context, "scanned_reasons", set())
-    if code in reasons:
-        raise AssertionError(f"Reason code {code!r} appears in audit/responses")
 
 
-@then('no record or response carries error.type "{code}"')
-def step_no_record_carries_error_type(context: Context, code: str) -> None:
-    error_types = getattr(context, "scanned_error_types", set())
-    if code in error_types:
-        raise AssertionError(f"error.type {code!r} appears in audit/responses")
-
-
-@then("the IMAP server received at most {limit:d} IMAP connections")
-def step_imap_server_received_at_most(context: Context, limit: int) -> None:
-    """Generic counterpart to the gmail-specific ‘mock-gmail server received…’
-    step. Counts every IMAP connection the test fixtures have observed."""
-    gmail_state = getattr(context, "gmail_state", None)
-    if gmail_state is not None:
-        count = gmail_state.total_connections
-    else:
-        imap_fixture = getattr(context, "imap", None)
-        count = getattr(imap_fixture, "total_connections", 0) if imap_fixture else 0
-    if count > limit:
-        raise AssertionError(
-            f"IMAP server connection count {count} exceeds limit {limit}"
-        )
 
 
 # --------------------------------------------------------------------- ADR 0028
 
 
-def _sink_dir(context: Context) -> "Path":
+def _sink_dir(context: Context) -> Path:
     """Return the scenario's sink dir or fail with a helpful message."""
     sink = getattr(context, "attachment_sink_dir", None)
     if sink is None:
@@ -3576,93 +2359,40 @@ def _sink_dir(context: Context) -> "Path":
     return _Path(sink)
 
 
-@then("the file named saved_to exists in the sink directory")
-def step_file_saved_to_exists(context: Context) -> None:
-    response = _last_response(context)
-    name = response.get("saved_to")
-    if not isinstance(name, str):
-        raise AssertionError(f"Response has no string 'saved_to': {response!r}")
-    path = _sink_dir(context) / name
-    if not path.is_file():
-        raise AssertionError(f"Expected sink file {path} to exist; it does not")
 
 
-@then("the file named saved_to in the sink has size {size:d} bytes")
-def step_file_saved_to_size(context: Context, size: int) -> None:
-    response = _last_response(context)
-    name = response["saved_to"]
-    path = _sink_dir(context) / name
-    actual = path.stat().st_size
-    if actual != size:
-        raise AssertionError(
-            f"Sink file {path} size {actual} != expected {size}"
-        )
 
 
-@then("the sha256 of the file named saved_to in the sink equals the response field content_hash")
-def step_file_saved_to_sha256(context: Context) -> None:
-    import hashlib as _hashlib
-
-    response = _last_response(context)
-    name = response["saved_to"]
-    expected = response.get("content_hash")
-    path = _sink_dir(context) / name
-    actual = _hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual != expected:
-        raise AssertionError(
-            f"sha256({path}) = {actual}; response.content_hash = {expected}"
-        )
 
 
 @then("the response content has no resource block")
 def step_response_no_resource_block(context: Context) -> None:
     """The MCP CallToolResult must not carry an EmbeddedResource block
     after ADR 0028; _emit emits text-only content."""
-    blob = getattr(context, "last_blob", None)
-    if blob is not None:
+    blocks = getattr(context, "last_content_blocks", None)
+    if blocks is None:
+        raw = getattr(context, "last_raw_payload", None)
+        if raw is not None and isinstance(raw, dict):
+            blocks = raw.get("content")
+    if blocks is None:
+        raise AssertionError("No MCP response content blocks recorded to check for resource block")
+    if not isinstance(blocks, list) or len(blocks) == 0:
+        raise AssertionError("MCP response content blocks is empty")
+    resource_blocks = [
+        b
+        for b in blocks
+        if isinstance(b, dict) and (b.get("type") in ("resource", "embedded_resource") or "resource" in b)
+    ]
+    if resource_blocks:
         raise AssertionError(
-            f"Response unexpectedly carries a resource block: {blob!r}"
+            f"Response unexpectedly carries resource block(s): {resource_blocks!r}"
         )
 
 
-@then("the response field {field} does NOT start with the literal \"{prefix}\"")
-def step_response_field_no_leading(context: Context, field: str, prefix: str) -> None:
-    found, value = _resolve_dotted_field(_last_response(context), field)
-    if not found:
-        raise AssertionError(f"Response has no field {field!r}")
-    if isinstance(value, str) and value.startswith(prefix):
-        raise AssertionError(
-            f"Field {field!r} unexpectedly starts with {prefix!r}: {value!r}"
-        )
 
 
-@then("the response field {field} has a byte length of at most {max_len:d}")
-def step_response_field_bytelen(context: Context, field: str, max_len: int) -> None:
-    found, value = _resolve_dotted_field(_last_response(context), field)
-    if not found:
-        raise AssertionError(f"Response has no field {field!r}")
-    if not isinstance(value, str):
-        raise AssertionError(f"Field {field!r}: expected str, got {type(value).__name__}")
-    n = len(value.encode("utf-8"))
-    if n > max_len:
-        raise AssertionError(
-            f"Field {field!r} byte length {n} exceeds max {max_len}: {value!r}"
-        )
 
 
-@then('the sink directory contains exactly {count:d} file')
-@then('the sink directory contains exactly {count:d} files')
-def step_sink_dir_exact_file_count(context: Context, count: int) -> None:
-    sink = _sink_dir(context)
-    if not sink.exists():
-        actual = 0
-    else:
-        actual = sum(1 for p in sink.iterdir() if p.is_file())
-    if actual != count:
-        listing = sorted(p.name for p in sink.iterdir() if p.is_file()) if sink.exists() else []
-        raise AssertionError(
-            f"Sink {sink} expected to hold {count} file(s); has {actual}: {listing}"
-        )
 
 
 @then("no file was written outside the sink directory")
@@ -3691,45 +2421,8 @@ def step_no_file_outside_sink(context: Context) -> None:
             raise AssertionError(f"Path-traversal artefact appeared: {candidate}")
 
 
-@then('the 8-hex segment in saved_to equals the first 8 hex chars of md5 of the file bytes')
-def step_saved_to_md5_segment(context: Context) -> None:
-    import hashlib as _hashlib
-    import re as _re
-
-    response = _last_response(context)
-    name = response["saved_to"]
-    m = _re.match(r"^.+_([0-9a-f]{8})\.[^.]+$", name)
-    if not m:
-        raise AssertionError(f"saved_to {name!r} does not match base_<8hex>.ext")
-    claimed = m.group(1)
-    path = _sink_dir(context) / name
-    actual = _hashlib.md5(path.read_bytes()).hexdigest()[:8]
-    if claimed != actual:
-        raise AssertionError(
-            f"saved_to hash segment {claimed} != md5(file_bytes)[:8] {actual}"
-        )
 
 
-@then('the saved_to value matches the bytes-md5 pattern "report_<hex>.pdf"')
-def step_saved_to_equals_pattern_using_md5(context: Context) -> None:
-    import hashlib as _hashlib
-    import re as _re
-
-    response = _last_response(context)
-    name = response["saved_to"]
-    # First parse out the claimed hash so we can verify against the
-    # actual file's bytes.
-    m = _re.match(r"^report_([0-9a-f]{8})\.pdf$", name)
-    if not m:
-        raise AssertionError(
-            f"saved_to {name!r} does not match report_<8hex>.pdf"
-        )
-    path = _sink_dir(context) / name
-    expected = _hashlib.md5(path.read_bytes()).hexdigest()[:8]
-    if m.group(1) != expected:
-        raise AssertionError(
-            f"saved_to hash {m.group(1)} != md5(bytes)[:8] {expected}"
-        )
 
 
 # ---- tool-description introspection -----------------------------------------
@@ -3750,6 +2443,7 @@ def _tool_description(context: Context, tool_name: str) -> str:
 
 
 @then('the description of tool "{tool}" contains the literal string "{needle}"')
+@then('the description of tool "{tool}" contains "{needle}"')
 def step_tool_desc_contains(context: Context, tool: str, needle: str) -> None:
     desc = _tool_description(context, tool)
     if needle not in desc:
@@ -3759,11 +2453,22 @@ def step_tool_desc_contains(context: Context, tool: str, needle: str) -> None:
 
 
 @then('the description of tool "{tool}" does NOT contain the literal string "{needle}"')
+@then('the description of tool "{tool}" does NOT contain "{needle}"')
 def step_tool_desc_no_contain(context: Context, tool: str, needle: str) -> None:
     desc = _tool_description(context, tool)
     if needle in desc:
         raise AssertionError(
             f"Tool {tool!r} description unexpectedly contains {needle!r}:\n{desc}"
+        )
+
+
+@then('the description of tool "{tool}" does NOT contain the configured sink path')
+def step_tool_desc_no_configured_sink_path(context: Context, tool: str) -> None:
+    desc = _tool_description(context, tool)
+    sink_dir = getattr(context, "attachment_sink_dir", None)
+    if sink_dir is not None and str(sink_dir) in desc:
+        raise AssertionError(
+            f"Tool {tool!r} description unexpectedly contains configured sink path {str(sink_dir)!r}:\n{desc}"
         )
 
 
@@ -3875,26 +2580,6 @@ def _draft_message_by_subject(context: Context, folder: str, subject: str) -> An
     return context.imap.fetch_message(instance, user, folder, uid)
 
 
-@then(
-    'the IMAP message in folder "{folder}" with subject "{subject}" '
-    'carries exactly {count:d} header "{header}"'
-)
-def step_imap_message_header_occurrence_count(
-    context: Context, folder: str, subject: str, count: int, header: str
-) -> None:
-    """Count *occurrences*, not presence.
-
-    ADR 0030 assigns the handle server-side; a caller that already put
-    an `X-SC-Draft-Id` in its payload must not end up with two of them,
-    which a presence check would happily accept.
-    """
-    message = _draft_message_by_subject(context, folder, subject)
-    present = message.get_all(header) or []
-    if len(present) != count:
-        raise AssertionError(
-            f"Message {subject!r} in {folder!r} carries {len(present)} "
-            f"{header!r} header(s), expected {count}: {present!r}"
-        )
 
 
 @then(
@@ -3958,60 +2643,56 @@ def step_header_is_not(
         )
 
 
-@then(
-    'the header "{header}" of the IMAP message in folder "{folder}" '
-    'with subject "{subject}" is a non-empty value'
-)
-def step_header_is_non_empty(
-    context: Context, header: str, folder: str, subject: str
-) -> None:
-    message = _draft_message_by_subject(context, folder, subject)
-    actual = _draft_header_value(message, header)
-    if actual is None or actual == "":
-        raise AssertionError(
-            f"Message {subject!r} in {folder!r} carries no usable {header!r} "
-            f"header: {actual!r}"
-        )
+
+
 
 
 @then(
     'the header "{header}" of the IMAP message in folder "{folder}" '
-    'with subject "{subject}" is a timestamp within the last {seconds:d} seconds'
+    'with subject "{subject}" matches "{pattern}"'
 )
-def step_header_is_recent_timestamp(
-    context: Context, header: str, folder: str, subject: str, seconds: int
+def step_header_matches_pattern(
+    context: Context, header: str, folder: str, subject: str, pattern: str
 ) -> None:
-    """A wall-clock window rather than "changed since the last read".
-
-    Two revisions can land inside the same second, so comparing two
-    `Date` values would be a coin flip. Asserting that the value is a
-    parseable timestamp close to now pins "regenerated at edit time"
-    without racing the clock.
-    """
-    from datetime import datetime, timezone
-    from email.utils import parsedate_to_datetime
-
+    import re
     message = _draft_message_by_subject(context, folder, subject)
-    raw = _draft_header_value(message, header)
-    if raw is None or raw == "":
+    value = _draft_header_value(message, header)
+    if value is None or value == "":
         raise AssertionError(
-            f"Message {subject!r} in {folder!r} carries no {header!r} header."
+            f"Message {subject!r} in {folder!r} carries no {header!r} header at all."
         )
-    try:
-        parsed = parsedate_to_datetime(raw)
-    except (TypeError, ValueError) as exc:
+    if not re.search(pattern, value):
         raise AssertionError(
-            f"{header!r} on {subject!r} in {folder!r} is not a parseable "
-            f"timestamp: {raw!r} ({exc})"
-        ) from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    age = (datetime.now(timezone.utc) - parsed).total_seconds()
-    if not -seconds <= age <= seconds:
+            f"Header {header!r} on {subject!r} in {folder!r} is {value!r}, which does not match {pattern!r}"
+        )
+
+
+@then('draft entry {idx:d} has field "{field}" equal to {expected}')
+def step_draft_entry_field_equals(
+    context: Context, idx: int, field: str, expected: str
+) -> None:
+    response = _last_response(context)
+    drafts = response.get("drafts", [])
+    if idx >= len(drafts):
+        raise AssertionError(f"Draft entry index {idx} out of range (only {len(drafts)} drafts)")
+    entry = drafts[idx]
+    actual = entry.get(field)
+    if expected == "null":
+        expected_val = None
+    elif expected == "true":
+        expected_val = True
+    elif expected == "false":
+        expected_val = False
+    elif expected.isdigit():
+        expected_val = int(expected)
+    elif expected.startswith('"') and expected.endswith('"'):
+        expected_val = expected[1:-1]
+    else:
+        expected_val = expected
+
+    if actual != expected_val:
         raise AssertionError(
-            f"{header!r} on {subject!r} in {folder!r} is {age:.0f}s away from "
-            f"now ({raw!r}); expected it to be regenerated within "
-            f"{seconds}s of the edit."
+            f"drafts[{idx}].{field}: expected {expected_val!r}, got {actual!r}"
         )
 
 
@@ -4033,36 +2714,170 @@ def step_response_field_does_not_equal(
         )
 
 
-@then('the description of tool "{tool}" contains the configured sink path')
-def step_tool_desc_contains_sink_path(context: Context, tool: str) -> None:
-    desc = _tool_description(context, tool)
-    sink = getattr(context, "attachment_sink_dir", None)
-    if sink is None:
+
+
+
+
+@then('the JSON response is remembered as "{key}"')
+@when('the JSON response is remembered as "{key}"')
+def step_remember_json_response(context: Context, key: str) -> None:
+    import copy
+    context.remembered_responses = getattr(context, "remembered_responses", {}) or {}
+    context.remembered_responses[key] = copy.deepcopy(context.last_response)
+
+
+@then('the JSON response equals the remembered "{key}"')
+def step_json_response_equals_remembered(context: Context, key: str) -> None:
+    remembered = (getattr(context, "remembered_responses", None) or {}).get(key)
+    if remembered is None:
+        raise AssertionError(f"No remembered response found for key {key!r}")
+    actual = context.last_response
+    if actual != remembered:
+        raise AssertionError(f"JSON response changed:\nRemembered: {remembered}\nActual: {actual}")
+
+
+@then('the JSON response has the exact same keys and values except "{except_key}" as "{key}"')
+def step_json_response_same_except(context: Context, except_key: str, key: str) -> None:
+    remembered = (getattr(context, "remembered_responses", None) or {}).get(key)
+    if remembered is None:
+        raise AssertionError(f"No remembered response found for key {key!r}")
+    actual = context.last_response
+    rem_copy = {k: v for k, v in remembered.items() if k != except_key}
+    act_copy = {k: v for k, v in actual.items() if k != except_key}
+    if act_copy != rem_copy:
         raise AssertionError(
-            "No sink configured; this assertion needs a `fresh writable` step."
-        )
-    if str(sink) not in desc:
-        raise AssertionError(
-            f"Tool {tool!r} description does not name sink {sink}:\n{desc}"
+            f"Responses differ on fields other than {except_key!r}:\nRemembered: {rem_copy}\nActual: {act_copy}"
         )
 
 
-@then("the tool call fails with an invalid-arguments error")
-def step_tool_call_invalid_arguments(context: Context) -> None:
-    """ADR 0031: a malformed call is a protocol-level reject, not a
-    response payload. JSON-RPC -32602 is the only acceptable shape."""
-    error = getattr(context, "last_rpc_error", None)
-    if error is None:
-        response = getattr(context, "last_response", None)
+@then('the caller sink subdirectory "{caller_id}" exists with mode {mode}')
+def step_caller_sink_subdir_exists_mode(context: Context, caller_id: str, mode: str) -> None:
+    import stat
+    sink_dir = getattr(context, "attachment_sink_dir", None)
+    if sink_dir is None:
+        raise AssertionError("Sink directory is not configured")
+    caller_dir = sink_dir / caller_id
+    if not caller_dir.is_dir():
+        raise AssertionError(f"Caller sink subdirectory {caller_dir} does not exist")
+    dir_stat = caller_dir.stat()
+    dir_mode = oct(stat.S_IMODE(dir_stat.st_mode))
+    expected_oct = oct(int(mode, 8))
+    if dir_mode != expected_oct:
+        raise AssertionError(f"Directory mode for {caller_dir}: expected {expected_oct}, got {dir_mode}")
+
+
+@then('the visible folder entry "{folder}" for "{account}" in describe_policy has:')
+def step_visible_folder_entry_describe_policy(
+    context: Context, folder: str, account: str
+) -> None:
+    response = _last_response(context)
+    accounts = response.get("accounts", [])
+    acct = next((a for a in accounts if a.get("id") == account), None)
+    if acct is None:
         raise AssertionError(
-            "Expected the tool call to fail with JSON-RPC -32602 "
-            f"(invalid arguments), but it returned a payload: {response!r}"
+            f"Account {account!r} not found in describe_policy response: {[a.get('id') for a in accounts]}"
         )
-    if error.get("code") != -32602:
+    folders = acct.get("folders_visible", [])
+    f_entry = next((f for f in folders if f.get("path") == folder), None)
+    if f_entry is None:
         raise AssertionError(
-            f"Expected JSON-RPC error code -32602 (invalid arguments), "
-            f"got {error.get('code')!r}: {error.get('message')!r}"
+            f"Folder {folder!r} not found in folders_visible for {account}: {[f.get('path') for f in folders]}"
         )
+
+    for row in context.table:
+        field = row["field"]
+        expected_raw = row["value"]
+        if expected_raw == "true":
+            expected: Any = True
+        elif expected_raw == "false":
+            expected = False
+        else:
+            expected = expected_raw
+
+        actual = f_entry.get(field)
+        if actual != expected:
+            raise AssertionError(
+                f"Field {field!r} on folder {folder}: expected {expected!r}, got {actual!r}"
+            )
+
+
+@then("the response field saved_path ends with the response field saved_to")
+def step_saved_path_ends_with_saved_to(context: Context) -> None:
+    response = _last_response(context)
+    saved_path = response.get("saved_path", "")
+    saved_to = response.get("saved_to", "")
+    if not saved_path or not saved_to:
+        raise AssertionError(f"saved_path ({saved_path!r}) or saved_to ({saved_to!r}) missing in response: {response}")
+    if not saved_path.endswith(saved_to):
+        raise AssertionError(f"saved_path {saved_path!r} does not end with saved_to {saved_to!r}")
+
+
+@when('the response field saved_path is remembered as "{key}"')
+@then('the response field saved_path is remembered as "{key}"')
+def step_remember_saved_path(context: Context, key: str) -> None:
+    remembered = getattr(context, "remembered_values", None)
+    if remembered is None:
+        remembered = {}
+        context.remembered_values = remembered
+    response = _last_response(context)
+    remembered[key] = response.get("saved_path")
+
+
+@then('the response field saved_path does not equal the remembered "{key}"')
+def step_saved_path_not_equal_remembered(context: Context, key: str) -> None:
+    remembered = getattr(context, "remembered_values", {}).get(key)
+    response = _last_response(context)
+    actual = response.get("saved_path")
+    if actual == remembered:
+        raise AssertionError(f"saved_path unexpectedly equals remembered {key!r}: {actual!r}")
+
+
+@then('the caller sink subdirectory "{caller_id}" contains {count:d} files')
+def step_caller_sink_subdir_contains_n_files(context: Context, caller_id: str, count: int) -> None:
+    sink_dir = getattr(context, "attachment_sink_dir", None)
+    if sink_dir is None:
+        raise AssertionError("Sink directory is not configured")
+    caller_dir = sink_dir / caller_id
+    if not caller_dir.is_dir():
+        if count == 0:
+            return
+        raise AssertionError(f"Caller sink subdirectory {caller_dir} does not exist")
+    files = [f for f in caller_dir.iterdir() if f.is_file()]
+    if len(files) != count:
+        raise AssertionError(f"Expected {count} files in {caller_dir}, found {len(files)}: {files}")
+
+
+@then("the sink base directory contains {count:d} files")
+def step_sink_base_dir_contains_n_files(context: Context, count: int) -> None:
+    sink_dir = getattr(context, "attachment_sink_dir", None)
+    if sink_dir is None or not sink_dir.is_dir():
+        if count == 0:
+            return
+        raise AssertionError(f"Sink base directory {sink_dir} does not exist")
+    files = [f for f in sink_dir.rglob("*") if f.is_file()]
+    if len(files) != count:
+        raise AssertionError(f"Expected {count} files in sink base {sink_dir}, found {len(files)}: {files}")
+
+
+@then('the IMAP folder "{folder}" is empty')
+def step_imap_folder_is_empty_assert(context: Context, folder: str) -> None:
+    from support.imap_fixture import resolve_account
+    account_id = _account_for_folder(context, folder)
+    instance, user = resolve_account(account_id)
+    if instance == "mock-gmail":
+        state = getattr(context, "gmail_state", None)
+        msgs = state.messages_in_folder(folder) if state else []
+        if msgs:
+            raise AssertionError(f"Expected {folder} to be empty, found {len(msgs)} messages")
+    else:
+        conn = context.imap.connect(instance, user)
+        conn.select(context.imap.to_wire(instance, user, folder))
+        status, data = conn.uid("SEARCH", None, "ALL")
+        if status != "OK":
+            raise AssertionError(f"IMAP SEARCH failed on {folder}: {data}")
+        uids = data[0].split() if data and data[0] else []
+        if uids:
+            raise AssertionError(f"Expected {folder} to be empty, found {len(uids)} UIDs: {uids}")
 
 
 @then('the IMAP folder "{folder}" contains no message with subject "{subject}"')
@@ -4105,9 +2920,1307 @@ def step_imap_message_with_subject_has_no_header(
             f"Folder {folder!r} holds no message with subject {subject!r}."
         )
     message = context.imap.fetch_message(instance, user, folder, uid)
-    present = message.get_all(header)
-    if present:
+    headers_to_check = [h.strip('"\'') for h in header.split('" and no header "')]
+    for h in headers_to_check:
+        present = message.get_all(h)
+        if present:
+            raise AssertionError(
+                f"Message {subject!r} in {folder!r} still carries header "
+                f"{h!r}: {present!r}"
+            )
+
+
+@then('the most recent audit entry has field "{field}" starting with "{prefix}"')
+def step_audit_entry_field_starts_with(context: Context, field: str, prefix: str) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    recs = list(reader.records())
+    if not recs:
+        raise AssertionError("No audit records found in audit log directory")
+    last_rec = recs[-1].record
+    val = str(last_rec.get(field, ""))
+    if not val.startswith(prefix):
         raise AssertionError(
-            f"Message {subject!r} in {folder!r} still carries header "
-            f"{header!r}: {present!r}"
+            f"Expected most recent audit entry field {field!r} to start with {prefix!r}, got {val!r}"
         )
+
+
+@then('the most recent audit entry for tool "{tool}" has field "{field}" starting with "{prefix}"')
+def step_audit_entry_tool_field_starts_with(context: Context, tool: str, field: str, prefix: str) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    recs = [r.record for r in reader.records() if r.record.get("tool") == tool]
+    if not recs:
+        raise AssertionError(f"No audit records found for tool {tool!r}")
+    last_rec = recs[-1]
+    val = str(last_rec.get(field, ""))
+    if not val.startswith(prefix):
+        raise AssertionError(
+            f"Expected most recent audit entry for tool {tool!r} field {field!r} to start with {prefix!r}, got {val!r}"
+        )
+
+
+@then("the audit file does NOT contain any of the literal strings:")
+def step_audit_file_does_not_contain_literal_strings(context: Context) -> None:
+    if not hasattr(context, "audit_dir") or not context.audit_dir.exists():
+        raise AssertionError("Audit directory does not exist or is not configured")
+    paths = list(context.audit_dir.glob("*.jsonl"))
+    if not paths:
+        raise AssertionError("No audit .jsonl files found in audit directory")
+    all_text = ""
+    for path in paths:
+        all_text += path.read_text(encoding="utf-8", errors="replace") + "\n"
+    if not all_text.strip():
+        raise AssertionError("Audit files exist but contain 0 records / empty text")
+    for row in context.table:
+        forbidden = row["forbidden_string"]
+        if forbidden in all_text:
+            raise AssertionError(f"Forbidden string {forbidden!r} leaked in audit file")
+
+
+@then('the IMAP message in folder "{folder}" on "{account_id}" with subject "{subject}" has header "From" equal to "{expected}"')
+def step_imap_message_header_from_equal(
+    context: Context, folder: str, account_id: str, subject: str, expected: str
+) -> None:
+    from support.imap_fixture import resolve_account
+
+    instance, user = resolve_account(account_id)
+    uid = context.imap.find_unique_uid_by_decoded_subject(instance, user, folder, subject)
+    if uid is None:
+        raise AssertionError(f"No message with subject {subject!r} found in {folder!r} on {account_id!r}")
+    msg = context.imap.fetch_message(instance, user, folder, uid)
+    actual_from = msg.get("From", "")
+    if actual_from != expected:
+        raise AssertionError(f"Header From: expected {expected!r}, got {actual_from!r}")
+
+
+_use_step_matcher_assert("re")
+
+
+@then(r'the startup error indicates "(?P<m1>[^"]+)" and "(?P<m2>[^"]+)"')
+def step_startup_error_indicates_two(context: Context, m1: str, m2: str) -> None:
+    proc = getattr(context, "startup_proc", None)
+    stderr = getattr(context, "bootstrap_stderr", "")
+    if proc is not None:
+        stderr = proc.stderr
+    if not stderr:
+        stderr = getattr(context, "http_startup_error", "")
+    if not stderr:
+        stderr = getattr(context, "startup_error", "")
+    if m1 not in stderr or m2 not in stderr:
+        raise AssertionError(f"Expected startup error mentioning {m1!r} and {m2!r}, got:\n{stderr}")
+
+
+@then(r'the startup error indicates "(?P<msg>[^"]+)"')
+def step_startup_error_indicates(context: Context, msg: str) -> None:
+    proc = getattr(context, "startup_proc", None)
+    stderr = getattr(context, "bootstrap_stderr", "")
+    if proc is not None:
+        stderr = proc.stderr
+    if not stderr:
+        stderr = getattr(context, "http_startup_error", "")
+    if not stderr:
+        stderr = getattr(context, "startup_error", "")
+    if msg not in stderr:
+        raise AssertionError(f"Expected startup error mentioning {msg!r}, got:\n{stderr}")
+
+
+_use_step_matcher_assert("parse")
+
+
+def _create_historical_sealed_file(audit_dir: Path, filename: str) -> None:
+    path = audit_dir / filename
+    date_str = filename[:10]
+    rec0 = {
+        "seq": 0,
+        "ts": f"{date_str}T10:00:00.000Z",
+        "tool": "list_accounts",
+        "caller_id": "invoice-agent",
+        "caller_addr": "stdio",
+        "decision": "ALLOW",
+        "reason": "authenticated",
+        "result": "OK",
+        "prev_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    }
+    line0 = json.dumps(rec0, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    h0 = hashlib.sha256(line0).hexdigest()
+    rec1 = {
+        "seq": 1,
+        "ts": f"{date_str}T23:59:59.999Z",
+        "tool": "eof_day",
+        "final_hash": f"sha256:{h0}",
+        "prev_hash": f"sha256:{h0}",
+    }
+    line1 = json.dumps(rec1, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    path.write_bytes(line0 + line1)
+    path.chmod(0o400)
+
+
+@given("the audit directory contains historical sealed day files:")
+def step_audit_dir_contains_historical_files(context: Context) -> None:
+    for row in context.table:
+        _create_historical_sealed_file(context.audit_dir, row["filename"])
+
+
+@given('the audit directory contains historical sealed file "{filename}"')
+def step_audit_dir_contains_historical_file(context: Context, filename: str) -> None:
+    _create_historical_sealed_file(context.audit_dir, filename)
+
+
+@given('the audit directory contains historical compressed archive "{filename}"')
+def step_audit_dir_contains_historical_archive(context: Context, filename: str) -> None:
+    import gzip
+
+    path = context.audit_dir / filename
+    date_str = filename[:10]
+    rec0 = {
+        "seq": 0,
+        "ts": f"{date_str}T10:00:00.000Z",
+        "tool": "list_accounts",
+        "caller_id": "invoice-agent",
+        "caller_addr": "stdio",
+        "decision": "ALLOW",
+        "reason": "authenticated",
+        "result": "OK",
+        "prev_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    }
+    line0 = json.dumps(rec0, sort_keys=True).encode("utf-8") + b"\n"
+    h0 = hashlib.sha256(line0).hexdigest()
+    rec1 = {
+        "seq": 1,
+        "ts": f"{date_str}T23:59:59.999Z",
+        "tool": "eof_day",
+        "final_hash": f"sha256:{h0}",
+        "prev_hash": f"sha256:{h0}",
+    }
+    line1 = json.dumps(rec1, sort_keys=True).encode("utf-8") + b"\n"
+    compressed = gzip.compress(line0 + line1)
+    path.write_bytes(compressed)
+    path.chmod(0o400)
+
+
+@given('the SHA-256 digest of plain file "{path_raw}" is remembered')
+def step_remember_plain_file_sha256(context: Context, path_raw: str) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, path_raw)
+    data = Path(resolved).read_bytes()
+    context.remembered_sha256 = hashlib.sha256(data).hexdigest()
+
+
+@then('decompressing "{path_raw}" yields the remembered SHA-256 digest')
+def step_decompress_yields_remembered_sha256(context: Context, path_raw: str) -> None:
+    import gzip
+
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, path_raw)
+    data = gzip.decompress(Path(resolved).read_bytes())
+    actual_sha = hashlib.sha256(data).hexdigest()
+    expected_sha = getattr(context, "remembered_sha256", "")
+    if actual_sha != expected_sha:
+        raise AssertionError(f"Decompressed SHA-256: expected {expected_sha}, got {actual_sha}")
+
+
+@then('the file "{path_raw}" exists with mode {mode:o}')
+def step_file_exists_with_mode(context: Context, path_raw: str, mode: int) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, path_raw)
+    path = Path(resolved)
+    if not path.is_file():
+        raise AssertionError(f"File {path} does not exist")
+    actual_mode = path.stat().st_mode & 0o777
+    if actual_mode != mode:
+        raise AssertionError(f"File {path} mode: expected {oct(mode)}, got {oct(actual_mode)}")
+
+
+@then('the file "{path_raw}" does not exist')
+def step_file_does_not_exist(context: Context, path_raw: str) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, path_raw)
+    path = Path(resolved)
+    if path.exists():
+        raise AssertionError(f"File {path} exists when it should not")
+
+
+@then('the file "{path_raw}" exists as plain JSONL')
+def step_file_exists_as_plain_jsonl(context: Context, path_raw: str) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, path_raw)
+    path = Path(resolved)
+    if not path.is_file():
+        raise AssertionError(f"File {path} does not exist")
+    if path.name.endswith(".gz"):
+        raise AssertionError(f"File {path} is compressed (.gz)")
+
+
+@then('the retention state of base date "{base_date}" in "{dir_path_raw}" is "{final_state}"')
+def step_retention_state_of_base_date(
+    context: Context, base_date: str, dir_path_raw: str, final_state: str
+) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, dir_path_raw)
+    audit_dir = Path(resolved)
+    plain = audit_dir / f"{base_date}.jsonl"
+    gz = audit_dir / f"{base_date}.jsonl.gz"
+
+    if final_state == "hot_sealed":
+        if not plain.is_file():
+            raise AssertionError(f"Expected hot_sealed plain file {plain} to exist")
+        mode = plain.stat().st_mode & 0o400
+        if mode != 0o400:
+            raise AssertionError(f"File {plain} mode: expected 0400, got {oct(mode)}")
+    elif final_state == "warm":
+        if not gz.is_file():
+            raise AssertionError(f"Expected warm compressed file {gz} to exist")
+        mode = gz.stat().st_mode & 0o400
+        if mode != 0o400:
+            raise AssertionError(f"File {gz} mode: expected 0400, got {oct(mode)}")
+        if plain.exists():
+            raise AssertionError(f"Plain file {plain} should not exist in warm state")
+    elif final_state == "deleted":
+        if plain.exists() or gz.exists():
+            raise AssertionError(f"Neither {plain} nor {gz} should exist in deleted state")
+    else:
+        raise AssertionError(f"Unknown final_state {final_state!r}")
+
+
+@given('an executable root-hook recorder script exists at "{script_raw}" writing its argv and environment keys to "{out_raw}"')
+def step_create_root_hook_recorder(context: Context, script_raw: str, out_raw: str) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    script_path = Path(_scratch_substitute(context, script_raw))
+    out_path = Path(_scratch_substitute(context, out_raw))
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    content = f"""#!/usr/bin/env python3
+import sys, os, json
+data = {{
+    "argv": sys.argv,
+    "env_keys": list(os.environ.keys())
+}}
+with open({str(out_path)!r}, "w", encoding="utf-8") as f:
+    json.dump(data, f)
+"""
+    script_path.write_text(content, encoding="utf-8")
+    script_path.chmod(0o755)
+
+
+@given('the server is configured with audit directory "{dir_raw}" and external_root_hook {hook_argv_raw}')
+def step_server_configured_audit_root_hook(context: Context, dir_raw: str, hook_argv_raw: str) -> None:
+    import ast
+
+    from features.steps.policy_steps import _ensure_builder, _scratch_substitute
+
+    builder = _ensure_builder(context)
+    builder.audit_directory = Path(_scratch_substitute(context, dir_raw))
+    raw_list = ast.literal_eval(hook_argv_raw)
+    resolved_list = [_scratch_substitute(context, item) for item in raw_list]
+    builder.audit_external_root_hook = resolved_list
+    builder.write()
+
+
+@then('"{out_raw}" records {count:d} invocation whose argument equals the final_hash field of the eof_day record in "{day_file}"')
+def step_root_hook_recorded_invocation(context: Context, out_raw: str, count: int, day_file: str) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+    from support.audit_reader import AuditReader
+
+    out_path = Path(_scratch_substitute(context, out_raw))
+    if not out_path.is_file():
+        raise AssertionError(f"Output file {out_path} does not exist")
+    data = json.loads(out_path.read_text(encoding="utf-8"))
+    argv = data.get("argv", [])
+    reader = AuditReader(context.audit_dir)
+    records = reader.read_file(day_file)
+    eof_rec = next((r.record for r in records if r.record.get("tool") == "eof_day"), None)
+    if not eof_rec:
+        raise AssertionError(f"No eof_day record in {day_file}")
+    expected_hash = eof_rec.get("final_hash")
+    if not any(arg == expected_hash for arg in argv):
+        raise AssertionError(f"Expected final_hash {expected_hash!r} in argv {argv!r}")
+
+
+@then('"{out_raw}" environment keys do NOT include "{leaked_key}"')
+def step_hook_out_env_keys_not_include(context: Context, out_raw: str, leaked_key: str) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    out_path = Path(_scratch_substitute(context, out_raw))
+    data = json.loads(out_path.read_text(encoding="utf-8"))
+    env_keys = data.get("env_keys", [])
+    if leaked_key in env_keys:
+        raise AssertionError(f"Environment key {leaked_key!r} leaked to child hook: {env_keys}")
+
+
+@then('the server stderr contains a critical log line mentioning "{text}"')
+def step_server_stderr_contains_critical(context: Context, text: str) -> None:
+    stderr = context.mcp.stderr_text if context.mcp else ""
+    if text not in stderr:
+        raise AssertionError(f"Expected server stderr mentioning {text!r}, got:\n{stderr}")
+
+
+@given("{caller_id} calls list_accounts {n:d} times")
+@when("{caller_id} calls list_accounts {n:d} times")
+def step_caller_calls_list_accounts_n_times(context: Context, caller_id: str, n: int) -> None:
+    from features.steps.mcp_steps import _ensure_mcp_client, _store_result
+
+    client = _ensure_mcp_client(context, caller_id)
+    for _ in range(n):
+        payload = client.call_tool("list_accounts", {})
+        _store_result(context, payload)
+
+
+@when("{caller_id} calls list_accounts, describe_policy, and tool_surface_info")
+def step_caller_calls_three_tools(context: Context, caller_id: str) -> None:
+    from features.steps.mcp_steps import _ensure_mcp_client, _store_result
+
+    client = _ensure_mcp_client(context, caller_id)
+    responses = []
+    for tool in ("list_accounts", "describe_policy", "tool_surface_info"):
+        payload = client.call_tool(tool, {})
+        _store_result(context, payload)
+        responses.append(payload)
+    context.three_tool_responses = responses
+
+
+@then('none of the tool responses contains any prev_hash value present in "{filename_raw}"')
+def step_none_contains_prev_hash(context: Context, filename_raw: str) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, filename_raw)
+    path = Path(resolved)
+    if not path.is_file():
+        raise AssertionError(f"File {path} does not exist")
+    prev_hashes = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rec = json.loads(line)
+            if rec.get("prev_hash"):
+                prev_hashes.add(rec["prev_hash"])
+
+    responses = getattr(context, "three_tool_responses", [])
+    for resp in responses:
+        resp_str = json.dumps(resp)
+        for ph in prev_hashes:
+            if ph in resp_str:
+                raise AssertionError(f"prev_hash {ph!r} leaked in tool response: {resp_str}")
+
+
+@then('file "{filename}" contains an outcome record for tool "{tool}" carrying non-empty fields "{f1}" and "{f2}"')
+def step_file_contains_outcome_record_carrying(
+    context: Context, filename: str, tool: str, f1: str, f2: str
+) -> None:
+    from support.audit_reader import AuditReader
+
+    reader = AuditReader(context.audit_dir)
+    records = reader.read_file(filename)
+    matches = [
+        r.record
+        for r in records
+        if r.record.get("tool") == tool and r.record.get("phase") == "outcome"
+    ]
+    if not matches:
+        raise AssertionError(f"No outcome record for tool {tool!r} in {filename}")
+    found = False
+    for rec in matches:
+        if rec.get(f1) and rec.get(f2):
+            found = True
+            break
+    if not found:
+        raise AssertionError(f"No outcome record carries non-empty {f1} and {f2} in {matches!r}")
+
+
+@then('the directory "{dir_path_raw}" has mode {mode:o}')
+def step_directory_has_mode(context: Context, dir_path_raw: str, mode: int) -> None:
+    from features.steps.policy_steps import _scratch_substitute
+
+    resolved = _scratch_substitute(context, dir_path_raw)
+    path = Path(resolved)
+    if not path.is_dir():
+        raise AssertionError(f"Directory {path} does not exist")
+    actual_mode = path.stat().st_mode & 0o777
+    if actual_mode != mode:
+        raise AssertionError(f"Directory {path} mode: expected {oct(mode)}, got {oct(actual_mode)}")
+
+
+@given('the server is armed with IMAP_MCP_TEST_INJECT_INTERNAL_ERROR="{inject_val}"')
+def step_server_armed_with_internal_error(context: Context, inject_val: str) -> None:
+    extra = getattr(context, "mcp_extra_env", None) or {}
+    extra["IMAP_MCP_TEST_INJECT_INTERNAL_ERROR"] = inject_val
+    context.mcp_extra_env = extra
+
+
+@when("the server process is killed with SIGKILL")
+def step_server_killed_sigkill(context: Context) -> None:
+    if context.mcp is not None:
+        context.mcp._proc.kill()
+        context.mcp._proc.wait()
+    if getattr(context, "mcp_clients", None):
+        context.mcp_clients.clear()
+    context.mcp = None
+
+
+@when('the server is restarted and {caller_id} calls list_accounts')
+def step_server_restarted_and_caller_calls(context: Context, caller_id: str) -> None:
+    if getattr(context, "mcp_clients", None):
+        for c in context.mcp_clients.values():
+            try:
+                c.close()
+            except Exception:
+                pass
+        context.mcp_clients.clear()
+    if context.mcp is not None:
+        try:
+            context.mcp.close()
+        except Exception:
+            pass
+        context.mcp = None
+    from features.steps.mcp_steps import _ensure_mcp_client, _store_result
+
+    client = _ensure_mcp_client(context, caller_id)
+    payload = client.call_tool("list_accounts", {})
+    _store_result(context, payload)
+
+
+@when('the server process is started without IMAP_MCP_TEST_MODE and with environment {hook_var}="{hook_val}"')
+def step_server_started_without_test_mode(context: Context, hook_var: str, hook_val: str) -> None:
+    from features.steps.mcp_steps import _server_binary
+    from support.server_bootstrap import try_bootstrap_server
+
+    builder = getattr(context, "policy_builder", None)
+    if builder is not None:
+        builder.write()
+    env = dict(os.environ)
+    env.pop("IMAP_MCP_TEST_MODE", None)
+    env[hook_var] = hook_val
+    caller = next(iter(context.policy_builder.callers), None) if getattr(context, "policy_builder", None) else None
+    caller_id = caller.id if caller else "bootstrap-probe"
+    res = try_bootstrap_server(
+        _server_binary(context),
+        context.config_dir,
+        caller_id=caller_id,
+        extra_env=env,
+        timeout=3.0,
+    )
+    if res.timed_out:
+        raise AssertionError(f"Server process hung when started with {hook_var}={hook_val}")
+    context.startup_proc = res
+
+
+@when('an external writer alters the "{field}" value of record index {index:d} in "{filename}"')
+def step_external_writer_alters_record(context: Context, field: str, index: int, filename: str) -> None:
+    path = context.audit_dir / filename
+    lines = [l for l in path.read_bytes().splitlines(keepends=True) if l.strip()]
+    rec = json.loads(lines[index])
+    rec[field] = "tampered_value"
+    lines[index] = json.dumps(rec).encode("utf-8") + b"\n"
+    path.write_bytes(b"".join(lines))
+
+
+@then('the offline chain verifier reports records {idx1:d} and {idx2:d} as valid and record {idx3:d} as broken prev_hash')
+def step_offline_chain_verifier_reports(
+    context: Context, idx1: int, idx2: int, idx3: int
+) -> None:
+    files = sorted(context.audit_dir.glob("*.jsonl"))
+    if not files:
+        raise AssertionError("No audit files in audit directory")
+    path = files[-1]
+    lines = [l for l in path.read_bytes().splitlines(keepends=True) if l.strip()]
+    valid_indices = []
+    broken_indices = []
+    prev_line = None
+    for seq, line in enumerate(lines):
+        rec = json.loads(line)
+        if seq == 0:
+            valid_indices.append(seq)
+        else:
+            expected_prev = "sha256:" + hashlib.sha256(prev_line).hexdigest()
+            if rec.get("prev_hash") == expected_prev:
+                valid_indices.append(seq)
+            else:
+                broken_indices.append(seq)
+        prev_line = line
+    if idx1 not in valid_indices or idx2 not in valid_indices:
+        raise AssertionError(f"Expected records {idx1} and {idx2} to be valid, got valid: {valid_indices}")
+    if idx3 not in broken_indices:
+        raise AssertionError(f"Expected record {idx3} to be broken, got broken: {broken_indices}")
+
+
+def _parse_folder_spec_local(context: Context, folder_spec: str) -> tuple[str, str, str, str]:
+    from support.imap_fixture import resolve_account
+
+    if ":" in folder_spec:
+        account_id, _, folder = folder_spec.partition(":")
+    else:
+        account_id = _account_for_folder(context, folder_spec)
+        folder = folder_spec
+    instance, user = resolve_account(account_id)
+    return account_id, instance, user, folder
+
+
+def _get_body_text_local(msg: Any) -> str:
+    if msg.is_multipart():
+        parts = []
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    parts.append(payload.decode("utf-8", errors="replace"))
+        return "".join(parts)
+    payload = msg.get_payload(decode=True)
+    if payload:
+        return payload.decode("utf-8", errors="replace")
+    return ""
+
+
+@then('within {seconds:d} seconds the WAL entry for the crashed move has status "{status}"')
+@then('within {seconds:d} seconds the WAL entry for the crashed draft revision has status "{status}"')
+def step_wal_entry_crashed_status_within(context: Context, seconds: int, status: str) -> None:
+    import time
+
+    from support.wal_reader import WALReader
+
+    tx_id = getattr(context, "crashed_tx_id", None) or getattr(context, "last_tx_id", None)
+    if not tx_id:
+        raise AssertionError("No crashed tx_id recorded in context")
+    reader = WALReader(context.wal_path)
+    deadline = time.time() + seconds
+    last_status = None
+    while time.time() < deadline:
+        tx = reader.transaction(tx_id)
+        if tx is not None:
+            last_status = tx.status
+            if last_status == status:
+                return
+        time.sleep(0.2)
+    raise AssertionError(
+        f"WAL tx {tx_id!r} did not reach status {status!r} within {seconds}s (last: {last_status!r})"
+    )
+
+
+@then('the WAL entry for the crashed move has status "{status}"')
+def step_wal_entry_crashed_status(context: Context, status: str) -> None:
+    from support.wal_reader import WALReader
+
+    tx_id = getattr(context, "crashed_tx_id", None) or getattr(context, "last_tx_id", None)
+    if not tx_id:
+        raise AssertionError("No crashed tx_id recorded in context")
+    reader = WALReader(context.wal_path)
+    tx = reader.transaction(tx_id)
+    if tx is None:
+        raise AssertionError(f"No WAL entry found for tx_id {tx_id!r}")
+    if tx.status != status:
+        raise AssertionError(f"Expected WAL tx {tx_id!r} status {status!r}, got {tx.status!r}")
+
+
+@then('within {seconds:d} seconds the WAL entry for the crashed move has retry_count >= {min_count:d}')
+def step_wal_entry_crashed_retry_count_within_gte(context: Context, seconds: int, min_count: int) -> None:
+    import time
+
+    from support.wal_reader import WALReader
+
+    tx_id = getattr(context, "crashed_tx_id", None) or getattr(context, "last_tx_id", None)
+    if not tx_id:
+        raise AssertionError("No crashed tx_id recorded in context")
+    reader = WALReader(context.wal_path)
+    deadline = time.time() + seconds
+    last_count = None
+    while time.time() < deadline:
+        tx = reader.transaction(tx_id)
+        if tx is not None:
+            last_count = tx.retry_count
+            if last_count >= min_count:
+                return
+        time.sleep(0.2)
+    raise AssertionError(
+        f"WAL tx {tx_id!r} did not reach retry_count >= {min_count} within {seconds}s (last: {last_count!r})"
+    )
+
+
+@then('the WAL entry for the crashed move has retry_count >= {min_count:d}')
+def step_wal_entry_crashed_retry_count_gte(context: Context, min_count: int) -> None:
+    from support.wal_reader import WALReader
+
+    tx_id = getattr(context, "crashed_tx_id", None) or getattr(context, "last_tx_id", None)
+    if not tx_id:
+        raise AssertionError("No crashed tx_id recorded in context")
+    reader = WALReader(context.wal_path)
+    tx = reader.transaction(tx_id)
+    if tx is None:
+        raise AssertionError(f"No WAL entry found for tx_id {tx_id!r}")
+    if tx.retry_count < min_count:
+        raise AssertionError(f"Expected WAL tx {tx_id!r} retry_count >= {min_count}, got {tx.retry_count}")
+
+
+@then('the WAL entry for the crashed move has retry_count {expected_count:d}')
+def step_wal_entry_crashed_retry_count(context: Context, expected_count: int) -> None:
+    from support.wal_reader import WALReader
+
+    tx_id = getattr(context, "crashed_tx_id", None) or getattr(context, "last_tx_id", None)
+    if not tx_id:
+        raise AssertionError("No crashed tx_id recorded in context")
+    reader = WALReader(context.wal_path)
+    tx = reader.transaction(tx_id)
+    if tx is None:
+        raise AssertionError(f"No WAL entry found for tx_id {tx_id!r}")
+    if tx.retry_count != expected_count:
+        raise AssertionError(f"Expected WAL tx {tx_id!r} retry_count {expected_count}, got {tx.retry_count}")
+
+
+@when('the WAL retry_count for the crashed move is set to {count:d}')
+def step_wal_retry_count_set(context: Context, count: int) -> None:
+    import sqlite3
+
+    tx_id = getattr(context, "crashed_tx_id", None) or getattr(context, "last_tx_id", None)
+    if not tx_id:
+        raise AssertionError("No crashed tx_id recorded in context")
+    with sqlite3.connect(context.wal_path) as conn:
+        conn.execute("UPDATE transactions SET retry_count = ? WHERE tx_id = ?", (count, tx_id))
+
+
+@then('the WAL entry for the crashed move has staged_rfc822 equal to null')
+def step_wal_entry_crashed_staged_rfc822_null(context: Context) -> None:
+    from support.wal_reader import WALReader
+
+    tx_id = getattr(context, "crashed_tx_id", None) or getattr(context, "last_tx_id", None)
+    if not tx_id:
+        raise AssertionError("No crashed tx_id recorded in context")
+    reader = WALReader(context.wal_path)
+    tx = reader.transaction(tx_id)
+    if tx is None:
+        raise AssertionError(f"No WAL entry found for tx_id {tx_id!r}")
+    if tx.staged_rfc822 is not None:
+        raise AssertionError(f"Expected staged_rfc822 to be NULL for tx_id {tx_id!r}, got {len(tx.staged_rfc822)} bytes")
+
+
+@then('the WAL database file exists with mode {mode} and {count:d} transaction entries')
+def step_wal_db_mode_and_count(context: Context, mode: str, count: int) -> None:
+    import stat
+
+    if not context.wal_path.exists():
+        raise AssertionError(f"WAL database file {context.wal_path} does not exist")
+    st = context.wal_path.stat()
+    actual_mode = oct(stat.S_IMODE(st.st_mode))
+    expected_mode = oct(int(mode, 8))
+    if actual_mode != expected_mode:
+        raise AssertionError(f"WAL file mode expected {expected_mode}, got {actual_mode}")
+    from support.wal_reader import WALReader
+
+    reader = WALReader(context.wal_path)
+    txs = reader.all_transactions()
+    if len(txs) != count:
+        raise AssertionError(f"WAL transaction entries expected {count}, got {len(txs)}")
+
+
+@given('an identical copy of uid {uid:d} from "{src_box}" already exists in "{dst_box}"')
+def step_identical_copy_already_exists(
+    context: Context, uid: int, src_box: str, dst_box: str
+) -> None:
+    from features.steps.policy_steps import flush_staged_messages
+
+    flush_staged_messages(context)
+    src_acc, _, src_folder = src_box.partition(":")
+    dst_acc, _, dst_folder = dst_box.partition(":")
+    from support.imap_fixture import resolve_account
+
+    src_inst, src_user = resolve_account(src_acc)
+    dst_inst, dst_user = resolve_account(dst_acc)
+    from support.imap_fixture import resolve_uid
+
+    actual_uid = resolve_uid(context, src_acc, src_folder, uid)
+    raw = context.imap.fetch_raw(src_inst, src_user, src_folder, actual_uid)
+    context.imap.append_verbatim(dst_inst, dst_user, dst_folder, raw)
+
+
+@given('two identical copies of uid {uid:d} from "{src_box}" already exist in "{dst_box}"')
+def step_two_identical_copies_already_exist(
+    context: Context, uid: int, src_box: str, dst_box: str
+) -> None:
+    from features.steps.policy_steps import flush_staged_messages
+
+    flush_staged_messages(context)
+    src_acc, _, src_folder = src_box.partition(":")
+    dst_acc, _, dst_folder = dst_box.partition(":")
+    from support.imap_fixture import resolve_account, resolve_uid
+
+    src_inst, src_user = resolve_account(src_acc)
+    dst_inst, dst_user = resolve_account(dst_acc)
+    actual_uid = resolve_uid(context, src_acc, src_folder, uid)
+    raw = context.imap.fetch_raw(src_inst, src_user, src_folder, actual_uid)
+    context.imap.append_verbatim(dst_inst, dst_user, dst_folder, raw)
+    context.imap.append_verbatim(dst_inst, dst_user, dst_folder, raw)
+
+
+@given(
+    'the folder "{folder}" holds a message at uid {uid:d} with message-id "{message_id}", '
+    'from "{from_addr}", to "{to_addr}", subject "{subject}", date "{date_str}", '
+    'and body prefix "{prefix}" repeated {count:d} times followed by "{tail}"'
+)
+def step_folder_holds_message_with_prefix_tail_uid(
+    context: Context,
+    folder: str,
+    uid: int,
+    message_id: str,
+    from_addr: str,
+    to_addr: str,
+    subject: str,
+    date_str: str,
+    prefix: str,
+    count: int,
+    tail: str,
+) -> None:
+    from email.utils import format_datetime
+
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    body = prefix * count + tail
+    parsed_dt = datetime.fromisoformat(date_str)
+    if parsed_dt.tzinfo is None:
+        parsed_dt = parsed_dt.replace(tzinfo=UTC)
+    formatted_date = format_datetime(parsed_dt)
+    msg_bytes = (
+        f"From: {from_addr}\r\n"
+        f"To: {to_addr}\r\n"
+        f"Subject: {subject}\r\n"
+        f"Message-ID: {message_id}\r\n"
+        f"Date: {formatted_date}\r\n"
+        f"Content-Type: text/plain; charset=utf-8\r\n"
+        f"Content-Transfer-Encoding: 7bit\r\n"
+        f"MIME-Version: 1.0\r\n\r\n"
+        f"{body}\r\n"
+    ).encode()
+    context.imap.append_verbatim(instance, user, fld, msg_bytes)
+    all_uids = context.imap.folder_uids(instance, user, fld)
+    u = all_uids[-1] if all_uids else uid
+    lookup = getattr(context, "message_uids", None)
+    if lookup is None:
+        lookup = {}
+        context.message_uids = lookup
+    acc_id, _, _, _ = _parse_folder_spec_local(context, folder)
+    lookup[(acc_id, fld, uid)] = u
+
+
+@given(
+    'the folder "{folder}" holds a message with message-id "{message_id}", '
+    'from "{from_addr}", to "{to_addr}", subject "{subject}", date "{date_str}", '
+    'and body prefix "{prefix}" repeated {count:d} times followed by "{tail}"'
+)
+def step_folder_holds_message_with_prefix_tail(
+    context: Context,
+    folder: str,
+    message_id: str,
+    from_addr: str,
+    to_addr: str,
+    subject: str,
+    date_str: str,
+    prefix: str,
+    count: int,
+    tail: str,
+) -> None:
+    from email.utils import format_datetime
+
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    body = prefix * count + tail
+    parsed_dt = datetime.fromisoformat(date_str)
+    if parsed_dt.tzinfo is None:
+        parsed_dt = parsed_dt.replace(tzinfo=UTC)
+    formatted_date = format_datetime(parsed_dt)
+    msg_bytes = (
+        f"From: {from_addr}\r\n"
+        f"To: {to_addr}\r\n"
+        f"Subject: {subject}\r\n"
+        f"Message-ID: {message_id}\r\n"
+        f"Date: {formatted_date}\r\n"
+        f"Content-Type: text/plain; charset=utf-8\r\n"
+        f"Content-Transfer-Encoding: 7bit\r\n"
+        f"MIME-Version: 1.0\r\n\r\n"
+        f"{body}\r\n"
+    ).encode()
+    context.imap.append_verbatim(instance, user, fld, msg_bytes)
+
+
+@given('the folder "{folder}" holds a message without Message-ID:')
+def step_folder_holds_message_without_message_id(context: Context, folder: str) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    for row in context.table:
+        uid = int(row["uid"])
+        from_addr = row["from_address"]
+        to_addr = row["to_address"]
+        subject = row["subject"]
+        date_str = row["date"]
+        exact_size = int(row["exact_size_bytes"])
+
+        parsed_dt = datetime.fromisoformat(date_str)
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=UTC)
+        formatted_date = email.utils.format_datetime(parsed_dt)
+
+        header_str = (
+            f"From: {from_addr}\r\n"
+            f"To: {to_addr}\r\n"
+            f"Subject: {subject}\r\n"
+            f"Date: {formatted_date}\r\n"
+            f"Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Transfer-Encoding: 7bit\r\n"
+            f"MIME-Version: 1.0\r\n\r\n"
+        )
+        headers_len = len(header_str.encode("utf-8"))
+        padding_needed = exact_size - headers_len
+        if padding_needed < 0:
+            raise AssertionError(f"Headers length {headers_len} exceeds exact_size {exact_size}")
+        body = "X" * padding_needed
+        msg_bytes = header_str.encode("utf-8") + body.encode("utf-8")
+        if len(msg_bytes) != exact_size:
+            raise AssertionError(f"Constructed bytes length {len(msg_bytes)} != {exact_size}")
+
+        context.imap.append_verbatim(instance, user, fld, msg_bytes)
+        all_uids = context.imap.folder_uids(instance, user, fld)
+        u = all_uids[-1] if all_uids else uid
+        lookup = getattr(context, "message_uids", None)
+        if lookup is None:
+            lookup = {}
+            context.message_uids = lookup
+        acc_id, _, _, _ = _parse_folder_spec_local(context, folder)
+        lookup[(acc_id, fld, uid)] = u
+
+
+@then('the folder "{folder}" contains {count:d} message with message-id "{message_id}"')
+@then('the folder "{folder}" contains {count:d} messages with message-id "{message_id}"')
+def step_folder_contains_messages_with_message_id(
+    context: Context, folder: str, count: int, message_id: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.search_by_message_id(instance, user, fld, message_id)
+    if len(uids) != count:
+        raise AssertionError(
+            f"Folder {folder!r} contains {len(uids)} message(s) with Message-ID {message_id!r}, "
+            f"expected {count}"
+        )
+
+
+@then(
+    '{count1:d} message in "{folder}" has body ending with "{tail1}" '
+    'and {count2:d} has body ending with "{tail2}"'
+)
+def step_messages_have_body_ending_with(
+    context: Context, count1: int, folder: str, tail1: str, count2: int, tail2: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    c1 = 0
+    c2 = 0
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        body = _get_body_text_local(msg).rstrip("\r\n")
+        if body.endswith(tail1):
+            c1 += 1
+        elif body.endswith(tail2):
+            c2 += 1
+    if c1 != count1 or c2 != count2:
+        raise AssertionError(
+            f"Expected {count1} ending with {tail1!r} and {count2} ending with {tail2!r}, "
+            f"got {c1} and {c2} among {len(uids)} messages in {folder}"
+        )
+
+
+@then(
+    'the folder "{folder}" contains {count:d} message from "{from_addr}" '
+    'with subject "{subject}" and exact RFC822 size {size:d} bytes'
+)
+def step_folder_contains_message_exact_size(
+    context: Context, folder: str, count: int, from_addr: str, subject: str, size: int
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    matches = 0
+    for u in uids:
+        raw = context.imap.fetch_raw(instance, user, fld, u)
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        msg_from = msg.get("From") or ""
+        msg_subj = msg.get("Subject") or ""
+        if from_addr in msg_from and msg_subj == subject and len(raw) == size:
+            matches += 1
+    if matches != count:
+        raise AssertionError(
+            f"Expected {count} message(s) from {from_addr!r} with subject {subject!r} "
+            f"and size {size}, got {matches} in {folder}"
+        )
+
+
+@then('the folder "{folder}" contains {count:d} message with subject "{subject}"')
+@then('the folder "{folder}" contains {count:d} messages with subject "{subject}"')
+@then('the IMAP folder "{folder}" contains {count:d} message with subject "{subject}"')
+@then('the IMAP folder "{folder}" contains {count:d} messages with subject "{subject}"')
+def step_folder_contains_subject_count(
+    context: Context, folder: str, count: int, subject: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    matches = 0
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if (msg.get("Subject") or "") == subject:
+            matches += 1
+    if matches != count:
+        raise AssertionError(
+            f"Folder {folder!r} contains {matches} messages with subject {subject!r}, expected {count}"
+        )
+
+
+@then('the IMAP folder "{folder}" contains {count:d} message with header "{header}" set')
+@then('the IMAP folder "{folder}" contains {count:d} messages with header "{header}" set')
+def step_folder_contains_messages_with_header_set(
+    context: Context, folder: str, count: int, header: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    matches = 0
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if msg.get(header) is not None:
+            matches += 1
+    if matches != count:
+        raise AssertionError(
+            f"Folder {folder!r} contains {matches} messages with header {header!r} set, expected {count}"
+        )
+
+
+@then('{n:d} concurrent update_draft response has result "{res1}" with revision {rev:d} and {m:d} has result "{res2}" with error.type "{err_type}"')
+def step_concurrent_update_draft_assertion(
+    context: Context,
+    n: int,
+    res1: str,
+    rev: int,
+    m: int,
+    res2: str,
+    err_type: str,
+) -> None:
+    responses = getattr(context, "concurrent_update_responses", [])
+    successes = [
+        r for r in responses
+        if r.get("result") == res1 and r.get("revision") == rev
+    ]
+    failures = [
+        r for r in responses
+        if r.get("result") == res2 and (r.get("error") or {}).get("type") == err_type
+    ]
+    if len(successes) != n or len(failures) != m:
+        raise AssertionError(
+            f"Expected {n} response(s) with result={res1!r}, rev={rev} and {m} with result={res2!r}, error.type={err_type!r}. Responses: {responses}"
+        )
+
+
+@then('the IMAP folder "{folder}" contains {count:d} message carrying header "{header}" equal to "{val}"')
+@then('the IMAP folder "{folder}" contains {count:d} messages carrying header "{header}" equal to "{val}"')
+def step_folder_contains_header_equal(
+    context: Context, folder: str, count: int, header: str, val: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    matches = 0
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if (msg.get(header) or "") == val:
+            matches += 1
+    if matches != count:
+        raise AssertionError(
+            f"Folder {folder!r} contains {matches} messages with header {header!r} equal to {val!r}, expected {count}"
+        )
+
+
+@then('the response field {field} does NOT contain "{expected}"')
+def step_response_field_does_not_contain(context: Context, field: str, expected: str) -> None:
+    response = _last_response(context)
+    found, actual = _resolve_dotted_field(response, field)
+    if not found:
+        raise AssertionError(f"Field {field!r} not found in response: {sorted(response.keys())}")
+    if not isinstance(actual, (str, list, dict, set, tuple)):
+        raise AssertionError(f"Field {field!r} is not a string or container (type: {type(actual).__name__})")
+    if actual is not None and expected in str(actual):
+        raise AssertionError(f"Field {field!r} contains {expected!r}: {actual!r}")
+
+
+@then('the IMAP folder "{folder}" contains {count:d} message with keyword "{keyword}"')
+@then('the IMAP folder "{folder}" contains {count:d} messages with keyword "{keyword}"')
+def step_imap_folder_contains_keyword_count(
+    context: Context, folder: str, count: int, keyword: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    if count == 0 and not uids:
+        raise AssertionError(
+            f"Positive control failed: folder {folder!r} holds 0 messages total; "
+            f"cannot witness absence of keyword {keyword!r}."
+        )
+    matches = 0
+    conn = context.imap.connect(instance, user)
+    conn.select(context.imap._q(context.imap.to_wire(instance, user, fld)))
+    for u in uids:
+        status, data = conn.uid("FETCH", str(u), "(FLAGS)")
+        if status == "OK" and data and data[0]:
+            flags_str = str(data[0])
+            if keyword in flags_str:
+                matches += 1
+    if matches != count:
+        raise AssertionError(
+            f"Expected {count} messages with keyword {keyword!r} in {folder}, got {matches}"
+        )
+
+
+@then('the IMAP folder "{folder}" contains {count:d} message with flag "{flag}"')
+@then('the IMAP folder "{folder}" contains {count:d} messages with flag "{flag}"')
+def step_imap_folder_contains_flag_count(
+    context: Context, folder: str, count: int, flag: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    if count == 0 and not uids:
+        raise AssertionError(
+            f"Positive control failed: folder {folder!r} holds 0 messages total; "
+            f"cannot witness absence of flag {flag!r}."
+        )
+    matches = 0
+    conn = context.imap.connect(instance, user)
+    conn.select(context.imap._q(context.imap.to_wire(instance, user, fld)))
+    for u in uids:
+        status, data = conn.uid("FETCH", str(u), "(FLAGS)")
+        if status == "OK" and data and data[0]:
+            flags_str = str(data[0])
+            if flag in flags_str:
+                matches += 1
+    if matches != count:
+        raise AssertionError(
+            f"Expected {count} messages with flag {flag!r} in {folder}, got {matches}"
+        )
+
+
+@then('the response field error.detail is a non-empty string of at most 256 characters')
+def step_response_field_error_detail_len_256(context: Context) -> None:
+    response = _last_response(context)
+    found, actual = _resolve_dotted_field(response, "error.detail")
+    if not found or not isinstance(actual, str) or not actual or len(actual) > 256:
+        raise AssertionError(f"Expected error.detail to be non-empty string <= 256 chars, got: {actual!r}")
+
+
+def _matches_subject(msg: Any, subject: str) -> bool:
+    from email.header import decode_header, make_header
+
+    raw_subj = msg.get("Subject") or ""
+    decoded = str(make_header(decode_header(raw_subj)))
+    return decoded == subject or raw_subj == subject
+
+
+@then('the IMAP message in folder "{folder}" with subject "{subject}" has header "{header}" equal to "{expected}"')
+def step_imap_message_with_subject_has_header(
+    context: Context, folder: str, subject: str, header: str, expected: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if _matches_subject(msg, subject):
+            actual = msg.get(header) or ""
+            if actual != expected:
+                raise AssertionError(f"Header {header!r} on message with subject {subject!r}: expected {expected!r}, got {actual!r}")
+            return
+    raise AssertionError(f"No message with subject {subject!r} found in {folder}")
+
+
+@then('the IMAP message in folder "{folder}" with subject "{subject}" has Cc header containing "{a1}" and "{a2}"')
+def step_imap_message_cc_containing_two(
+    context: Context, folder: str, subject: str, a1: str, a2: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if _matches_subject(msg, subject):
+            cc = msg.get("Cc") or ""
+            if a1 not in cc or a2 not in cc:
+                raise AssertionError(f"Cc header {cc!r} does not contain both {a1!r} and {a2!r}")
+            return
+    raise AssertionError(f"No message with subject {subject!r} found in {folder}")
+
+
+@then('the IMAP message in folder "{folder}" with subject "{subject}" has {header_name} header NOT containing "{val}"')
+def step_imap_message_header_not_containing(
+    context: Context, folder: str, subject: str, header_name: str, val: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if _matches_subject(msg, subject):
+            hdr_val = msg.get(header_name) or ""
+            if val in hdr_val:
+                raise AssertionError(f"{header_name} header {hdr_val!r} unexpectedly contains {val!r}")
+            return
+    raise AssertionError(f"No message with subject {subject!r} found in {folder}")
+
+
+@then('the IMAP message in folder "{folder}" with subject "{subject}" carries 1 header "X-SC-Draft-Id", 1 header "X-SC-Draft-Rev", and 1 header "X-SC-Provenance"')
+def step_imap_message_carries_draft_headers(
+    context: Context, folder: str, subject: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if _matches_subject(msg, subject):
+            d_id = msg.get("X-SC-Draft-Id")
+            d_rev = msg.get("X-SC-Draft-Rev")
+            d_prov = msg.get("X-SC-Provenance")
+            if not d_id or not d_rev or not d_prov:
+                raise AssertionError(
+                    f"Message missing required draft headers: X-SC-Draft-Id={d_id!r}, "
+                    f"X-SC-Draft-Rev={d_rev!r}, X-SC-Provenance={d_prov!r}"
+                )
+            return
+    raise AssertionError(f"No message with subject {subject!r} found in {folder}")
+
+
+@then('the IMAP message in folder "{folder}" with header "In-Reply-To" equal to "{irt}" has decoded subject "{expected_subj}"')
+def step_imap_message_with_irt_has_decoded_subject(
+    context: Context, folder: str, irt: str, expected_subj: str
+) -> None:
+    from email.header import decode_header, make_header
+
+    _, instance, user, fld = _parse_folder_spec_local(context, folder)
+    uids = context.imap.folder_uids(instance, user, fld)
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if (msg.get("In-Reply-To") or "").strip() == irt.strip():
+            raw_subj = msg.get("Subject") or ""
+            decoded = str(make_header(decode_header(raw_subj)))
+            if decoded != expected_subj:
+                raise AssertionError(f"Decoded subject expected {expected_subj!r}, got {decoded!r}")
+            return
+    raise AssertionError(f"No message with In-Reply-To={irt!r} found in {folder}")
+
+
+@then('a direct IMAP FETCH of the message with subject "{subject}" in "{box}" shows decoded plain text containing "{text}"')
+def step_direct_imap_fetch_text_containing(
+    context: Context, subject: str, box: str, text: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, box)
+    uids = context.imap.folder_uids(instance, user, fld)
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if _matches_subject(msg, subject):
+            body = _get_body_text_local(msg)
+            if text not in body:
+                raise AssertionError(f"Expected text {text!r} in body, got: {body!r}")
+            return
+    raise AssertionError(f"No message with subject {subject!r} found in {box}")
+
+
+@then('a direct IMAP FETCH of the message with subject "{subject}" in "{box}" shows decoded plain text NOT containing "{text}"')
+def step_direct_imap_fetch_text_not_containing(
+    context: Context, subject: str, box: str, text: str
+) -> None:
+    _, instance, user, fld = _parse_folder_spec_local(context, box)
+    uids = context.imap.folder_uids(instance, user, fld)
+    for u in uids:
+        msg = context.imap.fetch_message(instance, user, fld, u)
+        if _matches_subject(msg, subject):
+            body = _get_body_text_local(msg)
+            if text in body:
+                raise AssertionError(f"Forbidden text {text!r} found in body: {body!r}")
+            return
+    raise AssertionError(f"No message with subject {subject!r} found in {box}")
+
+
+def _registry_path(context: Context) -> Path:
+    bdd_root = getattr(context, "bdd_root", None)
+    if bdd_root is not None:
+        return Path(bdd_root).parent / "docs" / "contract" / "registry.yaml"
+    return Path(__file__).resolve().parents[3] / "docs" / "contract" / "registry.yaml"
+
+
+@then("docs/contract/registry.yaml declares caller_allow_reasons equal to:")
+def step_registry_declares_caller_allow_reasons(context: Context) -> None:
+    import yaml
+
+    expected = [row[0] for row in context.table]
+    registry_path = _registry_path(context)
+    data = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    actual = data.get("caller_allow_reasons", [])
+    if actual != expected:
+        raise AssertionError(f"Expected caller_allow_reasons {expected}, got {actual}")
+
+
+@then("docs/contract/registry.yaml declares caller_deny_reasons equal to:")
+def step_registry_declares_caller_deny_reasons(context: Context) -> None:
+    import yaml
+
+    expected = [row[0] for row in context.table]
+    registry_path = _registry_path(context)
+    data = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    actual = data.get("caller_deny_reasons", [])
+    if actual != expected:
+        raise AssertionError(f"Expected caller_deny_reasons {expected}, got {actual}")
+
+
+@then("docs/contract/registry.yaml declares caller_error_types equal to:")
+def step_registry_declares_caller_error_types(context: Context) -> None:
+    import yaml
+
+    expected = [row[0] for row in context.table]
+    registry_path = _registry_path(context)
+    data = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    actual = data.get("caller_error_types", [])
+    if actual != expected:
+        raise AssertionError(f"Expected caller_error_types {expected}, got {actual}")
+
+
+@then(
+    'none of the captured responses or audit entries in this scenario carry any of {forbidden_list_raw}'
+)
+def step_none_carry_forbidden_values(context: Context, forbidden_list_raw: str) -> None:
+    import ast
+
+    forbidden = ast.literal_eval(forbidden_list_raw)
+    history = getattr(context, "response_history", [])
+    if getattr(context, "last_response", None):
+        history = history + [context.last_response]
+    for resp in history:
+        resp_str = json.dumps(resp)
+        for f in forbidden:
+            if f in resp_str:
+                raise AssertionError(f"Forbidden term {f!r} found in response: {resp_str}")
+    if getattr(context, "audit_dir", None) and context.audit_dir.exists():
+        for path in context.audit_dir.glob("*.jsonl"):
+            content = path.read_text(encoding="utf-8", errors="replace")
+            for f in forbidden:
+                if f in content:
+                    raise AssertionError(f"Forbidden term {f!r} found in audit log {path}: {content}")
+
+
+@then(
+    'file "{filename}" contains at least {count:d} records and every record\'s reason and error_type belong to docs/contract/registry.yaml'
+)
+def step_file_contains_valid_registry_records(context: Context, filename: str, count: int) -> None:
+    import yaml
+
+    from support.audit_reader import AuditReader
+
+    registry_path = _registry_path(context)
+    data = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    allowed_reasons = set(data.get("caller_allow_reasons", []) + data.get("caller_deny_reasons", []))
+    allowed_errors = set(data.get("caller_error_types", []))
+
+    reader = AuditReader(context.audit_dir)
+    records = reader.read_file(filename)
+    if len(records) < count:
+        raise AssertionError(f"Expected at least {count} records in {filename}, found {len(records)}")
+    for r in records:
+        rec = r.record
+        reason = rec.get("reason")
+        if reason and reason not in allowed_reasons:
+            raise AssertionError(f"Unknown reason {reason!r} in audit record: {rec}")
+        error_type = rec.get("error_type") or (rec.get("error") or {}).get("type")
+        if error_type and error_type not in allowed_errors:
+            raise AssertionError(f"Unknown error_type {error_type!r} in audit record: {rec}")

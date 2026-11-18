@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 from .base import (
     MCP_SERVER_NAME,
@@ -28,20 +28,20 @@ DISALLOWED = [
 
 
 class ClaudeCodeDriver(HarnessDriver):
-    restrictions = [
+    restrictions: ClassVar[list[str]] = [
         "MCP: only the run's server (--mcp-config <run file> --strict-mcp-config).",
         "Built-in tools removed: " + ", ".join(DISALLOWED) + " (--disallowedTools).",
-        "Permission mode dontAsk: only mcp__imap is pre-approved; any other tool call that would "
-        "prompt (e.g. Read outside the allow list) is denied.",
-        "Settings: --setting-sources user (needed: the Vertex login lives in user settings); project "
-        "and local settings are skipped. User-level plugins/skills may still load.",
-        "Runtime guard: any other MCP server in the session, a call to it, or a shell/write call "
-        "aborts the run as not-assessable (isolation_breach).",
-        "HOME is not isolated (OAuth/Vertex login state lives in ~/.claude); ~/.claude/CLAUDE.md "
-        "would be loaded if it existed (it does not on the reference machine).",
+        ("Permission mode dontAsk: only mcp__imap is pre-approved; any other tool call that would "
+        "prompt (e.g. Read outside the allow list) is denied."),
+        ("Settings: --setting-sources user (needed: the Vertex login lives in user settings); project "
+        "and local settings are skipped. User-level plugins/skills may still load."),
+        ("Runtime guard: any other MCP server in the session, a call to it, or a shell/write call "
+        "aborts the run as not-assessable (isolation_breach)."),
+        ("HOME is not isolated (OAuth/Vertex login state lives in ~/.claude); ~/.claude/CLAUDE.md "
+        "would be loaded if it existed (it does not on the reference machine)."),
     ]
 
-    _servers: list[str] = []
+    _servers: ClassVar[list[str]] = []
 
     def breach(self, result: TurnResult) -> str | None:
         foreign = [s for s in self._servers if s != MCP_SERVER_NAME]

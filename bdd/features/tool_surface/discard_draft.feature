@@ -1,44 +1,30 @@
-Feature: discard_draft moves every revision of a draft to the account's trash by its handle
+Feature: discard_draft moves all verified own revisions in \Drafts to \Trash by handle
 
-  ADR 0030 hides UIDs: create_draft, get_draft, list_drafts and
-  update_draft address a draft only by its draft_id. ADR 0031 says a
-  draft is discarded with move, and move takes a UID. A caller holding
-  only the handle therefore has to find the UID by searching the drafts
-  folder for the subject, and may pick a human's draft with the same
-  subject. This feature closes the gap without reopening ADR 0018: the
-  draft is moved to the trash folder, never hard-deleted, and the same
-  capabilities as for move apply (move_out on the drafts folder,
-  accept_incoming on the trash folder).
-
-  ADR 0034 (amends 0018, 0027 with trash_unavailable, and 0031).
-
-  What is at stake. Agents create a corrected draft instead of revising
-  the old one, and the old one stays behind for the owner to delete by
-  hand. Without a handle-based discard, the clean-up step is a guess.
-
-  Independent-channel rule. Every Then about where a draft ended up is
-  a direct IMAP SEARCH against the IMAP server for the X-SC-Draft-Id
-  header, independent of the server's response and of list_drafts.
-
-  Rules used for the numbers below:
-    - The trash folder is the folder carrying the RFC 6154 \Trash
-      special-use flag on that account.
-    - Every message carrying the handle in the named folder is moved,
-      residue of an interrupted revision included (ADR 0030 §2).
+  ADR 0042, ADR 0044, and ADR 0063 §3 specify discard_draft:
+    - Evaluates gates in deterministic order: source \Drafts role +
+      move_out=true -> account \Trash existence (trash_unavailable) ->
+      \Trash accept_incoming=true (capability_missing) -> caller
+      provenance verification.
+    - Verifies authentic caller provenance (X-SC-Provenance + WAL
+      ownership) on all matching revisions and moves them to \Trash.
+    - Returns ALLOW + ERROR not_found for unknown or foreign handles,
+      ALLOW + ERROR trash_unavailable if the account lacks \Trash, and
+      never touches human-authored drafts without provenance.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Happy path, Gmail with localized folder names                : 1
-    - Happy path, standard IMAP with a \Trash folder               : 1
-    - Residue revisions are discarded together                     : 1
-    - move_out missing on the drafts folder                        : 1
-    - accept_incoming missing on the trash folder                  : 1
-    - Account has no \Trash folder                                 : 1
-    - Unknown handle                                               : 1
-    - Message without a handle is never touched                    : 1
+    - Happy path on standard IMAP with \Trash                      : 1
+    - Happy path on localized German Gmail                         : 1
+    - Residue revisions discarded together with current revision   : 1
+    - Missing move_out or accept_incoming -> capability_missing    : 2
+    - Account without \Trash -> ALLOW + ERROR trash_unavailable    : 1
+    - Unknown handle -> ALLOW + ERROR not_found                    : 1
+    - Human draft with identical subject never touched             : 1
     Total enumerated                                               : 8   covered by this feature: 8
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folders:
+    Given the server clock is pinned to "2026-10-31T12:00:00Z"
+    And the audit log directory is a fresh $TMPDIR/audit
+    And the IMAP account "gupta-scaratec" exists with folders:
       | folder path | special use |
       | INBOX       |             |
       | Drafts      | \Drafts     |
@@ -46,10 +32,8 @@ Feature: discard_draft moves every revision of a draft to the account's trash by
     And the server is configured with caller "draft-agent" using policy "draft-policy"
     And policy "draft-policy" grants account "gupta-scaratec"
 
-  # --- Main path -------------------------------------------------------
-
-  Scenario: A draft created through the server is discarded by its handle on standard IMAP
-    Given policy "draft-policy" grants folder:
+  Scenario: An authentic own draft is discarded by handle to Trash on standard IMAP
+    Given policy "draft-policy" grants folder on account "gupta-scaratec":
       | folder | mode      | default  | rules | draft_append | move_out | accept_incoming |
       | Drafts | blacklist | FULL     | []    | true         | true     | false           |
       | Trash  | blacklist | METADATA | []    | false        | false    | true            |
@@ -70,20 +54,16 @@ Feature: discard_draft moves every revision of a draft to the account's trash by
     And the response field moved_to equals "Trash"
     And a direct IMAP SEARCH on "gupta-scaratec:Drafts" for header X-SC-Draft-Id equal to the returned draft_id returns zero results
     And a direct IMAP SEARCH on "gupta-scaratec:Trash" for header X-SC-Draft-Id equal to the returned draft_id returns exactly one result
-    And the audit log contains an entry with:
-      | field    | value         |
-      | tool     | discard_draft |
-      | decision | ALLOW         |
-      | result   | OK            |
+    And the audit log contains an outcome record for tool "discard_draft" with decision "ALLOW" and result "OK"
 
-  Scenario: A draft is discarded by its handle on a Gmail account with localized folder names
+  Scenario: An authentic own draft is discarded by handle on a localized German Gmail account
     Given the IMAP account "gupta-gmail-de" exists with provider "google" and folders:
       | folder path      |
       | INBOX            |
       | [Gmail]/All Mail |
       | [Gmail]/Drafts   |
       | [Gmail]/Trash    |
-    And the mock-gmail server uses localized folder names:
+    And the mock-gmail server for "gupta-gmail-de" uses localized folder names:
       | canonical        | localized                | flags                  |
       | [Gmail]/All Mail | [Gmail]/Alle Nachrichten | \All \HasNoChildren    |
       | [Gmail]/Drafts   | [Gmail]/Entw&APw-rfe     | \Drafts \HasNoChildren |
@@ -110,92 +90,86 @@ Feature: discard_draft moves every revision of a draft to the account's trash by
     And a direct IMAP SEARCH on "gupta-gmail-de:[Gmail]/Entw&APw-rfe" for header X-SC-Draft-Id equal to the returned draft_id returns zero results
     And a direct IMAP SEARCH on "gupta-gmail-de:[Gmail]/Papierkorb" for header X-SC-Draft-Id equal to the returned draft_id returns exactly one result
 
-  Scenario: Residue of an interrupted revision is discarded together with the current revision
-    Given policy "draft-policy" grants folder:
-      | folder | mode      | default  | rules | move_out | accept_incoming |
-      | Drafts | blacklist | FULL     | []    | true     | false           |
-      | Trash  | blacklist | METADATA | []    | false    | true            |
-    And the IMAP folder "Drafts" holds drafts carrying the handle "8f14e45f-ceea-4e7a-9d2b-0a1c3b5d7e90":
-      | uid | revision | subject          |
-      | 41  | 2        | Angebot (alt)    |
-      | 42  | 3        | Angebot (neu)    |
-    When draft-agent calls discard_draft with account "gupta-scaratec", folder "Drafts", draft_id "8f14e45f-ceea-4e7a-9d2b-0a1c3b5d7e90"
+  Scenario: Authentic residue of an interrupted revision is discarded together with the current revision
+    Given policy "draft-policy" grants folder on account "gupta-scaratec":
+      | folder | mode      | default  | rules | draft_append | draft_edit | move_out | accept_incoming |
+      | Drafts | blacklist | FULL     | []    | true         | true       | true     | false           |
+      | Trash  | blacklist | METADATA | []    | false        | false      | false    | true            |
+    And draft-agent creates a draft in "gupta-scaratec:Drafts" with subject "Angebot (alt)" and body "Woche 14"
+    And an interrupted revision leaves both authentic revision 1 ("Angebot (alt)") and authentic revision 2 ("Angebot (neu)") for that draft_id in "gupta-scaratec:Drafts" with no active WAL entry
+    When draft-agent calls discard_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id
     Then the response decision is ALLOW
     And the response field discarded_count equals 2
-    And a direct IMAP SEARCH on "gupta-scaratec:Drafts" for header X-SC-Draft-Id "8f14e45f-ceea-4e7a-9d2b-0a1c3b5d7e90" returns zero results
-    And a direct IMAP SEARCH on "gupta-scaratec:Trash" for header X-SC-Draft-Id "8f14e45f-ceea-4e7a-9d2b-0a1c3b5d7e90" returns exactly 2 results
+    And a direct IMAP SEARCH on "gupta-scaratec:Drafts" for header X-SC-Draft-Id equal to the returned draft_id returns zero results
+    And a direct IMAP SEARCH on "gupta-scaratec:Trash" for header X-SC-Draft-Id equal to the returned draft_id returns 2 results
 
-  # --- Negative controls: capabilities ---------------------------------
-
-  Scenario Outline: discard_draft is refused when a capability of move is missing
-    Given policy "draft-policy" grants folder:
-      | folder | mode      | default  | rules | move_out          | accept_incoming          |
-      | Drafts | blacklist | FULL     | []    | <drafts_move_out> | false                    |
-      | Trash  | blacklist | METADATA | []    | false             | <trash_accept_incoming>  |
-    And the IMAP folder "Drafts" holds drafts carrying the handle "c9f0f895-fb98-4b91-9d4e-5a6b7c8d9e01":
-      | uid | revision | subject       |
-      | 51  | 1        | Kurze Notiz   |
-    When draft-agent calls discard_draft with account "gupta-scaratec", folder "Drafts", draft_id "c9f0f895-fb98-4b91-9d4e-5a6b7c8d9e01"
+  Scenario Outline: discard_draft is denied with capability_missing when move_out or accept_incoming is missing
+    Given policy "draft-policy" grants folder on account "gupta-scaratec":
+      | folder | mode      | default  | rules | draft_append | move_out          | accept_incoming         |
+      | Drafts | blacklist | FULL     | []    | true         | <drafts_move_out> | false                   |
+      | Trash  | blacklist | METADATA | []    | false        | false             | <trash_accept_incoming> |
+    And draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", fields:
+      """
+      {"to": ["mara@example.org"], "subject": "Kurze Notiz", "body_text": "Text"}
+      """
+    When draft-agent calls discard_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id
     Then the response decision is DENY
     And the response field reason equals "capability_missing"
-    And the response field missing_capability equals "<missing>"
-    And the IMAP folder "Drafts" still contains uid 51
-    And a direct IMAP SEARCH on "gupta-scaratec:Trash" for header X-SC-Draft-Id "c9f0f895-fb98-4b91-9d4e-5a6b7c8d9e01" returns zero results
+    And the response does not contain any field named "missing_capability"
+    And a direct IMAP SEARCH on "gupta-scaratec:Drafts" for header X-SC-Draft-Id equal to the returned draft_id returns exactly one result
+    And a direct IMAP SEARCH on "gupta-scaratec:Trash" for header X-SC-Draft-Id equal to the returned draft_id returns zero results
 
     Examples:
-      | drafts_move_out | trash_accept_incoming | missing         |
-      | false           | true                  | move_out        |
-      | true            | false                 | accept_incoming |
+      | drafts_move_out | trash_accept_incoming |
+      | false           | true                  |
+      | true            | false                 |
 
-  # --- Error paths -----------------------------------------------------
-
-  Scenario: An account without a trash folder reports trash_unavailable and moves nothing
+  Scenario: Account without a \Trash folder returns trash_unavailable and moves nothing
     Given the IMAP account "info-bg" exists with folders:
       | folder path  | special use |
       | INBOX        |             |
       | INBOX/Drafts | \Drafts     |
     And policy "draft-policy" grants account "info-bg"
     And policy "draft-policy" grants folder on account "info-bg":
-      | folder       | mode      | default | rules | move_out |
-      | INBOX/Drafts | blacklist | FULL    | []    | true     |
-    And the IMAP folder "INBOX/Drafts" on "info-bg" holds drafts carrying the handle "45c48cce-2e2d-4fbd-a1b2-c3d4e5f60718":
-      | uid | revision | subject     |
-      | 7   | 1        | Entwurf BG  |
-    When draft-agent calls discard_draft with account "info-bg", folder "INBOX/Drafts", draft_id "45c48cce-2e2d-4fbd-a1b2-c3d4e5f60718"
+      | folder       | mode      | default | rules | draft_append | move_out |
+      | INBOX/Drafts | blacklist | FULL    | []    | true         | true     |
+    And draft-agent calls create_draft with account "info-bg", folder "INBOX/Drafts", fields:
+      """
+      {"to": ["mara@example.org"], "subject": "Entwurf BG", "body_text": "Text"}
+      """
+    When draft-agent calls discard_draft with account "info-bg", folder "INBOX/Drafts", the returned draft_id
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
     And the response field error.type equals "trash_unavailable"
-    And the IMAP folder "INBOX/Drafts" on "info-bg" still contains uid 7
+    And a direct IMAP SEARCH on "info-bg:INBOX/Drafts" for header X-SC-Draft-Id equal to the returned draft_id returns exactly one result
 
-  Scenario: An unknown handle reports draft_not_found and moves nothing
-    Given policy "draft-policy" grants folder:
+  Scenario: Unknown handle returns ALLOW + ERROR not_found and leaves existing mail untouched
+    Given policy "draft-policy" grants folder on account "gupta-scaratec":
       | folder | mode      | default  | rules | move_out | accept_incoming |
       | Drafts | blacklist | FULL     | []    | true     | false           |
       | Trash  | blacklist | METADATA | []    | false    | true            |
-    And the IMAP folder "Drafts" holds messages:
-      | uid | from                   | subject          | date                 |
-      | 61  | owner@example.org      | Eigener Entwurf  | 2026-10-30T08:00:00Z |
+    And the folder "Drafts" holds messages:
+      | uid | from_address      | to_address     | subject         | date                 |
+      | 61  | owner@example.org | b@example.org  | Eigener Entwurf | 2026-10-30T08:00:00Z |
     When draft-agent calls discard_draft with account "gupta-scaratec", folder "Drafts", draft_id "00000000-0000-4000-8000-000000000000"
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error.type equals "draft_not_found"
+    And the response field error.type equals "not_found"
     And the IMAP folder "Drafts" still contains uid 61
 
-  Scenario: A draft without a handle in the same folder is never touched by a discard
-    # The owner's own drafts (written in a mail client) carry no
-    # X-SC-Draft-Id. A discard of the agent's draft must not touch them,
-    # even when the subject is identical.
-    Given policy "draft-policy" grants folder:
-      | folder | mode      | default  | rules | move_out | accept_incoming |
-      | Drafts | blacklist | FULL     | []    | true     | false           |
-      | Trash  | blacklist | METADATA | []    | false    | true            |
-    And the IMAP folder "Drafts" holds messages:
-      | uid | from              | subject         | date                 |
-      | 71  | owner@example.org | Terminvorschlag | 2026-10-30T08:00:00Z |
-    And the IMAP folder "Drafts" holds drafts carrying the handle "d3d94468-02a4-4b5a-8c6d-7e8f9a0b1c2d":
-      | uid | revision | subject         |
-      | 72  | 1        | Terminvorschlag |
-    When draft-agent calls discard_draft with account "gupta-scaratec", folder "Drafts", draft_id "d3d94468-02a4-4b5a-8c6d-7e8f9a0b1c2d"
+  Scenario: Human-authored draft with identical subject is untouched when discarding agent draft
+    Given policy "draft-policy" grants folder on account "gupta-scaratec":
+      | folder | mode      | default  | rules | draft_append | move_out | accept_incoming |
+      | Drafts | blacklist | FULL     | []    | true         | true     | false           |
+      | Trash  | blacklist | METADATA | []    | false        | false    | true            |
+    And the folder "Drafts" holds messages:
+      | uid | from_address      | to_address             | subject         | date                 |
+      | 71  | owner@example.org | mara.lindqvist@example.org | Terminvorschlag | 2026-10-30T08:00:00Z |
+    And draft-agent calls create_draft with account "gupta-scaratec", folder "Drafts", fields:
+      """
+      {"to": ["mara.lindqvist@example.org"], "subject": "Terminvorschlag", "body_text": "Dienstag?"}
+      """
+    When draft-agent calls discard_draft with account "gupta-scaratec", folder "Drafts", the returned draft_id
     Then the response field discarded_count equals 1
     And the IMAP folder "Drafts" still contains uid 71
-    And the IMAP folder "Drafts" does not contain uid 72
+    And a direct IMAP SEARCH on "gupta-scaratec:Drafts" for header X-SC-Draft-Id equal to the returned draft_id returns zero results

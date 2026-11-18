@@ -1,192 +1,148 @@
-Feature: fetch_attachment sink semantics — filename sanitization, length cap, health, configuration
+Feature: Symlink-safe per-caller attachment sink, filename sanitization, and static tool-description hygiene
 
-  ADR 0028 specifies that fetch_attachment writes the decoded bytes to
-  the operator-configured attachment_sink_directory. This file pins
-  the safety- and configuration-relevant edges of that contract:
-  filename sanitization (no path traversal, no shell-active glyphs,
-  no leading dots), the 200-byte base / 255-byte total length cap,
-  the sink health check that runs on every list_tools and every
-  fetch_attachment call, and the two failure modes
-  (sink_not_configured, sink_not_writable). The happy-path bytes-on-
-  disk story lives in fetch_attachment_content.feature.
+  ADR 0047 hardens attachment delivery against path traversal, shell
+  glyphs, RFC 2047 / raw-8-bit header quirks, symlink escapes, and host
+  layout disclosure:
+    - Every path segment (<sink_base> and <sink_base>/<caller_id>) is
+      opened relative to its parent directory descriptor with no-follow
+      semantics, and every artifact file is created with exclusive-create,
+      no-follow, and read-only mode 0400 semantics.
+    - Pre-existing symlinks at either <sink_base> or <sink_base>/<caller_id>
+      fail closed with sink_not_writable without touching the symlink target.
+    - tools/list publishes a static description for fetch_attachment and
+      never discloses the host filesystem path (LIM 0013 & LIM 0016 resolved).
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Sanitization: path separators stripped              : 1
-    - Sanitization: shell-active glyphs replaced          : 1
-    - Sanitization: leading dot stripped                  : 1
-    - Sanitization: RFC 2047 B-encoded word decoded       : 1
-    - Sanitization: RFC 2047 Q-encoded word decoded       : 1
-    - Sanitization: raw 8-bit filename header (no crash)  : 1
-    - Length cap: base name truncated to 200 bytes        : 1
-    - sink_not_configured surfaces in tool description    : 1
-    - sink_not_configured surfaces on fetch_attachment    : 1
-    - sink_not_writable when dir does not exist           : 1
-    - sink_not_writable when dir is read-only             : 1
-    - Tool description names the configured sink path     : 1
-    - Health check passes silently when sink is healthy   : 1
-    Total enumerated                                       : 13   covered by this feature: 13
+    - Sanitization: path separators, shell glyphs, leading dot : 3
+    - Length cap: 500-byte filename fits <= 255-byte limit     : 1
+    - RFC 2047 B-encoded, Q-encoded, and raw 8-bit filenames   : 3
+    - Symlink escape blocked on base dir & caller subdir       : 2
+    - sink_not_configured & sink_not_writable (missing, ro)    : 3
+    - tools/list description omits host filesystem sink path   : 1
+    Total enumerated                                           : 13  covered by this feature: 13
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folder "INBOX/Documents"
+    Given the server clock is pinned to "2026-06-18T12:00:00Z"
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path     |
+      | INBOX           |
+      | INBOX/Documents |
     And the server is configured with caller "doc-agent" using policy "doc-policy"
     And policy "doc-policy" grants account "gupta-scaratec"
-    And policy "doc-policy" folder defaults for "INBOX/Documents" are:
-      | mode      | default |
-      | blacklist | FULL    |
-    And the folder "INBOX/Documents" holds a message with:
-      | uid | from                 | subject |
-      | 701 | sender@test.example  | Pinned  |
+    And policy "doc-policy" grants folder on account "gupta-scaratec":
+      | folder          | mode      | default | rules |
+      | INBOX/Documents | blacklist | FULL    | []    |
+    And the folder "INBOX/Documents" holds messages:
+      | uid | from_address        | to_address            | subject | date                 |
+      | 701 | sender@test.example | me@gupta-scaratec.com | Pinned  | 2026-06-17T09:00:00Z |
 
-  # ----------------------------------------------------------- Sanitization
-
-  Scenario: filename with path separators is stripped to a safe base
+  Scenario: Filename containing path traversal segments is sanitized inside the caller directory
     Given the server attachment sink directory is a fresh writable directory
-    And the message has attachment "../../etc/passwd.pdf" of type "application/pdf" with size 128 bytes
+    And the message at uid 701 has attachment "../../etc/passwd.pdf" of type "application/pdf" with content byte "A" repeated 128 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    And the response field saved_to matches the regex "^[A-Za-z0-9._-]+_[0-9a-f]{8}\.pdf$"
-    And the response field saved_to does NOT contain the literal string "/"
+    And the response field saved_to matches "^doc-agent/[0-9a-f]{32}_[A-Za-z0-9._-]+\.pdf$"
     And the response field saved_to does NOT contain the literal string ".."
+    And no file was written outside the sink directory
+    And the file at saved_path exists with mode 0400 and exact content byte "A" repeated 128 times
 
-    # Persistence-Validierung: no file ever got written outside the sink
-    Then no file was written outside the sink directory
-    And the file named saved_to exists in the sink directory
-
-  Scenario: filename with shell-active and Unicode-control glyphs is sanitized
+  Scenario: Filename containing shell-active characters and spaces is sanitized to safe ASCII
     Given the server attachment sink directory is a fresh writable directory
-    And the message has attachment "invoice;rm -rf /.pdf" of type "application/pdf" with size 64 bytes
+    And the message at uid 701 has attachment "invoice;rm -rf /.pdf" of type "application/pdf" with content byte "B" repeated 64 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
-    Then the response field saved_to matches the regex "^[A-Za-z0-9._-]+_[0-9a-f]{8}\.pdf$"
+    Then the response field saved_to matches "^doc-agent/[0-9a-f]{32}_[A-Za-z0-9._-]+\.pdf$"
     And the response field saved_to does NOT contain the literal string ";"
     And the response field saved_to does NOT contain the literal string " "
+    And the file at saved_path exists with mode 0400 and exact content byte "B" repeated 64 times
 
-  Scenario: filename with a leading dot becomes a non-hidden file
+  Scenario: Filename with a leading dot is prefixed by artifact_id and stripped of leading dots in base
     Given the server attachment sink directory is a fresh writable directory
-    And the message has attachment ".hidden.pdf" of type "application/pdf" with size 32 bytes
+    And the message at uid 701 has attachment ".hidden.pdf" of type "application/pdf" with content byte "C" repeated 32 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
-    Then the response field saved_to matches the regex "^[A-Za-z0-9_-][A-Za-z0-9._-]*_[0-9a-f]{8}\.pdf$"
-    And the response field saved_to does NOT start with the literal "."
+    Then the response field saved_to matches "^doc-agent/[0-9a-f]{32}_hidden\.pdf$"
+    And the file at saved_path exists with mode 0400 and exact content byte "C" repeated 32 times
 
-  # ----------------------------------------------------------- Length cap
-
-  Scenario: 500-byte filename is truncated to fit the 255-byte filesystem limit
+  Scenario: 500-byte original filename is truncated so the leaf filename is at most 255 bytes
     Given the server attachment sink directory is a fresh writable directory
-    And the message has an attachment whose original filename is 500 bytes long, mime type "application/pdf", size 256 bytes
+    And the message at uid 701 has an attachment whose original filename is 500 "a" characters plus ".pdf", mime type "application/pdf", content byte "D" repeated 256 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
-    Then the response field saved_to has a byte length of at most 255
-    And the response field saved_to matches the regex "^[A-Za-z0-9._-]{1,200}_[0-9a-f]{8}\.pdf$"
-    And the file named saved_to exists in the sink directory
-
-  # ----------------------------------------------------------- RFC 2047 decoding
-
-  # Some mail servers (e.g. sgh-net.de) put an RFC 2047 encoded-word
-  # directly in the Content-Disposition filename parameter on the
-  # wire. The default email.compat32 parser does NOT decode it, so
-  # get_filename() hands the server the raw `=?utf-8?b?...?=` token.
-  # The server must decode the encoded-word BEFORE sanitization, or
-  # the on-disk name becomes the unreadable mojibake reported on
-  # 2026-06-15 (`__utf-8_b_..._<hash>`).
+    Then the leaf filename of saved_to has byte length at most 255
+    And the response field saved_to matches "^doc-agent/[0-9a-f]{32}_a+\.pdf$"
+    And the file at saved_path exists with mode 0400 and exact content byte "D" repeated 256 times
 
   Scenario: RFC 2047 B-encoded filename is decoded before sanitization
     Given the server attachment sink directory is a fresh writable directory
-    And the message has attachment with raw wire filename "=?utf-8?b?ZmEgMjAyNi02IEt1YmEucGRm?=" of type "application/pdf" with size 96 bytes
+    And the message at uid 701 has attachment with raw wire filename "=?utf-8?b?ZmEgMjAyNi02IEt1YmEucGRm?=" of type "application/pdf" with content byte "E" repeated 96 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
     Then the response decision is ALLOW
-    And the response field result equals "OK"
-    # decoded "fa 2026-6 Kuba.pdf" -> spaces sanitized to "_"
-    And the response field saved_to matches the regex "^fa_2026-6_Kuba_[0-9a-f]{8}\.pdf$"
+    And the response field saved_to matches "^doc-agent/[0-9a-f]{32}_fa_2026-6_Kuba\.pdf$"
     And the response field saved_to does NOT contain the literal string "utf-8"
-    And the file named saved_to exists in the sink directory
+    And the file at saved_path exists with mode 0400 and exact content byte "E" repeated 96 times
 
   Scenario: RFC 2047 Q-encoded filename is decoded before sanitization
     Given the server attachment sink directory is a fresh writable directory
-    And the message has attachment with raw wire filename "=?utf-8?q?Rechnung_M=C3=A4rz.pdf?=" of type "application/pdf" with size 96 bytes
+    And the message at uid 701 has attachment with raw wire filename "=?utf-8?q?Rechnung_M=C3=A4rz.pdf?=" of type "application/pdf" with content byte "F" repeated 96 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
     Then the response decision is ALLOW
-    And the response field result equals "OK"
-    # decoded "Rechnung März.pdf": Q-underscore -> space -> "_",
-    # the umlaut "ä" is outside [A-Za-z0-9._-] -> "_". The presence
-    # of "Rechnung_M" with NO "?q?" or "C3" proves the decode ran
-    # before sanitization.
-    And the response field saved_to matches the regex "^Rechnung_M_rz_[0-9a-f]{8}\.pdf$"
+    And the response field saved_to matches "^doc-agent/[0-9a-f]{32}_Rechnung_M_rz\.pdf$"
     And the response field saved_to does NOT contain the literal string "?"
-    And the file named saved_to exists in the sink directory
+    And the file at saved_path exists with mode 0400 and exact content byte "F" repeated 96 times
 
-  # ------------------------------------------ raw 8-bit filename header (no crash)
-
-  # Reported 2026-06-18: fetch_attachment crashes with
-  #   "'Header' object has no attribute 'lower'"
-  # on any message whose headers carry RAW 8-bit (non-ASCII) bytes —
-  # e.g. a "Rechnungsausgang" PDF from a sender with a German umlaut.
-  # When a header value is not pure ASCII and is NOT an RFC 2047
-  # encoded-word, Python's email.compat32 parser returns an
-  # email.header.Header object, not a str. The attachment walk calls
-  # `.lower()` on the Content-Disposition value directly; Header has no
-  # `.lower()`, so the whole call dies with an unhandled AttributeError
-  # instead of writing the attachment. RFC 2047 encoded-words (the two
-  # scenarios above) parse to str and are unaffected — this is the
-  # distinct raw-8-bit path the bug report mis-attributed to RFC 2047.
-
-  Scenario: attachment on a message with a raw 8-bit Content-Disposition header is delivered, not crashed
+  Scenario: Raw 8-bit non-ASCII Content-Disposition header is sanitized cleanly without crashing
     Given the server attachment sink directory is a fresh writable directory
-    And the message has attachment with raw 8-bit wire filename "Rechnung Dürr.pdf" of type "application/pdf" with size 96 bytes
+    And the message at uid 701 has attachment with raw 8-bit wire filename "Rechnung Dürr.pdf" of type "application/pdf" with content byte "G" repeated 96 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
     Then the response decision is ALLOW
-    And the response field result equals "OK"
-    # raw "Rechnung Dürr.pdf": space and the non-ASCII "ü" bytes are
-    # outside [A-Za-z0-9._-] and collapse to "_". The decisive proof is
-    # that a response comes back at all instead of an AttributeError.
-    And the response field saved_to matches the regex "^Rechnung_D.*_[0-9a-f]{8}\.pdf$"
-    And the file named saved_to exists in the sink directory
+    And the response field saved_to matches "^doc-agent/[0-9a-f]{32}_Rechnung_D[A-Za-z0-9._-]*\.pdf$"
+    And the file at saved_path exists with mode 0400 and exact content byte "G" repeated 96 times
 
-  # ----------------------------------------------------------- sink_not_configured
+  Scenario: Symlink at the configured sink base directory is rejected with sink_not_writable
+    Given "$TMPDIR/outside_target" is an empty writable directory and the configured sink path is a symlink pointing to "$TMPDIR/outside_target"
+    And the message at uid 701 has attachment "report.pdf" of type "application/pdf" with content byte "H" repeated 64 times
+    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
+    Then the response decision is ALLOW
+    And the response field result equals "ERROR"
+    And the response field error.type equals "sink_not_writable"
+    And the directory "$TMPDIR/outside_target" contains 0 files
 
-  Scenario: tool description names the absence of a sink when not configured
+  Scenario: Pre-planted symlink at <sink_base>/<caller_id> is rejected via O_NOFOLLOW without writing to target
+    Given the server attachment sink directory is a fresh writable directory
+    And "$TMPDIR/victim_policy_dir" is an empty writable directory and "<sink_base>/doc-agent" is a symlink pointing to "$TMPDIR/victim_policy_dir"
+    And the message at uid 701 has attachment "evil.yaml" of type "application/x-yaml" with content byte "Y" repeated 64 times
+    When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
+    Then the response decision is ALLOW
+    And the response field result equals "ERROR"
+    And the response field error.type equals "sink_not_writable"
+    And the directory "$TMPDIR/victim_policy_dir" contains 0 files
+
+  Scenario: fetch_attachment returns sink_not_configured when no sink directory is configured
     Given the server attachment sink directory is not configured
-    When doc-agent calls the MCP list_tools method
-    Then the description of tool "fetch_attachment" contains the literal string "not configured"
-
-  Scenario: fetch_attachment returns sink_not_configured when no sink is set
-    Given the server attachment sink directory is not configured
-    And the message has attachment "report.pdf" of type "application/pdf" with size 64 bytes
+    And the message at uid 701 has attachment "report.pdf" of type "application/pdf" with content byte "I" repeated 64 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
     And the response field error.type equals "sink_not_configured"
-    And the response field error.detail contains the literal string "attachment_sink_directory"
 
-  # ----------------------------------------------------------- sink_not_writable
-
-  Scenario: fetch_attachment returns sink_not_writable when the directory is missing
+  Scenario: fetch_attachment returns sink_not_writable when the configured base directory does not exist
     Given the server attachment sink directory points at a path that does not exist
-    And the message has attachment "report.pdf" of type "application/pdf" with size 64 bytes
+    And the message at uid 701 has attachment "report.pdf" of type "application/pdf" with content byte "J" repeated 64 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
     And the response field error.type equals "sink_not_writable"
-    And the response field error.detail contains the literal string "does not exist"
 
-  Scenario: fetch_attachment returns sink_not_writable when the directory is read-only
-    Given the server attachment sink directory is a read-only directory
-    And the message has attachment "report.pdf" of type "application/pdf" with size 64 bytes
+  Scenario: fetch_attachment returns sink_not_writable when the configured base directory is read-only
+    Given the test runner is not executing as root
+    And the server attachment sink directory is a read-only directory
+    And the message at uid 701 has attachment "report.pdf" of type "application/pdf" with content byte "K" repeated 64 times
     When doc-agent calls fetch_attachment with account "gupta-scaratec", folder "INBOX/Documents", uid 701, part_id 0
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
     And the response field error.type equals "sink_not_writable"
-    And the response field error.detail contains the literal string "not writable"
 
-  # ----------------------------------------------------------- Tool description rendering
-
-  Scenario: tool description names the configured sink path when healthy
+  Scenario: tools/list publishes a static description for fetch_attachment and never discloses the host sink path
     Given the server attachment sink directory is a fresh writable directory
     When doc-agent calls the MCP list_tools method
-    Then the description of tool "fetch_attachment" contains the configured sink path
-    And the description of tool "fetch_attachment" does NOT contain the literal string "not configured"
-    And the description of tool "fetch_attachment" does NOT contain the literal string "not writable"
-
-  Scenario: tool description names the sink-not-writable state on list_tools
-    Given the server attachment sink directory points at a path that does not exist
-    When doc-agent calls the MCP list_tools method
-    Then the description of tool "fetch_attachment" contains the literal string "not writable"
-    And the description of tool "fetch_attachment" contains the literal string "does not exist"
+    Then the description of tool "fetch_attachment" contains "ADR 0047"
+    And the description of tool "fetch_attachment" does NOT contain the configured sink path

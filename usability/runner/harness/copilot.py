@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, ClassVar
 
 from .base import (
     MCP_SERVER_NAME,
@@ -26,17 +26,17 @@ EXTRA = ["--disallow-temp-dir"]
 
 
 class CopilotDriver(HarnessDriver):
-    restrictions = [
-        "MCP: --additional-mcp-config @<run file>; --disable-builtin-mcps removes the GitHub MCP "
+    restrictions: ClassVar[list[str]] = [
+        ("MCP: --additional-mcp-config @<run file>; --disable-builtin-mcps removes the GitHub MCP "
         "servers; a per-run COPILOT_HOME holds no user MCP config, skills, plugins or instructions "
-        "(login comes from the system keyring and still works).",
-        "Built-in tools denied: --deny-tool shell, write, url (deny beats --allow-all-tools). The "
-        "tools stay visible to the model; attempts are recorded as denials.",
+        "(login comes from the system keyring and still works)."),
+        ("Built-in tools denied: --deny-tool shell, write, url (deny beats --allow-all-tools). The "
+        "tools stay visible to the model; attempts are recorded as denials."),
         "--no-ask-user removes the ask_user tool: questions end the turn as text.",
-        "Runtime guard: another connected MCP server, a call to it, or a shell/write call that was "
-        "not denied aborts the run as not-assessable (isolation_breach).",
-        "File access is limited to the working directory; --disallow-temp-dir removes the default "
-        "access to the system temp dir (where the run's server config lives).",
+        ("Runtime guard: another connected MCP server, a call to it, or a shell/write call that was "
+        "not denied aborts the run as not-assessable (isolation_breach)."),
+        ("File access is limited to the working directory; --disallow-temp-dir removes the default "
+        "access to the system temp dir (where the run's server config lives)."),
     ]
 
     def prepare(self, instructions: str | None) -> None:
@@ -75,7 +75,7 @@ class CopilotDriver(HarnessDriver):
                 return f"call to foreign MCP tool {call.name}"
         return None
 
-    _connected: list[str] = []
+    _connected: ClassVar[list[str]] = []
 
     def new_session_id(self) -> str | None:
         return str(uuid.uuid4())

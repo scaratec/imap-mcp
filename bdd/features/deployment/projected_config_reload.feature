@@ -1,215 +1,94 @@
-@pending
-Feature: Configuration reload from a projected ConfigMap volume
-  As a cluster operator running imap-mcp as a sidecar (ADR-0029),
-  I want the server to pick up a changed policy after the kubelet has
-  atomically re-projected the ConfigMap volume and I have signalled the
-  process,
-  so that a policy change reaches the running server without a rebuild
-  and without the server ever reading a half-written file.
+Feature: Atomic configuration reload from Kubernetes projected ConfigMap and Secret volumes
 
-  # @pending: red-first specification for ADR-0029 §5. SIGHUP reload
-  # itself exists and is covered by features/policy/policy_reload.feature;
-  # what is unproven is that it survives the *symlink indirection* a
-  # kubelet uses. The harness needs a step that builds the
-  # `..&lt;timestamp&gt;/` + `..data` + per-key-symlink layout and swaps it
-  # the way the kubelet does. The tag comes off with that step.
-  # See docs/ROADMAP.md entry 24.
-
-  Kubernetes does not write into a projected volume in place. It
-  materialises the new content in a fresh timestamped directory next to
-  the old one, points the `..data` symlink at it with a single atomic
-  `rename(2)`, and then removes the old directory. Every user-visible
-  entry in the mount root is a symlink through `..data`:
-
-      /config/
-        ..2026_08_25_09_00_00.418273651/   <- previous content
-        ..2026_08_25_11_30_00.771049238/   <- new content
-        ..data -> ..2026_08_25_11_30_00.771049238
-        accounts.yaml -> ..data/accounts.yaml
-        callers.yaml  -> ..data/callers.yaml
-        policies      -> ..data/policies
-
-  Two properties follow, and both are load-bearing for ADR-0029:
-
-  1. A reader that opens `/config/accounts.yaml` fresh on every load
-     always sees a complete, self-consistent generation. There is no
-     torn read to defend against, so the server needs no locking or
-     retry around config loading.
-  2. A reader that resolved the path once and held on to the *realpath*
-     — or held an open directory handle — is pinned to a generation the
-     kubelet will delete. Its next read fails with ENOENT rather than
-     returning stale data. This is the failure this feature exists to
-     rule out.
-
-  The kubelet sends no signal on re-projection. The pod's process
-  therefore keeps serving the old configuration until something sends
-  SIGHUP. ADR-0029 §5 makes that the operator's responsibility and
-  names rolling the pod on a ConfigMap-content hash as the recommended
-  way to discharge it. The first scenario below is the one an operator
-  most needs to see: editing the ConfigMap alone changes nothing.
+  ADR 0049 §3 and ADR 0051 §3 ensure that configuration and secret loads
+  follow Kubernetes `..data` symlink swaps cleanly:
+    - Swapping `..data` alone does not alter enforcement until SIGHUP.
+    - On SIGHUP, the loader verifies a stable `..data` generation across
+      all files, validates cross-file references (caller -> policy ->
+      accounts), and swaps state atomically even after old timestamped
+      directories have been garbage-collected.
+    - Broken YAML or missing referenced policy files reject the reload
+      and retain the previous configuration.
 
   Covered error layers (per BDD Guidelines §4.5):
-    - Swap without signal: old policy still in force  : 1
-    - Swap with SIGHUP: new policy takes effect       : 1
-    - Stale generation removed after swap             : 1
-    - Repeated swaps between two SIGHUPs              : 1
-    - Malformed content delivered by swap             : 1
-    - Policy file added by swap                       : 1
-    - Policy file removed by swap                     : 1
-    - Secret volume re-projected: token rotation      : 1
-    Total enumerated                                  : 8   covered by this feature: 8
+    - Projection swap without SIGHUP keeps previous policy active   : 1
+    - Projection swap followed by SIGHUP activates new policy       : 1
+    - Garbage-collecting superseded generation does not break reload: 1
+    - Multiple swaps before SIGHUP apply only the newest generation : 1
+    - Malformed YAML in new generation preserves previous policy    : 1
+    - Switching caller to a newly added policy file succeeds        : 1
+    - Removing the caller's referenced policy file rejects reload   : 1
+    - Re-projecting the Secret volume rotates bearer token on SIGHUP: 1
+    Total enumerated                                                : 8   covered by this feature: 8
 
   Background:
-    Given the IMAP account "gupta-scaratec" exists with folder "INBOX/Rechnungen"
-    And the server is configured with caller "invoice-agent" using policy "invoice-policy"
-    And policy "invoice-policy" grants account "gupta-scaratec"
-    And policy "invoice-policy" folder "INBOX/Rechnungen" has:
-      | mode      | default | rules |
-      | whitelist | NONE    | [{from_domain=hornbach.de -> ENVELOPE}] |
+    Given the server clock is pinned to "2026-08-25T12:00:00Z"
+    And the audit log directory is a fresh $TMPDIR/audit
+    And the IMAP account "gupta-scaratec" exists with folders:
+      | folder path      |
+      | INBOX            |
+      | INBOX/Rechnungen |
     And the folder "INBOX/Rechnungen" holds messages:
-      | uid | from                  |
-      | 301 | rechnung@hornbach.de  |
-      | 302 | marketing@example.com |
-    And the config directory is projected as a Kubernetes ConfigMap volume
-    And the server is started with transport "http" on a random port
+      | uid | from_address          | to_address            | subject    | date                 |
+      | 301 | rechnung@hornbach.de  | me@gupta-scaratec.com | Rechnung 1 | 2026-08-24T09:00:00Z |
+      | 302 | marketing@example.com | me@gupta-scaratec.com | Newsletter | 2026-08-24T10:00:00Z |
+    And the projected ConfigMap and Secret volumes are initialized for caller "invoice-agent" with bearer token "correct-horse-battery" and policy "invoice-policy" granting whitelist hornbach.de -> ENVELOPE on "gupta-scaratec:INBOX/Rechnungen"
+    And the server process is started from the projected volumes with transport "http" on 127.0.0.1 and a random port
+    And the MCP client performs an Initialize handshake with caller_id "invoice-agent" and bearer token "correct-horse-battery"
 
-  Scenario: Re-projecting the volume alone does not change enforcement
-    # The pitfall ADR-0029 §5 exists to prevent: an operator edits the
-    # ConfigMap, sees `kubectl get configmap` show the new content, and
-    # concludes the change is live. It is not.
-    Given invoice-agent sees 1 message in "INBOX/Rechnungen"
-    When the projected ConfigMap is atomically swapped, replacing policy "invoice-policy" with:
-      """
-      name: invoice-policy
-      accounts:
-        gupta-scaratec:
-          folders:
-            - path: INBOX/Rechnungen
-              mode: whitelist
-              default: ENVELOPE
-              rules: []
-      """
+  Scenario: Re-projecting the ConfigMap volume without SIGHUP keeps the old policy active
+    When the MCP client calls search on the established HTTP session with account "gupta-scaratec", folder "INBOX/Rechnungen", criteria {}, scope "all"
+    Then the response field total_visible equals 1
+    When the projected ConfigMap is atomically swapped so policy "invoice-policy" grants blacklist default ENVELOPE on "gupta-scaratec:INBOX/Rechnungen"
     And no signal is sent to the server
-    Then invoice-agent still sees 1 message in "INBOX/Rechnungen"
-    And the file "/config/policies/invoice-policy.yaml" resolves to the new generation
+    And the MCP client calls search on the established HTTP session with account "gupta-scaratec", folder "INBOX/Rechnungen", criteria {}, scope "all"
+    Then the response field total_visible equals 1
 
-  Scenario: SIGHUP after the swap puts the new policy in force
-    When the projected ConfigMap is atomically swapped, replacing policy "invoice-policy" with:
-      """
-      name: invoice-policy
-      accounts:
-        gupta-scaratec:
-          folders:
-            - path: INBOX/Rechnungen
-              mode: whitelist
-              default: ENVELOPE
-              rules: []
-      """
+  Scenario: SIGHUP after the ConfigMap swap activates the new policy generation
+    When the projected ConfigMap is atomically swapped so policy "invoice-policy" grants blacklist default ENVELOPE on "gupta-scaratec:INBOX/Rechnungen"
     And the server receives SIGHUP
-    Then invoice-agent sees 2 messages in "INBOX/Rechnungen"
+    And the MCP client calls search on the established HTTP session with account "gupta-scaratec", folder "INBOX/Rechnungen", criteria {}, scope "all"
+    Then the response field total_visible equals 2
 
-  Scenario: Reload succeeds after the superseded generation has been removed
-    # The regression this rules out: a server that cached the realpath
-    # of the config directory at startup reads through a path that no
-    # longer exists once the kubelet garbage-collects the old
-    # generation, and the reload fails with ENOENT instead of applying.
-    When the projected ConfigMap is atomically swapped, replacing policy "invoice-policy" with:
-      """
-      name: invoice-policy
-      accounts:
-        gupta-scaratec:
-          folders:
-            - path: INBOX/Rechnungen
-              mode: whitelist
-              default: ENVELOPE
-              rules: []
-      """
-    And the superseded projection generation is removed
+  Scenario: SIGHUP reload succeeds after kubelet removes the superseded timestamp directory
+    When the projected ConfigMap is atomically swapped so policy "invoice-policy" grants blacklist default ENVELOPE on "gupta-scaratec:INBOX/Rechnungen"
+    And the superseded ConfigMap projection directory is deleted
     And the server receives SIGHUP
-    Then the reload succeeds
-    And invoice-agent sees 2 messages in "INBOX/Rechnungen"
+    Then the audit log contains a record with tool "policy_reload", result "OK", reason "policy_reload_ok"
+    When the MCP client calls search on the established HTTP session with account "gupta-scaratec", folder "INBOX/Rechnungen", criteria {}, scope "all"
+    Then the response field total_visible equals 2
 
-  Scenario: Only the newest generation is applied when several swaps precede one signal
-    # The kubelet syncs on its own schedule; two ConfigMap edits inside
-    # one sync period collapse into one visible generation, and an
-    # operator who signals once must get the newest, not an intermediate.
-    When the projected ConfigMap is atomically swapped, replacing policy "invoice-policy" with:
-      """
-      name: invoice-policy
-      accounts:
-        gupta-scaratec:
-          folders:
-            - path: INBOX/Rechnungen
-              mode: whitelist
-              default: BODY
-              rules: []
-      """
-    And the projected ConfigMap is atomically swapped, replacing policy "invoice-policy" with:
-      """
-      name: invoice-policy
-      accounts:
-        gupta-scaratec:
-          folders:
-            - path: INBOX/Rechnungen
-              mode: whitelist
-              default: ENVELOPE
-              rules: []
-      """
+  Scenario: Multiple swaps before a single SIGHUP apply the newest generation
+    When the projected ConfigMap is atomically swapped so policy "invoice-policy" grants blacklist default BODY on "gupta-scaratec:INBOX/Rechnungen"
+    And the projected ConfigMap is atomically swapped so policy "invoice-policy" grants blacklist default ENVELOPE on "gupta-scaratec:INBOX/Rechnungen"
     And the server receives SIGHUP
-    Then invoice-agent sees 2 messages in "INBOX/Rechnungen"
-    And invoice-agent's visibility for uid 302 in "INBOX/Rechnungen" is "ENVELOPE"
+    And the MCP client calls fetch_envelope on the established HTTP session with account "gupta-scaratec", folder "INBOX/Rechnungen", uid 302
+    Then the response decision is ALLOW
+    And the response field visibility_applied equals "ENVELOPE"
 
-  Scenario: A malformed generation is rejected and the last known good policy stays in force
-    When the projected ConfigMap is atomically swapped, replacing policy "invoice-policy" with:
-      """
-      name: invoice-policy
-      accounts:
-        gupta-scaratec:
-          folders:
-            - path: INBOX/Rechnungen
-              mode: whitelist
-              default: ENVELOPE  rules:   # <-- missing newline; invalid YAML
-      """
+  Scenario: A malformed YAML generation is rejected on SIGHUP and the previous policy stays active
+    When the projected ConfigMap is atomically swapped with malformed YAML in "invoice-policy.yaml"
     And the server receives SIGHUP
-    Then the reload fails
-    And invoice-agent still sees 1 message in "INBOX/Rechnungen"
-    And the server is still serving requests
+    Then the audit log contains a record with tool "policy_reload", result "ERROR", reason "policy_reload_rejected"
+    When the MCP client calls search on the established HTTP session with account "gupta-scaratec", folder "INBOX/Rechnungen", criteria {}, scope "all"
+    Then the response field total_visible equals 1
 
-  Scenario: A policy file added by the swap becomes available after the signal
-    Given the server is configured with caller "audit-agent" using policy "audit-policy"
-    When the projected ConfigMap is atomically swapped, adding policy "audit-policy" with:
-      """
-      name: audit-policy
-      accounts:
-        gupta-scaratec:
-          folders:
-            - path: INBOX/Rechnungen
-              mode: whitelist
-              default: ENVELOPE
-              rules: []
-      """
+  Scenario: Switching callers.yaml to a newly added policy file in the same swap succeeds on SIGHUP
+    When the projected ConfigMap is atomically swapped adding policy "audit-policy" (blacklist default ENVELOPE on "gupta-scaratec:INBOX/Rechnungen") and pointing caller "invoice-agent" to "audit-policy"
     And the server receives SIGHUP
-    Then the reload succeeds
-    And audit-agent sees 2 messages in "INBOX/Rechnungen"
+    Then the audit log contains a record with tool "policy_reload", result "OK", reason "policy_reload_ok"
+    When the MCP client calls search on the established HTTP session with account "gupta-scaratec", folder "INBOX/Rechnungen", criteria {}, scope "all"
+    Then the response field total_visible equals 2
 
-  Scenario: A policy file removed by the swap is rejected while a caller still references it
-    # A ConfigMap key removed by mistake must not silently leave a
-    # caller with no policy — under ADR-0001 that would be
-    # indistinguishable from default-deny and would hide the operator
-    # error until someone noticed missing mail.
-    When the projected ConfigMap is atomically swapped, removing policy "invoice-policy"
+  Scenario: Removing the policy file referenced by callers.yaml is rejected on SIGHUP and preserves enforcement
+    When the projected ConfigMap is atomically swapped removing "invoice-policy.yaml" while caller "invoice-agent" still references "invoice-policy"
     And the server receives SIGHUP
-    Then the reload fails
-    And the reload error names caller "invoice-agent" and the missing policy "invoice-policy"
-    And invoice-agent still sees 1 message in "INBOX/Rechnungen"
+    Then the audit log contains a record with tool "policy_reload", result "ERROR", reason "policy_reload_rejected"
+    When the MCP client calls search on the established HTTP session with account "gupta-scaratec", folder "INBOX/Rechnungen", criteria {}, scope "all"
+    Then the response field total_visible equals 1
 
-  Scenario: A rotated caller token in the projected Secret volume takes effect after the signal
-    # Secret volumes are re-projected by exactly the same mechanism.
-    # The scenario is here rather than in caller_authentication.feature
-    # because it is the projection, not the auth check, under test.
-    Given the secret directory is projected as a Kubernetes Secret volume
-    And invoice-agent authenticates successfully with bearer token "correct-horse-battery"
-    When the projected Secret is atomically swapped, setting "callers/invoice-agent/token" to "rotated-token-value"
+  Scenario: Re-projecting the Secret volume rotates the shared_token bearer credential on SIGHUP
+    When the projected Secret volume is atomically swapped updating "callers/invoice-agent/token" to "rotated-token-value"
     And the server receives SIGHUP
-    Then a handshake with caller_id "invoice-agent" and bearer token "rotated-token-value" succeeds
-    And a handshake with caller_id "invoice-agent" and bearer token "correct-horse-battery" fails with error "auth_failed"
+    Then a new MCP HTTP Initialize handshake with caller_id "invoice-agent" and bearer token "rotated-token-value" succeeds
+    And a new MCP HTTP Initialize handshake with caller_id "invoice-agent" and bearer token "correct-horse-battery" fails with error "auth_failed"

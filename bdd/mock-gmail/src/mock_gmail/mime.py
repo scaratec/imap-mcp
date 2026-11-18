@@ -73,7 +73,8 @@ def _raw_body(part: EmailMessage) -> str:
 def _part(part: EmailMessage) -> str:
     if part.is_multipart() and part.get_content_type() != "message/rfc822":
         children = part.get_payload()
-        assert isinstance(children, list)
+        if not isinstance(children, list):
+            raise ValueError("Children must be a list")
         inner = "".join(_part(child) for child in children if isinstance(child, EmailMessage))
         subtype = part.get_content_subtype().upper()
         return (

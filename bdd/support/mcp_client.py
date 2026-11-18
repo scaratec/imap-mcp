@@ -3,20 +3,6 @@
 The BDD harness talks to the server exclusively through these clients.
 They speak the MCP Initialize / list_tools / tools/call handshakes as
 JSON-RPC 2.0 framed over the chosen transport.
-
-Two transports are supported:
-
-- `MCPClient` — stdio. Caller identity is the `IMAP_MCP_CALLER_ID` env
-  var (stdio_trusted, ADR 0015).
-- `MCPHttpClient` — Streamable HTTP. Caller identity comes from the
-  `X-MCP-Caller-Id` header; the bearer token from
-  `Authorization: Bearer <token>` (LIM-0007 paydown, ADR 0023).
-
-No Python-level import of the server package occurs in either client.
-The server is started as `SERVER_BINARY` (path configurable via
-IMAP_MCP_SERVER_BINARY env var), and communication is byte-level. This
-is deliberate: the BDD suite must exercise the same surface any other
-MCP client would.
 """
 
 from __future__ import annotations
@@ -24,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import socket
 import subprocess
 import threading
@@ -32,6 +19,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 
 class MCPRPCError(Exception):
@@ -57,20 +46,20 @@ class MCPClient:
     caller_id: str
     extra_env: dict[str, str] | None = None
     unset_env: tuple[str, ...] = ()
-    """Variables removed from the inherited environment before start."""
     client_name: str = "imap-mcp-bdd"
     client_version: str = "0.1.0"
-    """`clientInfo` sent in the Initialize request."""
+    last_response_text_bytes: int = 0
+    server_info: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._proc: subprocess.Popen[bytes] | None = None
         self._stdin: io.BufferedWriter | None = None
-        self._stdout: io.BufferedReader | None = None
+        self._stdout_queue: queue.Queue[bytes | None] = queue.Queue()
+        self._unhandled_responses: dict[str, dict[str, Any]] = {}
+        self._stdout_thread: threading.Thread | None = None
         self._stderr_log: list[bytes] = []
         self._stderr_thread: threading.Thread | None = None
         self._initialized = False
-
-    # --------------------------------------------------------- lifecycle
 
     def start(self) -> None:
         if self._proc is not None:
@@ -92,9 +81,14 @@ class MCPClient:
             env=env,
             bufsize=0,
         )
-        assert self._proc.stdin is not None and self._proc.stdout is not None
+        if self._proc.stdin is None or self._proc.stdout is None:
+            raise MCPClientError("Process stdin/stdout not available")
         self._stdin = self._proc.stdin
-        self._stdout = self._proc.stdout
+
+        self._stdout_thread = threading.Thread(
+            target=self._drain_stdout, args=(self._proc.stdout,), daemon=True
+        )
+        self._stdout_thread.start()
 
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr, args=(self._proc.stderr,), daemon=True
@@ -116,10 +110,8 @@ class MCPClient:
         finally:
             self._proc = None
             self._stdin = None
-            self._stdout = None
 
     def close_stdin(self) -> None:
-        """End the session the way a harness does: EOF on the server's stdin."""
         if self._stdin is None:
             raise MCPClientError("Server stdin not available")
         self._stdin.close()
@@ -131,34 +123,29 @@ class MCPClient:
         self._proc.send_signal(sig)
 
     def poll_exit(self) -> int | None:
-        """The server's exit code, or None while it still runs."""
         if self._proc is None:
             raise MCPClientError("Server process not started")
         return self._proc.poll()
-
-    # --------------------------------------------------------- MCP API
 
     def list_tools(self) -> list[dict[str, Any]]:
         result = self._rpc("tools/list", {})
         return list(result.get("tools", []))
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Invoke a tool and return its result payload.
-
-        Tool call errors surface as MCPRPCError so step code can assert
-        on codes. Payload-level DENY/ALLOW outcomes return normally.
-        """
-        return self._rpc(
+        result = self._rpc(
             "tools/call",
             {"name": name, "arguments": arguments},
         )
+        contents = result.get("content", [])
+        if contents and isinstance(contents, list) and isinstance(contents[0], dict) and "text" in contents[0]:
+            self.last_response_text_bytes = len(contents[0]["text"].encode("utf-8"))
+        else:
+            self.last_response_text_bytes = 0
+        return result
 
     def call_tools_concurrently(
         self, calls: list[tuple[str, dict[str, Any]]], timeout: float = 60.0
     ) -> list[dict[str, Any]]:
-        """Send every `tools/call` request before reading any response, so
-        the server has all of them in flight at once; return the results
-        in request order. JSON-RPC errors raise MCPRPCError."""
         request_ids = [str(uuid.uuid4()) for _ in calls]
         for request_id, (name, arguments) in zip(request_ids, calls):
             self._send(
@@ -169,18 +156,23 @@ class MCPClient:
                     "params": {"name": name, "arguments": arguments},
                 }
             )
-        if self._stdout is None:
-            raise MCPClientError("Server stdout not available")
         pending = set(request_ids)
         responses: dict[str, dict[str, Any]] = {}
+        for req_id in list(pending):
+            if req_id in self._unhandled_responses:
+                responses[req_id] = self._unhandled_responses.pop(req_id)
+                pending.discard(req_id)
+
         deadline = time.monotonic() + timeout
         while pending:
-            if time.monotonic() >= deadline:
+            remaining = max(0.01, deadline - time.monotonic())
+            try:
+                line = self._stdout_queue.get(timeout=remaining)
+            except queue.Empty:
                 raise MCPClientError(
-                    f"Timed out waiting for {len(pending)} of {len(calls)} responses"
-                )
-            line = self._stdout.readline()
-            if not line:
+                    f"Timed out waiting for {len(pending)} of {len(calls)} responses. Stderr:\n{self.stderr_text}"
+                ) from None
+            if line is None:
                 raise MCPClientError(
                     f"Server closed stdout with {len(pending)} responses outstanding. "
                     f"Stderr:\n{self.stderr_text}"
@@ -189,9 +181,13 @@ class MCPClient:
             if not line:
                 continue
             message = json.loads(line.decode("utf-8"))
-            if message.get("id") in pending:
-                pending.discard(message["id"])
-                responses[message["id"]] = message
+            msg_id = message.get("id")
+            if msg_id in pending:
+                pending.discard(msg_id)
+                responses[msg_id] = message
+            elif msg_id:
+                self._unhandled_responses[msg_id] = message
+
         results: list[dict[str, Any]] = []
         for request_id in request_ids:
             response = responses[request_id]
@@ -202,14 +198,7 @@ class MCPClient:
         return results
 
     def raw_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Escape hatch for calling arbitrary JSON-RPC methods.
-
-        Used by non_goal_rejection.feature to probe nonexistent tool
-        names and by tests that need to inspect JSON-RPC error codes.
-        """
         return self._rpc(method, params)
-
-    # --------------------------------------------------------- internals
 
     def _initialize(self) -> None:
         result = self._rpc(
@@ -221,19 +210,13 @@ class MCPClient:
             },
         )
         self.server_info = dict(result.get("serverInfo", {}))
-        # ADR 0027: the surface version travels inside `instructions`
-        # because the MCP SDK does not surface custom `serverInfo.metadata`
-        # natively. The server prefixes the JSON envelope with a fixed
-        # marker so this parser is stable.
         instructions = result.get("instructions") or ""
         marker = "imap-mcp surface metadata: "
         if marker in instructions:
-            import json as _json
-
             tail = instructions.split(marker, 1)[1].strip()
             try:
-                metadata = _json.loads(tail)
-            except _json.JSONDecodeError:
+                metadata = json.loads(tail)
+            except json.JSONDecodeError:
                 metadata = {}
             if isinstance(metadata, dict):
                 self.server_info["metadata"] = metadata
@@ -267,13 +250,18 @@ class MCPClient:
         self._stdin.flush()
 
     def _read_matching(self, request_id: str, timeout: float = 10.0) -> dict[str, Any]:
+        if request_id in self._unhandled_responses:
+            return self._unhandled_responses.pop(request_id)
+
         deadline = time.monotonic() + timeout
-        if self._stdout is None:
-            raise MCPClientError("Server stdout not available")
         while time.monotonic() < deadline:
-            line = self._stdout.readline()
-            if not line:
-                stderr = b"".join(self._stderr_log).decode("utf-8", "replace")
+            remaining = max(0.01, deadline - time.monotonic())
+            try:
+                line = self._stdout_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if line is None:
+                stderr = self.stderr_text
                 raise MCPClientError(
                     f"Server closed stdout before responding to {request_id}. "
                     f"Stderr:\n{stderr}"
@@ -284,10 +272,24 @@ class MCPClient:
             try:
                 message = json.loads(line.decode("utf-8"))
             except json.JSONDecodeError as exc:
-                raise MCPClientError(f"Non-JSON line on stdout: {line!r} ({exc})")
-            if message.get("id") == request_id:
+                raise MCPClientError(f"Non-JSON line on stdout: {line!r} ({exc})") from exc
+
+            msg_id = message.get("id")
+            if msg_id == request_id:
                 return message
-        raise MCPClientError(f"Timed out waiting for response to {request_id}")
+            if msg_id is not None:
+                self._unhandled_responses[msg_id] = message
+
+        stderr = self.stderr_text
+        raise MCPClientError(f"Timed out after {timeout}s waiting for response to {request_id}. Stderr:\n{stderr}")
+
+    def _drain_stdout(self, stream: io.BufferedReader) -> None:
+        while True:
+            line = stream.readline()
+            if not line:
+                self._stdout_queue.put(None)
+                break
+            self._stdout_queue.put(line)
 
     def _drain_stderr(self, stream: io.BufferedReader) -> None:
         for chunk in iter(lambda: stream.read(4096), b""):
@@ -301,9 +303,6 @@ class MCPClient:
 
 
 def _pick_free_port() -> int:
-    """Reserve and release an ephemeral TCP port. Standard test pattern;
-    a transient race can occur if a concurrent process grabs the port
-    in the half-second before the server binds, but in CI it's fine."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
@@ -311,16 +310,7 @@ def _pick_free_port() -> int:
 
 @dataclass
 class MCPHttpClient:
-    """Streamable HTTP variant of `MCPClient`.
-
-    The server is launched as a subprocess with `--transport http`
-    on a randomly chosen free port, then driven via JSON-RPC POST
-    to `/mcp/`. The bearer token + caller_id are sent on every
-    request as HTTP headers.
-
-    Initialize is a normal JSON-RPC method; failures surface as
-    HTTP 401 (auth path) or as a JSON-RPC error (protocol path).
-    """
+    """Streamable HTTP variant of `MCPClient`."""
 
     server_binary: Path
     config_dir: Path
@@ -329,13 +319,15 @@ class MCPHttpClient:
     port: int = 0
     bearer_token: str | None = None
     caller_id: str | None = None
+    client_name: str = "imap-mcp-bdd-http"
+    client_version: str = "0.1.0"
+    last_response_text_bytes: int = 0
+    server_info: dict[str, Any] = field(default_factory=dict)
     _proc: subprocess.Popen[bytes] | None = field(default=None, init=False)
     _stderr_log: list[bytes] = field(default_factory=list, init=False)
     _stderr_thread: threading.Thread | None = field(default=None, init=False)
     _initialized: bool = field(default=False, init=False)
     _session_id: str | None = field(default=None, init=False)
-
-    # ---------------------------------------------------------- lifecycle
 
     def start_server(self, port: int | None = None) -> None:
         if self._proc is not None:
@@ -358,14 +350,14 @@ class MCPHttpClient:
             env=env,
             bufsize=0,
         )
+        if self._proc.stdout is None or self._proc.stderr is None:
+            raise MCPClientError("Process stdout/stderr not available")
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr,
             args=(self._proc.stderr,),
             daemon=True,
         )
         self._stderr_thread.start()
-        # Drain stdout in the background too so a noisy server doesn't
-        # deadlock on a full pipe.
         threading.Thread(
             target=self._drain_stderr,
             args=(self._proc.stdout,),
@@ -405,14 +397,9 @@ class MCPHttpClient:
         finally:
             self._proc = None
 
-    # ------------------------------------------------------------- MCP API
-
     def initialize(
         self, caller_id: str, bearer_token: str
     ) -> dict[str, Any]:
-        """Perform the MCP Initialize handshake. Returns the result on
-        success; raises MCPClientError on transport-level failure or
-        MCPRPCError on JSON-RPC error."""
         self.caller_id = caller_id
         self.bearer_token = bearer_token
         result = self._rpc(
@@ -420,11 +407,10 @@ class MCPHttpClient:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "imap-mcp-bdd-http", "version": "0.1.0"},
+                "clientInfo": {"name": self.client_name, "version": self.client_version},
             },
         )
-        # The SDK returns the session id in a header; with stateless=True
-        # there is none, but we record it for completeness.
+        self.server_info = dict(result.get("serverInfo", {}))
         self._initialized = True
         return result
 
@@ -433,20 +419,48 @@ class MCPHttpClient:
         return list(result.get("tools", []))
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return self._rpc("tools/call", {"name": name, "arguments": arguments})
+        result = self._rpc("tools/call", {"name": name, "arguments": arguments})
+        contents = result.get("content", [])
+        if contents and isinstance(contents, list) and isinstance(contents[0], dict) and "text" in contents[0]:
+            self.last_response_text_bytes = len(contents[0]["text"].encode("utf-8"))
+        else:
+            self.last_response_text_bytes = 0
+        return result
 
     def raw_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         return self._rpc(method, params)
 
-    # -------------------------------------------------------- internals
+    def raw_http_request(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None = None,
+        content: bytes | None = None,
+        json_data: Any = None,
+        timeout: float = 10.0,
+    ) -> httpx.Response:
+        url = f"http://{self.host}:{self.port}" + (path if path.startswith("/") else f"/{path}")
+        req_headers = dict(headers or {})
+        if self._session_id and "Mcp-Session-Id" not in req_headers:
+            req_headers["Mcp-Session-Id"] = self._session_id
+        if self.bearer_token and "Authorization" not in req_headers:
+            req_headers["Authorization"] = f"Bearer {self.bearer_token}"
+        if self.caller_id and "X-MCP-Caller-Id" not in req_headers:
+            req_headers["X-MCP-Caller-Id"] = self.caller_id
+        return httpx.request(
+            method,
+            url,
+            headers=req_headers,
+            content=content,
+            json=json_data,
+            timeout=timeout,
+        )
 
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/mcp/"
 
     def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        import httpx
-
         request_id = str(uuid.uuid4())
         body = {
             "jsonrpc": "2.0",
@@ -490,14 +504,11 @@ class MCPHttpClient:
                 f"HTTP {response.status_code} from server: {response.text!r}"
             )
 
-        # Capture session id on first stateful response (no-op when
-        # the server runs stateless=True).
-        if "mcp-session-id" in response.headers and self._session_id is None:
-            self._session_id = response.headers["mcp-session-id"]
+        for hdr_name, hdr_val in response.headers.items():
+            if hdr_name.lower() == "mcp-session-id":
+                self._session_id = hdr_val
+                break
 
-        # Streamable HTTP returns either application/json or
-        # text/event-stream; with json_response=True on the server it
-        # is the former, but be lenient.
         ctype = response.headers.get("content-type", "")
         if "text/event-stream" in ctype:
             payload = self._parse_sse(response.text, request_id)
@@ -507,7 +518,7 @@ class MCPHttpClient:
             except json.JSONDecodeError as exc:
                 raise MCPClientError(
                     f"Non-JSON response: {response.text!r} ({exc})"
-                )
+                ) from exc
 
         if isinstance(payload, list):
             payload = next(
@@ -519,8 +530,6 @@ class MCPHttpClient:
         return payload.get("result", {})
 
     def _parse_sse(self, text: str, request_id: str) -> dict[str, Any]:
-        """Pick the JSON-RPC message matching `request_id` out of an
-        SSE-framed response."""
         for block in text.split("\n\n"):
             for line in block.splitlines():
                 if not line.startswith("data:"):

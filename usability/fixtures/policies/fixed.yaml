@@ -12,14 +12,16 @@ accounts:
       mark_seen: true
       mark_tagged: true
       move_out: true
-      accept_incoming: true
+      copy_out: true
+      accept_incoming: false
       rules: []
     - path: INBOX/Rechnungseingänge
       mode: blacklist
       default: FULL
       mark_seen: true
       mark_tagged: true
-      move_out: true
+      move_out: false
+      copy_out: true
       accept_incoming: true
       rules: []
     - path: "[Gmail]/Drafts"
@@ -28,7 +30,8 @@ accounts:
       draft_append: true
       draft_edit: true
       move_out: true
-      accept_incoming: true
+      copy_out: true
+      accept_incoming: false
       rules: []
     - path: "[Gmail]/Sent Mail"
       mode: blacklist
@@ -36,7 +39,10 @@ accounts:
       rules: []
     - path: "[Gmail]/Trash"
       mode: blacklist
-      default: FULL
+      default: METADATA
+      draft_append: false
+      draft_edit: false
+      move_out: false
       accept_incoming: true
       rules: []
     - path: "[Gmail]/All Mail"

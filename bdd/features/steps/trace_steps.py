@@ -13,10 +13,9 @@ Attribute values are compared in their text form: booleans as `true` /
 from __future__ import annotations
 
 import re
-import subprocess
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -157,14 +156,27 @@ def _resolve_uid_hint(context: Context, fragment: str) -> str:
     hint -> UID in `context.message_uids`, as every UID-bearing step of
     the suite does. `"uid": 311` names the message seeded as uid 311.
     """
-    lookup: dict[tuple[str, str, int], int] = getattr(context, "message_uids", {}) or {}
+    from support.imap_fixture import resolve_uid
 
     def substitute(match: re.Match[str]) -> str:
         hint = int(match.group(2))
-        actual = {uid for (_a, _f, h), uid in lookup.items() if h == hint}
-        if len(actual) == 1:
-            return f"{match.group(1)}{actual.pop()}"
-        return match.group(0)
+        m_acc = re.search(r'"account":\s*"([^"]+)"', fragment)
+        m_fld = re.search(r'"folder":\s*"([^"]+)"', fragment)
+        account = m_acc.group(1) if m_acc else getattr(context, "last_call_account", None)
+        folder = m_fld.group(1) if m_fld else getattr(context, "last_call_folder", None)
+        if not account or not folder:
+            resp = getattr(context, "last_response", None) or {}
+            account = account or resp.get("account")
+            folder = folder or resp.get("folder")
+
+        if account and folder:
+            real_uid = resolve_uid(context, account, folder, hint)
+            return f"{match.group(1)}{real_uid}"
+
+        raise AssertionError(
+            f"Cannot resolve UID hint {hint} in trace fragment: "
+            "account and folder are not specified in fragment or context"
+        )
 
     return re.sub(r'("uid": )(\d+)', substitute, fragment)
 
@@ -190,34 +202,9 @@ def _all_values(span: Any) -> list[str]:
     return values
 
 
-def _installed_server_version(context: Context) -> str:
-    """Version of the distribution that installs the server binary,
-    read from the server environment's package metadata."""
-    from features.steps.mcp_steps import _server_binary
-
-    python = Path(_server_binary(context)).parent / "python"
-    probe = (
-        "from importlib.metadata import distributions\n"
-        "hits = {d.version for d in distributions() "
-        "if any(ep.group == 'console_scripts' and ep.name == 'imap-mcp' "
-        "for ep in d.entry_points)}\n"
-        "print(hits.pop() if len(hits) == 1 else '')\n"
-    )
-    result = subprocess.run(
-        [str(python), "-c", probe], capture_output=True, text=True, timeout=30, check=False
-    )
-    version = result.stdout.strip()
-    if result.returncode != 0 or not version:
-        raise AssertionError(
-            f"Could not read the installed server version via {python}: "
-            f"rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
-        )
-    return version
-
-
 def _iso_to_unix_nano(timestamp: str) -> int:
-    moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    moment = datetime.fromisoformat(timestamp)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
     delta = moment - epoch
     return (delta.days * 86_400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1_000
 
@@ -236,8 +223,72 @@ def step_trace_collector_listening(context: Context) -> None:
     context.trace_collector = collector
     env = getattr(context, "mcp_extra_env", None) or {}
     env["OTEL_EXPORTER_OTLP_ENDPOINT"] = collector.endpoint
-    env["OTEL_BSP_SCHEDULE_DELAY"] = _TEST_BSP_SCHEDULE_DELAY_MS
+    if "OTEL_BSP_SCHEDULE_DELAY" not in env:
+        env["OTEL_BSP_SCHEDULE_DELAY"] = _TEST_BSP_SCHEDULE_DELAY_MS
     context.mcp_extra_env = env
+
+
+@given(r"the OTLP trace endpoint points to a closed loopback port")
+def step_otlp_closed_loopback(context: Context) -> None:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    env = getattr(context, "mcp_extra_env", None) or {}
+    env["OTEL_EXPORTER_OTLP_ENDPOINT"] = f"http://127.0.0.1:{port}"
+    context.mcp_extra_env = env
+
+
+@then(
+    r'within (?P<seconds>\d+) seconds the trace sink contains a span "(?P<name>[^"]+)" '
+    r'whose attribute "(?P<attribute>[^"]+)" equals (?P<count>\d+) "(?P<char>[^"]+)" characters'
+)
+def step_sink_span_char_repeat(
+    context: Context, seconds: str, name: str, attribute: str, count: str, char: str
+) -> None:
+    expected = char * int(count)
+    _wait_for_span(context, int(seconds), name, _equals(attribute, expected))
+
+
+@then(
+    r'the attributes (?P<attrs_raw>\[[^\]]+\]) of span "(?P<name>[^"]+)" '
+    r'are remembered as "(?P<key>[^"]+)"'
+)
+def step_remember_span_attributes(
+    context: Context, attrs_raw: str, name: str, key: str
+) -> None:
+    import json
+
+    span = _the_span(context, name)
+    attrs = json.loads(attrs_raw)
+    context.remembered_values[key] = {a: span.attributes.get(a) for a in attrs}
+
+
+@then(
+    r'within (?P<seconds>\d+) seconds the trace sink contains a span "(?P<name>[^"]+)" '
+    r'whose attributes (?P<attrs_raw>\[[^\]]+\]) equal the remembered "(?P<key>[^"]+)"'
+)
+def step_sink_span_attrs_equal_remembered(
+    context: Context, seconds: str, name: str, attrs_raw: str, key: str
+) -> None:
+    import json
+
+    expected = context.remembered_values.get(key)
+    if expected is None:
+        raise AssertionError(f"No remembered values for key {key!r}")
+    attrs = json.loads(attrs_raw)
+
+    def predicate(span: Any) -> str | None:
+        reasons = []
+        for a in attrs:
+            actual = span.attributes.get(a)
+            exp = expected.get(a)
+            if actual != exp:
+                reasons.append(f"{a}: expected {exp!r}, got {actual!r}")
+        return "; ".join(reasons) or None
+
+    _wait_for_span(context, int(seconds), name, predicate)
 
 
 # --------------------------------------------------- Then: single spans
@@ -445,10 +496,12 @@ def step_every_span_resource_equal(
 
 @then(
     r'every span in the trace sink has the resource attribute "(?P<attribute>[^"]+)" '
-    r"equal to the installed package version"
+    r'equal to "(?P<expected>[^"]*)"'
 )
-def step_every_span_resource_package_version(context: Context, attribute: str) -> None:
-    _every_span(context, 0, _resource_equals(attribute, _installed_server_version(context)))
+def step_every_span_resource_attr_equals(
+    context: Context, attribute: str, expected: str
+) -> None:
+    _every_span(context, 0, _resource_equals(attribute, expected))
 
 
 @then(r'every span in the trace sink has a non-empty resource attribute "(?P<attribute>[^"]+)"')

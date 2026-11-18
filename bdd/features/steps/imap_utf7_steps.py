@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 
-from behave import given, then
+from behave import given, then, use_step_matcher
 from behave.runner import Context
 
 from support.imap_fixture import resolve_account
+
+use_step_matcher("parse")
 
 
 # ------------------------------------------------------------------ Given
@@ -33,10 +35,30 @@ def step_imap_proxy_capture(context: Context, account_id: str) -> None:
     _start_imap_proxy(context, account_id)
 
 
+@given('the IMAP proxy for "{account_id}" injects raw LIST entry "{entry}"')
+def step_imap_proxy_inject_list_entry(
+    context: Context, account_id: str, entry: str
+) -> None:
+    try:
+        decoded_entry = entry.encode("utf-8").decode("unicode_escape")
+    except Exception:
+        decoded_entry = entry
+    config_path = context.scratch_dir / f"imap-proxy-{account_id}.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            config = {}
+    else:
+        config = {}
+    config["inject_list_entry"] = decoded_entry
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+
 @given('the IMAP account "{account_id}" exists')
 def step_imap_account_exists(context: Context, account_id: str) -> None:
     """Register the account in accounts.yaml without creating any folders."""
-    from features.steps.policy_steps import _ensure_builder, _ensure_account_registered
+    from features.steps.policy_steps import _ensure_account_registered, _ensure_builder
 
     builder = _ensure_builder(context)
     _ensure_account_registered(context, builder, account_id)
@@ -73,107 +95,6 @@ def step_imap_exposes_wire_mailboxes(
 
 
 # ------------------------------------------------------------------ Then
-
-@then("the response lists message uid {uid:d}")
-def step_response_lists_uid(context: Context, uid: int) -> None:
-    actual_uid = uid
-    for key, mapped in getattr(context, "message_uids", {}).items():
-        if key[2] == uid:
-            actual_uid = mapped
-            break
-    response = _last_response(context)
-    messages = response.get("messages") or []
-    found_uids = [m.get("uid") for m in messages if isinstance(m, dict)]
-    if actual_uid not in found_uids:
-        raise AssertionError(
-            f"Message uid {uid} (resolved to {actual_uid}) not found "
-            f"in response. Present uids: {found_uids!r}"
-        )
-
-
-@then('the response is not denied with reason "{reason}"')
-def step_response_not_denied_with_reason(
-    context: Context, reason: str
-) -> None:
-    response = _last_response(context)
-    actual_reason = response.get("reason")
-    if actual_reason == reason:
-        raise AssertionError(
-            f"Response was denied with reason {reason!r} — expected it "
-            f"not to be. Full response: {response!r}"
-        )
-
-
-@then(
-    'the most recent audit entry for tool "{tool}" has source folder '
-    'field equal to "{source}" and target folder field equal to "{target}"'
-)
-def step_audit_move_folder_fields(
-    context: Context, tool: str, source: str, target: str
-) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    matches = list(reader.find(tool=tool))
-    if not matches:
-        raise AssertionError(f"No audit entries found for tool={tool!r}")
-    last = matches[-1].record
-    args = last.get("args_summary", {})
-    actual_source = (
-        last.get("source_folder")
-        or last.get("source", {}).get("folder")
-        or (args.get("source") or {}).get("folder")
-    )
-    actual_target = (
-        last.get("target_folder")
-        or last.get("target", {}).get("folder")
-        or (args.get("target") or {}).get("folder")
-    )
-    errors: list[str] = []
-    if actual_source != source:
-        errors.append(
-            f"source folder: expected {source!r}, got {actual_source!r}"
-        )
-    if actual_target != target:
-        errors.append(
-            f"target folder: expected {target!r}, got {actual_target!r}"
-        )
-    if errors:
-        raise AssertionError(
-            "; ".join(errors) + f". Full record: {last!r}"
-        )
-
-
-@then(
-    'no audit entry written during this scenario contains '
-    'the substring "{substring}"'
-)
-def step_no_audit_substring(context: Context, substring: str) -> None:
-    from support.audit_reader import AuditReader
-
-    reader = AuditReader(context.audit_dir)
-    for rec in reader.records():
-        text = json.dumps(rec.record)
-        if substring in text:
-            raise AssertionError(
-                f"Audit entry contains forbidden substring "
-                f"{substring!r}: {rec.record!r}"
-            )
-
-
-@then(
-    'no folder path in the response contains the substring "{substring}"'
-)
-def step_no_folder_path_contains(context: Context, substring: str) -> None:
-    response = _last_response(context)
-    folders = response.get("folders") or []
-    for f in folders:
-        path = f.get("path") if isinstance(f, dict) else str(f)
-        if substring in (path or ""):
-            raise AssertionError(
-                f"Folder path {path!r} contains forbidden substring "
-                f"{substring!r}"
-            )
 
 
 @then(
@@ -213,8 +134,7 @@ def step_imap_search_subject_exactly_one(
 
         account_id = _account_for_folder(context, folder)
     instance, user = resolve_account(account_id)
-    context.imap.close_all()
-    uid = context.imap.find_uid_by_decoded_subject(
+    uid = context.imap.find_unique_uid_by_decoded_subject(
         instance, user, folder, subject
     )
     if uid is None:

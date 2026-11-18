@@ -49,7 +49,7 @@ def run_metrics(ev: Evidence, task_usage: dict[str, Any], turns: int) -> dict[st
     span_calls = ev.span_calls()
     out: dict[str, Any] = {}
     out["tool_calls"] = len(audit)
-    ideal = ev.scenario.ideal_calls
+    ideal = ev.scenario.get_ideal_calls(getattr(ev, "variant", None))
     out["ideal_ratio"] = round(len(audit) / ideal, 2) if ideal else None
     out["calls_by_tool"] = dict(sorted(Counter(tools).items()))
     out["failed_calls"] = [
@@ -76,9 +76,8 @@ def run_metrics(ev: Evidence, task_usage: dict[str, Any], turns: int) -> dict[st
             for m in response.get("messages") or []:
                 if isinstance(m, dict) and "uid" in m:
                     listed.add((account, folder, int(m["uid"])))
-        elif tool == "fetch_envelope" and isinstance(request.get("uid"), int):
-            if (account, folder, request["uid"]) in listed:
-                refetch.append({"folder": folder, "uid": request["uid"]})
+        elif tool == "fetch_envelope" and isinstance(request.get("uid"), int) and (account, folder, request["uid"]) in listed:
+            refetch.append({"folder": folder, "uid": request["uid"]})
     out["refetch_after_listing"] = refetch
     discovery: Counter[tuple[str, str]] = Counter()
     beyond = []
@@ -98,9 +97,10 @@ def run_metrics(ev: Evidence, task_usage: dict[str, Any], turns: int) -> dict[st
     out["largest_response_bytes"] = {"bytes": largest[0], "tool": largest[1]} if largest else None
     inp, outp = task_usage.get("input_tokens"), task_usage.get("output_tokens")
     out["tokens"] = {"input": inp, "output": outp} if (inp is not None or outp is not None) else "unknown"
-    out["response_token_share"] = (
+    out["response_bytes_per_input_token"] = (
         round(out["response_bytes"] / inp, 4) if isinstance(inp, int) and inp > 0 else None
     )
+    out["response_token_share"] = out["response_bytes_per_input_token"]
     out["wall_clock_seconds"] = ev.wall_clock_seconds
     tool_spans = ev.tool_spans()
     out["server_seconds"] = round(sum(_ns_seconds(s) for s in tool_spans), 3)
@@ -181,7 +181,7 @@ def _hard_wrapped(ev: Evidence, description: str) -> bool | None:
 
 
 def _ok(record: dict[str, Any]) -> bool:
-    return record.get("result", "OK") == "OK" and record.get("decision") != "DENY"
+    return record.get("decision") == "ALLOW" and record.get("result") == "OK"
 
 
 def _folder(record: dict[str, Any]) -> str | None:
@@ -300,14 +300,28 @@ def _scope_used(ev: Evidence, description: str) -> list[Any]:
     ]
 
 
+@measure("noticed_window_limit")
 @measure("noticed_outside_scope")
 def _noticed_outside_scope(ev: Evidence, description: str) -> bool | None:
-    calls = [(t, q, p) for t, q, p, _a in ev.span_calls() if t in LISTING_TOOLS]
-    first = next((i for i, (_t, _q, p) in enumerate(calls)
-                  if isinstance(p, dict) and (p.get("outside_scope_total") or 0) > 0), None)
+    calls = [(t, q, p, a) for t, q, p, a in ev.span_calls() if t in LISTING_TOOLS]
+    first = next(
+        (
+            i
+            for i, (_t, _q, p, a) in enumerate(calls)
+            if (
+                isinstance(p, dict)
+                and (
+                    p.get("completeness") in ("window_limited", "window_and_policy_limited")
+                    or (p.get("outside_scope_total") or 0) > 0
+                )
+            )
+            or (a.get("mcp.result.completeness") in ("window_limited", "window_and_policy_limited"))
+        ),
+        None,
+    )
     if first is None:
         return None
-    return any(q.get("scope") == "all" for _t, q, _p in calls[first + 1:])
+    return any(q.get("scope") == "all" for _t, q, _p, _a in calls[first + 1 :])
 
 
 def _criteria_list(ev: Evidence) -> list[dict[str, Any]]:
@@ -392,9 +406,30 @@ def _sink_files(ev: Evidence, description: str) -> list[dict[str, Any]]:
     return ev.sink_files
 
 
+def _is_empty_or_denied_audit_or_response(r: dict[str, Any], resp: Any) -> bool:
+    if r.get("decision") == "DENY":
+        return True
+    if isinstance(resp, dict):
+        if resp.get("decision") == "DENY":
+            return True
+        if resp.get("decision") in ("ALLOW", None) and resp.get("result") in ("OK", None):
+            comp = resp.get("completeness")
+            if comp in ("policy_may_hide", "window_and_policy_limited") or comp is None:
+                for key in ("uids", "messages"):
+                    if key in resp and not resp[key]:
+                        return True
+    return False
+
+
 def _after_first_deny(ev: Evidence) -> list[dict[str, Any]]:
     audit = ev.audit_calls()
-    first = next((i for i, r in enumerate(audit) if r.get("decision") == "DENY"), None)
+    spans = ev.span_calls()
+    first = None
+    for i, r in enumerate(audit):
+        resp = spans[i][2] if i < len(spans) else None
+        if _is_empty_or_denied_audit_or_response(r, resp):
+            first = i
+            break
     return [] if first is None else audit[first + 1:]
 
 
@@ -428,6 +463,8 @@ def scenario_measurements(ev: Evidence) -> dict[str, Any]:
             out[m.name] = fn(ev, m.description)
         except Exception as exc:  # noqa: BLE001 - a gap in evidence must not abort the matrix
             out[m.name] = {"error": repr(exc)}
+    if "noticed_window_limit" in out and "noticed_outside_scope" not in out:
+        out["noticed_outside_scope"] = out["noticed_window_limit"]
     return out
 
 

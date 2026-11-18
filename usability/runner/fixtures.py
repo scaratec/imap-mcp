@@ -30,7 +30,7 @@ if str(_MOCK_SRC) not in sys.path:
 
 from mock_gmail.state import GmailState, Message, decode_mutf7
 
-OWNER_ADDRESS = "inhaber@example.org"
+OWNER_ADDRESS = "owner@de-gmail.example"
 OWNER_NAME = "Kim Brandt"
 MESSAGE_ID_DOMAIN = "fixtures.usability.example.org"
 
@@ -110,7 +110,7 @@ class MailboxFixture:
 
 def _parse_day(value: str) -> datetime:
     if "T" in value:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+        return datetime.fromisoformat(value).astimezone(UTC)
     d = date.fromisoformat(value)
     return datetime(d.year, d.month, d.day, 8, 0, 0, tzinfo=UTC)
 
@@ -264,16 +264,17 @@ def _internal_folder(folder: str) -> str:
 
 def seed_state(state: GmailState, fixture: MailboxFixture) -> None:
     """Seed a fresh mock-gmail state. UIDs follow the table's `uid` column."""
+    from usability.runner.serverconf import FIXTURE_PASSWORD
+
     state.reset()
+    state.password = FIXTURE_PASSWORD
     state.set_localized_folders(fixture.localized)
     for folder in fixture.custom_folders:
         state.create_folder(encode_mutf7(folder))
     for index, seed in enumerate(fixture.messages, start=1):
         if seed.ref is not None:
             internal = _internal_folder(seed.folder)
-            counters = state._uid_counters
-            if counters.get(internal, 0) < seed.ref:
-                counters[internal] = seed.ref - 1
+            state.set_next_uid(internal, seed.ref)
         msgid_number = 1_900_000_000_000_000_000 + index
         state.add_message(
             Message(
@@ -297,7 +298,8 @@ def seed_state(state: GmailState, fixture: MailboxFixture) -> None:
 def mime_structure(part: email.message.Message) -> str:
     if part.is_multipart():
         payload = part.get_payload()
-        assert isinstance(payload, list)
+        if not isinstance(payload, list):
+            raise AssertionError(f"Expected list payload for multipart message, got {type(payload)}")
         children = ",".join(mime_structure(p) for p in payload if isinstance(p, email.message.Message))
         return f"{part.get_content_type()}[{children}]"
     return part.get_content_type()

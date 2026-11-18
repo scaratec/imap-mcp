@@ -1,55 +1,38 @@
-Feature: Gmail special-use folders resolve on every path, from the first call on
+Feature: Gmail special-use folders resolve canonically from the first call on
 
-  ADR 0033.
+  ADR 0056 preserves session-start RFC 6154 special-use alias
+  resolution on granted Google accounts: callers and policies may use
+  canonical ([Gmail]/Drafts) or localized ([Gmail]/Entwürfe) names,
+  wire commands always address the localized mUTF-7 mailbox, responses
+  always emit canonical paths, identical duplicate policy entries
+  collapse cleanly, and discrepant entries fail closed with
+  policy_alias_conflict.
 
-  A Gmail account in German shows its system folders under localized
-  wire names ([Gmail]/Entwürfe, [Gmail]/Papierkorb, [Gmail]/Alle
-  Nachrichten). Policies, tool descriptions and list_folders speak the
-  canonical names ([Gmail]/Drafts, [Gmail]/Trash, [Gmail]/All Mail).
-  ADR 0016 promises an intent-level surface, so the caller must not have
-  to know which language the mailbox owner chose.
-
-  What is at stake. Today the canonical name only works after
-  list_folders has filled a per-process alias cache, and the Gmail
-  label-swap move never consults that cache at all. On a German account
-  an agent that discards a draft by moving "[Gmail]/Drafts" to
-  "[Gmail]/Trash" gets result ERROR with error_type "uid_not_found" and
-  concludes that drafts cannot be deleted. Policies carry every system
-  folder twice as a workaround, and two entries for one physical folder
-  can disagree. Production evidence: audit log 2026-05-19 to 2026-10-31,
-  9 failed moves from [Gmail]/Drafts, 12 failed create_draft calls on
-  [Gmail]/Drafts, all on gupta@scaratec.com (German locale).
-
-  Independent-channel rule. Every Then that claims a folder was
-  addressed reads the IMAP command log the mock records (it never sees
-  the server's alias map) or a direct IMAP SEARCH against the mock. The
-  first scenario pins the mock itself: it must reject the English name
-  on a localized account, as Gmail does, otherwise every other scenario
-  here could pass against a mock that is more forgiving than production
-  (Guideline §7.2).
-
-  Covered error layers (per BDD Guidelines §4.5):
-    - Mock fidelity: English name refused on localized account     : 1
-    - First call in a session uses a canonical special-use path   : 3 (read tools)
-    - First call in a session writes to a canonical path          : 1
-    - Label-swap move across canonical/localized name forms       : 3
-    - Unselectable source folder reported as folder_absent        : 1
-    - Cross-account saga resolves All Mail on a localized account : 1
-    - Canonical-only policy governs the localized name            : 1
-    - Localized-only policy entry governs the canonical name      : 1
-    - Conflicting entries for one special-use folder fail closed   : 1
-    - Responses echo the canonical name                            : 1
-    Total enumerated                                               : 14  covered by this feature: 14
+  Fixture fidelity checks (mock self-validation, not SUT error paths): 1
+  Covered SUT error layers (per BDD Guidelines §4.5):
+    - First call in session resolves canonical special-use read path : 3
+    - First call in session writes to canonical [Gmail]/Drafts       : 1
+    - Label-swap move across canonical and localized name forms      : 3
+    - Unselectable source folder reported as error.type=folder_absent: 1
+    - Cross-account saga resolves localized All Mail & removes INBOX : 1
+    - Canonical-only policy governs localized caller argument        : 1
+    - Localized-only policy governs canonical caller argument        : 1
+    - Identical duplicate entries collapse cleanly                   : 1
+    - Discrepant duplicate entries fail closed (policy_alias_conflict): 2
+    - Responses echo canonical folder path                           : 1
+    Total SUT enumerated                                             : 15  covered by this feature: 15 (plus 1 mock-fidelity check)
 
   Background:
-    Given the IMAP account "gupta-gmail-de" exists with provider "google" and folders:
+    Given the server clock is pinned to "2026-11-02T12:00:00Z"
+    And the audit log directory is a fresh $TMPDIR/audit
+    And the IMAP account "gupta-gmail-de" exists with provider "google" and folders:
       | folder path       |
       | INBOX             |
       | [Gmail]/All Mail  |
       | [Gmail]/Drafts    |
       | [Gmail]/Sent Mail |
       | [Gmail]/Trash     |
-    And the mock-gmail server uses localized folder names:
+    And the mock-gmail server for "gupta-gmail-de" uses localized folder names:
       | canonical         | localized                | flags                  |
       | [Gmail]/All Mail  | [Gmail]/Alle Nachrichten | \All \HasNoChildren    |
       | [Gmail]/Drafts    | [Gmail]/Entw&APw-rfe     | \Drafts \HasNoChildren |
@@ -58,20 +41,16 @@ Feature: Gmail special-use folders resolve on every path, from the first call on
     And the server is configured with caller "draft-agent" using policy "de-policy"
     And policy "de-policy" grants account "gupta-gmail-de"
 
-  # --- Mock fidelity ---------------------------------------------------
-
   Scenario: The localized mock refuses the English name, as Gmail does
     When a direct IMAP SELECT of "[Gmail]/Drafts" is issued against "gupta-gmail-de"
     Then the direct IMAP command is answered with status "NO"
     When a direct IMAP SELECT of "[Gmail]/Entw&APw-rfe" is issued against "gupta-gmail-de"
     Then the direct IMAP command is answered with status "OK"
 
-  # --- Main path: no list_folders before the first call ----------------
-
   Scenario Outline: A read tool resolves a canonical special-use path as the first call of a session
     Given policy "de-policy" grants folder:
-      | folder    | mode      | default  | rules |
-      | <folder>  | blacklist | ENVELOPE | []    |
+      | folder   | mode      | default  | rules |
+      | <folder> | blacklist | ENVELOPE | []    |
     And no tool has been called in this server session yet
     When draft-agent calls <tool> with account "gupta-gmail-de", folder "<folder>"
     Then the response decision is ALLOW
@@ -85,7 +64,7 @@ Feature: Gmail special-use folders resolve on every path, from the first call on
       | list_messages | [Gmail]/Trash     | [Gmail]/Papierkorb       |
       | folder_stats  | [Gmail]/All Mail  | [Gmail]/Alle Nachrichten |
 
-  Scenario: create_draft on the canonical Drafts path lands in the localized folder as the first call
+  Scenario: create_draft on canonical [Gmail]/Drafts lands in localized Drafts as the first call
     Given policy "de-policy" grants folder:
       | folder         | mode      | default | rules | draft_append |
       | [Gmail]/Drafts | blacklist | FULL    | []    | true         |
@@ -102,22 +81,19 @@ Feature: Gmail special-use folders resolve on every path, from the first call on
       """
     Then the response decision is ALLOW
     And the response field result equals "OK"
-    And a direct IMAP SEARCH on "gupta-gmail-de:[Gmail]/Entw&APw-rfe" for subject "Angebot Fruehjahr" returns exactly one result
+    And a direct IMAP SEARCH on "gupta-gmail-de:[Gmail]/Entw&APw-rfe" for header X-SC-Draft-Id equal to the returned draft_id returns exactly one result
     And the IMAP command log for "gupta-gmail-de" contains no command addressing the mailbox "[Gmail]/Drafts"
 
-  # --- Discarding a draft: the label-swap move -------------------------
-
-  Scenario Outline: A draft moves to the trash on a localized account whichever name form the caller uses
+  Scenario Outline: A draft moves to trash on a localized account whichever name form the caller uses
     Given policy "de-policy" grants folder:
       | folder         | mode      | default  | rules | move_out | accept_incoming |
       | [Gmail]/Drafts | blacklist | FULL     | []    | true     | false           |
       | [Gmail]/Trash  | blacklist | METADATA | []    | false    | true            |
-    And a Gmail message with:
-      | x_gm_msgid | message_id               | from                    | subject          |
-      | 20001      | <d-20001@example.org>    | draft-agent@example.org | Entwurf Angebot  |
-    And the message carries Gmail labels ["\\Drafts"]
-    And the message has UID 301 under "[Gmail]/Drafts", UID 20001 under "[Gmail]/All Mail"
-    When draft-agent calls move with account "gupta-gmail-de", source folder "<source>" uid 301, target folder "<target>"
+    And a Gmail message on "gupta-gmail-de" has:
+      | x_gm_msgid | message_id            | from_address            | to_address     | subject         | date                 |
+      | 20001      | <d-20001@example.org> | draft-agent@example.org | me@example.org | Entwurf Angebot | 2026-11-01T09:00:00Z |
+    And the Gmail message 20001 on "gupta-gmail-de" carries labels ["\\Drafts"] with UID 301 in "[Gmail]/Drafts" and UID 20001 in "[Gmail]/All Mail"
+    When draft-agent calls move with source {"account": "gupta-gmail-de", "folder": "<source>", "uid": 301}, target {"account": "gupta-gmail-de", "folder": "<target>"}
     Then the response decision is ALLOW
     And the response field result equals "OK"
     And the response field mechanism equals "gmail_label_swap"
@@ -125,31 +101,27 @@ Feature: Gmail special-use folders resolve on every path, from the first call on
     And a direct IMAP SEARCH on "gupta-gmail-de:[Gmail]/Papierkorb" for X-GM-MSGID 20001 returns exactly one result
 
     Examples:
-      | source               | target              |
-      | [Gmail]/Drafts       | [Gmail]/Trash       |
-      | [Gmail]/Entwürfe     | [Gmail]/Papierkorb  |
-      | [Gmail]/Drafts       | [Gmail]/Papierkorb  |
+      | source           | target             |
+      | [Gmail]/Drafts   | [Gmail]/Trash      |
+      | [Gmail]/Entwürfe | [Gmail]/Papierkorb |
+      | [Gmail]/Drafts   | [Gmail]/Papierkorb |
 
-  # --- Error path: the source folder cannot be selected ----------------
-
-  Scenario: A move whose source folder does not exist reports folder_absent, never uid_not_found
-    # Today the label-swap branch maps every SELECT failure to
-    # uid_not_found, which tells the caller its UID is wrong when in fact
-    # the folder name is. ADR 0025 defines folder_absent for this case.
+  Scenario: A move whose source folder does not exist reports error.type=folder_absent
     Given policy "de-policy" grants folder:
       | folder           | mode      | default  | rules | move_out | accept_incoming |
       | [Gmail]/Archiv19 | blacklist | FULL     | []    | true     | false           |
       | [Gmail]/Trash    | blacklist | METADATA | []    | false    | true            |
-    When draft-agent calls move with account "gupta-gmail-de", source folder "[Gmail]/Archiv19" uid 301, target folder "[Gmail]/Trash"
+    When draft-agent calls move with source {"account": "gupta-gmail-de", "folder": "[Gmail]/Archiv19", "uid": 301}, target {"account": "gupta-gmail-de", "folder": "[Gmail]/Trash"}
     Then the response decision is ALLOW
     And the response field result equals "ERROR"
-    And the response field error_type equals "folder_absent"
+    And the response field error.type equals "folder_absent"
+    And the response does not contain any field named "error_type"
     And the IMAP command log for "gupta-gmail-de" contains no STORE command
 
-  # --- Cross-account saga ----------------------------------------------
-
-  Scenario: A cross-account move from a localized account fetches from the localized All Mail folder
-    Given the IMAP account "archive-srv" exists with provider "imap-standard" and folder "Archiv"
+  Scenario: Cross-account move from a localized Google account fetches from localized All Mail and removes INBOX
+    Given the IMAP account "archive-srv" exists with provider "imap-standard" and folders:
+      | folder path |
+      | Archiv      |
     And policy "de-policy" grants account "archive-srv"
     And policy "de-policy" grants folder on account "gupta-gmail-de":
       | folder | mode      | default | rules | move_out | accept_incoming |
@@ -157,18 +129,17 @@ Feature: Gmail special-use folders resolve on every path, from the first call on
     And policy "de-policy" grants folder on account "archive-srv":
       | folder | mode      | default | rules | accept_incoming |
       | Archiv | blacklist | FULL    | []    | true            |
-    And a Gmail message with:
-      | x_gm_msgid | message_id             | from                       | subject         |
-      | 20002      | <m-20002@example.org>  | rechnung@nordlicht.example.org | Rechnung 4711 |
-    And the message has UID 512 under "INBOX", UID 20002 under "[Gmail]/All Mail"
-    When draft-agent calls move with source {"account":"gupta-gmail-de","folder":"INBOX","uid":512}, target {"account":"archive-srv","folder":"Archiv"}
-    Then the transaction reaches state committed within 60 seconds
+    And a Gmail message on "gupta-gmail-de" has:
+      | x_gm_msgid | message_id            | from_address                   | to_address     | subject       | date                 |
+      | 20002      | <m-20002@example.org> | rechnung@nordlicht.example.org | me@example.org | Rechnung 4711 | 2026-11-01T09:00:00Z |
+    And the Gmail message 20002 on "gupta-gmail-de" carries labels ["INBOX"] with UID 512 in "INBOX" and UID 20002 in "[Gmail]/All Mail"
+    When draft-agent calls move with source {"account": "gupta-gmail-de", "folder": "INBOX", "uid": 512}, target {"account": "archive-srv", "folder": "Archiv"}
+    Then the WAL entry for the returned tx_id has status "committed"
     And the IMAP command log for "gupta-gmail-de" contains a SELECT or EXAMINE of the wire mailbox "[Gmail]/Alle Nachrichten"
     And a direct IMAP SEARCH on "archive-srv:Archiv" for message-id "<m-20002@example.org>" returns exactly one result
+    And a direct IMAP SEARCH on "gupta-gmail-de:INBOX" for X-GM-MSGID 20002 returns zero results
 
-  # --- Policy addressing: one physical folder, one policy entry --------
-
-  Scenario: A policy written only in canonical names governs the localized name
+  Scenario: A policy written only in canonical names governs localized caller input
     Given policy "de-policy" grants folder:
       | folder         | mode      | default | rules | draft_append |
       | [Gmail]/Drafts | blacklist | FULL    | []    | true         |
@@ -176,25 +147,29 @@ Feature: Gmail special-use folders resolve on every path, from the first call on
     Then the response decision is ALLOW
     And the IMAP command log for "gupta-gmail-de" contains a SELECT or EXAMINE of the wire mailbox "[Gmail]/Entw&APw-rfe"
 
-  Scenario: A policy entry under the localized name governs the canonical name
-    # Existing deployments list both names; this keeps a policy that only
-    # lists the localized name working after the change.
+  Scenario: A policy written under the localized name governs canonical caller input
     Given policy "de-policy" grants folder:
       | folder             | mode      | default  | rules |
       | [Gmail]/Papierkorb | blacklist | METADATA | []    |
-    When draft-agent calls list_messages with account "gupta-gmail-de", folder "[Gmail]/Trash"
+    When draft-agent calls list_messages with account "gupta-gmail-de", folder "[Gmail]/Trash", criteria {}, scope "all"
     Then the response decision is ALLOW
     And the IMAP command log for "gupta-gmail-de" contains a SELECT or EXAMINE of the wire mailbox "[Gmail]/Papierkorb"
 
-  Scenario: Two policy entries for the same special-use folder that disagree fail closed
-    # ADR 0033 adds the reason code policy_alias_conflict to ADR 0017.
-    # Fail closed because either entry could be the one the operator
-    # meant; picking the more permissive would be a policy bypass.
+  Scenario: Two identical policy entries for canonical and localized names collapse cleanly
+    Given policy "de-policy" grants folder:
+      | folder             | mode      | default  | rules |
+      | [Gmail]/Trash      | blacklist | METADATA | []    |
+      | [Gmail]/Papierkorb | blacklist | METADATA | []    |
+    When draft-agent calls list_messages with account "gupta-gmail-de", folder "[Gmail]/Trash", criteria {}, scope "all"
+    Then the response decision is ALLOW
+    And the response field result equals "OK"
+
+  Scenario: Two disagreeing policy entries for the same special-use folder fail closed with policy_alias_conflict
     Given policy "de-policy" grants folder:
       | folder             | mode      | default | rules |
       | [Gmail]/Trash      | whitelist | NONE    | []    |
       | [Gmail]/Papierkorb | blacklist | FULL    | []    |
-    When draft-agent calls list_messages with account "gupta-gmail-de", folder "[Gmail]/Papierkorb"
+    When draft-agent calls list_messages with account "gupta-gmail-de", folder "[Gmail]/Papierkorb", criteria {}, scope "all"
     Then the response decision is DENY
     And the response field reason equals "policy_alias_conflict"
     And the audit log contains an entry with:
@@ -204,10 +179,16 @@ Feature: Gmail special-use folders resolve on every path, from the first call on
       | reason   | policy_alias_conflict |
     And the IMAP command log for "gupta-gmail-de" contains no SELECT or EXAMINE of the wire mailbox "[Gmail]/Papierkorb"
 
-  Scenario: Responses name a special-use folder by its canonical path
-    # ADR 0033 amends ADR 0025. list_folders already answers in
-    # canonical names; echoing the same vocabulary everywhere teaches a
-    # caller one set of names instead of two.
+  Scenario: Discrepant canonical and localized Sent Mail entries also fail closed on search
+    Given policy "de-policy" grants folder:
+      | folder            | mode      | default  | rules |
+      | [Gmail]/Sent Mail | blacklist | METADATA | []    |
+      | [Gmail]/Gesendet  | blacklist | FULL     | []    |
+    When draft-agent calls search with account "gupta-gmail-de", folder "[Gmail]/Sent Mail", criteria {}, scope "all"
+    Then the response decision is DENY
+    And the response field reason equals "policy_alias_conflict"
+
+  Scenario: Responses echo the canonical special-use folder path even when called with localized name
     Given policy "de-policy" grants folder:
       | folder         | mode      | default | rules | draft_append |
       | [Gmail]/Drafts | blacklist | FULL    | []    | true         |

@@ -9,7 +9,13 @@ import sys
 from samples import FEATURES
 
 from usability.runner import REPO_ROOT
-from usability.runner.fixtures import GmailState, build_mailbox, encode_mutf7, seed_state, snapshot
+from usability.runner.fixtures import (
+    GmailState,
+    build_mailbox,
+    encode_mutf7,
+    seed_state,
+    snapshot,
+)
 from usability.runner.pdf import format_eur, invoice_lines, render_pdf
 
 
@@ -28,11 +34,11 @@ def test_same_input_same_bytes_in_process() -> None:
 
 def test_same_bytes_across_processes() -> None:
     code = (
-        "import sys; sys.path.insert(0, %r); sys.path.insert(0, %r)\n"
+        "import sys; sys.path.insert(0, {!r}); sys.path.insert(0, {!r})\n"
         "from samples import FEATURES\n"
         "from test_fixtures import _digest\n"
         "print(_digest('S1'), _digest('R3'))"
-    ) % (str(REPO_ROOT), str(REPO_ROOT / "usability" / "tests"))
+    ).format(str(REPO_ROOT), str(REPO_ROOT / "usability" / "tests"))
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                          env={"PYTHONHASHSEED": "12345", "PATH": ""})
     assert out.stdout.split() == [_digest("S1"), _digest("R3")]
@@ -93,3 +99,37 @@ def test_owner_draft_is_seeded_in_drafts() -> None:
     drafts = [m for m in snapshot(state) if "[Gmail]/Drafts" in m["folders"]]
     assert [d["subject"] for d in drafts] == ["Lieferverzögerung"]
     assert "\\Draft" in drafts[0]["flags"]
+
+
+def test_mock_gmail_login_smoke_with_fixture_password() -> None:
+    import asyncio
+
+    from mock_gmail.server import start_gmail_mock
+
+    from usability.runner.serverconf import FIXTURE_PASSWORD
+
+    state = GmailState()
+    seed_state(state, build_mailbox(FEATURES.scenarios["S1"]))
+
+    async def _run() -> None:
+        server, port = await start_gmail_mock(state, host="127.0.0.1", port=0)
+        try:
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            greeting = await r.readline()
+            if b"OK Gimap ready" not in greeting:
+                raise AssertionError(f"Invalid greeting: {greeting!r}")
+            w.write(f'a01 LOGIN "test@scaratec.com" "{FIXTURE_PASSWORD}"\r\n'.encode())
+            await w.drain()
+            resp = await r.readline()
+            if not resp.startswith(b"a01 OK"):
+                raise AssertionError(f"Expected a01 OK, got {resp!r}")
+            w.write(b"a02 LOGOUT\r\n")
+            await w.drain()
+            await r.read()
+            w.close()
+            await w.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(_run())
