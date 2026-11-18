@@ -2,45 +2,6 @@
 
 <!-- version list -->
 
-## v3.0.0 (2026-11-17)
-
-### Breaking Changes
-
-- **security & tool-surface (`ADR 0040`–`0055`)**: Major security and
-  authorization overhaul to Tool Surface `3.0.0` (27 tools: 13 read, 10
-  write, 4 meta):
-  - Retire `add_attachment`, `replace_attachment`, `delete_attachment`,
-    and `modify_message` on received mail; add structured `attachments` on
-    `create_draft` and `update_draft` for own drafts (`ADR 0045`, `0052`).
-  - Enforce strict non-interference for `NONE` and above-grant fields:
-    remove `matched_total`, `filtered_out`, `outside_scope_total`,
-    `hidden_*_count`, `canonical_all_mail_uid`, `matched_rule_index`,
-    `sender_rules_count`, and `list_folders.message_count`; emit
-    `total_visible`, static `completeness`, Gmail `object_id`, and opaque
-    `not_found` below `METADATA` (`ADR 0040`, `0043`, `0044`, `0053`).
-  - Replace asymmetric rule keys (`from`, `to`, `to_contains`) with
-    closed direction-aware RFC 5322 predicates (`from_address`,
-    `from_domain`, `to_address`, `to_domain`, `cc_address`, `cc_domain`,
-    `recipient_address`, `recipient_domain`, `all_recipients_in_domains`,
-    `provenance: "own"`) and unified UTC `INTERNALDATE` time semantics
-    (`ADR 0041`).
-  - Enforce `Write <= Read` per-message visibility floors, flow
-    monotonicity (`relocation_would_escalate`), `copy_out` on `copy`,
-    read-only `\Flagged` (`forbidden_flag`), `draft_recipients` allowlists
-    (`recipient_not_allowed`), and HMAC-signed `X-SC-Provenance` + WAL
-    draft/transaction ownership (`ADR 0042`, `0045`, `0046`).
-  - Deliver attachments into per-caller `0700` directories with UUIDv4
-    prefixes opened via `openat` (`O_CREAT | O_EXCL | O_NOFOLLOW`, `0400`),
-    omitting host paths from `list_tools` and filenames from audit logs
-    (`ADR 0047`).
-  - Enforce pre-effect `intent` auditing, automatic UTC day-roll
-    retention, single-caller `callers.yaml`, `acknowledge_plaintext: true`
-    on `file_dir`, durable `needs_rebootstrap` in `wal.db`, `GET /healthz`
-    (`200`/`503`), startup saga recovery, test-hook production gate, and
-    multi-instance pool defaults `max_size=2, idle_ttl=120s`
-    (`ADR 0048`–`0051`, `0055`).
-
-
 ## v2.3.0 (2026-11-03)
 
 ### Bug Fixes

@@ -118,6 +118,8 @@ Feature: Pluggable secret-store backends
     And the server process is started with transport "http" on 127.0.0.1 and a random port
     When the MCP client performs an Initialize handshake with caller_id "invoice-agent" and bearer token "correct-horse-battery"
     Then the handshake succeeds
+    When the MCP client calls get_caller_identity on the established HTTP session
+    Then the response field caller_id equals "invoice-agent"
     And the audit file does NOT contain any of the literal strings:
       | forbidden_string        |
       | correct-horse-battery   |

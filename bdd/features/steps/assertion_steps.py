@@ -3191,14 +3191,39 @@ def step_retention_state_of_base_date(
         raise AssertionError(f"Unknown final_state {final_state!r}")
 
 
+def _find_scrubbed_python() -> str:
+    import subprocess
+    import sys
+
+    candidates = ["/usr/bin/python3", "/bin/python3", sys.executable]
+    clean_env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}
+    for candidate in candidates:
+        cand_path = Path(candidate)
+        if cand_path.is_file() and os.access(cand_path, os.X_OK):
+            try:
+                res = subprocess.run(
+                    [candidate, "-c", "import sys; sys.exit(0)"],
+                    env=clean_env,
+                    capture_output=True,
+                    timeout=2.0,
+                    check=False,
+                )
+                if res.returncode == 0:
+                    return candidate
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return sys.executable
+
+
 @given('an executable root-hook recorder script exists at "{script_raw}" writing its argv and environment keys to "{out_raw}"')
 def step_create_root_hook_recorder(context: Context, script_raw: str, out_raw: str) -> None:
     from features.steps.policy_steps import _scratch_substitute
 
+    py_interp = _find_scrubbed_python()
     script_path = Path(_scratch_substitute(context, script_raw))
     out_path = Path(_scratch_substitute(context, out_raw))
     script_path.parent.mkdir(parents=True, exist_ok=True)
-    content = f"""#!/usr/bin/env python3
+    content = f"""#!{py_interp}
 import sys, os, json
 data = {{
     "argv": sys.argv,
