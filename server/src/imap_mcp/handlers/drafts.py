@@ -1276,6 +1276,9 @@ async def _do_update_draft(
                     account_id,
                     folder_path,
                 )
+                context.saga._audit_step(
+                    ambig_tx_id, "escalated", outcome="ERROR", reason="draft_ambiguous"
+                )
                 context.saga.wal.mark_needs_operator(ambig_tx_id, reason="draft_ambiguous")
             extra["tx_id"] = ambig_tx_id
             return error_envelope(
@@ -1478,8 +1481,8 @@ async def _do_update_draft(
         if tx_id and context.saga is not None:
             count = context.saga.wal.bump_retry(tx_id, f"delete_failed: {expunge_err}")
             if count >= context.saga.retry_limit:
-                context.saga.wal.mark_needs_operator(tx_id)
                 context.saga._audit_step(tx_id, "escalated", outcome="ERROR")
+                context.saga.wal.mark_needs_operator(tx_id)
         res_err: dict[str, Any] = {
             "decision": "ALLOW",
             "result": "ERROR",
@@ -1502,8 +1505,8 @@ async def _do_update_draft(
 
     if tx_id and context.saga is not None:
         context.saga.wal.mark_deleted(tx_id)
-        context.saga.wal.commit(tx_id)
         context.saga._audit_step(tx_id, "commit")
+        context.saga.wal.commit(tx_id)
 
         p_final = email.message_from_bytes(final_bytes)
         mid = p_final.get("Message-ID")

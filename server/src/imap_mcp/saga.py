@@ -263,8 +263,8 @@ class SagaManager:
             except Exception as exc:  # noqa: BLE001
                 count = self.wal.bump_retry(tx_id, f"fetch_failed: {exc}")
                 if count >= self.retry_limit:
-                    self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
+                    self.wal.mark_needs_operator(tx_id)
                 return SagaResult(
                     tx_id=tx_id,
                     mechanism="saga",
@@ -273,6 +273,7 @@ class SagaManager:
                 )
 
             if raw is None:
+                self._audit_step(tx_id, "aborted", outcome="ERROR", reason="uid_not_found")
                 self.wal.abort(tx_id, "uid_not_found")
                 return SagaResult(
                     tx_id=tx_id, mechanism="saga", result="ERROR", error_type="not_found"
@@ -302,8 +303,8 @@ class SagaManager:
                     effective_caller, src_account.id, src_folder, dst_account.id, dst_folder
                 )
                 if not still_allowed:
-                    self.wal.abort(tx_id, "saga_aborted")
                     self._audit_step(tx_id, "aborted", outcome="ERROR", reason="saga_aborted")
+                    self.wal.abort(tx_id, "saga_aborted")
                     return SagaResult(
                         tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
                     )
@@ -317,10 +318,10 @@ class SagaManager:
                 canonical_sha256=canonical_digest,
             )
             if existing == "ambiguous":
-                self.wal.mark_needs_operator(tx_id, reason="ambiguous_target_match")
                 self._audit_step(
                     tx_id, "escalated", outcome="ERROR", reason="ambiguous_target_match"
                 )
+                self.wal.mark_needs_operator(tx_id, reason="ambiguous_target_match")
                 return SagaResult(
                     tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
                 )
@@ -345,16 +346,16 @@ class SagaManager:
             except TimeoutError:
                 count = self.wal.bump_retry(tx_id, "append_failed: timeout")
                 if count >= self.retry_limit:
-                    self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
+                    self.wal.mark_needs_operator(tx_id)
                 return SagaResult(
                     tx_id=tx_id, mechanism="saga", result="ERROR", error_type="append_timeout"
                 )
             except Exception as exc:  # noqa: BLE001
                 count = self.wal.bump_retry(tx_id, f"append_failed: {exc}")
                 if count >= self.retry_limit:
-                    self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
+                    self.wal.mark_needs_operator(tx_id)
                 err_str = str(exc).lower()
                 err_type = (
                     "transient_imap_failure"
@@ -371,8 +372,8 @@ class SagaManager:
             if not ok:
                 count = self.wal.bump_retry(tx_id, "append_failed: server rejected")
                 if count >= self.retry_limit:
-                    self.wal.mark_needs_operator(tx_id)
                     self._audit_step(tx_id, "escalated", outcome="ERROR")
+                    self.wal.mark_needs_operator(tx_id)
                 return SagaResult(
                     tx_id=tx_id, mechanism="saga", result="ERROR", error_type="append_rejected"
                 )
@@ -430,8 +431,8 @@ class SagaManager:
                 except Exception as exc:  # noqa: BLE001
                     count = self.wal.bump_retry(tx_id, f"delete_failed: {exc}")
                     if count >= self.retry_limit:
-                        self.wal.mark_needs_operator(tx_id)
                         self._audit_step(tx_id, "escalated", outcome="ERROR")
+                        self.wal.mark_needs_operator(tx_id)
                     return SagaResult(
                         tx_id=tx_id,
                         mechanism=mechanism,
@@ -442,8 +443,8 @@ class SagaManager:
             self._audit_step(tx_id, "deleted")
             _maybe_crash("post_delete")
 
-        self.wal.commit(tx_id)
         self._audit_step(tx_id, "commit")
+        self.wal.commit(tx_id)
         return SagaResult(tx_id=tx_id, mechanism=mechanism, result="OK")
 
     async def resume(self, tx: dict[str, Any]) -> SagaResult | None:
@@ -455,15 +456,15 @@ class SagaManager:
         status = tx["status"]
 
         if int(tx.get("retry_count") or 0) >= self.retry_limit:
-            self.wal.mark_needs_operator(tx_id)
             self._audit_step(tx_id, "escalated", outcome="ERROR")
+            self.wal.mark_needs_operator(tx_id)
             return SagaResult(
                 tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
             )
 
         if status == "pending":
-            self.wal.abort(tx_id, "saga_aborted")
             self._audit_step(tx_id, "aborted", outcome="ERROR", reason="saga_aborted")
+            self.wal.abort(tx_id, "saga_aborted")
             return SagaResult(
                 tx_id=tx_id,
                 mechanism="saga",
@@ -484,8 +485,8 @@ class SagaManager:
                 effective_caller, src_account.id, tx["src_folder"], dst_account.id, tx["dst_folder"]
             )
             if not still_allowed:
-                self.wal.abort(tx_id, "saga_aborted")
                 self._audit_step(tx_id, "aborted", outcome="ERROR", reason="saga_aborted")
+                self.wal.abort(tx_id, "saga_aborted")
                 return SagaResult(
                     tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
                 )
@@ -502,10 +503,10 @@ class SagaManager:
                 canonical_sha256=canonical_digest,
             )
             if existing == "ambiguous":
-                self.wal.mark_needs_operator(tx_id, reason="ambiguous_target_match")
                 self._audit_step(
                     tx_id, "escalated", outcome="ERROR", reason="ambiguous_target_match"
                 )
+                self.wal.mark_needs_operator(tx_id, reason="ambiguous_target_match")
                 return SagaResult(
                     tx_id=tx_id, mechanism="saga", result="ERROR", error_type="saga_aborted"
                 )
@@ -520,8 +521,8 @@ class SagaManager:
                 if not raw:
                     count = self.wal.bump_retry(tx_id, "append_failed: no payload")
                     if count >= self.retry_limit:
-                        self.wal.mark_needs_operator(tx_id)
                         self._audit_step(tx_id, "escalated", outcome="ERROR")
+                        self.wal.mark_needs_operator(tx_id)
                     return SagaResult(
                         tx_id=tx_id, mechanism="saga", result="ERROR", error_type="append_failed"
                     )
@@ -539,8 +540,8 @@ class SagaManager:
                 if not ok:
                     count = self.wal.bump_retry(tx_id, "append_failed")
                     if count >= self.retry_limit:
-                        self.wal.mark_needs_operator(tx_id)
                         self._audit_step(tx_id, "escalated", outcome="ERROR")
+                        self.wal.mark_needs_operator(tx_id)
                     return SagaResult(
                         tx_id=tx_id, mechanism="saga", result="ERROR", error_type="append_rejected"
                     )
