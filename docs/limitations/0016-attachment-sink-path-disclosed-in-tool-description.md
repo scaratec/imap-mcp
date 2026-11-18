@@ -1,22 +1,20 @@
 # LIM 0016: Attachment sink path is disclosed in the tool description
 
-- **Status:** Accepted
-- **Resolution intent:** permanent (architectural boundary)
+- **Status:** Resolved
+- **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-06-08
-- **Date approved:** 2026-06-08
+- **Date approved:** 2026-11-17 (reclassified from permanent and paid down in 3.0.0)
+- **Date resolved:** 2026-11-17
 - **Proposed by:** Randy Nel Gupta
 - **Approved by:** Randy Nel Gupta
-- **Related ADRs:** [ADR-0028](../adr/0028-attachment-file-sink-delivery.md)
+- **Resolution commit:** 8324738, 366c013
+- **Scope:** server/src/imap_mcp/dispatch.py, server/src/imap_mcp/handlers/fetch.py
+- **Related ADRs:** [ADR-0028](../adr/0028-attachment-file-sink-delivery.md), [ADR-0047](../adr/0047-per-caller-symlink-safe-attachment-delivery.md)
+- **Related Guidelines:** BDD Guidelines §1.2 (observable behaviour)
 
 ## Resolution intent
 
-`permanent`. The disclosure is structural: the agent must know
-where to read files; the tool description is the one place the
-MCP protocol gives us to put static, per-tool documentation.
-Any design that hides the path either hides it from the agent
-too (defeating the sink's purpose) or invents a separate
-out-of-band discovery channel (re-creating the problem the
-file sink solves).
+`must-resolve` (reclassified 2026-11-17 by owner from `permanent` and paid down in `3.0.0`). The original static-tool-description rationale was superseded by [ADR-0047](../adr/0047-per-caller-symlink-safe-attachment-delivery.md), which omits host paths from `tools/list` and returns `saved_path` solely inside `FULL`-authorized `fetch_attachment` responses.
 
 ## Context
 
@@ -87,43 +85,22 @@ disclosure plus an operator-side guidance note.
   to processes with filesystem permission. The disclosure
   does not grant read access; it grants knowledge of where
   to look if access already exists.
-- README guidance (TODO) will recommend choosing a sink
-  path that does not encode sensitive identifiers in the
-  directory name.
 
 ## Residual risk
 
-A multi-tenant deployment where caller A is trusted with
-attachment data and caller B is not — but both call
-`list_tools` to discover their available tools — leaks the
-sink path to caller B. Caller B cannot read the files
-(filesystem permissions), but learns that caller A's files
-are at a knowable location. If caller B later gains
-filesystem access by a separate vulnerability, the path is
-already known and the lateral move is one `ls` command away.
-
-The worst plausible scenario is a misconfigured multi-caller
-deployment combined with a separate filesystem-read
-vulnerability in caller B. Neither alone is sufficient; both
-together would be.
+Prior to `3.0.0`, callers without `FULL` visibility learned the operator's configured host sink directory path from `tools/list`. Eliminated once `ADR-0047` removed the path from `tools/list`.
 
 ## Triggers for revisit
 
-- An operator scenario where the sink-path information itself
-  is rated as sensitive enough to justify a hiding mechanism
-  (e.g. a compliance audit that explicitly prohibits
-  filesystem-layout disclosure across tenants).
-- An MCP protocol extension that adds caller-scoped tool
-  metadata, so the description can vary per caller, at which
-  point the path could be omitted from descriptions for
-  callers that do not have `fetch_attachment` granted by
-  policy.
+- Any compliance review forbidding host filesystem path disclosure prior to per-message `FULL` authorization (triggered and resolved on 2026-11-17).
+
+## Resolution note
+
+Resolved in `3.0.0` by [ADR-0047](../adr/0047-per-caller-symlink-safe-attachment-delivery.md): `list_tools` publishes a static contract description without any host filesystem path, and `saved_path` is returned solely inside the `fetch_attachment` response after `FULL` visibility authorization has succeeded.
 
 ## References
 
-- [ADR-0028](../adr/0028-attachment-file-sink-delivery.md) —
-  attachment file sink; this LIM names the disclosure trade-
-  off the ADR makes.
+- [ADR-0028](../adr/0028-attachment-file-sink-delivery.md), [ADR-0047](../adr/0047-per-caller-symlink-safe-attachment-delivery.md).
 - [LIM-0013](0013-single-attachment-sink-path.md),
   [LIM-0014](0014-attachment-sink-requires-caller-filesystem-access.md),
   [LIM-0015](0015-attachment-sink-cleanup-out-of-scope.md)

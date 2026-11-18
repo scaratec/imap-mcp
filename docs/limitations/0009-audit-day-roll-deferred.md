@@ -11,14 +11,14 @@
   rotation, file-mode-transitions, retention-deletion, gzip-integrity,
   retention-parameter-overrides und no-MCP-tool-reads-audit Szenarien
   laufen grün.
-- **Date resolved:** 2026-05-06 — external-root-hash-hook und
-  manual-deletion-detection implementiert. Structured logging via
-  `logging.critical()` bei out-of-band-Löschung. Alle 7 Szenarien
-  in `audit_retention.feature` grün.
+- **Date resolved:** 2026-05-06 — `AuditWriter.rotate()`, external root-hash hook, and `audit_file_missing` detection implemented (`83c391e`, `fb23b4e`); further hardened in `3.0.0` with automatic day-seal execution ([ADR-0048](../adr/0048-pre-effect-audit-and-test-boundary.md)).
 - **Proposed by:** claude (imap-mcp BDD phase F)
-- **Approved by:** Randy N. Gupta
-- **Related ADRs:** [ADR-0021](../adr/0021-audit-format.md),
-  [ADR-0022](../adr/0022-audit-retention.md)
+- **Approved by:** Randy Nel Gupta
+- **Resolution commit:** 83c391e, fb23b4e
+- **Scope:** server/src/imap_mcp/audit.py
+- **Related ADRs:** [ADR-0021](../adr/0021-audit-log-format.md),
+  [ADR-0022](../adr/0022-audit-retention-and-access-model.md),
+  [ADR-0048](../adr/0048-pre-effect-audit-and-test-boundary.md)
 - **Related Guidelines:** BDD Guidelines §4.5
 
 ## Resolution intent
@@ -109,5 +109,4 @@ The two remaining scenarios are now green:
 ## References
 
 - Scenarios listed above.
-- ADR 0021, ADR 0022.
-- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase F)
+- [ADR-0021](../adr/0021-audit-log-format.md), [ADR-0022](../adr/0022-audit-retention-and-access-model.md), [ADR-0048](../adr/0048-pre-effect-audit-and-test-boundary.md).

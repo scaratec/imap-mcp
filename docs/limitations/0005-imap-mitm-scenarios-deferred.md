@@ -6,8 +6,10 @@
 - **Date approved:** 2026-04-21
 - **Date resolved:** 2026-04-22
 - **Proposed by:** claude (imap-mcp BDD phase C)
-- **Approved by:** Randy N. Gupta
-- **Related ADRs:** [ADR-0006](../adr/0006-cross-account-move-saga.md)
+- **Approved by:** Randy Nel Gupta
+- **Resolution commit:** 8695a67
+- **Scope:** bdd/support/imap_proxy.py, server/src/imap_mcp/imap_core.py
+- **Related ADRs:** [ADR-0006](../adr/0006-cross-account-move-via-saga.md)
 - **Related Guidelines:** BDD Guidelines §4.5
 
 ## Resolution intent
@@ -159,5 +161,4 @@ now first-class members of the green suite.
 - Proxy: `bdd/support/imap_proxy.py`
 - Server: `server/src/imap_mcp/imap_core.py` (`UidStale`,
   `_extract_uidvalidity`, `move_message`)
-- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase C-Rest)
-- ADR 0006
+- [ADR-0006](../adr/0006-cross-account-move-via-saga.md)

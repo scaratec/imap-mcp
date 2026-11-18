@@ -52,30 +52,36 @@
 > Geschäftsregel aus den sichtbaren Daten ableitbar?
 
 Diese Prüfung umfasst implizit den **reason-code-spezifischen
-Prüfauftrag** aus [LIM-0001](../limitations/0001-reason-code-symmetry-in-bdd.md)
-§Mitigations §5: Jede `reason`-Wert-Assertion wird gegen die canonical
-Reason-Code-Tabelle in ADR-0017 abgeglichen, und der Audit prüft, ob
-mindestens zwei Szenarien mit unterschiedlichen Sender/Folder/Account-
-Kombinationen denselben Code aufrufen (Variance-Disziplin §2.3).
+Prüfauftrag** aus [LIM-0024](../limitations/0024-reason-code-symmetry-in-contract-tests.md)
+und [ADR-0062](../adr/0062-closed-reason-and-error-code-registry.md):
+Jede `reason`- und `error.type`-Assertion wird gegen die geschlossene
+Registry in `docs/contract/registry.yaml` abgeglichen, mit mindestens
+zwei unabhängigen Szenarien je kanonischem Caller-Reason-Code
+(Variance-Disziplin §2.3).
 
 | Szenario | Then-Wert | Herkunft | Befund |
 |---|---|---|---|
-| `<datei:zeile>` | `<Wert>` | (a) wörtlich aus `<Given/When>` / (b) abgeleitet aus `<Regel>` / (c) Vokabular-Token aus ADR-0017 | OK |
+| `<datei:zeile>` | `<Wert>` | (a) wörtlich aus `<Given/When>` / (b) abgeleitet aus `<Regel>` / (c) Vokabular-Token aus `ADR-0062` | OK |
 
 ### Reason-Code-Coverage (Subprüfung von Prüfung 2)
 
-| Reason-Code (ADR-0017) | Mindestens 2 unabhängige Szenarien? | Belege |
+| Reason-Code (`ADR-0062`) | Mindestens 2 unabhängige Szenarien? | Belege |
 |---|---|---|
-| `account_hidden` | <yes/no> | <datei:zeile, datei:zeile> |
+| `authenticated` | <yes/no> | <datei:zeile, datei:zeile> |
+| `folder_default_applied` | <yes/no> | … |
+| `rule_matched` | <yes/no> | … |
+| `account_hidden` | <yes/no> | … |
+| `needs_rebootstrap` | <yes/no> | … |
 | `folder_hidden` | <yes/no> | … |
-| `sender_not_whitelisted` | <yes/no> | … |
-| `sender_blacklisted` | <yes/no> | … |
-| `visibility_below_<level>` | <yes/no> | … |
+| `policy_alias_conflict` | <yes/no> | … |
+| `visibility_below_<LEVEL>` | <yes/no> | … |
 | `capability_missing` | <yes/no> | … |
+| `forbidden_flag` | <yes/no> | … |
+| `relocation_would_escalate` | <yes/no> | … |
+| `recipient_not_allowed` | <yes/no> | … |
+| `tool_not_applicable_for_provider` | <yes/no> | … |
 | `auth_failed` | <yes/no> | … |
-| `forbidden_system_flag` | <yes/no> | … |
 | `unknown_tool` | <yes/no> | … |
-| <neue Codes hier ergänzen> | <yes/no> | … |
 
 ### Findings — Prüfung 2
 

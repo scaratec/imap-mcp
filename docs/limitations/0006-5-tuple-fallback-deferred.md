@@ -13,8 +13,10 @@
   Audit-Reason `ambiguous_fallback_match`. Beide Szenarien in
   `saga_crash_recovery.feature:96,111` jetzt grün.
 - **Proposed by:** claude (imap-mcp BDD phase B)
-- **Approved by:** Randy N. Gupta
-- **Related ADRs:** [ADR-0008](../adr/0008-saga-idempotency.md)
+- **Approved by:** Randy Nel Gupta
+- **Resolution commit:** 33ade8d
+- **Scope:** server/src/imap_mcp/saga.py, server/src/imap_mcp/wal.py
+- **Related ADRs:** [ADR-0008](../adr/0008-idempotency-via-message-id-and-hash.md), [ADR-0046](../adr/0046-content-verified-sagas-and-wal-leases.md)
 - **Related Guidelines:** BDD Guidelines §4.5, §13.2
 
 ## Resolution intent
@@ -101,8 +103,11 @@ therefore owed to the spec.
 - ADR 0008 is superseded with a different idempotency contract.
 - Phase B of the BDD plan is re-opened for full coverage.
 
+## Resolution note
+
+Resolved 2026-04-28 (`33ade8d`) and hardened to full `canonical_sha256` verification in `3.0.0` (`ADR-0046`).
+
 ## References
 
-- Scenarios: `bdd/features/transactions/saga_crash_recovery.feature:96,110`
-- ADR 0008, section "Fallback key".
-- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase B)
+- Scenarios: `bdd/features/transactions/saga_crash_recovery.feature`
+- [ADR-0008](../adr/0008-idempotency-via-message-id-and-hash.md), [ADR-0046](../adr/0046-content-verified-sagas-and-wal-leases.md)

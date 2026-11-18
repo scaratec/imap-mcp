@@ -1,422 +1,248 @@
 # imap-mcp
 
-A security-focused [Model Context Protocol][mcp] server that mediates LLM
-access to IMAP mailboxes under strict, auditable policy. Designed for
-agents that need to read, classify, move, and archive mail — but must be
-prevented from reading what they shouldn't, moving what they shouldn't,
-or leaving no trace of what they did.
+A security-focused [Model Context Protocol][mcp] server (`sc-imap-mcp`
+**`3.0.0`**, `tool_set_version: "3.0.0"`) that mediates LLM agent access
+to IMAP mailboxes under strict message-centric authorization,
+non-interference, flow monotonicity, cryptographic draft provenance, and
+tamper-evident hash-chained auditing.
 
 [mcp]: https://modelcontextprotocol.io/
 
-## Status
+## Security boundary & deployment posture
 
-**V1 — 241 BDD scenarios green, 0 skipped.** The server is
-runnable on stdio and HTTP/SSE transports. Gmail (with localized folder
-name resolution via RFC 6154) and standard IMAP providers are supported.
-Optional OpenTelemetry tracing with Jaeger.
+> **Important ([LIM 0019](docs/limitations/0019-policy-integrity-requires-out-of-process-trust-boundary.md), [ADR 0051](docs/adr/0051-loopback-kubernetes-sidecar-topology.md)):**
+> `imap-mcp` enforces policy strictly across the MCP protocol and
+> attachment-sink boundaries. However, if you run `imap-mcp` over local
+> `stdio` under the **same OS user** as a CLI agent that has unrestricted
+> host shell or file-write permissions, that agent can edit
+> `~/.config/imap-mcp/policies/*.yaml` directly on disk.
+> - **Adversarial / production sandbox:** Run `imap-mcp` under a dedicated
+>   OS user or as a loopback Kubernetes sidecar container with read-only
+>   `/config`, `/secrets`, and `/sink` mounts ([guide](docs/ops/kubernetes-sidecar-deployment.md)).
+> - **Workstation convenience (`stdio`):** Restrict shell/file-edit
+>   access to `~/.config/imap-mcp` in your agent harness.
 
 ## Quick start
 
 ```bash
-# Install via pipx (recommended — isolated environment, global CLI)
+# Install via pipx (isolated environment, global CLI)
 pipx install "sc-imap-mcp[tracing]"
 
-# Or via pip
-pip install sc-imap-mcp[tracing]
-
-# Without tracing
-pipx install sc-imap-mcp
-
-# From source
-cd server && pip install -e ".[tracing]"
-
-# Upgrade
-pipx upgrade sc-imap-mcp
+# Or from local source
+pipx install --force "./server[tracing]"
 ```
 
-### Configure
+### Configure (`~/.config/imap-mcp`)
 
-```bash
-mkdir -p ~/.config/imap-mcp/{policies,secrets/accounts/my-account}
+Each server instance serves **strictly one configured caller** in
+`callers.yaml` ([ADR 0049](docs/adr/0049-single-caller-boundary-and-validated-loading.md)):
 
-# Create accounts.yaml, callers.yaml, policies/*.yaml
-# (see Configuration section below)
-
-# Store your IMAP password or OAuth refresh token
-echo -n 'your-password' > ~/.config/imap-mcp/secrets/accounts/my-account/password
-```
-
-### Run on stdio (for Claude Desktop, Claude Code, Cline)
-
-```bash
-IMAP_MCP_CONFIG_DIR=~/.config/imap-mcp \
-IMAP_MCP_CALLER_ID=my-agent \
-  imap-mcp --transport stdio
-```
-
-### Register with Claude Code
-
-```bash
-claude mcp add --scope user imap-mcp \
-  --env IMAP_MCP_CONFIG_DIR=$HOME/.config/imap-mcp \
-  --env IMAP_MCP_CALLER_ID=my-agent \
-  -- imap-mcp --transport stdio
-```
-
-### Run on HTTP (for callers that cannot use stdio)
-
-```bash
-IMAP_MCP_CONFIG_DIR=~/.config/imap-mcp \
-  imap-mcp --transport http --host 127.0.0.1 --port 8080
-```
-
-> This heading previously read "for multi-agent setups". That is not a
-> supported shape: `get_transaction_status` does not check the
-> requesting caller against the transaction's owner, so on an instance
-> with several entries in `callers.yaml` any caller holding a `tx_id`
-> can read another caller's transaction and trigger IMAP writes under
-> that caller's credentials. Run **one caller per instance** until that
-> is fixed — see [ADR 0029](docs/adr/0029-kubernetes-sidecar-deployment-topology.md) §3
-> and `docs/ROADMAP.md` entry 20.
->
-> For agents in Kubernetes pods, deploy one sidecar per agent:
-> [Kubernetes sidecar deployment](docs/ops/kubernetes-sidecar-deployment.md).
-
-## Architecture
-
-```
-┌──────────────────────────┐
-│  LLM agent (MCP client)  │
-└────────────┬─────────────┘
-             │ MCP (stdio or HTTP/SSE)
-┌────────────▼─────────────────────────────────────────┐
-│  imap-mcp                                            │
-│  ┌─────────────────────────────────────────────────┐ │
-│  │ Policy Decision Point  — default-deny           │ │
-│  │ Redaction / Transparency Layer                  │ │
-│  │ Transaction Manager (WAL + saga)                │ │
-│  │ IMAP Core · Batch Fetch · OAuth2 adapters       │ │
-│  │ Pluggable Secret Store                          │ │
-│  │ Append-only Audit Log with hash chain           │ │
-│  │ OpenTelemetry Tracing (optional)                │ │
-│  └─────────────────────────────────────────────────┘ │
-└─────────┬───────────────────┬────────────────────────┘
-          │ IMAP/IMAPS        │ IMAP/IMAPS
-┌─────────▼────┐   ┌──────────▼────┐
-│ Account A    │   │ Account B     │
-│ (e.g. Gmail) │   │ (e.g. Dovecot)│
-└──────────────┘   └───────────────┘
-```
-
-## Configuration
-
-The server reads its configuration from a directory of YAML files
-pointed to by `IMAP_MCP_CONFIG_DIR`.
-
-```
-config/
-├── accounts.yaml        # IMAP accounts, secret store, audit, WAL
-├── callers.yaml         # MCP callers and their auth
+```text
+~/.config/imap-mcp/
+├── accounts.yaml        # IMAP accounts, secret_store, audit, wal, attachment_sink
+├── callers.yaml         # Exactly ONE caller entry per instance
 └── policies/
-    ├── invoice-agent.yaml
-    └── overview-bot.yaml
+    └── my-policy.yaml   # Message-centric folder & rule grants
 ```
 
-### accounts.yaml
-
-Defines every IMAP account the server may connect to, plus the
-secret store backend, audit log, and WAL configuration.
+#### `accounts.yaml`
 
 ```yaml
 accounts:
-  - id: company-mail
-    provider: imap-standard       # or "google" for Gmail
-    host: imap.example.com
-    port: 993
-    auth:
-      type: password              # or "xoauth2"
-      secret_ref: secret://accounts/company-mail/password
-    token_cache: memory_only      # or "persist_all" (OAuth only)
-
-  - id: gmail-work
-    provider: google
+  - id: user@company.com
+    provider: google              # or "imap-standard"
     host: imap.gmail.com
-    port: 993
+    port: 993                     # 993 = implicit TLS (IMAP4_SSL)
     auth:
-      type: xoauth2
-      secret_ref: secret://accounts/gmail-work/refresh_token
+      type: xoauth2               # or "password"
+      secret_ref: secret://accounts/user@company.com/refresh_token
       oauth_scope: https://mail.google.com/
-    token_cache: persist_all
+    token_cache: persist_all      # or "memory_only"
 
   - id: accounting@company.com
+    provider: imap-standard
     host: imap.company.com
     port: 993
-    user: mail2223                  # explicit IMAP login (when != id)
+    user: mail2223                # optional explicit IMAP login username
     auth:
       type: password
       secret_ref: secret://accounts/accounting@company.com/password
 
 secret_store:
-  backend: file_dir               # or "env_var" or "gpg_file"
-  path: /home/user/.config/imap-mcp/secrets
+  backend: file_dir               # "file_dir", "env_var", or "gpg_file"
+  path: ~/.config/imap-mcp/secrets
+  acknowledge_plaintext: true     # required for file_dir (ADR 0050)
 
 audit:
-  directory: /home/user/.config/imap-mcp/audit
-  hot_days: 90                    # days before gzip compression
-  warm_days: 275                  # additional days as .gz
-  delete_after_days: 365          # total age before deletion
+  directory: ~/.config/imap-mcp/audit
+  hot_days: 90
+  delete_after_days: 365
 
 wal:
-  path: /home/user/.config/imap-mcp/wal.db
+  path: ~/.config/imap-mcp/wal.db
+
+attachment_sink:
+  directory: ~/Desktop/tmp/imap-mcp-outdir
 ```
 
-#### Account fields
+> **Note on Gmail / M365 OAuth scopes ([ADR 0050](docs/adr/0050-secret-stores-and-oauth-posture.md)):**
+> Google IMAP (`https://mail.google.com/`) and Microsoft 365 IMAP do not
+> offer a read-only IMAP OAuth scope. On those providers, the `imap-mcp`
+> policy is your sole read/write authorization boundary.
 
-| Field | Required | Default | Description |
-|---|---|---|---|
-| `id` | yes | — | Unique identifier referenced in policies. For Gmail with OAuth, use the email address (e.g. `user@company.com`) |
-| `provider` | no | `imap-standard` | `imap-standard`, `google`, or `google-mock` |
-| `host` | no | `127.0.0.1` | IMAP server hostname |
-| `port` | no | `143` | IMAP port. Use `993` for IMAPS (Gmail, most providers) |
-| `user` | no | derived from `id` | Explicit IMAP login username. Use when the IMAP user differs from the account id (e.g. `mail2223` for `accounting@example.com`) |
-| `auth.type` | yes | — | `password` or `xoauth2` |
-| `auth.secret_ref` | yes | — | Reference to the secret store (e.g. `secret://accounts/x/password`) |
-| `auth.oauth_scope` | no | — | OAuth2 scope for xoauth2 accounts |
-| `token_cache` | no | `memory_only` | `memory_only` (access tokens in RAM only) or `persist_all` (also persisted) |
-
-#### Secret store backends
-
-| Backend | Description | Config fields |
-|---|---|---|
-| `file_dir` | Plaintext files; confidentiality from the surrounding system (git-crypt, SOPS, LUKS) | `path` |
-| `env_var` | Read-only from environment variables. | — |
-| `gpg_file` | Per-file GPG decryption using the operator's key | `path`, `recipient`, `gnupghome` |
-
-Secret references use the format `secret://path/segments`. For `file_dir`,
-this resolves to `{path}/path/segments`.
-
-### callers.yaml
-
-Defines every MCP caller (agent) that may connect to the server.
+#### `callers.yaml`
 
 ```yaml
 callers:
   - id: my-agent
     policy: my-policy
     auth:
-      type: stdio_trusted
-
-  - id: invoice-bot
-    policy: invoice-policy
-    auth:
-      type: shared_token
-      token_secret_ref: secret://callers/invoice-bot/token
+      type: stdio_trusted         # stdio only; HTTP requires shared_token
 ```
 
-#### Caller auth types
-
-| Type | Transport | Mechanism |
-|---|---|---|
-| `stdio_trusted` | stdio only | Caller ID set via `IMAP_MCP_CALLER_ID` env var by the orchestrator. |
-| `shared_token` | stdio + HTTP | Bearer token verified with constant-time comparison. On HTTP: `Authorization: Bearer <token>` header. |
-
-Caller identity is immutable for the session duration. No impersonation
-primitive exists.
-
-### policies/\<name\>.yaml
-
-Each policy file defines what one caller may see and do.
+#### `policies/my-policy.yaml`
 
 ```yaml
 name: my-policy
 accounts:
-  company-mail:
-    - path: INBOX
-      mode: blacklist
-      default: ENVELOPE
-      mark_seen: true
-      rules: []
-
-  gmail-work:
+  user@company.com:
     - path: INBOX
       mode: whitelist
       default: NONE
       mark_seen: true
       move_out: true
       rules:
+        - match: { flagged: true }
+          grant: FULL
         - match: { from_domain: hornbach.de }
           grant: FULL
-        - match: { from_domain: amazon.de }
-          grant: FULL
 
-    - path: Archive
+    - path: "[Gmail]/Sent Mail"
       mode: whitelist
       default: NONE
+      rules:
+        - match: { flagged: true }
+          grant: FULL
+        - match: { provenance: own }
+          grant: FULL
+        - match: { to_domain: hornbach.de }
+          grant: FULL
+
+    - path: "[Gmail]/Drafts"
+      mode: blacklist
+      default: FULL
+      draft_append: true
+      draft_edit: true
+      move_out: true
+      draft_recipients:
+        allowed_domains: [company.com, hornbach.de]
+      rules: []
+
+    - path: "[Gmail]/Trash"
+      mode: blacklist
+      default: METADATA
       accept_incoming: true
       rules: []
 ```
 
-#### Folder policy fields
+## Policy model (3.0.0)
 
-| Field | Required | Default | Description |
-|---|---|---|---|
-| `path` | yes | — | IMAP folder path (e.g. `INBOX`, `INBOX/Invoices`, `[Gmail]/All Mail`) |
-| `mode` | yes | — | `whitelist` (default=NONE, rules grant access) or `blacklist` (default>NONE, rules cap access) |
-| `default` | yes | — | Default visibility level when no rule matches |
-| `rules` | no | `[]` | Sender-specific overrides (see below) |
-| `mark_seen` | no | `false` | Can toggle `\Seen` flag |
-| `mark_tagged` | no | `false` | Can set keywords and `\Flagged` |
-| `move_out` | no | `false` | Can remove messages from this folder |
-| `accept_incoming` | no | `false` | Can receive messages moved/copied in |
-| `draft_append` | no | `false` | Can append new drafts |
+### Linear visibility levels ([ADR 0002](docs/adr/0002-linear-visibility-levels.md), [ADR 0043](docs/adr/0043-non-interference-transparency-and-search.md))
 
-#### Visibility levels
-
-Each rule grants exactly one level from this hierarchy:
-
-```
+```text
 NONE < COUNT < METADATA < ENVELOPE < HEADERS < BODY < FULL
 ```
 
-| Level | What is exposed |
-|---|---|
-| `NONE` | Nothing (message is invisible) |
-| `COUNT` | Message count only (`folder_stats`) |
-| `METADATA` | UIDs, sizes, flags (`search`) |
-| `ENVELOPE` | From, To, Subject, Date (`fetch_envelope`, `list_messages`) |
-| `HEADERS` | Full RFC 5322 header block (`fetch_headers`) |
-| `BODY` | Plain-text and HTML bodies (`fetch_body`) |
-| `FULL` | Everything including attachments (`fetch_attachment`) |
+- **`NONE` is strictly non-interfering:** Hidden accounts, folders, and
+  `NONE` messages never alter any caller-visible count, pagination field,
+  or error type (`not_found` is returned identically for missing, foreign,
+  and `< METADATA` objects; [ADR 0044](docs/adr/0044-normalized-envelope-and-code-registry.md)).
+- **Gmail multi-label composition ([ADR 0040](docs/adr/0040-message-centric-policy-and-gmail-composition.md)):**
+  Account-wide `blacklist` `cap` rules apply across all folders, and
+  `[Gmail]/All Mail` or `[Gmail]/Starred` never escalate visibility above
+  a message's specific labels.
 
-#### Sender rule grammar
+### Closed predicate grammar ([ADR 0041](docs/adr/0041-direction-aware-rule-grammar-and-provenance.md))
 
-Rules use a closed set of predicates. Predicates within one rule are
-AND-combined; multiple rules in a folder are OR-combined.
-
-| Predicate | Type | Example |
+| Predicate | Min `criteria` floor | Matches |
 |---|---|---|
-| `from` | exact email | `alice@example.com` |
-| `from_domain` | domain (case-insensitive, trailing-dot tolerant) | `hornbach.de` |
-| `to` | exact email | `billing@company.com` |
-| `to_contains` | substring | `team` |
-| `subject_contains` | substring (case-insensitive, NFC-normalized) | `rechnung` |
-| `has_attachment` | boolean | `true` |
-| `flagged` | boolean | `true` |
-| `newer_than` | duration | `30d` |
-| `older_than` | duration | `90d` |
-| `size_gt` | bytes | `10000` |
-| `size_lt` | bytes | `1500` |
+| `from_address` / `from_domain` | `ENVELOPE` | Exact parsed `From:` `addr-spec` or DNS/IDNA domain |
+| `to_address` / `to_domain` | `ENVELOPE` | Any parsed `To:` `addr-spec` or exact domain |
+| `cc_address` / `cc_domain` | `ENVELOPE` | Any parsed `Cc:` `addr-spec` or exact domain |
+| `recipient_address` / `recipient_domain` | `ENVELOPE` | Any parsed `To:`, `Cc:`, or `Bcc:` address/domain |
+| `all_recipients_in_domains` | `ENVELOPE` | Non-empty recipients and **every** recipient in domain list |
+| `subject_contains` | `ENVELOPE` | Case-folded Unicode-NFC substring in decoded `Subject:` |
+| `has_attachment` | `BODY` | At least one MIME attachment part ([ADR 0047](docs/adr/0047-per-caller-symlink-safe-attachment-delivery.md)) |
+| `flagged` | `METADATA` | IMAP `\Flagged` star (read-only to agents; human curation signal) |
+| `provenance: "own"` | `METADATA` | Authentic message/draft authored by this `caller_id` ([ADR 0042](docs/adr/0042-cryptographic-and-wal-provenance.md)) |
+| `newer_than` / `older_than` | `METADATA` | `INTERNALDATE` age (`1s`..`36500d` / `100y`) |
+| `since` / `before` | `METADATA` | `INTERNALDATE` UTC calendar bounds (`YYYY-MM-DD`) |
+| `size_gt` / `size_lt` | `METADATA` | RFC822 size in bytes (`1..1073741824`) |
 
-In `whitelist` mode, rules use `grant: <level>`. In `blacklist` mode,
-rules use `cap: <level>`. Mixing both in one folder is a parse-time
-error.
+### Folder write capabilities & invariants ([ADR 0045](docs/adr/0045-write-visibility-floors-and-flow-monotonicity.md))
 
-The `flagged` predicate matches the IMAP `\Flagged` flag (starred in
-Gmail), enabling rules like "grant full access to all starred messages":
+| Capability | Governing tools | Per-message read floor & invariant |
+|---|---|---|
+| `mark_seen` | `mark_seen`, `bulk_mark_seen` | `eff_vis >= METADATA` |
+| `mark_tagged` | `mark_tagged`, `bulk_mark_tagged` | `eff_vis >= ENVELOPE`; user keywords only (`\Flagged` and all `\`-system flags forbidden) |
+| `move_out` | `move`, `discard_draft` | `eff_src >= ENVELOPE` and `eff_dst <= eff_src` (`relocation_would_escalate` otherwise) |
+| `copy_out` | `copy` | `eff_src >= ENVELOPE` and `eff_dst <= eff_src` |
+| `accept_incoming` | target of `move`, `copy`, `discard_draft` | Destination folder must grant `accept_incoming: true` |
+| `draft_append` | `create_draft`, `create_reply_draft` | `\Drafts` folder only; reply requires source `eff_vis >= BODY`; enforces `draft_recipients` |
+| `draft_edit` | `update_draft` | `\Drafts` folder + verified `X-SC-Provenance` ownership; enforces `draft_recipients` |
 
-```yaml
-- path: INBOX
-  mode: whitelist
-  default: NONE
-  rules:
-    - match: { flagged: true }
-      grant: FULL
-```
-
-## MCP tool surface
-
-Thirty tools (tool set 2.2.0), each gated on exactly one visibility
-level or one capability. `tool_surface_info` reports the tool set
-version at runtime.
+## MCP Tool Surface 3.0.0 (27 tools)
 
 ### Read tools (13)
 
-| Tool | Min visibility | Description |
-|---|---|---|
-| `list_accounts` | — | List visible accounts + `hidden_accounts_count` |
-| `list_folders` | COUNT | List visible folders + `hidden_folders_count` (canonical names) |
-| `list_labels` | COUNT | Gmail only: list labels with flags |
-| `folder_stats` | COUNT | Message counts per visibility level |
-| `search` | METADATA | Search for UIDs with `matched_total` / `matched_visible` / `filtered_out`; `outside_scope_total` under the 7-day default; `since` / `before` calendar dates |
-| `list_messages` | METADATA | **Primary tool for reading mail.** From, subject, date per message; same criteria and window rules as `search`; pagination |
-| `fetch_envelope` | ENVELOPE | From, To, Subject, Date for a single message by UID |
-| `fetch_headers` | HEADERS | Full RFC 5322 headers |
-| `fetch_body` | BODY | Plain-text and HTML bodies |
-| `list_attachments` | BODY | Attachment metadata of a message |
-| `fetch_attachment` | FULL | Save one MIME part to the attachment sink |
-| `list_drafts` | METADATA | Drafts in a folder with their handles |
-| `get_draft` | BODY | Read a draft by its handle |
+`list_accounts`, `list_folders`, `list_labels` (Google), `folder_stats`,
+`search`, `list_messages`, `fetch_envelope`, `fetch_headers`,
+`fetch_body`, `list_attachments`, `fetch_attachment`, `list_drafts`,
+`get_draft`.
 
-### Write tools (13)
+### Write tools (10)
 
-| Tool | Required capability | Description |
-|---|---|---|
-| `mark_seen` | `mark_seen` | Toggle `\Seen` flag on a single message |
-| `bulk_mark_seen` | `mark_seen` | Toggle `\Seen` on all messages matching criteria |
-| `mark_tagged` | `mark_tagged` | Add/remove keywords |
-| `bulk_mark_tagged` | `mark_tagged` | Add/remove keywords on all messages matching criteria |
-| `move` | `move_out` + `accept_incoming` | Move message (Gmail: label swap; other servers: native MOVE; cross-account: saga) |
-| `copy` | `accept_incoming` | Copy message to target folder |
-| `create_draft` | `draft_append` | Append a draft: plain text or HTML from fields, or a raw RFC 5322 message; reports the stored `format` |
-| `create_reply_draft` | `draft_append` | Reply draft with recipients, subject and quote set by the server; `reply_text` and/or `reply_html` |
-| `update_draft` | `draft_edit` | Revise a draft field-wise under its handle |
-| `discard_draft` | `move_out` + `accept_incoming` | Move every revision of a draft to the `\Trash` folder by its handle; never hard-deletes |
-| `add_attachment` | `modify_message` | Add an attachment (message rewrite) |
-| `replace_attachment` | `modify_message` | Replace an attachment (message rewrite) |
-| `delete_attachment` | `modify_message` | Remove an attachment (message rewrite) |
+`mark_seen`, `bulk_mark_seen`, `mark_tagged`, `bulk_mark_tagged`, `move`,
+`copy`, `create_draft`, `create_reply_draft`, `update_draft`,
+`discard_draft`.
 
 ### Meta tools (4)
 
-| Tool | Description |
-|---|---|
-| `describe_policy` | Caller's own policy profile (accounts, folders, capabilities, hidden counts). Never reveals rule patterns or other callers. |
-| `get_caller_identity` | Resolved `caller_id` for the current session |
-| `get_transaction_status` | WAL state of a saga transaction |
-| `tool_surface_info` | Tool set version and package version |
+`describe_policy`, `get_caller_identity`, `get_transaction_status`,
+`tool_surface_info`.
 
-### Upgrading to 2.2.0
+### Upgrading from 2.x to 3.0.0
 
-- **Gmail folder names.** System folders such as `[Gmail]/Drafts` and
-  `[Gmail]/Entwürfe` now address the same folder, and responses always
-  name it canonically (`[Gmail]/Drafts`). A policy that lists both
-  names with **different** settings now denies that folder with
-  `policy_alias_conflict`; keep one entry per folder, preferably under
-  the canonical name ([ADR 0033](docs/adr/0033-gmail-special-use-folder-resolution.md)).
-- **Trace payloads** default to `redacted`. Set
-  `IMAP_MCP_TRACE_PAYLOADS=full` to keep complete request and response
-  payloads in a trace store only you can read
-  ([ADR 0037](docs/adr/0037-trace-payload-modes.md)).
+1. **Retired tools & capabilities:** `add_attachment`,
+   `replace_attachment`, `delete_attachment`, and `modify_message` are
+   removed ([ADR 0045](docs/adr/0045-write-visibility-floors-and-flow-monotonicity.md),
+   [ADR 0052](docs/adr/0052-tool-surface-3-0-0-and-non-goals.md)). Pass
+   structured `attachments` to `create_draft` or `update_draft` for own
+   drafts. Add `copy_out: true` on folders from which `copy` is allowed.
+2. **Predicate keys:** Replace `from:` with `from_address:`, `to:` with
+   `to_address:` (or `recipient_address:`), and `to_contains:` with exact
+   `to_domain:` / `recipient_domain:` ([ADR 0041](docs/adr/0041-direction-aware-rule-grammar-and-provenance.md)).
+3. **Secret store & single caller:** Add `acknowledge_plaintext: true`
+   under `secret_store` when using `file_dir` ([ADR 0050](docs/adr/0050-secret-stores-and-oauth-posture.md)),
+   and keep exactly one caller entry per `callers.yaml` ([ADR 0049](docs/adr/0049-single-caller-boundary-and-validated-loading.md)).
+4. **Non-interfering responses:** `matched_total`, `filtered_out`,
+   `outside_scope_total`, `hidden_*_count`, `canonical_all_mail_uid`,
+   `matched_rule_index`, and `list_folders.message_count` are replaced by
+   `total_visible`, `returned_count`, static `completeness`, and Gmail
+   `object_id` ([ADR 0040](docs/adr/0040-message-centric-policy-and-gmail-composition.md),
+   [ADR 0043](docs/adr/0043-non-interference-transparency-and-search.md)).
+5. **Per-caller read-only attachment delivery:** `fetch_attachment` writes
+   `<sink>/<caller_id>/<uuid4_hex>_<name>.<ext>` (`0400`) via `openat` +
+   `O_NOFOLLOW | O_EXCL` and returns `saved_to` + `saved_path`
+   ([ADR 0047](docs/adr/0047-per-caller-symlink-safe-attachment-delivery.md)).
+   Clean aged artifacts periodically via `systemd-tmpfiles` or
+   `find <sink> -type f -mtime +30 -delete` ([LIM 0015](docs/limitations/0015-attachment-sink-cleanup-out-of-scope.md)).
 
-### Deliberately absent
+## OAuth2 bootstrap & remediation
 
-`delete` (drafts are discarded to the trash with `discard_draft`), `expunge`, `raw_imap_command`, `fetch_raw_rfc822`, cross-account
-search, MCP resource subscriptions, folder CRUD, policy reload via MCP.
-See [ADR 0018](docs/adr/0018-non-goal-tool-surface.md).
-
-## Environment variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `IMAP_MCP_CONFIG_DIR` | yes | Path to the configuration directory |
-| `IMAP_MCP_CALLER_ID` | stdio_trusted only | Caller identity for stdio transport |
-| `IMAP_MCP_OAUTH_CLIENT_ID` | xoauth2 accounts | OAuth2 client ID from GCP Console |
-| `IMAP_MCP_OAUTH_CLIENT_SECRET` | xoauth2 accounts | OAuth2 client secret from GCP Console |
-| `IMAP_MCP_HTTP_HOST` | no | Bind address for HTTP (default: `127.0.0.1`) |
-| `IMAP_MCP_HTTP_PORT` | no | Port for HTTP (default: `0` = ephemeral) |
-| `IMAP_MCP_APPEND_TIMEOUT` | no | Timeout in seconds for IMAP APPEND |
-| `IMAP_MCP_POOL_MAX_SIZE` | no | Pooled IMAP connections per account (default: `4`, ADR 0013). Gmail allows about 15 concurrent connections per account across all clients and server instances |
-| `IMAP_MCP_POOL_IDLE_TTL` | no | Seconds an unused pooled connection stays open (default: `600`) |
-| `IMAP_MCP_POOL_MAX_AGE` | no | Seconds after which a pooled connection is closed however busy it is (default: `3600`) |
-| `IMAP_MCP_POOL_ACQUIRE_TIMEOUT` | no | Seconds a call waits for a free connection when all are in use (default: `30`) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | OTLP endpoint for tracing (e.g. `http://localhost:4317`) |
-| `OTEL_RESOURCE_ATTRIBUTES` | no | Extra resource attributes on every span, e.g. `run.id=…,harness=…` |
-| `IMAP_MCP_TRACE_PAYLOADS` | no | `off`, `redacted` (default) or `full`: what tool spans record of request and response (ADR 0037) |
-| `IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS` | no | Cut for each payload in mode `full` (default: `16384`) |
-
-## OAuth2 bootstrap
-
-For accounts with `auth.type: xoauth2` (e.g. Gmail), run the
-interactive bootstrap once per account to obtain the refresh token:
+Run `imap-mcp-oauth-bootstrap` interactively on a workstation to mint a
+refresh token (or clear a persisted `needs_rebootstrap` state after
+`invalid_grant`, [ADR 0059](docs/adr/0059-oauth2-pkce-and-durable-account-health.md), [ADR 0064](docs/adr/0064-durable-account-health-and-token-lifecycle.md)):
 
 ```bash
 IMAP_MCP_CONFIG_DIR=~/.config/imap-mcp \
@@ -425,110 +251,34 @@ IMAP_MCP_OAUTH_CLIENT_SECRET=your-client-secret \
   imap-mcp-oauth-bootstrap --account user@company.com
 ```
 
-This prints a URL. Open it in a browser, complete the Google consent
-flow, then paste the redirect URL back into the terminal. On success,
-the refresh token is stored in the secret store. The server then
-exchanges it for access tokens automatically.
+## Environment variables
 
-### Setting up a GCP OAuth client
-
-1. Go to https://console.cloud.google.com/apis/credentials
-2. Create credentials > OAuth client ID > Desktop app
-3. Copy the Client ID and Client Secret
-4. Use them as `IMAP_MCP_OAUTH_CLIENT_ID` and `IMAP_MCP_OAUTH_CLIENT_SECRET`
-
-## Tracing (optional)
-
-Install with tracing support and start Jaeger:
-
-```bash
-pip install sc-imap-mcp[tracing]
-cd ops/tracing && docker compose up -d
-
-# Add to your MCP server config:
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
-```
-
-Open http://localhost:16686 for the Jaeger UI. Every MCP tool call
-creates a span `tool.<name>` with one child span per IMAP command
-(`imap.connect`, `imap.authenticate`, `imap.select`, `imap.uid_fetch`,
-…), the MCP client name and version, the response size and, for
-listing tools, result counts (ADR 0038). Batched spans are flushed
-when stdin closes or on `SIGTERM`.
-
-`IMAP_MCP_TRACE_PAYLOADS` controls the `mcp.request` and `mcp.response`
-attributes (ADR 0037): `redacted` (default) records the arguments as
-the audit log does and the response without message content,
-addresses, subjects, headers, bodies or attachment data; `off` records
-neither; `full` records both complete, each cut at
-`IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS` characters. Use `full` only with a
-trace store that is protected like the mailbox itself. An unknown
-value stops the server at startup.
-
-## Policy reload
-
-Send `SIGHUP` to the running server process. The server re-parses the
-entire config directory, validates it, and swaps the in-memory state
-atomically. Parse or validation errors preserve the previous policy
-and write an audit record with the error.
-
-```bash
-kill -HUP $(pidof imap-mcp)
-```
-
-## Gmail support
-
-Accounts with `provider: google` get explicit Gmail semantics:
-
-- `list_labels` tool available (Gmail only)
-- `search` results include `canonical_all_mail_uid` for cross-label deduplication
-- Intra-account `move` implemented as label swap (not physical MOVE)
-- Cross-account sagas fetch deterministically from `[Gmail]/All Mail`
-- `[Gmail]/Trash`, `[Gmail]/Drafts` etc. are policy-addressable folders
-- Localized folder names (e.g. `[Gmail]/Entwürfe` in German) are
-  resolved to canonical paths via RFC 6154 special-use flags
-
-## Audit log
-
-Append-only JSONL with SHA-256 hash chain, one file per UTC day.
-Strict no-content-leak rule: no message bodies, subjects, attachment
-filenames, OAuth tokens, or cleartext sender addresses in DENY records.
-
-## Implementation stack
-
-- **Language:** Python 3.11+
-- **IMAP:** `aioimaplib` (IMAP4 and IMAP4_SSL)
-- **MCP:** the official `mcp` SDK (stdio + HTTP/SSE)
-- **Storage:** `aiosqlite` for WAL; YAML for config
-- **Validation:** `pydantic` v2 (strict mode)
-- **OAuth:** `httpx` + first-party flow implementation
-- **Tracing:** OpenTelemetry (optional, via `[tracing]` extra)
-- **Testing:** `pytest` (property tests) + `behave` (BDD, 241 scenarios)
-
-## Testing
-
-```bash
-# BDD suite (requires Docker for IMAP fixtures)
-cd bdd && docker compose -f docker/docker-compose.yml up -d
-.venv/bin/behave --no-color --format=progress features/
-
-# Server property tests
-cd server && .venv/bin/pytest tests/policy/ -q
-```
+| Variable | Required | Description |
+|---|---|---|
+| `IMAP_MCP_CONFIG_DIR` | yes | Path to the configuration directory |
+| `IMAP_MCP_CALLER_ID` | `stdio_trusted` | Caller identity for stdio transport |
+| `IMAP_MCP_OAUTH_CLIENT_ID` | `xoauth2` | OAuth2 client ID |
+| `IMAP_MCP_OAUTH_CLIENT_SECRET` | `xoauth2` | OAuth2 client secret |
+| `IMAP_MCP_SERVER_HMAC_KEY` | `env_var` store | 64-hex-char HMAC key when using read-only `env_var` secret store |
+| `IMAP_MCP_APPEND_TIMEOUT` | no | Seconds to wait for a tagged IMAP `APPEND` response before `append_timeout` (default: `30`) |
+| `IMAP_MCP_POOL_MAX_SIZE` | no | Pooled IMAP connections per account per process (default: `2`, [ADR 0055](docs/adr/0055-bounded-per-account-connection-pool.md)) |
+| `IMAP_MCP_POOL_IDLE_TTL` | no | Idle connection TTL in seconds (default: `120`) |
+| `IMAP_MCP_POOL_MAX_AGE` | no | Maximum connection age in seconds (default: `1800`) |
+| `IMAP_MCP_POOL_ACQUIRE_TIMEOUT` | no | Seconds to wait before `pool_exhausted` (default: `30`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | OTLP collector endpoint (e.g. `http://localhost:4317`) |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | Extra OTel resource attributes |
+| `IMAP_MCP_TRACE_PAYLOADS` | no | `off`, `redacted` (default), or `full` ([ADR 0053](docs/adr/0053-non-interfering-telemetry-and-usability-isolation.md)) |
+| `IMAP_MCP_TRACE_PAYLOAD_MAX_CHARS` | no | Max chars per payload in `full` mode (default: `16384`) |
 
 ## Documentation
 
-The design is captured in 33 ADRs under [`docs/adr/`](docs/adr/).
-Limitation records under [`docs/limitations/`](docs/limitations/).
-Error-path analysis at
-[`docs/error_path_analysis.md`](docs/error_path_analysis.md).
-Open work at [`docs/ROADMAP.md`](docs/ROADMAP.md).
-
-Operations:
-
-- [Kubernetes sidecar deployment](docs/ops/kubernetes-sidecar-deployment.md)
-  — image, manifest, pitfalls, pre-flight checklist, day-2 procedures.
-- [Self-hosted CI runner setup](docs/ops/arc-runner-setup.md)
+- **ADRs (65 records, `0000`–`0064`):** [`docs/adr/README.md`](docs/adr/README.md)
+- **Limitation Records (`0001`–`0024`):** [`docs/limitations/README.md`](docs/limitations/README.md)
+- **Closed Code Registry:** `docs/contract/registry.yaml` ([ADR 0062](docs/adr/0062-closed-reason-and-error-code-registry.md))
+- **Error-Path Analysis:** [`docs/error_path_analysis.md`](docs/error_path_analysis.md)
+- **Spec-Audit Archive:** [`docs/spec-audit/`](docs/spec-audit/)
+- **Roadmap:** [`docs/ROADMAP.md`](docs/ROADMAP.md)
+- **Operations:** [`docs/ops/kubernetes-sidecar-deployment.md`](docs/ops/kubernetes-sidecar-deployment.md), [`docs/ops/arc-runner-setup.md`](docs/ops/arc-runner-setup.md)
 
 ## License
 

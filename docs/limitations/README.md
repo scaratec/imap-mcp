@@ -2,7 +2,8 @@
 
 A Limitation Record documents an **accepted, bounded weakness** of the
 system — a place where the project has consciously decided to live with
-less than the guidelines or the ADRs would otherwise demand.
+less than the BDD Guidelines (v1.8.0) or the [ADRs](../adr/) would
+otherwise demand.
 
 This directory is **not** a general-purpose debt log. It is a narrow,
 high-friction mechanism with explicit governance.
@@ -13,157 +14,64 @@ high-friction mechanism with explicit governance.
 > ADRs. A Limitation Record is the documented exception, never the
 > norm.**
 
-If an implementer finds that a clean solution is "hard", "expensive",
-or "tedious", that is *not* cause for a Limitation Record. It is cause
-to solve the problem. A Limitation Record applies only when there is a
-demonstrable, substantive reason why the clean path cannot be taken —
-for instance:
-
-- A theoretical limit of the testing paradigm (e.g. API-contract tests
-  inherently share vocabulary with the API under test).
-- An external dependency that the project cannot control.
-- A scope boundary explicitly ruled out by a superseded decision.
-
 ## Governance
 
-Three rules, all mandatory:
-
-1. **No self-approval.** An implementer — including any LLM agent —
-   cannot unilaterally declare a limitation. A new record must be
-   **reviewed and explicitly approved** by the project owner before
-   it is merged. The approval is recorded in the "Approved by" field.
-
-2. **No silent acceptance.** A limitation that is not in this
-   directory does not exist. Code comments, commit messages, or
-   off-band remarks do not substitute for a Limitation Record.
-   Shortcuts that are not written down here are bugs, not
+1. **No self-approval.** Every live `Accepted` or `Mitigated` record must
+   be reviewed and explicitly approved by the project owner (`Approved by`
+   + `Date approved`).
+2. **No silent acceptance.** Shortcuts not recorded here are bugs, not
    limitations.
-
-3. **Every field is filled.** The template below is the minimum
-   content. "TBD", "N/A", or empty fields in a live record are a
-   process violation and block merge.
-
-A pull request that introduces a Limitation Record is held to a
-higher bar than a pull request that solves the underlying problem.
-That asymmetry is intentional — it makes clean solutions the cheaper
-path.
-
-## What a record must demonstrate
-
-A convincing record answers, in order:
-
-1. **What is the weakness, precisely?** Vague descriptions hide
-   limitations inside other limitations.
-2. **Why is the clean solution not chosen?** Cost/benefit,
-   theoretical constraint, out-of-scope decision, external
-   dependency. Hand-waving ("because BDD can't do it") is insufficient.
-3. **What mitigations are already in place?** Structural cross-
-   checks, redundancy, audits, complementary unit tests. Absence of
-   mitigations is a red flag for the reviewer.
-4. **What residual risk remains?** In concrete terms. "Minor
-   inconvenience" is not a residual-risk statement; "a bug in the
-   visibility-level mapping could escape BDD detection if it only
-   affects the reason code and no other field" is.
-5. **When must this be revisited?** A trigger condition that is
-   observable from the outside. Without a trigger, a limitation is
-   forever.
+3. **Every field is filled.** [`TEMPLATE.md`](TEMPLATE.md) defines the
+   mandatory metadata and sections (`Scope`, `Resolution commit` for
+   `Resolved`, `Withdrawal commit` for `Withdrawn`, etc.).
 
 ## Lifecycle
 
-```
-proposed -> Accepted -> (Mitigated -> Resolved)
+```text
+Proposed -> Accepted -> (Mitigated -> Resolved)
                      -> Superseded by LIM-NNNN
+         -> Withdrawn (paid down before owner approval)
 ```
-
-- **Proposed** — drafted, not yet approved. Must not be merged to
-  `main`.
-- **Accepted** — approved by the project owner; known limitation in
-  force. Accepted records carry a mandatory `Resolution intent`
-  (see below).
-- **Mitigated** — further mitigations have been added that materially
-  reduce the residual risk. Record remains live.
-- **Resolved** — the underlying problem has been solved. Record is
-  kept for the history but no longer governs anything.
-- **Superseded** — replaced by a later record that re-scopes the
-  limitation. Both remain in the repository.
-
-### Resolution intent
-
-Every `Accepted` record declares itself as one of:
-
-- **`must-resolve`** — a technical debt. Accepted *now* because the
-  clean solution cannot yet be built, but a paydown is owed. A
-  corresponding task is expected to exist in the project tracker,
-  and the record references concrete triggers under which the debt
-  becomes due.
-- **`permanent`** — an architectural or theoretical boundary. No
-  paydown is owed. Triggers for revisit exist for completeness (so
-  that future external changes can force re-examination) but no
-  active resolution work is expected.
-
-A `must-resolve` record is **not** a softer version of `permanent`.
-It is a commitment: the project owes the underlying problem a clean
-solution, and the record is the IOU. Conversion from `must-resolve`
-to `permanent` requires a new approval cycle and a superseding
-record.
 
 ## Numbering & naming
 
 - `NNNN-short-kebab-case-title.md`, numbered sequentially starting at
-  `0001`. Numbers are never reused.
-- `0000` is reserved for this meta-document (see template below).
-
-## Format
-
-Every record uses [`TEMPLATE.md`](TEMPLATE.md). No deviations.
+  `0001`. Numbers are never reused (`0011` is `bulk_move`; the historical
+  duplicate search-performance record was renumbered to `0023`).
+- `0000` is reserved for this meta-document.
 
 ## Index
 
-| #    | Title | Status | Intent | Approved by |
-|------|-------|--------|--------|-------------|
-| 0001 | [Reason-code symmetry in BDD contract tests](0001-reason-code-symmetry-in-bdd.md) | Resolved | must-resolve | Randy Nel Gupta |
-| 0002 | [Gmail scenarios not runnable against current fixture](0002-gmail-scenarios-not-runnable.md) | Resolved | must-resolve | Randy Nel Gupta |
-| 0003 | [OAuth2 scenarios reference a nonexistent mock provider](0003-oauth2-scenarios-not-runnable.md) | Resolved | must-resolve | Randy Nel Gupta |
-| 0004 | [IMAP fault injection via in-process env var](0004-imap-fault-injection-via-env-var.md) | Resolved | must-resolve | Randy N. Gupta |
-| 0005 | [IMAP MITM scenarios deferred](0005-imap-mitm-scenarios-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
-| 0006 | [5-tuple fallback identity deferred](0006-5-tuple-fallback-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
-| 0007 | [HTTP transport deferred](0007-http-transport-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
-| 0008 | [SIGHUP policy reload deferred](0008-sighup-policy-reload-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
-| 0009 | [Audit day-roll and retention deferred](0009-audit-day-roll-deferred.md) | Resolved | must-resolve | Randy N. Gupta |
-| 0010 | [Production IMAP scenarios not covered by BDD](0010-production-imap-bdd-gaps.md) | Accepted | must-resolve | — |
-| 0011 | [bulk_move tool deferred](0011-bulk-move-deferred.md) | Accepted | must-resolve | Randy Nel Gupta |
-| 0011 | [Search performance on large mailboxes](0011-search-performance-large-mailbox.md) | Resolved | must-resolve | — |
-| 0012 | [Wire-level response transparency uneven across tools](0012-wire-response-transparency-uneven-across-tools.md) | Proposed | must-resolve | — (pending) |
-| 0013 | [Single attachment sink path](0013-single-attachment-sink-path.md) | Accepted | permanent | Randy Nel Gupta |
-| 0014 | [Attachment sink requires caller filesystem access](0014-attachment-sink-requires-caller-filesystem-access.md) | Accepted | permanent | Randy Nel Gupta |
-| 0015 | [Attachment sink cleanup is out of scope](0015-attachment-sink-cleanup-out-of-scope.md) | Accepted | permanent | Randy Nel Gupta |
-| 0016 | [Attachment sink path is disclosed in the tool description](0016-attachment-sink-path-disclosed-in-tool-description.md) | Accepted | permanent | Randy Nel Gupta |
-| 0017 | [Expired OAuth refresh token not proactively or durably detectable](0017-expired-oauth-token-not-proactively-or-durably-detectable.md) | Proposed | must-resolve | — (pending) |
-| 0018 | [OAuth re-auth not initiable from MCP; deny carries no remediation guidance](0018-oauth-reauth-not-initiable-from-mcp-no-remediation-guidance.md) | Proposed | must-resolve | — (pending) |
-| 0019 | [Policy integrity requires an out-of-process trust boundary](0019-policy-integrity-requires-out-of-process-trust-boundary.md) | Proposed | permanent | — (pending) |
-| 0020 | [Audit chain fragments across per-agent instances](0020-audit-chain-fragments-across-per-agent-instances.md) | Proposed | permanent | — (pending) |
-| 0021 | [OAuth bootstrap and token persistence are not possible in-pod](0021-oauth-bootstrap-and-token-persistence-not-possible-in-pod.md) | Proposed | must-resolve | — (pending) |
-| 0022 | [Externally edited drafts lose their handle](0022-externally-edited-drafts-lose-their-handle.md) | Proposed | permanent | — (pending) |
-
-> **Numbering defect:** `0011` is used twice — by
-> [`0011-bulk-move-deferred.md`](0011-bulk-move-deferred.md) and by
-> [`0011-search-performance-large-mailbox.md`](0011-search-performance-large-mailbox.md).
-> This violates the "numbers are never reused" rule above. Both records
-> are live and neither can be silently renumbered, because external
-> references may already point at either file. Resolving the collision
-> requires an owner decision (renumber the later one to the next free
-> number and leave a redirect stub, or accept the duplicate as
-> historical). Recorded here so the next author does not rediscover it.
+| # | Title | Status | Intent | Approved by |
+|---|---|---|---|---|
+| 0001 | [Reason-code symmetry in BDD contract tests](0001-reason-code-symmetry-in-bdd.md) | Superseded by [LIM-0024](0024-reason-code-symmetry-in-contract-tests.md) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0002 | [Gmail scenarios not runnable against current fixture](0002-gmail-scenarios-not-runnable.md) | Resolved (`fb23b4e`) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0003 | [OAuth2 scenarios reference a nonexistent mock provider](0003-oauth2-scenarios-not-runnable.md) | Resolved (`fb23b4e`) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0004 | [IMAP fault injection via in-process env var](0004-imap-fault-injection-via-env-var.md) | Resolved (`a03955a`) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0005 | [IMAP MITM scenarios deferred](0005-imap-mitm-scenarios-deferred.md) | Resolved (`8695a67`) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0006 | [5-tuple fallback identity deferred](0006-5-tuple-fallback-deferred.md) | Resolved (`33ade8d`) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0007 | [HTTP transport deferred](0007-http-transport-deferred.md) | Resolved (`a03955a`) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0008 | [SIGHUP policy reload deferred](0008-sighup-policy-reload-deferred.md) | Resolved (`fb23b4e`) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0009 | [Audit day-roll and retention deferred](0009-audit-day-roll-deferred.md) | Resolved (`fb23b4e`) | must-resolve | Randy Nel Gupta (2026-04-21) |
+| 0010 | [Production IMAPS TLS handshake not exercised by local BDD stack](0010-production-imap-bdd-gaps.md) | Accepted | must-resolve | Randy Nel Gupta (2026-11-17) |
+| 0011 | [bulk_move tool deferred](0011-bulk-move-deferred.md) | Accepted | must-resolve | Randy Nel Gupta (2026-06-05) |
+| 0012 | [Wire-level response transparency uneven across tools](0012-wire-response-transparency-uneven-across-tools.md) | Withdrawn (`8324738`) | must-resolve | n/a (paid down in 3.0.0) |
+| 0013 | [Single attachment sink path](0013-single-attachment-sink-path.md) | Resolved (`8324738`) | must-resolve | Randy Nel Gupta (2026-11-17) |
+| 0014 | [Attachment sink requires caller filesystem access](0014-attachment-sink-requires-caller-filesystem-access.md) | Accepted | permanent | Randy Nel Gupta (2026-11-17) |
+| 0015 | [Attachment sink cleanup is out of scope](0015-attachment-sink-cleanup-out-of-scope.md) | Accepted | permanent | Randy Nel Gupta (2026-11-17) |
+| 0016 | [Attachment sink path is disclosed in the tool description](0016-attachment-sink-path-disclosed-in-tool-description.md) | Resolved (`8324738`) | must-resolve | Randy Nel Gupta (2026-11-17) |
+| 0017 | [Expired OAuth refresh token not proactively or durably detectable](0017-expired-oauth-token-not-proactively-or-durably-detectable.md) | Withdrawn (`8324738`) | must-resolve | n/a (paid down in 3.0.0) |
+| 0018 | [OAuth re-authentication cannot be initiated from the MCP surface](0018-oauth-reauth-not-initiable-from-mcp-no-remediation-guidance.md) | Accepted | permanent | Randy Nel Gupta (2026-11-17) |
+| 0019 | [Policy integrity requires an out-of-process trust boundary](0019-policy-integrity-requires-out-of-process-trust-boundary.md) | Mitigated | permanent | Randy Nel Gupta (2026-11-17) |
+| 0020 | [Audit chain fragments across per-agent sidecar instances](0020-audit-chain-fragments-across-per-agent-instances.md) | Accepted | permanent | Randy Nel Gupta (2026-11-17) |
+| 0021 | [OAuth interactive bootstrap and secret-projection writes are out-of-pod](0021-oauth-bootstrap-and-token-persistence-not-possible-in-pod.md) | Accepted | permanent | Randy Nel Gupta (2026-11-17) |
+| 0022 | [Externally edited drafts become non-editable by handle](0022-externally-edited-drafts-lose-their-handle.md) | Accepted | permanent | Randy Nel Gupta (2026-11-17) |
+| 0023 | [Search performance on large mailboxes](0023-search-performance-large-mailbox.md) | Resolved (`e94f308`) | must-resolve | Randy Nel Gupta (2026-05-07) |
+| 0024 | [Structural reason-code symmetry in black-box contract tests](0024-reason-code-symmetry-in-contract-tests.md) | Mitigated | permanent | Randy Nel Gupta (2026-11-17) |
 
 ## Relationship to ADRs
 
 ADRs record *decisions that shape the system*. Limitation Records
-document *accepted weaknesses in the chosen direction*. They are not
-interchangeable:
-
-- An ADR can introduce a new capability.
-- A Limitation Record cannot. It only admits a gap.
-
-A Limitation Record typically references one or more ADRs (the
-decisions whose clean implementation is being bounded) and, where
-relevant, specific sections of the BDD Guidelines.
+document *accepted weaknesses in the chosen direction*. An ADR can
+introduce a capability; a Limitation Record only bounds an accepted
+exception.

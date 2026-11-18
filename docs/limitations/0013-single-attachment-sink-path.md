@@ -1,22 +1,20 @@
 # LIM 0013: Single attachment sink path
 
-- **Status:** Accepted
-- **Resolution intent:** permanent (architectural boundary)
+- **Status:** Resolved
+- **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-06-08
-- **Date approved:** 2026-06-08
+- **Date approved:** 2026-11-17 (reclassified from permanent and paid down in 3.0.0)
+- **Date resolved:** 2026-11-17
 - **Proposed by:** Randy Nel Gupta
 - **Approved by:** Randy Nel Gupta
-- **Related ADRs:** [ADR-0028](../adr/0028-attachment-file-sink-delivery.md)
-- **Related Guidelines:** none specific
+- **Resolution commit:** 8324738, 366c013
+- **Scope:** server/src/imap_mcp/handlers/fetch.py
+- **Related ADRs:** [ADR-0028](../adr/0028-attachment-file-sink-delivery.md), [ADR-0047](../adr/0047-per-caller-symlink-safe-attachment-delivery.md)
+- **Related Guidelines:** BDD Guidelines §6.1 (isolation)
 
 ## Resolution intent
 
-`permanent`. This is a tool-surface slimness decision the project
-holds indefinitely. Multi-sink support would multiply tool
-arguments, multiply audit fields, and re-introduce the caller-
-chosen-path attack vector that the single-sink design takes off
-the table. There is no future state in which "multiple sink
-directories" becomes the right answer for this server.
+`must-resolve` (reclassified 2026-11-17 by owner from `permanent` and paid down in `3.0.0`). The original single-shared-directory rationale was superseded by [ADR-0047](../adr/0047-per-caller-symlink-safe-attachment-delivery.md), which isolates every caller inside `<base_dir>/<caller_id>/` (`0700`) without adding caller-chosen path arguments.
 
 ## Context
 
@@ -116,11 +114,14 @@ them onto the same shelf.
   channel that obviates the file sink entirely, in which case
   this whole ADR/LIM cluster gets reconsidered.
 
+## Resolution note
+
+Resolved in `3.0.0` by [ADR-0047](../adr/0047-per-caller-symlink-safe-attachment-delivery.md) and [ADR-0049](../adr/0049-single-caller-boundary-and-validated-loading.md): each server instance enforces a single caller and writes attachments into an isolated per-caller `0700` subdirectory (`<base_dir>/<caller_id>/`) using `openat` with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode `0400`.
+
 ## References
 
-- [ADR-0028](../adr/0028-attachment-file-sink-delivery.md) —
-  attachment file sink; this LIM bounds it.
+- [ADR-0028](../adr/0028-attachment-file-sink-delivery.md), [ADR-0047](../adr/0047-per-caller-symlink-safe-attachment-delivery.md).
 - [LIM-0014](0014-attachment-sink-requires-caller-filesystem-access.md)
   — the related "agent needs filesystem access" constraint.
 - [LIM-0016](0016-attachment-sink-path-disclosed-in-tool-description.md)
-  — the related path-disclosure constraint.
+  — the related path-disclosure constraint (also Resolved in `3.0.0`).

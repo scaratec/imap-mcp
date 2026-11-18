@@ -1,66 +1,49 @@
-# LIM 0010: Production IMAP scenarios not covered by BDD
+# LIM 0010: Production IMAPS TLS handshake not exercised by local BDD stack
 
 - **Status:** Accepted
 - **Resolution intent:** must-resolve (technical debt)
 - **Date proposed:** 2026-05-07
+- **Date approved:** 2026-11-17
 - **Proposed by:** Spec-Audit (production deployment test)
-- **Related ADRs:** ADR-0009, ADR-0011, ADR-0015
-- **Related Guidelines:** BDD Guidelines §7.2 (mocks must simulate behaviour, not wishful thinking)
+- **Approved by:** Randy Nel Gupta
+- **Scope:** bdd/docker, server/src/imap_mcp/imap_core.py
+- **Related ADRs:** [ADR-0012](../adr/0012-python-runtime-and-library-stack.md), [ADR-0050](../adr/0050-secret-stores-and-oauth-posture.md), [ADR-0055](../adr/0055-bounded-per-account-connection-pool.md)
+- **Related Guidelines:** BDD Guidelines §7.1 (deterministic mocks), §7.2 (mocks must simulate real behaviour)
+
+## Resolution intent
+
+`must-resolve`. OAuth `client_secret` validation and email-address account IDs (`user` vs. `id`) are now covered directly by the `3.0.0` BDD suite (`auth/oauth2_bootstrap.feature` and `auth/explicit_imap_user.feature`). The remaining gap — exercising `IMAP4_SSL` over TLS port 993 against a local Dovecot listener with ephemeral test PKI — is a bounded fixture debt to be closed when the Docker IMAP stack adds a TLS listener.
 
 ## Context
 
-Three production-relevant code paths are not covered by BDD scenarios
-because the test fixtures do not replicate production conditions:
-
-### 1. IMAPS (Port 993 / TLS)
-
-The entire BDD stack runs against Dovecot on port 11143 (plain IMAP).
-No scenario exercises `IMAP4_SSL`. The bug (connection hang on port
-993) was discovered during production deployment against Gmail and
-fixed empirically.
-
-**Infrastructure needed:** Dovecot with TLS certificate in
-`bdd/docker/docker-compose.yml`.
-
-### 2. OAuth `client_secret` in token exchange
-
-The mock OAuth server (`navikt/mock-oauth2-server`) does not require
-`client_secret` in token exchange requests. The bug (missing
-`client_secret` in both `oauth_bootstrap.py` and `oauth_manager.py`)
-was discovered during production deployment against Google OAuth and
-fixed empirically.
-
-**Infrastructure needed:** Configure mock OAuth server to validate
-`client_secret` presence, or add a BDD scenario that asserts the
-token exchange request body contains `client_secret`.
-
-### 3. Account IDs with email addresses
-
-The BDD fixture uses short-form account IDs (`gupta-scaratec`,
-`personal`) that comply with the `_imap_user_for()` convention
-(split at first dash). Production accounts use email addresses
-(`gupta@scaratec.com`) as IDs, which pass through unsplit. No
-scenario tests this path.
-
-**Infrastructure needed:** A scenario with an email-address account
-ID, or better: an explicit `imap_user` field in the Account config
-model so the IMAP username is not derived by convention.
+Production IMAP providers (Gmail, Microsoft 365, hosted Dovecot) speak implicit TLS on port 993 (`IMAP4_SSL`), whereas `bdd/docker/docker-compose.yml` exposes plain IMAP on loopback ports `11143` and `12143` (`IMAP4`).
 
 ## Nature of the weakness
 
-All three gaps were found during the first production deployment.
-The BDD suite gave a false sense of completeness because the mocks
-were too permissive (§7.2 violation).
+No automated BDD scenario exercises the `IMAP4_SSL` branch in `imap_core.py`, TLS certificate validation failures, or TLS session reuse across pooled connections.
+
+## Why the clean solution is not chosen
+
+Wiring implicit TLS in `bdd/docker/` requires generating ephemeral CA and leaf certificates before `docker compose up` and injecting a custom `SSL_CERT_FILE` trust bundle into both server and proxy processes without weakening production default `ssl.create_default_context()` verification. Keeping the current plain-TCP loopback stack avoids adding a custom trust-anchor override hook to production TLS setup until a dedicated PKI fixture is built.
 
 ## Mitigations in place
 
-- All three bugs have been fixed in the server code.
-- The fixes are covered by empirical evidence (manual tests against
-  real Gmail).
-- The fixes are deployed via `pipx install sc-imap-mcp`.
+- OAuth `client_secret` verification and email-shaped account IDs (originally bundled here) are now covered by `bdd/features/auth/oauth2_bootstrap.feature` and `bdd/features/auth/explicit_imap_user.feature`.
+- `IMAP4_SSL` in `server/src/imap_mcp/imap_core.py` is a two-line branch over `port == 993` using stdlib `ssl` defaults (`aioimaplib.IMAP4_SSL`) and is verified in live workstation operation against `imap.gmail.com:993` and hosted Dovecot (`993`).
+- Unit tests in `server/tests/` verify `IMAP4_SSL` selection on port `993`.
+
+## Residual risk
+
+An `aioimaplib` upgrade that breaks `IMAP4_SSL` handshake framing or `SSLContext` defaults while leaving plain `IMAP4` intact passes the local BDD suite and fails first against a live port-993 provider.
 
 ## Triggers for revisit
 
-- Any new IMAP provider integration (Exchange, Fastmail).
-- OAuth scope or credential changes.
-- Next BDD sprint targeting production parity.
+- Any `aioimaplib` major/minor dependency bump.
+- Addition of custom TLS options (for example client certificates / mTLS or custom CA bundles) in `accounts.yaml`.
+- Any TLS-related connection bug observed in production.
+
+## References
+
+- [ADR-0012](../adr/0012-python-runtime-and-library-stack.md) — `aioimaplib` client library.
+- [ADR-0050](../adr/0050-secret-stores-and-oauth-posture.md) — explicit `user` login identity and OAuth posture.
+- [ADR-0055](../adr/0055-bounded-per-account-connection-pool.md) — per-account connection pool.

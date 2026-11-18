@@ -16,8 +16,10 @@
   denied with `capability_missing`. 6 of 7 scenarios green; remaining
   1 (OAuth-scope-change) depends on LIM-0003.
 - **Proposed by:** claude (imap-mcp BDD phase E)
-- **Approved by:** Randy N. Gupta
-- **Related ADRs:** [ADR-0014](../adr/0014-policy-reload.md)
+- **Approved by:** Randy Nel Gupta
+- **Resolution commit:** 6cf0600, fb23b4e
+- **Scope:** server/src/imap_mcp/reload.py
+- **Related ADRs:** [ADR-0014](../adr/0014-policy-as-git-versioned-yaml.md), [ADR-0049](../adr/0049-single-caller-boundary-and-validated-loading.md)
 - **Related Guidelines:** BDD Guidelines §4.5
 
 ## Resolution intent
@@ -108,8 +110,11 @@ an apparent change is invisible until restart.
   missing reload path.
 - ADR 0014 is superseded.
 
+## Resolution note
+
+Resolved 2026-05-06 (`6cf0600`, `fb23b4e`) via atomic `SIGHUP` configuration swap and in-flight saga coordination (`ADR-0046`, `ADR-0049`).
+
 ## References
 
-- Scenarios: `bdd/features/policy/policy_reload.feature` (all 7)
-- ADR 0014.
-- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase E)
+- Scenarios: `bdd/features/policy/policy_reload.feature`
+- [ADR-0014](../adr/0014-policy-as-git-versioned-yaml.md), [ADR-0049](../adr/0049-single-caller-boundary-and-validated-loading.md).

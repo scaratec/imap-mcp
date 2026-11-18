@@ -11,7 +11,9 @@
   [Gmail]/All Mail fetch. Alle 6 Szenarien grün.
 - **Proposed by:** Claude (implementation agent)
 - **Approved by:** Randy Nel Gupta
-- **Related ADRs:** [ADR-0019](../adr/0019-gmail-label-semantics.md)
+- **Resolution commit:** fb23b4e
+- **Scope:** bdd/mock-gmail, server/src/imap_mcp
+- **Related ADRs:** [ADR-0019](../adr/0019-gmail-label-semantics.md), [ADR-0040](../adr/0040-message-centric-policy-and-gmail-composition.md)
 - **Related Guidelines:** BDD Guidelines §4.1 (Circular-Test Prohibition), §7.1 (Deterministic mocks), §6.1 (Isolation)
 
 ## Context
@@ -155,6 +157,10 @@ absorbed into this record.
 - **18 months since the last validator run against real Gmail**,
   regardless of other triggers. Drift is real; time-based review
   prevents quiet decay.
+
+## Resolution note
+
+Resolved 2026-05-07 (`fb23b4e`) via the isolated `bdd/mock-gmail/` IMAP server implementing `X-GM-MSGID`, `X-GM-LABELS`, `MOVE`, `UIDPLUS`, localized mUTF-7 folders, and `AUTHENTICATE XOAUTH2` (`ADR-0040`, `ADR-0056`).
 
 ## References
 

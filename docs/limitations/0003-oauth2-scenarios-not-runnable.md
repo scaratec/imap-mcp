@@ -12,7 +12,9 @@
   Verbindungen. Alle `@pending_LIM_0003`-Szenarien aufgelöst.
 - **Proposed by:** Claude (implementation agent)
 - **Approved by:** Randy Nel Gupta
-- **Related ADRs:** [ADR-0009](../adr/0009-oauth2-authorization-code-with-scope-minimization.md), [ADR-0010](../adr/0010-configurable-token-cache-strategy.md), [ADR-0011](../adr/0011-pluggable-secret-store-backend.md)
+- **Resolution commit:** a03955a, fb23b4e
+- **Scope:** bdd/mock-oauth, server/src/imap_mcp/auth
+- **Related ADRs:** [ADR-0009](../adr/0009-oauth2-authorization-code-with-scope-minimization.md), [ADR-0010](../adr/0010-configurable-token-cache-strategy.md), [ADR-0011](../adr/0011-pluggable-secret-store-backend.md), [ADR-0050](../adr/0050-secret-stores-and-oauth-posture.md)
 - **Related Guidelines:** BDD Guidelines §7.1 (deterministic mocks), §7.2 (mocks must simulate behaviour, not wishful thinking), §4.3 (persistence validation)
 
 ## Context
@@ -155,6 +157,10 @@ one.
   a hypothetical risk.
 - **A new `auth.type` is added** (e.g. `mtls` as mentioned in ADR
   0015) that is not yet mock-supported.
+
+## Resolution note
+
+Resolved 2026-05-06 (`a03955a`, `fb23b4e`) via `navikt/mock-oauth2-server` in `bdd/docker/docker-compose.yml` and HTTP control wrapper `bdd/mock-oauth/` (`ADR-0059`).
 
 ## References
 

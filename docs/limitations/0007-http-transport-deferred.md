@@ -6,10 +6,12 @@
 - **Date approved:** 2026-04-21
 - **Date resolved:** 2026-04-29
 - **Proposed by:** claude (imap-mcp BDD phase D)
-- **Approved by:** Randy N. Gupta
-- **Related ADRs:** [ADR-0015](../adr/0015-caller-identity.md),
-  [ADR-0018](../adr/0018-non-goals.md),
-  [ADR-0021](../adr/0021-audit-format.md)
+- **Approved by:** Randy Nel Gupta
+- **Resolution commit:** 12e8f22, a03955a
+- **Scope:** server/src/imap_mcp/runtime/http.py, server/src/imap_mcp/secrets.py
+- **Related ADRs:** [ADR-0015](../adr/0015-caller-identity-and-authentication.md),
+  [ADR-0018](../adr/0018-non-goal-tool-surface.md),
+  [ADR-0021](../adr/0021-audit-log-format.md)
 - **Related Guidelines:** BDD Guidelines §4.5
 
 ## Resolution intent
@@ -163,5 +165,4 @@ Suite-Total: **174 passed / 0 failed / 18 skipped** (the remaining
 - Server: `server/src/imap_mcp/secrets.py`, `server/src/imap_mcp/server.py`
   (`_stdio_deny_initialize`, `BearerAuthMiddleware`),
   `server/src/imap_mcp/auth/oauth_bootstrap.py`.
-- ADR 0015, ADR 0018, ADR 0021.
-- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase D-Rest)
+- [ADR-0015](../adr/0015-caller-identity-and-authentication.md), [ADR-0018](../adr/0018-non-goal-tool-surface.md), [ADR-0021](../adr/0021-audit-log-format.md).

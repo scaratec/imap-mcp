@@ -6,10 +6,12 @@
 - **Date approved:** 2026-04-21
 - **Date resolved:** 2026-04-29
 - **Proposed by:** claude (imap-mcp BDD phase A)
-- **Approved by:** Randy N. Gupta
-- **Related ADRs:** [ADR-0006](../adr/0006-cross-account-move-saga.md),
-  [ADR-0007](../adr/0007-wal-schema.md),
-  [ADR-0008](../adr/0008-saga-idempotency.md),
+- **Approved by:** Randy Nel Gupta
+- **Resolution commit:** 4116236, a03955a
+- **Scope:** bdd/support/imap_proxy.py, server/src/imap_mcp/imap_core.py
+- **Related ADRs:** [ADR-0006](../adr/0006-cross-account-move-via-saga.md),
+  [ADR-0007](../adr/0007-sqlite-as-wal-store.md),
+  [ADR-0008](../adr/0008-idempotency-via-message-id-and-hash.md),
   [ADR-0023](../adr/0023-test-only-control-surface.md)
 - **Related Guidelines:** BDD Guidelines §4.5 (error-path enumeration),
   §13.2 (persistence validation)
@@ -155,7 +157,6 @@ mechanism — orthogonal to the LIM-0004 surface.
 
 ## References
 
-- Plan: `/home/randy/.claude/plans/noble-prancing-glacier.md` (Phase R)
 - Module: `bdd/support/imap_proxy.py` (proxy with fault hooks)
 - Server: `server/src/imap_mcp/imap_core.py` (`_open_imap` pre-flight TCP probe)
 - Scenarios: `bdd/features/transactions/cross_account_move_saga.feature`

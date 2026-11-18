@@ -21,13 +21,13 @@ open http://localhost:16686
 
 Every MCP tool call creates a trace with nested spans:
 
-```
-tool.list_messages (root)
-├── imap.connect        (host, port, latency)
-├── imap.authenticate   (auth_type, success/failure)
-├── imap.search         (folder, criteria, result_count)
-├── pdp.evaluate        (mode, decision, matched_rule)
-└── imap.fetch_envelope (uid, latency)  ×N
+```text
+tool.list_messages (root: mcp.tool, mcp.caller_id, mcp.decision, mcp.result.visible, mcp.result.returned)
+├── imap.connect        (command, status)
+├── imap.authenticate   (command, status)
+├── imap.select         (command, status)
+├── imap.uid_search     (command, status)
+└── imap.uid_fetch      (command, status)
 ```
 
 Cross-account moves show the full saga:
