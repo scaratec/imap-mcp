@@ -1,6 +1,6 @@
 # ADR 0031: Draft Revision via the Message-Rewrite Saga
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0063](0063-structured-own-draft-composition-and-revision.md)
 - **Date:** 2026-09-18
 - **Deciders:** Randy Gupta
 

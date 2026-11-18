@@ -1,8 +1,8 @@
 # ADR 0039: A Usability Matrix for Agent Behaviour, Apart from BDD
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0060](0060-usability-matrix-evaluation-boundaries.md)
 - **Date:** 2026-11-03
-- **Deciders:** Randy Gupta
+- **Deciders:** Randy Nel Gupta
 
 ## Context
 

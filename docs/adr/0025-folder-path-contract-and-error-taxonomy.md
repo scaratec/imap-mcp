@@ -1,6 +1,6 @@
 # ADR 0025: Folder-Path Contract and Error Taxonomy
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0056](0056-canonical-folder-resolution-and-code-registry.md)
 - **Date:** 2026-06-05
 - **Deciders:** Randy Nel Gupta
 

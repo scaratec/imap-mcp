@@ -1,6 +1,6 @@
 # ADR 0023: Test-only control surface (env vars, hidden tools, private response keys)
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0058](0058-closed-test-mode-control-boundary.md)
 - **Date:** 2026-04-27
 - **Deciders:** Randy Nel Gupta
 

@@ -1,6 +1,6 @@
 # ADR 0008: Idempotency via Message-ID with Content-Hash Witness
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0046](0046-content-verified-sagas-and-wal-leases.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

@@ -1,6 +1,6 @@
 # ADR 0026: Tool-Surface Consistency
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0052](0052-tool-surface-3-0-0-and-non-goals.md)
 - **Date:** 2026-06-05
 - **Deciders:** Randy Nel Gupta
 

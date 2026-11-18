@@ -1,8 +1,8 @@
 # ADR 0038: Traces Carry What Usage Efficiency Needs
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0053](0053-non-interfering-telemetry-and-usability-isolation.md)
 - **Date:** 2026-11-03
-- **Deciders:** Randy Gupta
+- **Deciders:** Randy Nel Gupta
 
 ## Context
 

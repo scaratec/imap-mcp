@@ -1,6 +1,6 @@
 # ADR 0010: Configurable Token Cache Strategy
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0064](0064-durable-account-health-and-token-lifecycle.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

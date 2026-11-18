@@ -1,6 +1,6 @@
 # ADR 0002: Linear Visibility Levels
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0043](0043-non-interference-transparency-and-search.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

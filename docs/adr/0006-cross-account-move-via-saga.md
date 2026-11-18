@@ -1,6 +1,6 @@
 # ADR 0006: Cross-Account Move via Saga, Native MOVE Within Account
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0046](0046-content-verified-sagas-and-wal-leases.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

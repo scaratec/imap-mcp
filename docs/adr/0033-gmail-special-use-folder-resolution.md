@@ -1,9 +1,8 @@
 # ADR 0033: Gmail Special-Use Folders Resolve on Every Path
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0056](0056-canonical-folder-resolution-and-code-registry.md)
 - **Date:** 2026-11-03
-- **Deciders:** Randy Gupta
-- **Amends:** [ADR 0017] (reason code), [ADR 0019] (label swap), [ADR 0025] (folder names in responses)
+- **Deciders:** Randy Nel Gupta
 
 ## Context
 

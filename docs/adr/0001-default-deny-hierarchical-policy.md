@@ -1,6 +1,6 @@
 # ADR 0001: Default-Deny Hierarchical Policy Model
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0040](0040-message-centric-policy-and-gmail-composition.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

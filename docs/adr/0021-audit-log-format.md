@@ -1,6 +1,6 @@
 # ADR 0021: Audit Log Format
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0048](0048-pre-effect-audit-and-test-boundary.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

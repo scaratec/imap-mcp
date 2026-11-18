@@ -1,6 +1,6 @@
 # ADR 0027: Error Envelope and Tool-Surface Versioning
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0044](0044-normalized-envelope-and-code-registry.md)
 - **Date:** 2026-06-05
 - **Deciders:** Randy Nel Gupta
 

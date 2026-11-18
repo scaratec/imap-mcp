@@ -1,6 +1,6 @@
 # ADR 0020: imap-agent as a Future Client, not a Component
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0054](0054-generic-mail-mediation-scope-boundary.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

@@ -1,6 +1,6 @@
 # ADR 0029: Kubernetes Sidecar Deployment Topology
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0051](0051-loopback-kubernetes-sidecar-topology.md)
 - **Date:** 2026-08-25
 - **Deciders:** Randy Nel Gupta
 

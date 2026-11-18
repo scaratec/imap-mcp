@@ -1,6 +1,6 @@
 # ADR 0005: Per-Folder Write Capabilities
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0045](0045-write-visibility-floors-and-flow-monotonicity.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

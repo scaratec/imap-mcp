@@ -1,6 +1,6 @@
 # ADR 0032: One Audit Chain Shared by Local Server Instances
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0048](0048-pre-effect-audit-and-test-boundary.md)
 - **Date:** 2026-10-18
 - **Deciders:** Randy Nel Gupta
 

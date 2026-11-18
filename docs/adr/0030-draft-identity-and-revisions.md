@@ -1,6 +1,6 @@
 # ADR 0030: Draft Identity via In-Message Handle and Revision Counter
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0042](0042-cryptographic-and-wal-provenance.md)
 - **Date:** 2026-09-18
 - **Deciders:** Randy Gupta
 

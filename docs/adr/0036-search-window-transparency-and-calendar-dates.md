@@ -1,9 +1,8 @@
 # ADR 0036: Search Reports What Its Window Hid and Accepts Calendar Dates
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0043](0043-non-interference-transparency-and-search.md)
 - **Date:** 2026-11-03
-- **Deciders:** Randy Gupta
-- **Amends:** [ADR 0024] (calendar bounds beside durations), [ADR 0026] §5 (response field)
+- **Deciders:** Randy Nel Gupta
 
 ## Context
 

@@ -1,6 +1,6 @@
 # ADR 0009: OAuth2 Authorization-Code Flow with Per-Account Scope Minimization
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0059](0059-oauth2-pkce-and-durable-account-health.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

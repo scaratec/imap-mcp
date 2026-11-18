@@ -1,9 +1,8 @@
 # ADR 0034: Discard a Draft by Its Handle
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0063](0063-structured-own-draft-composition-and-revision.md)
 - **Date:** 2026-11-03
-- **Deciders:** Randy Gupta
-- **Amends:** [ADR 0018] (discarding stays a move), [ADR 0027] (error type), [ADR 0031] (how a draft is discarded)
+- **Deciders:** Randy Nel Gupta
 
 ## Context
 

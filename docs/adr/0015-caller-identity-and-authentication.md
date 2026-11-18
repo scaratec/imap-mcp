@@ -1,6 +1,6 @@
 # ADR 0015: Caller Identity and Authentication
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0049](0049-single-caller-boundary-and-validated-loading.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

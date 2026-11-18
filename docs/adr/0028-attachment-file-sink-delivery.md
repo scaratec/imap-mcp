@@ -1,6 +1,6 @@
 # ADR 0028: Attachment File-Sink Delivery
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0047](0047-per-caller-symlink-safe-attachment-delivery.md)
 - **Date:** 2026-06-08
 - **Deciders:** Randy Nel Gupta
 

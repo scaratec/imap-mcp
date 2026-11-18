@@ -1,6 +1,6 @@
 # ADR 0011: Pluggable Secret Store Backend
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0050](0050-secret-stores-and-oauth-posture.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

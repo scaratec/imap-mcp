@@ -1,6 +1,6 @@
 # ADR 0012: Python 3.11+ Runtime and Library Stack
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0061](0061-python-runtime-and-strict-verification-stack.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

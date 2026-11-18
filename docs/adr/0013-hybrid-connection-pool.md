@@ -1,6 +1,6 @@
 # ADR 0013: Hybrid IMAP Connection Pool
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0055](0055-bounded-per-account-connection-pool.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 

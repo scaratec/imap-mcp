@@ -1,6 +1,6 @@
 # ADR 0024: Duration Grammar Single Source
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0041](0041-direction-aware-rule-grammar-and-provenance.md)
 - **Date:** 2026-06-05
 - **Deciders:** Randy Nel Gupta
 

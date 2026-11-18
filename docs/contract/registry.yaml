@@ -1,0 +1,71 @@
+version: "3.0.0"
+
+caller_allow_reasons:
+  - authenticated
+  - folder_default_applied
+  - rule_matched
+
+caller_deny_reasons:
+  - auth_failed
+  - unknown_tool
+  - account_hidden
+  - needs_rebootstrap
+  - folder_hidden
+  - policy_alias_conflict
+  - visibility_below_COUNT
+  - visibility_below_METADATA
+  - visibility_below_ENVELOPE
+  - visibility_below_HEADERS
+  - visibility_below_BODY
+  - visibility_below_FULL
+  - capability_missing
+  - forbidden_flag
+  - relocation_would_escalate
+  - recipient_not_allowed
+  - tool_not_applicable_for_provider
+
+caller_error_types:
+  - not_found
+  - folder_absent
+  - select_failed
+  - uidvalidity_changed
+  - append_rejected
+  - append_timeout
+  - append_failed
+  - empty_reply_text
+  - missing_message_id
+  - attachment_not_found
+  - sink_not_configured
+  - sink_not_writable
+  - draft_not_editable
+  - draft_revision_conflict
+  - draft_ambiguous
+  - trash_unavailable
+  - saga_aborted
+  - transient_imap_failure
+  - unsupported_imap_capability
+  - pool_exhausted
+  - secret_unavailable
+  - internal_error
+
+audit_internal_reasons:
+  - day_roll
+  - retention_delete
+  - audit_file_missing
+  - saga_step
+  - ambiguous_target_match
+  - policy_reload_ok
+  - policy_reload_rejected
+  - token_refresh_ok
+  - token_refresh_failed
+  - oauth_bootstrap_ok
+  - pool_drain
+  - mutf7_decode_fallback
+  - identity_immutable
+  - invalid_arguments
+  - internal_error
+  - object_missing
+  - message_not_granted
+  - message_capped
+  - foreign_caller
+  - eof_day

@@ -1,9 +1,8 @@
 # ADR 0035: Draft Body Format Is a Deliberate, Equally Easy Choice
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0063](0063-structured-own-draft-composition-and-revision.md)
 - **Date:** 2026-11-03
-- **Deciders:** Randy Gupta
-- **Amends:** [ADR 0026] (create_draft input), [ADR 0031] (shared field set), the reply contract of `create_reply_draft`
+- **Deciders:** Randy Nel Gupta
 
 ## Context
 

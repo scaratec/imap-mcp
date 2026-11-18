@@ -1,6 +1,6 @@
 # ADR 0014: Policy as Git-Versioned YAML with SIGHUP Reload
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0049](0049-single-caller-boundary-and-validated-loading.md)
 - **Date:** 2026-04-20
 - **Deciders:** Randy Nel Gupta
 
