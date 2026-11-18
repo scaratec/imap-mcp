@@ -2,6 +2,38 @@
 
 <!-- version list -->
 
+## v3.0.0 (2026-11-18)
+
+### Bug Fixes
+
+- **saga**: Fsync terminal saga_transition audit before WAL state update
+  ([`24a8782`](https://github.com/scaratec/imap-mcp/commit/24a87824b1d3c2413d1171b243a4bb74fcdfc07a))
+
+### Documentation
+
+- **adr**: Define 3.0.0 security architecture and contracts
+  ([`40e7607`](https://github.com/scaratec/imap-mcp/commit/40e760715d3277b638b4fef4ed71ef5d0cfa0764))
+
+- **governance**: Record 3.0.0 LIM paydowns, spec-audit, and docs
+  ([`fb99400`](https://github.com/scaratec/imap-mcp/commit/fb99400533cec775605fad15ac8b74c7304b64c5))
+
+- **roadmap**: Refresh the smoke test and the next block after 2.3.0
+  ([`9f174a6`](https://github.com/scaratec/imap-mcp/commit/9f174a69fec710722fb77bac36135ae8431c1bda))
+
+### Features
+
+- **server**: Overhaul sc-imap-mcp to 3.0.0 security boundary
+  ([`8324738`](https://github.com/scaratec/imap-mcp/commit/8324738f016b14576e268c3338b25b853f97d4b0))
+
+### Testing
+
+- **bdd**: Align 64 BDD features, mocks, steps, and usability to 3.0.0
+  ([`366c013`](https://github.com/scaratec/imap-mcp/commit/366c0137068ace2a40109687b4e35ba14633bd37))
+
+- **bdd**: Fix ARC runner hook python and gpg_file audit check
+  ([`54419b3`](https://github.com/scaratec/imap-mcp/commit/54419b313a58c0514069bdc7fe6d117f0a5cb144))
+
+
 ## v2.3.0 (2026-11-03)
 
 ### Bug Fixes
